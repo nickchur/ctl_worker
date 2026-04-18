@@ -1,0 +1,1116 @@
+"""### 🔄 DAG: `CTL.{wf_name}` — Рабочий процесс загрузки CTL (Change Tracking & Loading)
+
+Динамически генерируемый DAG для выполнения ETL-процессов в рамках системы **CTL** (Change Tracking & Loading).  
+Отвечает за инициализацию, выполнение бизнес-логики, валидацию и финализацию загрузок с полной интеграцией в Airflow и внешние системы.
+
+---
+
+#### 🚀 Запуск
+DAG может быть запущен:
+- **По событию** (`Dataset`) — при появлении новых данных.
+- **По расписанию** (`Cron`) — автоматически по времени.
+- **Вручную** — через интерфейс Airflow.
+
+Поддерживает сложные условия запуска: `AND`, `OR`, смешанные триггеры (событие + время).
+
+---
+
+#### 📌 Основные задачи
+
+| Задача       | Назначение |
+|--------------|-----------|
+| `run_prm`    | Инициализация параметров, создание загрузки в CTL, обработка типа запуска. |
+| `run_tfs` (опц.) | Загрузка файлов из S3/TFS в Greenplum. |
+| `run_exe`    | Выполнение основной логики в Greenplum через SQL-процедуру. |
+| `run_out` (опц.) | Экспорт данных и генерация `Dataset`-событий. |
+| `run_end`    | Публикация статистик по сущностям, отправка событий, финализация. |
+
+> ⚠️ `run_sts` и `run_end` (старая версия) закомментированы — логика объединена в `run_end`.
+
+---
+
+#### 🔧 Особенности реализации
+
+- **Гибкие расписания:**  
+  Поддержка `Dataset`, `Cron`, `DatasetOrTimeSchedule`, условных выражений (`startCondition`).
+- **Повторные попытки:**  
+  Управление через `wfp_retry`: количество, задержки, условия (`on_error`, `on_no_data`), циклические retry (`-7`).
+- **Режимы запуска:**  
+  Автоматическое определение: `AF-EVENT`, `AF-TIME`, `manual`, `AF-tfs-in`.
+- **TFS Integration:**  
+  Прямая загрузка CSV-файлов из S3 в Greenplum с архивацией/обработкой ошибок.
+- **Статусы и события:**  
+  Двусторонняя синхронизация статусов с CTL API. Генерация `Dataset` при успешной загрузке.
+- **Тестовый режим:**  
+  Поддержка `wf_test_mode` с имитацией выполнения и задержками.
+- **SLA и таймауты:**  
+  Настройка `sla`, `execution_timeout`, `dagrun_timeout` на основе параметров.
+
+---
+
+#### 🏷️ Метаданные
+
+- **Теги:** `['CTL', '{profile}', 'CTL_wf', '{category}', 'AF_event']`
+- **Max active runs:** `1` (если `singleLoading`), иначе `1000`
+- **Catchup:** `False`
+- **Pause при создании:** зависит от `scheduled`
+- **Пулы:**  
+  - `ctl_pool` — задачи управления  
+  - `gp_pool` — выполнение в Greenplum
+
+---
+
+#### 🔄 Жизненный цикл загрузки
+
+1. **run_prm** → создаёт `loading_id`, устанавливает `RUNNING`.
+2. **run_tfs** → (если есть) загружает файлы.
+3. **run_exe** → выполняет бизнес-логику в GP.
+4. **run_end** → публикует метрики, генерирует события, завершает загрузку.
+5. При ошибке → анализируется `retry`, возможен `TIME-WAIT` или завершение.
+
+---
+
+> 💡 *Примечание:* Этот DAG — часть динамической системы. Все экземпляры создаются на лету на основе конфигурации из `ctl_workflows`.*
+"""
+# Airflow 2.10.1
+
+from airflow import DAG
+
+from airflow.datasets import DatasetAlias, Dataset
+from airflow.timetables.datasets import DatasetOrTimeSchedule
+from airflow.timetables.trigger import CronTriggerTimetable
+
+from airflow.utils.dates import days_ago
+
+from airflow.utils.state import State
+from airflow.utils.session import create_session #, provide_session
+from airflow.models import  Param, TaskInstance
+
+# from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
+from airflow.decorators import task
+from airflow.exceptions import AirflowFailException, AirflowSkipException, AirflowRescheduleException
+
+# from datetime import timedelta
+# from functools import partial
+import ast
+import time
+import json
+import pendulum
+import random
+
+from datetime import timedelta
+from functools import reduce
+from operator import and_, or_
+from pprint import PrettyPrinter
+
+
+from plugins.utils import add_note, on_callback, str2timedelta, update_dag_pause, safe_eval, readable 
+from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv
+from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete
+from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, 
+                              ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed)
+
+from logging import  getLogger
+logger = getLogger('airflow.task')
+
+# Справочники
+profile = get_config()['profile']
+archive = get_config().get('archive_category', 'p1080.ARCHIVE')
+
+# cat_dict = ctl_obj_load('ctl_categories')
+# wfs_dict = ctl_obj_load('ctl_workflows')
+# ent_dict = ctl_obj_load('ctl_entities')
+enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
+ctl_events = ctl_obj_load('ctl_events')
+
+def req(url, method='get', data={}, log=True, logs=None):
+    """Унифицированный интерфейс к API CTL:
+    - Автоматически маршрутизирует запросы.
+    - Поддерживает `/statval/m`, `/loading/status` и другие.
+    - Логирует все вызовы.
+    """
+    if log:
+        logger.info(dict(url=url, method=method, data=data))
+    
+    if type(logs) == dict:
+        ind = len(logs)
+        logs[ind] = str(data)
+    elif type(logs) == list:
+        logs.append(str(data))
+    
+    if url == '/statval/m':
+        lid = data['loading_id']
+        eid = data['entity_id']
+        sid = data['stat_id']
+        url = f'/v4/api/loading/{lid}/entity/{eid}/stat/{sid}/statval?profile={profile}'
+        json = data['avalue']
+        ret = ctl_api(url, method, json=json)
+    # elif url == '/loading/status':
+    #     lid = data['loading_id']
+    #     ret = ctl_api(f'/v4/api/loading/{lid}/status', method, json=data)
+    elif not url.startswith('/v'):
+        url = '/v5/api' + url 
+        ret = ctl_api(url, method, data)
+    elif url.startswith('/v4'):
+        ret = ctl_api(url, method, json=data)
+    else:
+        ret = ctl_api(url, method, data)
+    
+    return ret
+
+def get_params(context):
+    ti = context['task_instance']
+    wf_prm = ti.xcom_pull(key='params', task_ids=f'run_prm')
+    if not wf_prm:
+        msg = "⚠️Params is empty"
+        add_note(msg, context, level='Task,DAG')
+        raise AirflowSkipException(msg)
+    return wf_prm
+
+def parse_condition(cond, enames):
+    ctype = cond.get('$type')
+    
+    # 1. Базовые элементы
+    if ctype == 'statVal':
+        e_id = cond['entityId']
+        return Dataset(f"CTL/{cond['profile']}/{e_id}/{enames.get(e_id, 'unknown')}")
+    
+    if ctype == 'cronExpression':
+        return CronTriggerTimetable(cond['expr'], timezone="Europe/Moscow")
+    
+    # 2. Рекурсивная сборка (OR / AND)
+    if ctype in ('or', 'and'):
+        datasets = []
+        timetable = None
+        
+        for c in cond.get('inner', []):
+            res = parse_condition(c, enames)
+            if isinstance(res, CronTriggerTimetable):
+                timetable = res  # Запоминаем крон
+            elif res:
+                datasets.append(res)
+        
+        # Объединяем найденные датасеты
+        op = or_ if ctype == 'or' else and_
+        combined_ds = reduce(op, datasets) if datasets else None
+        
+        # 3. Финальная сборка узла
+        if timetable and combined_ds:
+            if ctype == 'or':
+                # Обязательно список [combined_ds]
+                return DatasetOrTimeSchedule(timetable=timetable, datasets=[combined_ds])
+            else:
+                return None
+            #     return DatasetAndTimeSchedule(timetable=timetable, datasets=[combined_ds])
+        
+        return combined_ds or timetable
+
+    return None
+
+def get_schedule(w, enames):
+    wf_params = w.get('params', {})
+    is_dataset_run = get_config().get('dug_run') == 'dataset'
+    
+    # 1. Начальный schedule
+    schedule = Dataset(f"CTL/wf/{w['id']}/{w['name']}", extra={}) if is_dataset_run else None
+    
+    # 2. Если воркер в архиве — возвращаем как есть
+    if w.get('category') == archive:
+        return schedule, "ARCHIVE"
+
+    # 3. Определение тега (упрощенный маппинг)
+    is_scheduled = w.get('scheduled', False)
+    prefix = 'CTL_' if is_scheduled else 'AF_'
+    
+    if w.get('wf_event_sched'):   tag_type = 'event'
+    elif w.get('wf_time_sched'):  tag_type = 'time'
+    elif w.get('startCondition'): tag_type = 'condition'
+    else:                         tag_type = 'manual'
+    
+    tag = f"{prefix}{tag_type}"
+    
+    # 4. Обработка логики расписания (только для не-scheduled или специфичных условий)
+    if not is_scheduled:
+        # Вариант TFS
+        if tfs_path := wf_params.get('wf_tfs_in'):
+            ds = Dataset(f"TFS/{profile}/{tfs_path.lstrip('/')}")
+            schedule = (schedule | ds) if schedule else ds
+            tag = 'AF_tfs-in'
+
+        # Вариант Events
+        elif event_sched_dict := w.get('wf_event_sched'):
+            datasets = [
+                Dataset(f"CTL/{pes.split('/')[0]}/{pes.split('/')[1]}/{enames[int(pes.split('/')[1])]}")
+                for pes, active in event_sched_dict.items() if active
+            ]
+            if datasets:
+                op = and_ if w.get('eventAwaitStrategy') == 'and' else or_
+                event_combined = reduce(op, datasets)
+                schedule = (schedule | event_combined) if schedule else event_combined
+
+        # Вариант Time
+        elif time_sched := w.get('wf_time_sched'):
+            cron = CronTriggerTimetable(time_sched.get("sched", '0 0 1 1 *'), timezone="Europe/Moscow")
+            schedule = DatasetOrTimeSchedule(timetable=cron, datasets=[schedule]) if schedule else cron
+        
+        elif cond_dict := w.get('startCondition'):
+            parsed_cond = parse_condition(cond_dict, enames)
+            schedule = parsed_cond
+            
+            # if parsed_cond:
+            #     schedule = (schedule | parsed_cond) if schedule else parsed_cond
+
+    return schedule, tag
+
+def set_pause(wf_name, cat):
+    
+    if get_config().get('is_paused'):
+        is_paused = True
+    elif get_config().get('un_paused') and cat != archive:
+        is_paused = False
+    else:
+        is_paused = None
+    
+    if is_paused is not None:
+        try:
+            # Находим запись дага в БД и ставим is_paused 
+            update_dag_pause(dag_id = f'CTL.{wf_name}', paused=is_paused)
+        except Exception as e:
+            logger.debug(f"Failed to update pause state for {wf_name}: {e}")
+    
+
+for w in ctl_obj_load('ctl_workflows').values():
+    if w.get('profile') != profile: continue
+    if w.get('deleted', False): continue 
+    
+    cat_full = w['category']
+    cat_prfx = cat_full.split('.')[0]
+    cat_name = cat_full.split('.')[-1]
+    
+    # wid = w['id']
+    wf_name = w['name'] #.split('.')[-1]
+    wf_short = w['name'].split('.')[-1]
+    
+    tags=[w['profile'], 'CTL_wf', cat_full]
+    tags.append('CTL_archive' if cat_full == archive else 'CTL')
+    
+    # Определяем is_paused
+    set_pause(wf_name, cat_full)
+
+    # Определение расписания и зависмости
+    try:
+        schedule, tag = get_schedule(w, enames)
+    except Exception as e:
+        schedule, tag = None, 'AF_error'
+    tags.append(tag)
+    
+    # Параметры
+    wf_params = w['params'].copy()
+    wf_params['wf_exe'] = wf_params.get('wf_exe', wf_params.get('wf_exec')) or f'pr_{wf_short}()'
+    wf_params['save_params'] = Param(False, type="boolean", title="Сохранить параметры")
+    wf_params['start_wf'] = Param(True, type="boolean", title="Запустить")
+    
+    schedule_wf = w.get('scheduled', False) and w.get('singleLoading', False)
+    wf_params['schedule_wf'] = Param(schedule_wf, type="boolean", title="Поставить на расписание")
+
+
+    #TFS
+    if wf_tfs_in  := wf_params.get('wf_tfs_in'):  tags.append('tfs-in')
+    if wf_tfs_out := wf_params.get('wf_tfs_out'): tags.append('tfs-out')
+
+    # Entity
+    w_eids = [int(e.strip()) for e in w['params'].get('wf_entity', '').split(',') if e.strip()]
+
+    # Timeouts
+    # task_time = str2timedelta(config.get('task_timeout', 'hours=1'))
+    # prm_task_to = task_time
+    # tfs_task_to = (prm_task_to + task_time) if w.get('wf_tfs_in') else prm_task_to
+    
+    exe_timeout = wf_params.get('wf_timeout', get_config().get('exe_timeout', 'hours=4')) 
+    try: exe_timeout = timedelta(minutes = int(exe_timeout))
+    except: exe_timeout = str2timedelta(exe_timeout)
+    # exe_timeout += timedelta(minutes = +10)
+    
+    # exe_task_to = tfs_task_to + exe_timeout + task_time
+    # end_task_to = exe_task_to + task_time
+    # dagrun_timeout =  end_task_to + task_time
+    sla_time = str2timedelta(get_config().get('sla_time', 'hours=2'))
+
+            
+    conf = dict(
+        schedule=schedule,
+        tags=tags,
+        max_active_runs= 1 if w.get('singleLoading', True) else 1000,
+        # dagrun_timeout=dagrun_timeout,
+        is_paused_upon_creation= not w.get('scheduled', False),
+    )
+
+    ctl_url = f"{get_config()['conns']['ctl']['url']}/#/workflow-details/{w['id']}"
+    doc_md = (
+        f"###🔗 [CTL/{profile}/{wf_name}]({ctl_url})  TimeOut: {exe_timeout}\n\n"
+        # f"```json\n{json.dumps(w, indent=4)}\n```"
+        f"```\n{PrettyPrinter(indent=4, width=200, compact=True).pformat(w)}\n```\n"
+        f"```\n{PrettyPrinter(indent=4, width=200, compact=True).pformat(conf)}\n```\n"
+        f"```\n{PrettyPrinter(indent=4, width=200, compact=True).pformat(w_eids)}\n```\n"
+    )
+    
+    with DAG(f'CTL.{wf_name}', 
+        default_args={
+            # 'owner': 'EDP.ETL',
+            'owner': profile,
+            'depends_on_past': False,
+            'email': ['p1080@sber.ru'],
+            'email_on_failure': False,
+            'email_on_retry': False,
+            'retries': 2,
+            'retry_delay': timedelta(minutes=1),
+            'retry_exponential_backoff': True,  
+            'max_retry_delay': timedelta(minutes=10),
+            'pool': 'ctl_pool',
+            # 'execution_timeout': timedelta(minutes=15),  
+            'on_failure_callback': on_callback,
+            # 'on_success_callback': on_callback,
+            # 'on_retry_callback': on_callback,
+            # 'on_execute_callback': None,
+        },
+        # start_date=days_ago(1),
+        start_date=pendulum.now('UTC').subtract(hours=1),
+        catchup=False,
+        on_failure_callback=on_callback,
+        # on_success_callback=on_callback,
+        params=wf_params,
+        doc_md=doc_md, 
+        **conf, 
+    ) as dag:
+
+
+        @task(pool='ctl_pool', ) #   execution_timeout=prm_task_to,
+        def run_prm(wf, params=None, **context):
+            """### Инициализация параметров и создание загрузки
+
+            - Обрабатывает триггер (событие, время, ручной запуск).
+            - Формирует `params` с учётом retry, времени и типа запуска.
+            - Создаёт новую загрузку в CTL через `/v4/api/wf/{wid}/loading`.
+            - Обновляет статус на `RUNNING`.
+
+            **XCom Output:** `params` — полный набор параметров для следующих задач.
+
+            **Особенности:**
+            - Поддерживает `scheduleAfterStart` — перевод в режим расписания.
+            - Автоматически удаляет расписание, если `!singleLoading`.
+            """
+            chk_any_conn('ctl')
+            ti = context['task_instance']
+            
+            wid = int(wf['id'])
+            schedule_wf = params.get('schedule_wf', False)
+            
+            if params.get('save_params'):
+                res = {}
+                new_prm = [   
+                    # { "param": k, "prior_value": v if isinstance(v, (bool, int, float, str)) or v else str(v) } 
+                    { "param": k, "prior_value": str(v) } 
+                    for k,v in params.items() if k.startswith('wf')
+                ]
+                res['del'] = ctl_api(f"/v4/api/wf/{wid}/params", "delete")
+                res['new'] = ctl_api(f"/v4/api/wf/{wid}/params", "post", json=new_prm)
+                res['prm'] = new_prm
+                
+                msg = '⚙️ Параметры были сохранены.'
+                add_note(res, context, level='DAG,Task', title=msg)
+                
+            if not params.get('start_wf'):
+                msg = '⚠️ Задание не запущено.'
+                if schedule_wf and not wf['scheduled']: 
+                    ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+                    msg += ' ⏰ Задание поставлено на расписание.'
+                elif not schedule_wf and wf['scheduled']: 
+                    ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                    msg += ' 💀 Задание снято с расписания.'
+
+                add_note('', context, level='DAG,Task', title=msg)
+                raise AirflowSkipException(msg)
+                
+
+            all_events = context.get("triggering_dataset_events", {})
+            if all_events:
+                # Проходим по всем датасетам, которые триггернули запуск и берем последнее событие
+                run_type = 'AF-UNKNOWN'
+                ds_url = None
+                for dataset_uri, events in all_events.items():
+                    ds_url = dataset_uri
+                    for event in events:
+                        af_sdt = ''
+                        af_event = ''
+                        run_id = event.source_dag_run.run_id if event.source_dag_run else ''
+                        
+                        if event.extra.get("af_sdt"):
+                            params = {**params, **event.extra}
+                        
+                        for k,v in event.extra.items():
+                            for ek, ev in wf.get('wf_event_sched', {}).items():
+                                if ev and k.endswith(ek): 
+                                    af_event = k
+                            if k.endswith('/dt'): 
+                                af_sdt = v
+                        
+                        params[ds_url] = {
+                            af_event: af_sdt,
+                            'src_id': run_id,
+                        }
+                        
+                        params['af_sdt'] = max(af_sdt, params.get('af_sdt', ''))
+                        run_type = params.get('wfp_run_type', 'AF-EVENT')
+                        # break
+                        
+                    # params['af_ds'] = ds_url
+                        
+                run_note = f"dataset {ds_url}"
+                # add_note("🔍 "+run_note, context)
+            else:
+                run_note = context['dag_run'].run_id.split('_')[0]
+                # context['dag_run'].external_trigger
+                # context['dag_run'].run_type.upper()
+                run_type = params.get('wfp_run_type', 'AF-' + run_note.upper())
+            add_note(f'🔍{run_type} {run_note}', context)
+            
+            if params.get('loading_id'): # old loading
+
+                dug_run = context['dag_run']
+                params = dug_run.conf
+
+                lid = int(params['loading_id'])
+                # wid = int(params['wf_id'])
+                
+                # Проверяем статус загрузки
+                ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='WAIT-AF')
+                ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
+                
+                retry = ctl_get_retry(params=params, wf=wf)
+                params['wfp_retry'] = retry
+                logger.info(f"🔍 {lid} {retry}")
+                
+            else: # new loading
+
+                # wid = int(params.get('wf_id', wf.get('id', 0)))
+                # if wf['scheduled'] and wf['singleLoading']: 
+                if wf['scheduled']: 
+                    ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                    
+                prm = { k:str(v) for k,v in params.items() if k.startswith('wf') }  
+                prm['wfp_run_type'] = run_type
+                    # ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+
+                schedule_wf = params.get('schedule_wf', False)
+                new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={schedule_wf}", "post", json=prm)
+                lid = int(new_lid['loadingId'])
+                ctl_set_status(lid, 'RUNNING', 'NEW-AF ' + context['dag_run'].run_id)
+                
+                retry = ctl_get_retry(params=params, wf=wf)
+                wf_name = params.get('wfp_name', wf.get('name', ''))
+                
+                if not params.get('af_sdt'):
+                    params["af_sdt"] = pendulum.instance(ti.start_date).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
+                
+                params['loading_id'] = lid
+                params['wf_id'] = wid
+                params['wfp_name'] = wf_name
+                params['wfp_run_type'] = run_type
+                # params['wfp_status'] = 'RUNNING'
+                # params['wfp_status_log'] = ''
+                # params['wfp_status_sdt'] = params['af_sdt']
+                params['wfp_retry'] = retry
+                
+                
+                # Проверяем события на expire
+                ctl_chk_expire(wf, params, context)
+                
+            # Статистика по сущностям
+            eids = ctl_get_eids(wid, params)
+            eids = [f"{e}/{enames[e]}" for e in eids]
+            ti.xcom_push(key='eids', value=eids)
+            add_note(eids, context, level='Task,DAG',title=f"🔍 Entities")
+            # params['eids'] = eids
+                        
+            tfs = params.get('wf_tfs_in')
+            
+            if tfs is not None: 
+                tfs_mask = params.get('wf_tfs_mask', '*').strip(' ')
+                tfs_table = params.get('wf_tfs_table','')
+                tfs_schema = params.get('wf_tfs_schema','dia')
+                ctl_set_status(lid, 'RUNNING', f"TFS 🔍 {tfs}/{tfs_mask} -> {tfs_schema}.{tfs_table}")
+            else:
+                ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
+
+            add_note(params, context, level='Task', title='Params')
+            ti.xcom_push(key='params', value=params)
+
+            ctl_url = f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}"
+            msg = f"🔗 [Loading {lid}_{retry.get('try',1)} {run_type} {run_note}]({ctl_url})"
+            add_note(msg, context, level='Task,DAG')
+            
+            # return params
+
+        if wf_tfs_in:
+            @task(pool='gp_pool', ) #execution_timeout=tfs_task_to,)
+            def run_tfs(wf, **context):
+                """### Загрузка файлов из TFS"""
+                from pathlib import Path
+                
+                ti = context['task_instance']
+                
+                # Параметры
+                wf_prm = get_params(context)
+                
+                prefix  = wf_prm.get('wf_tfs_in','').strip(' ').strip('/')+'/'
+                mask    = wf_prm.get('wf_tfs_mask', '*').strip(' ')
+                options = wf_prm.get('wf_tfs_options')
+                table   = wf_prm.get('wf_tfs_table')
+                schema  = wf_prm.get('wf_tfs_schema')
+                truncate = str(wf_prm.get('wf_tfs_truncate', False)).lower() in ['true', 'yes']
+
+                wf_timeout = wf_prm.get('wf_timeout', get_config().get('gp_timeout', 'hours=3')) 
+                try: wf_timeout = timedelta(minutes = int(wf_timeout))
+                except: wf_timeout = str2timedelta(wf_timeout)
+                
+                if schema:
+                    if not schema.startswith('s_grnplm_vd_hr_edp_'):
+                        schema = 's_grnplm_vd_hr_edp_' + schema
+                
+                err_prefix = get_config().get('tfs_err_prefix') or 'tfs-errors'
+                arc_prefix = get_config().get('tfs_arc_prefix') or 'tfs-archive'
+
+                s3 = get_config()['conns']['files']
+                path = f"{s3['conn_id']}://{s3['bucket']}/{prefix}{mask}"
+
+                if not prefix:
+                    msg = f"✳️ TFS files are not required."
+                    add_note(msg, context, level='Task,DAG')
+                    ctl_set_status(lid, 'ERRORCHECK', msg)
+                    ctl_set_completed(lid, 'completed') # Completed/Aborted
+                    raise AirflowSkipException(msg)
+
+                lid = wf_prm.get('loading_id', 0)
+                # Проверяем статус загрузки
+                ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='TFS')
+                ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
+                
+                if '.done' in path:
+                    done_path = path.split('.done')[0]+'.done'
+                    done_mask = path.replace(done_path, '', 1)
+                    done_keys = s3_keys(done_path)
+                    keys = dict()
+                    for done_key in done_keys:
+                        path = f"{s3['conn_id']}://{s3['bucket']}/" + done_key[:-5] + done_mask
+                        logger.info(f"🔍 {path}")
+                        keys = {**keys, **s3_keys(path)}
+                else:
+                    done_keys = {}
+                    keys = s3_keys(path)
+                    
+                
+                if len(keys) == 0:
+                    msg = '⚠️ No new TFS files'
+                    add_note(msg, context, level='Task,DAG')
+                    ctl_set_status(lid, 'ERRORCHECK', msg)
+                    ctl_set_completed(lid, 'completed') # Completed/Aborted
+                    raise AirflowSkipException(msg)
+
+                for key, value in keys.items():
+                    new_path = f"{s3['conn_id']}://{s3['bucket']}/{key}"
+                    arc_path = f"{s3['conn_id']}://{s3['bucket']}/{arc_prefix}/{key}"
+                    err_path = f"{s3['conn_id']}://{s3['bucket']}/{err_prefix}/{key}"
+                    try:
+                        key_tbl = Path(key).name
+                        for s in [" ", "'", '"', ":", ";", "."]:
+                            key_tbl = key_tbl.split(s)[0]
+                            
+                        rows = gp_upload_s3_csv(
+                            table=table or key_tbl, 
+                            key=key, 
+                            options=options, 
+                            gp_schema=schema, 
+                            truncate=truncate,
+                            timeout=int(wf_timeout.total_seconds()), 
+                        )
+                        
+                        msg = f"✅ {value}: {readable(rows, 1000)}"
+                        ctl_set_status(lid, 'RUNNING', f'TFS-OK {msg}')
+                        add_note(msg, context, level='Task,DAG', title=f"✅ {key}")
+                        s3_move_s3(new_path, arc_path)
+                    except Exception as e:
+                        s3_move_s3(new_path, err_path)
+                        add_note(e, context, level='Task,DAG', title='❌ Error')
+                        
+                        ctl_set_status(lid, 'ERROR', e)
+                        ctl_set_completed(lid, 'completed') # Completed/Aborted
+                        raise AirflowFailException(e)
+                
+                if len(done_keys) > 0:
+                    for done_key in done_keys:
+                        done_path = f"{s3['conn_id']}://{s3['bucket']}/" + done_key
+                        s3_delete(done_path)
+                        add_note(f"🗑️ .done deleted: {done_path}", context, level='Task')
+
+                
+                # retry = ctl_get_retry(params=wf_prm, wf=wf)
+                retry = ctl_get_retry(params=wf_prm)
+                ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
+                
+
+        @task(pool='gp_pool', sla=sla_time, ) # execution_timeout=exe_task_to,)
+        def run_exe(wf, **context):
+            """### Выполнение бизнес-логики в Greenplum
+
+            - Запускает SQL-процедуру через `gp_exe`.
+            - Возвращает результат:
+            - `res`: код (положительный — успех, ноль — нет данных, отрицательный — ошибка).
+            - `msg`: сообщение.
+            - `cdc`, `hub`, `stat`, `html` — опциональные метрики.
+
+            **XCom Output:** `result` — словарь с результатом выполнения.
+
+            **Особенности:**
+            - Использует `PostgresHook` для подключения к Greenplum.
+            - Логирует PID и время начала.
+            """     
+            chk_any_conn('gp')
+            ti = context['task_instance']
+            wf_prm = get_params(context)
+            
+            wf_name = wf.get('name', 'unknown').split('.')[-1]
+            cat = wf['category'].split('.')[-1]
+            lid = wf_prm.get('loading_id', 0)
+            wid = wf_prm.get('wf_id', 0)
+            sdt = wf_prm.get('af_sdt', '')
+            exe = wf_prm.get('wf_exe', wf_prm.get('wf_exec')) 
+            
+            # Проверяем статус загрузки
+            ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
+                
+            # TEST !!!
+            test_mode = wf_prm.get('wf_test_mode', get_config().get('test_mode', False))
+            # test_mode = test_mode if isinstance(test_mode, (list, tuple)) else [test_mode, ]
+            test_mode = False if str(test_mode).lower() in ['false', 'none', '', '0'] else test_mode
+
+            # TEST !!!
+            if test_mode:
+                rand = random.random()
+                if False and len(test_mode) > 2 and isinstance(test_mode[2], str): 
+                    test_mode_str = test_mode[2]
+                    rand = safe_eval(test_mode_str)
+                else:
+                    rand = int((rand ** 3) * 45*60)
+                
+                exe = f"'Ok Test work',pg_sleep({rand})" # TEST !!!
+            
+
+            wfp = {}
+            retry = wf_prm.get('wfp_retry', {})
+            
+            val = {
+                'wf': wf_name  # имя воркфлоу
+                , 'cat': cat   # категория воркфлоу
+                , 'exe': exe   # запуск
+                , 'lid': lid   # id задачи
+                , 'cwf': wid   # id воркфлоу
+                , 'sdt': sdt   # дата запуска
+                # , 'wfp': wfp   # параметры
+                , 'rtr': retry # повторы
+            }
+            if wf_prm.get('wf_sch') is not None: val['sch'] = wf_prm['wf_sch']   # схема execute
+            # if params.get('swf_id') is not None: val['swf'] = params['swf_id']
+            if wf_prm.get('wf_zt_sch') is not None: val['zts'] = wf_prm['wf_zt_sch']   # ККД схема
+            if wf_prm.get('wf_zt_tbl') is not None: val['ztt'] = wf_prm['wf_zt_tbl']   # ККД таблица
+            if wf_prm.get('wf_zt_active') is not None: val['zta'] = wf_prm['wf_zt_active'] # ККД actual
+            if wf_prm.get('wf_zt_rollback') is not None: val['ztb'] = wf_prm['wf_zt_rollback'] # ККД rollback
+            if wf_prm.get('wf_zt_error') is not None: val['zte'] = wf_prm['wf_zt_error']   # ККД error
+            if wf_prm.get('wf_zt_param') is not None: val['ztp'] = wf_prm['wf_zt_param']   # ККД параметры
+
+            wf_timeout = wf_prm.get('wf_timeout', get_config().get('gp_timeout', 'hours=3')) 
+            try: wf_timeout = timedelta(minutes = int(wf_timeout))
+            except: wf_timeout = str2timedelta(wf_timeout)
+            # wf_timeout += timedelta(seconds = -15)
+            
+            ti.xcom_push(key='run_prm', value={**val, 'timeout': str(wf_timeout)} )
+            add_note({**val, 'timeout': str(wf_timeout)}, context, level='Task', title='Run_prm')
+
+
+            # gp_hook = PostgresHook(postgres_conn_id=config['gp_conn_id'])
+            sql = f"""select pr_swf_start_ctl($jsn${json.dumps(val)}$jsn$::json)"""
+            
+            # EXECUTE !!!
+            ts = time.time()
+            res = gp_exe(sql=sql, ti=ti, timeout=int(wf_timeout.total_seconds())) 
+            # res['ts'] = pendulum.duration(seconds= int(time.time() - ts)).in_words()
+            res['ts'] = str(timedelta(seconds=int(time.time() - ts)))
+            
+            # TEST !!!
+            if test_mode:
+                rand = random.random()
+                if False and len(test_mode) > 3 and isinstance(test_mode[3], str): 
+                    test_mode_str = test_mode[3]
+                    rand = safe_eval(test_mode_str)
+                else:
+                    # rand = 'random.randint(0, 2)' # TEST !!!
+                    rand = int(rand * (2 - 0 + 1)) + 0
+                
+                res['res'] = int(rand) # TEST !!!
+                
+            # res['icon'] = '✅' if res.get('res') > 0 else ('⚠️' if res.get('res') == 0 else '❌')
+            
+            ti.xcom_push(key='result', value=res)
+            add_note(res, context, level='Task,DAG', title='Result')
+
+            # return eids
+
+        if wf_tfs_out:
+            @task(pool='gp_pool', outlets=[ DatasetAlias(f"TFS/{profile}/{wf_tfs_out}") ],)
+            def run_out(wf, **context):
+                pass
+
+        outlets = [DatasetAlias(f"CTL/{profile}/{e}") for e in w_eids]
+        @task(outlets=outlets,) # execution_timeout=end_task_to) # trigger_rule = 'none_failed'
+        def run_end(wf, **context): #outlet_events,
+            """### Публикация статистики по сущностям
+
+            Для каждой сущности (`eid`) из `wf_entity`:
+            - Записывает статистики в CTL:
+            - `LAST_LOADED_TIME`
+            - `CHANGE`, `MAX_CDC_DATE`
+            - `METRIC_QUALITY`, `METRIC_ACTUALITY`
+            - Произвольные `stat_id`.
+            - Если данные загружены (`res > 0`) — генерирует `Dataset` событие.
+
+            **XCom Output:** `msg` — краткая запись о действиях.
+
+            **Особенности:**
+            - Поддерживает длинные сообщения (разбивка по 5000 символов).
+            - Отправляет события в `CTL/{profile}/entities`.
+            """
+            
+            ti = context['task_instance']
+            chk_any_conn('ctl')
+            # Параметры
+            wf_prm = get_params(context)
+            
+            # Результат
+            result = ti.xcom_pull(key='result', task_ids=f'run_exe')
+            if not result:
+                add_note("⚠️ Result is empty", context, level='Task,DAG')
+                raise AirflowSkipException("⚠️ Result is empty")
+            
+            # Статистика по сущностям
+            eids = ti.xcom_pull(key='eids', task_ids='run_prm')
+            add_note(eids, context, level='Task', title='Entities')
+
+            # eids = [eid,] if isinstance(eid, str) else eid
+            # logger.info(f'🔍 {wf["name"]} {eids}')
+
+            lid = wf_prm.get('loading_id', 0)
+            
+            # Проверяем статус загрузки
+            ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
+            
+            msg = {}
+            for eid in eids:
+                eid = int(eid.split('/')[0])
+                
+                res = int(result['res']) if result.get('res') is not None else -99
+                logs = {}
+                
+                # Если результат содержит html
+                if result.get('html'):
+                    ctl_send_html(result['html'], lid, eid, wf['name'])
+                    result['html'] = ''
+
+                # data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 61
+                #         , 'avalue': [str(ret)]}
+                # req('/statval/m', 'post', data, log=False, logs=logs)  # CORRECTION_STATUS
+
+                data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 11
+                    , 'avalue': [pendulum.now(get_config()["tz"]).format('YYYY-MM-DD HH:mm:ss')]}
+                req('/statval/m', 'post', data, log=False, logs=logs)  # LAST_LOADED_TIME
+
+                # Если данные загружены
+                if res > 0:
+                    # Записать статистики CHANGE
+                    data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 2
+                        , 'avalue': ['1']}
+                    req('/statval/m', 'post', data, log=False, logs=logs)  # CHANGE
+
+                    if result.get('cdc'):
+                        data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 1
+                            , 'avalue': [str(result['cdc'])]}
+                        req('/statval/m', 'post', data, log=False, logs=logs)  # MAX_CDC_DATE
+
+                    # Записать статистики для DATA_HUB
+                    if result.get('hub'):
+                        data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 56
+                            , 'avalue': [json.dumps(result['hub'])]}
+                        req('/statval/m', 'post', data, log=False, logs=logs)  # METRIC_QUALITY
+
+                        if result['hub'].get('dataBusiness'):
+                            data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 55
+                                , 'avalue': [json.dumps(dict(dataBusiness=result['hub']['dataBusiness']))]}
+                            req('/statval/m', 'post', data, log=False, logs=logs)  # METRIC_ACTUALUTY
+
+                # elif res < 0:
+                #     data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 99
+                #             , 'avalue': [str(res)]}
+                #     req('/statval/m', 'post', data, log=False, logs=logs)  # MBX_ERROR
+
+                # Записать произвольные статистики
+                if result.get('stat'):
+                    for k, v in result['stat'].items():
+                        data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': int(k)
+                            , 'avalue': [v]}
+                        req('/statval/m', 'post', data, log=False, logs=logs)  # 5-BUSNINESS_DATE
+
+                ent_name = enames[eid]
+                ind = f'{lid}/{profile}/{eid}'
+                ext = {}
+                ext[f"{ind}/url"] = f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}"
+                ext[f"{ind}/dt"] = pendulum.now(get_config()["tz"]).format('YYYY-MM-DD HH:mm:ss')
+
+                for k, l in logs.items():
+                    v = ast.literal_eval(l)
+                    msg[f"{ind}/{ent_name}"] = { v['stat_id'] : v['avalue'][0]}
+                    ext[f"{ind}/{v['stat_id']}"] = v['avalue'][0]
+                
+                add_note(msg, context, level='Task')
+
+                if res > 0:
+                # if not ctl_events.get(f"{profile}/{eid}/2") and res > 0:
+                    sts = '' if res > 0 else ('.NO_NEW' if res == 0 else '.ERROR')
+                    ds = Dataset(f'CTL/{profile}/{eid}/{ent_name}{sts}')
+                    add_note(ds, context, level='Task')
+                    context['outlet_events'][f"CTL/{profile}/{eid}"].add(ds, extra=ext)    
+            
+            logger.info(f"✅ {context['outlet_events']}")
+            for outlet, value in context['outlet_events'].items():
+                # logger.info(f"✅ {outlet} {value}")
+                add_note(value.extra, context, level='Task', title=outlet)
+                # value.add(ds,extra=ext) 
+            
+            # return msg
+            ti.xcom_push(key='eids', value=json.dumps(msg, default=str))
+
+
+        # @task(pool='ctl_pool')
+        # def run_sts(wf, **context): 
+            """### Анализ результата и принятие решения
+
+            - Определяет статус: `SUCCESS`, `ERROR`, `TIME-WAIT` (retry).
+            - Учитывает:
+            - Код возврата.
+            - Настройки retry (`wf_retry_cnt`, `delay`, `on`).
+            - Специальные коды (например, `-7` → циклический retry).
+            - Обновляет статус в CTL:
+            - `ERRORCHECK` + `TIME-WAIT` — если нужен retry.
+            - `SUCCESS` / `ERROR` — если завершён.
+
+            **XCom Output:** `(status, action, res_icon, res_msg)` — финальное состояние.
+
+            **Особенности:**
+            - Поддерживает `eval_delta` для отложенных запусков.
+            - Логирует всё в `ctl_api` и `add_note`.
+            """ 
+            
+            # chk_any_conn('ctl')
+            # ti = context['task_instance']
+            # wf_prm = get_params(context)
+            
+            # lid = int(wf_prm['loading_id'])
+            # # Проверяем статус загрузки
+            # ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            # ti.xcom_push(key='status', value=json.dumps(ld_sts, default=str))
+
+            wid = int(wf['id'])
+            sdt = wf_prm['af_sdt'][:19]
+            retry = wf_prm['wfp_retry']
+
+            # left = retry.get('left')
+            logs = None
+            res = int(result['res']) if result.get('res') is not None else -99
+            # left = retry['left'] if retry.get('left') else 0
+
+            # Выбор шаблона писем с детализацией
+            # tmpls = ctl_api(f'/tmpl/loading/{lid}/OUT_STATUS_NOTICE') or []
+            # tmpl = next(iter(tmpls), None)
+            tmpl = ctl_api(f'/v4/api/wf/{wid}/tmpl') or {}
+            
+            if tmpl.get('id') != 2:
+                    if tmpl.get('id'):
+                        ctl_api(f'/v4/api/wf/{wid}/tmpl/{tmpl["id"]}', 'delete')
+                    # ctl_api(f'/v4/api/wf/{wid}/tmpl/1', 'delete')
+                    # ctl_api(f'/v4/api/wf/{wid}/tmpl/2', 'delete')
+                    ctl_api(f'/v4/api/wf/{wid}/tmpl/2', 'put')
+    
+            # Обработка Результата
+            # Эти коды возврвта не считаются ошибками, нужно повторить запуск
+            # -4 - unique, -5 - ztest, -7 - ctl_run
+            # if res in (-7,) and retry.get('left', 0) > -10 and retry.get('left', 0) <= 0:
+            #     err_retry = True
+            #     retry['delay'] = config['error_loop'] if config.get('error_loop') else "hours=+1"
+            # else:
+            err_retry = False
+
+            if res > 0:
+                res_msg = 'ok'
+                retry['ok'] = retry['ok'] + 1 if retry.get('ok') else 1
+                res_icon = '✅'
+            elif res == 0:
+                res_msg = 'no'
+                retry['no'] = retry['no'] + 1 if retry.get('no') else 1
+                res_icon = '⚠️'
+            elif err_retry:
+                res_msg = 'retry'
+                retry['err'] = retry['err'] + 1 if retry.get('err') else 1
+                res_icon = '♻️'
+            else:
+                res_msg = 'error'
+                retry['err'] = retry['err'] + 1 if retry.get('err') else 1
+                res_icon = '❌'
+
+
+            logs = {}
+            retry_on = retry.get('on',['error'])
+            
+            # Если нужна повторная попытка
+            if (retry.get('left', 0) > 0 and (res_msg in retry_on or str(res) in retry_on)) or err_retry:
+                retry['left'] = retry.get('left', 0)
+                retry['try'] = retry.get('try', 1)
+
+                status = 'ERRORCHECK'
+                action = 'retry'
+
+            # Если все попытки закончились
+            else:
+                if retry.get('try'):
+                    ctl_set_status(lid, 'RUNNING', f"END {retry}")
+
+                if retry.get('ok', 0) > 0 or retry.get('no', 0) > 0:
+                    status =  'SUCCESS'
+                    action = 'Completed'
+                else:
+                    status = 'ERROR'
+                    if wf.get('faultTolerance', {}).get('abortOnFailure', False):
+                        action = 'Aborted'
+                    else:
+                        action = 'Completed'
+
+            # ctl_set_status(lid, status, json.dumps(ret))
+            ctl_set_status(lid, status, result)
+            # add_note(result, context, level='Task', title=status)
+                
+            
+            if action == 'retry':
+                # new_time = eval_delta(sdt, retry.get('delay'))
+                now = pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
+                new_time = eval_delta(now, retry.get('delay'))
+                
+                for k in range(1, retry.get('try')): 
+                    new_time = eval_delta(new_time, retry.get('add'))
+
+                ctl_set_status(lid, 'TIME-WAIT', dict(time=new_time, retry=retry))
+            else:
+                # ctl_api(f'v4/api/loading/{lid}/{action.lower()}', 'put') # Completed/Aborted
+                ctl_set_completed(lid, action) # Completed/Aborted
+
+                
+            data = { #**retry,
+                'wf': wf['name'], 
+                'retry': retry, 
+                'sdt': f'{sdt}',
+                'run_type': wf_prm.get('wfp_run_type','UNKNOWN'),
+                'time': ( pendulum.now(get_config()['tz']) - pendulum.parse(sdt, tz=get_config()['tz']) ).in_words(locale='ru'),
+                # 'ret': result,
+            }
+            # logging(data, action=action, obj=lid, log=context)
+            add_note({**data, 'action': action, 'obj': lid }, context, level='Task,DAG', title='Log')
+            
+            ti.xcom_push(key='logs', value=logs)
+            
+            # sts = (status, action, res_icon, res_msg, result)
+            # ti.xcom_push(key='status', value=sts)
+            
+        
+        # @task(pool='ctl_pool', trigger_rule = 'none_failed')
+        # def run_end(wf, **context):
+        #     ti = context['task_instance']
+            # sts = ti.xcom_pull(key='status', task_ids='run_sts')
+            # if not sts:
+            #     msg = '⚠️ Status is empty'
+            #     add_note(msg, context, level='Task,DAG')
+            #     raise AirflowSkipException(msg)
+
+            """### Установка финального статуса DAG
+
+            - Принимает результат из `run_sts`.
+            - Устанавливает состояние DAG:
+            - `SUCCESS` — если `res_msg == 'ok'`
+            - `SKIPPED` — если `res_msg == 'no'`
+            - `FAILED` — если `res_msg == 'error'`
+            - Эмулирует состояние через прямое обновление `TaskInstance`.
+
+            **Поведение:**
+            - При `retry` — выбрасывает `AirflowSkipException`.
+            - При `error` — выбрасывает `AirflowFailException`.
+
+            **Цель:** корректное отображение в интерфейсе Airflow.
+            """
+            
+            # status, action, res_icon, res_msg, ret = sts
+            # msg = (
+            title = f"{status_icons[status]}{status} {action.upper()}\n\n" 
+            msg = f"{res_icon} {result.get('msg') if result.get('msg') else res_msg.upper()}\n\n"
+                # f"{ret.get('msg')}"
+            # )
+            add_note(msg, context, level='DAG,Task', title=title)
+
+            # ti = context['task_instance']
+            dag_id = ti.dag_id
+            run_id = ti.run_id
+            task_id = 'run_exe'
+
+            if res_msg == 'error':
+                state = State.FAILED
+            elif res_msg == 'no':
+                state = State.SKIPPED
+            else:
+                state = State.SUCCESS
+
+            with create_session() as session:
+                other_ti = session.query(TaskInstance).filter(
+                    TaskInstance.dag_id == dag_id,
+                    TaskInstance.run_id == run_id,
+                    TaskInstance.task_id == task_id
+                ).first()
+
+                if other_ti:
+                    other_ti.set_state(state)
+            
+            if action == 'retry':
+                raise AirflowSkipException()
+            elif status == 'ERROR':
+                raise AirflowFailException()
+    
+                
+        task_prm = run_prm(wf = w)
+        task_exe = run_exe(wf = w)
+        task_end = run_end(wf = w)
+        
+        if wf_tfs_in: 
+            task_prm >> run_tfs(wf = w) >> task_exe
+        else:
+            task_prm  >> task_exe
+        
+        if wf_tfs_out: 
+            task_exe >> run_out(wf = w) >> task_end
+        else:
+            task_exe >> task_end
+    
+    

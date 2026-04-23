@@ -18,12 +18,12 @@
 
 Имя архива и внутреннего файла выводятся из `s3_key` автоматически:
 
-| s3_key                        |` `| Архив в S3             |` `| Файл внутри архива |
-|-------------------------------|---|------------------------|---|--------------------|
-| path/archive.zip/data.csv     |` `| path/archive.zip       |` `| data.csv           |
-| path/archive.zip              |` `| path/archive.zip       |` `| archive            |
-| path/data.csv.zip             |` `| path/data.csv.zip      |` `| data.csv           |
-| path/data.csv                 |` `| path/data.csv.zip      |` `| data.csv           |
+| s3_key                          | Архив в S3                   | Файл внутри архива |
+|---------------------------------|------------------------------|--------------------|
+| `path/archive.zip/data.csv`     | →`path/archive.zip`          | →`data.csv`        |
+| `path/archive.zip`              | →`path/archive.zip`          | →`archive`         |
+| `path/data.csv.zip`             | →`path/data.csv.zip`         | →`data.csv`        |
+| `path/data.csv`                 | →`path/data.csv.zip`         | →`data.csv`        |
 """
 
 

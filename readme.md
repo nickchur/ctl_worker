@@ -16,9 +16,13 @@ ctl_worker/          # DAG'и Airflow
 ├── ctl_config.py    # Управление конфигурацией через Airflow Variables (PIN-защита)
 ├── ctl_checker.py   # Диагностика доступности CTL API
 ├── ctl_yml.py       # Экспорт конфигурации CTL в YAML (бэкап / миграция)
-├── ctl_tfs.py       # Управление Task Flow State
+├── ctl_tfs.py       # Перемещение файлов из TFS в S3, публикация Dataset
 ├── ctl_test.py      # Ручное тестирование и симуляции без влияния на продакшн
 └── ctl_test_conn.py # Проверка доступности всех подключений
+
+tools/               # Служебные DAG'и (ручной запуск)
+├── db_cleanup.py    # Очистка метадаты Airflow старше N дней
+└── s3_from_content.py # Загрузка текстового контента в S3
 
 plugins/             # Переиспользуемые модули (импортируются DAG'ами)
 ├── ctl_core.py      # Ядро: retry, события (AND/OR), TIME-WAIT, нормализация данных

@@ -39,6 +39,7 @@ from airflow.decorators import task, dag
 from airflow.models import Param
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.utils.task_group import TaskGroup
+from airflow.utils.helpers import cross_downstream
 from airflow.utils.session import create_session
 from sqlalchemy import text
 
@@ -270,7 +271,10 @@ def tools_db_cleanup():
         ct['task_instance'] >> [ct['trigger'], ct['dag_run']]
 
         # trigger, dag_run >> dataset_event, dataset, dataset_alias (параллельно)
-        [ct['trigger'], ct['dag_run']] >> [ct['dataset_event'], ct['dataset'], ct['dataset_alias']]
+        cross_downstream(
+            [ct['trigger'], ct['dag_run']],
+            [ct['dataset_event'], ct['dataset'], ct['dataset_alias']],
+        )
 
     check_group >> clean_group
 

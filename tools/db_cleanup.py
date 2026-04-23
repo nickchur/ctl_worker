@@ -42,6 +42,7 @@ from airflow.utils.helpers import cross_downstream
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.session import create_session
 from airflow.operators.python import get_current_context
+from airflow import settings
 from sqlalchemy import text
 
 from pprint import PrettyPrinter
@@ -216,6 +217,14 @@ def db_delete(sql, timeout=600):
     return rowcount
 
 
+def db_vacuum(table, timeout=3600):
+    ts = time.time()
+    with settings.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
+        conn.execute(text(f"VACUUM ANALYZE main.{table}"))
+    logger.info(f"✅ VACUUM ANALYZE main.{table} за {time.time() - ts:.2f}s")
+
+
 params = {
     'retention_days': Param(
         180,
@@ -227,6 +236,11 @@ params = {
         True,
         type='boolean',
         description='True — только подсчёт, False — реальное удаление',
+    ),
+    'vacuum': Param(
+        True,
+        type='boolean',
+        description='Запустить VACUUM ANALYZE после очистки',
     ),
 }
 for table in CLEANABLE_TABLES:
@@ -330,7 +344,27 @@ def tools_db_cleanup():
             [ct['dataset_event'], ct['dataset'], ct['dataset_alias']],
         )
 
-    check_group() >> clean_group()
+    def _make_vacuum(tbl):
+        @task(task_id=f'vacuum_{tbl}')
+        def _vacuum(_tbl=tbl, **context):
+            params = context['params']
+            if not params.get('vacuum', True):
+                raise AirflowSkipException('vacuum=False — пропущено')
+            if not params.get(_tbl, True):
+                raise AirflowSkipException(f'Таблица {_tbl} отключена')
+            if params.get('dry_run', True):
+                raise AirflowSkipException('🔒 dry_run=True — vacuum пропущен')
+            _ts = time.time()
+            db_vacuum(_tbl)
+            add_note(f'VACUUM ANALYZE выполнен', context=context, level='DAG,Task', title=f'🧹 {_tbl}', duration=time.time() - _ts)
+        return _vacuum()
+
+    @task_group(group_id='vacuum')
+    def vacuum_group():
+        for tbl in CLEANABLE_TABLES:
+            _make_vacuum(tbl)
+
+    check_group() >> clean_group() >> vacuum_group()
 
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()

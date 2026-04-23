@@ -6,7 +6,7 @@
 | Параметр        | Описание                                                   |
 |-----------------|------------------------------------------------------------|
 | 📡 `s3_conn_id`  | ID подключения к S3 (тип `aws`)                            |
-| 🪣 `bucket_name` | Имя бакета                                                 |
+| 📋 `bucket_name` | Имя бакета                                                 |
 | 🔑 `s3_key`      | Путь / ключ объекта в S3                                   |
 | 📝 `content`     | Список строк или base64-текст; `{{empty}}` → пустая строка |
 | 🗜️ `compress`    | Сжатие: `none` \| `gz` \| `zip`                            |
@@ -124,62 +124,37 @@ def tools_s3_from_content():
         except Exception:
             pass
 
-        import io
+        import io, gzip, zipfile
+
+        raw = content.encode('utf-8')
 
         if compress == 'gz':
-            import gzip
-
             buf = io.BytesIO()
             with gzip.GzipFile(fileobj=buf, mode='wb') as f:
-                f.write(content.encode('utf-8'))
+                f.write(raw)
             buf.seek(0)
-            hook.load_file_obj(
-                file_obj=buf,
-                bucket_name=bucket_name,
-                key=s3_key,
-                replace=replace,
-                extra_args={'ContentEncoding': 'gzip', 'ContentType': 'text/plain'},
-            )
+            hook.load_file_obj(file_obj=buf, bucket_name=bucket_name, key=s3_key, replace=replace)
 
         elif compress == 'zip':
-            import zipfile
-
-            # s3_key формат: path/archive.zip/filename.ext
             zip_marker = '.zip/'
-            zip_marker_pos = s3_key.lower().find(zip_marker)
-            if zip_marker_pos == -1:
-                raise ValueError(
-                    f"Для compress='zip' s3_key должен иметь формат 'path/archive.zip/filename.ext', получено: '{s3_key}'"
-                )
-            zip_s3_key = s3_key[:zip_marker_pos + len('.zip')]
-            internal_name = s3_key[zip_marker_pos + len(zip_marker):]
+            pos = s3_key.lower().find(zip_marker)
+            if pos == -1:
+                raise ValueError(f"Для compress='zip' s3_key должен иметь формат 'path/archive.zip/filename.ext', получено: '{s3_key}'")
+            zip_s3_key = s3_key[:pos + len('.zip')]
+            internal_name = s3_key[pos + len(zip_marker):]
             if not internal_name:
-                raise ValueError(
-                    f"Не задано имя файла внутри архива в s3_key: '{s3_key}'"
-                )
-
+                raise ValueError(f"Не задано имя файла внутри архива в s3_key: '{s3_key}'")
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr(internal_name, content.encode('utf-8'))
+                zf.writestr(internal_name, raw)
             buf.seek(0)
-            hook.load_file_obj(
-                file_obj=buf,
-                bucket_name=bucket_name,
-                key=zip_s3_key,
-                replace=replace,
-                extra_args={'ContentType': 'application/zip'},
-            )
-            logger.info(f"Successfully uploaded ZIP to s3://{bucket_name}/{zip_s3_key} (internal: {internal_name})")
-            return
+            hook.load_file_obj(file_obj=buf, bucket_name=bucket_name, key=zip_s3_key, replace=replace)
+            s3_key = f"{zip_s3_key} (internal: {internal_name})"
 
         else:
-            hook.load_bytes(
-                content.encode('utf-8'),
-                bucket_name=bucket_name,
-                key=s3_key,
-                replace=replace,
-            )
-        logger.info(f"Successfully uploaded content to s3://{bucket_name}/{s3_key}")
+            hook.load_bytes(raw, bucket_name=bucket_name, key=s3_key, replace=replace)
+
+        logger.info(f"Successfully uploaded to s3://{bucket_name}/{s3_key}")
 
     s3_from_content()
 

@@ -35,11 +35,11 @@
 > Минимальный порог `retention_days` — 30 дней.
 """
 
-from airflow.decorators import task, dag
+from airflow.decorators import task, dag, task_group
 from airflow.models import Param
 from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.utils.task_group import TaskGroup
 from airflow.utils.helpers import cross_downstream
+from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.session import create_session
 from airflow.operators.python import get_current_context
 from sqlalchemy import text
@@ -274,8 +274,16 @@ def tools_db_cleanup():
             add_note(f'{count} записей к удалению', context=context, level='DAG,Task', title=f'🔍 {_tbl}')
         return _check()
 
+    # Таски downstream от потенциально пропущенных — none_failed чтобы не каскадить skip
+    _none_failed = {
+        'task_instance', 'trigger', 'dag_run',
+        'dataset_event', 'dataset', 'dataset_alias',
+    }
+
     def _make_clean(tbl):
-        @task(task_id=f'clean_{tbl}')
+        tr = TriggerRule.NONE_FAILED if tbl in _none_failed else TriggerRule.ALL_SUCCESS
+
+        @task(task_id=f'clean_{tbl}', trigger_rule=tr)
         def _clean(_tbl=tbl, **context):
             params = context['params']
             if not params.get(_tbl, True):
@@ -291,13 +299,13 @@ def tools_db_cleanup():
             add_note(f'удалено {rowcount} строк', context=context, level='DAG,Task', title=f'🗑️ {_tbl}')
         return _clean()
 
-    # --- check: все таски параллельно ---
-    with TaskGroup('check') as check_group:
+    @task_group(group_id='check')
+    def check_group():
         for tbl in CLEANABLE_TABLES:
             _make_check(tbl)
 
-    # --- clean: с зависимостями по каскадам ---
-    with TaskGroup('clean') as clean_group:
+    @task_group(group_id='clean')
+    def clean_group():
         ct = {tbl: _make_clean(tbl) for tbl in CLEANABLE_TABLES}
 
         # Фаза 1 (параллельно) >> task_instance
@@ -317,7 +325,7 @@ def tools_db_cleanup():
             [ct['dataset_event'], ct['dataset'], ct['dataset_alias']],
         )
 
-    check_group >> clean_group
+    check_group() >> clean_group()
 
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()

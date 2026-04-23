@@ -67,6 +67,18 @@ s3_conns=get_conns_by_type(conn_type='aws')
     },
 )
 def tools_s3_from_str():
+    """
+    Загружает текстовый контент в S3 из параметров запуска DAG.
+
+    Параметры:
+        s3_conn_id   — ID подключения к S3 (тип aws)
+        bucket_name  — имя бакета
+        s3_key       — путь/ключ объекта в S3
+        content      — список строк (или base64-encoded текст)
+        compress     — сжатие: none | gz | zip
+                       для zip формат s3_key: path/archive.zip/filename.ext
+        replace      — перезаписать объект если уже существует (по умолчанию False)
+    """
 
     @task
     def s3_from_str(**context):

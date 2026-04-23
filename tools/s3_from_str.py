@@ -54,8 +54,8 @@ s3_conns=get_conns_by_type(conn_type='aws')
         "s3_key": Param('', type="string",),
         "content": Param([],
             title="content",
-            # type=["string", "null"],
-            # format="multiline",
+            type=["array", "null"],
+            description='Напишите "{{empty}}" если нужна пустая строка'
         ),
         "compress": Param(
             'none',
@@ -121,6 +121,7 @@ def tools_s3_from_str():
             raise ValueError(f"Бакет '{bucket_name}' не существует или недоступен для '{s3_conn_id}'")
 
         content = '\n'.join(content)
+        content = content.replace('{{empty}}', '')
         try:
             content = base64.b64decode(content).decode('utf-8')
         except Exception:

@@ -12,25 +12,25 @@
 
 #### Таблицы очистки и порядок удаления
 
-| # | Таблица                         | Критерий                              |
-|---|---------------------------------|---------------------------------------|
-| 1 | `callback_request`              | `created_at < cutoff`                 |
-| 2 | `celery_taskmeta`               | `date_done < cutoff`                  |
-| 3 | `celery_tasksetmeta`            | `date_done < cutoff`                  |
-| 4 | `session`                       | `expiry < NOW()`                      |
-| 5 | `import_error`                  | `timestamp < cutoff`                  |
-| 6 | `sla_miss`                      | `timestamp < cutoff`                  |
-| 7 | `log`                           | `dttm < cutoff`                       |
-| 8 | `job`                           | `latest_heartbeat < cutoff`           |
-| 9 | `xcom`                          | `timestamp < cutoff`                  |
-| 10| `rendered_task_instance_fields` | via `dag_run.execution_date < cutoff` |
-| 11| `task_instance_history`         | `updated_at < cutoff`                 |
-| 12| `task_instance`                 | `start_date < cutoff`                 |
-| 13| `trigger`                       | `created_date < cutoff`, без активных task_instance |
-| 14| `dag_run`                       | `execution_date < cutoff`             |
-| 15| `dataset_event`                 | `timestamp < cutoff`                  |
-| 16| `dataset`                       | `is_orphaned = TRUE`                  |
-| 17| `dataset_alias`                 | не в DAG-расписаниях и не в алиасах   |
+| #  | Таблица                         | Критерий                              | Заметки                                                      |
+|----|---------------------------------|---------------------------------------|--------------------------------------------------------------|
+| 1  | `callback_request`              | `created_at < cutoff`                 | Обработанные колбэки планировщика                            |
+| 2  | `celery_taskmeta`               | `date_done < cutoff`                  | Результаты Celery-задач (result backend)                     |
+| 3  | `celery_tasksetmeta`            | `date_done < cutoff`                  | Результаты Celery-групп (result backend)                     |
+| 4  | `session`                       | `expiry < NOW()`                      | Веб-сессии UI; не зависит от cutoff                          |
+| 5  | `import_error`                  | `timestamp < cutoff`                  | Ошибки парсинга DAG-файлов                                   |
+| 6  | `sla_miss`                      | `timestamp < cutoff`                  | Нарушения SLA                                                |
+| 7  | `log`                           | `dttm < cutoff`                       | Audit-лог событий (не логи тасков)                           |
+| 8  | `job`                           | `latest_heartbeat < cutoff`           | Записи SchedulerJob / LocalTaskJob                           |
+| 9  | `xcom`                          | `timestamp < cutoff`                  | ↳ каскад от `task_instance`                                  |
+| 10 | `rendered_task_instance_fields` | via `dag_run.execution_date < cutoff` | ↳ каскад от `task_instance`; нет своей колонки даты          |
+| 11 | `task_instance_history`         | `updated_at < cutoff`                 | ↳ каскад от `task_instance`; чистим до TI чтобы управлять объёмом |
+| 12 | `task_instance`                 | `start_date < cutoff`                 | ↳ каскад от `dag_run`                                        |
+| 13 | `trigger`                       | `created_date < cutoff`               | Deferred tasks; только без активных `task_instance`          |
+| 14 | `dag_run`                       | `execution_date < cutoff`             | Каскадно удаляет TI, xcom, rtif, dagrun_dataset_event и др.  |
+| 15 | `dataset_event`                 | `timestamp < cutoff`                  | Каскадно удаляет `dagrun_dataset_event`, `dataset_alias_dataset_event` |
+| 16 | `dataset`                       | `is_orphaned = TRUE`                  | Флаг выставляется Airflow при удалении DAG                   |
+| 17 | `dataset_alias`                 | не в DAG-расписаниях и не в алиасах   | Каскадно удаляет `dag_schedule_dataset_alias_reference`      |
 > **dry_run=True** по умолчанию — первый запуск всегда безопасен.
 > Минимальный порог `retention_days` — 30 дней.
 """

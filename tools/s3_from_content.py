@@ -17,17 +17,15 @@
 
 Имя архива и внутреннего файла выводятся из `s3_key` автоматически:
 
-| `s3_key`                        | Архив в S3                  | Файл внутри архива |
+| s3_key                          | Архив в S3                  | Файл внутри архива |
 |---------------------------------|-----------------------------|--------------------|
 | `path/archive.zip/data.csv`     | `path/archive.zip`          | `data.csv`         |
-| `path/archive.zip/` или `path/archive.zip` | `path/archive.zip` | `archive`          |
+| `path/archive.zip`              | `path/archive.zip`          | `archive`          |
 | `path/data.csv.zip`             | `path/data.csv.zip`         | `data.csv`         |
 | `path/data.csv`                 | `path/data.csv.zip`         | `data.csv`         |
 """
-from airflow import DAG
 from airflow.models import Param, Connection
-from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook # type: ignore
 from airflow.decorators import task, dag
 from airflow.configuration import get_custom_secret_backend
 

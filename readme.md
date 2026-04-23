@@ -20,9 +20,19 @@ ctl_worker/          # DAG'и Airflow
 ├── ctl_test.py      # Ручное тестирование и симуляции без влияния на продакшн
 └── ctl_test_conn.py # Проверка доступности всех подключений
 
-tools/               # Служебные DAG'и (ручной запуск)
-├── db_cleanup.py    # Очистка метадаты Airflow старше N дней
-└── s3_from_content.py # Загрузка текстового контента в S3
+tools/                   # Служебные DAG'и (ручной запуск) → tools/readme.md
+├── db_cleanup.py        # Очистка метадаты Airflow старше N дней
+├── s3_from_content.py   # Загрузка текстового контента в S3
+├── s3_to_s3.py          # Копирование объекта между S3-бакетами
+├── s3_to_s3_test.py     # Поиск по маске и копирование/перемещение S3→S3
+├── s3_checker.py        # Просмотр файлов S3: маска, сортировка, чтение содержимого
+├── s3_set_ttl.py        # Управление TTL-правилами S3-бакета
+├── s3_bucket_list.py    # Список всех бакетов по всем S3-подключениям
+├── s3_bucket_viewer.py  # Список бакетов через HrpS3BucketViewerOperator
+├── s3_viewer.py         # Список ключей и чтение файлов через HrpS3*Operator
+├── show_connections.py  # Подключения из secret backend, сгруппированные по типу
+├── maintenance.py       # Обслуживание S3-бакета: удаление старых объектов
+└── dummy.py             # Шаблон DAG для проверки Markdown в Airflow UI
 
 plugins/             # Переиспользуемые модули (импортируются DAG'ами)
 ├── ctl_core.py      # Ядро: retry, события (AND/OR), TIME-WAIT, нормализация данных

@@ -62,7 +62,8 @@ s3_conns=get_conns_by_type(conn_type='aws')
             type="string",
             enum=['none', 'gz', 'zip'],
             description="Архиватор: none — без сжатия, gz — gzip, zip — ZIP (s3_key: path/archive.zip/filename.ext)",
-        )
+        ),
+        "replace": Param(False, type="boolean", description="Перезаписать файл если существует"),
     },
 )
 def tools_s3_from_str():
@@ -86,6 +87,7 @@ def tools_s3_from_str():
         s3_key = params['s3_key']
         content = params['content']
         compress = params.get('compress', 'none')
+        replace = params.get('replace', False)
 
         if not s3_conn_id or not s3_conn_id.strip():
             raise ValueError("Параметр 's3_conn_id' не задан")
@@ -125,7 +127,7 @@ def tools_s3_from_str():
                 file_obj=buf,
                 bucket_name=bucket_name,
                 key=s3_key,
-                replace=True,
+                replace=replace,
                 extra_args={'ContentEncoding': 'gzip', 'ContentType': 'text/plain'},
             )
 
@@ -154,7 +156,7 @@ def tools_s3_from_str():
                 file_obj=buf,
                 bucket_name=bucket_name,
                 key=zip_s3_key,
-                replace=True,
+                replace=replace,
                 extra_args={'ContentType': 'application/zip'},
             )
             logger.info(f"Successfully uploaded ZIP to s3://{bucket_name}/{zip_s3_key} (internal: {internal_name})")
@@ -165,7 +167,7 @@ def tools_s3_from_str():
                 content.encode('utf-8'),
                 bucket_name=bucket_name,
                 key=s3_key,
-                replace=True,
+                replace=replace,
             )
         logger.info(f"Successfully uploaded content to s3://{bucket_name}/{s3_key}")
 

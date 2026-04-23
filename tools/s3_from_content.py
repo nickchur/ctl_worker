@@ -1,5 +1,4 @@
-"""
-## 🛠️ Загрузка контента в S3
+"""### 🛠️ Загрузка контента в S3
 
 Загружает текстовый контент в S3 из параметров запуска DAG.
 
@@ -13,7 +12,9 @@
 | 🔄 `replace`     | Перезаписать если существует *(default: `False`)*          |
 | ✅ `done_file`   | Создать пустой `<s3_key>.done` после загрузки *(default: `False`)* |
 
-### Режим `compress=zip`
+---
+
+#### Режим `compress=zip`
 
 Имя архива и внутреннего файла выводятся из `s3_key` автоматически:
 
@@ -24,6 +25,7 @@
 | `path/data.csv.zip`             | `path/data.csv.zip`         | `data.csv`         |
 | `path/data.csv`                 | `path/data.csv.zip`         | `data.csv`         |
 """
+
 from airflow.models import Param, Connection
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook # type: ignore
 from airflow.decorators import task, dag

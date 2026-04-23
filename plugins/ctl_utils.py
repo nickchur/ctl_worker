@@ -11,7 +11,7 @@
    - Поддержка Kerberos-аутентификации через `KerberosHttpHook`.
 
 2. **Работа с базами данных**:
-   - `pg_exe()`, `gp_exe()` — выполнение SQL в PostgreSQL и Greenplum с ретраями при сетевых ошибках.
+   - `pg_exe()`, `gp_exe()` — выполнение SQL в PostgreSQL (через `create_session`) и Greenplum с ретраями при сетевых ошибках.
    - `gp_upload_s3_csv()` — потоковая загрузка CSV/ZIP/GZ из S3 в Greenplum без сохранения на диск.
    - Автоматическое управление `statement_timeout` и `search_path`.
 
@@ -85,6 +85,7 @@ from airflow.models import Variable, Pool
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
+from airflow.utils.session import create_session
 from hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError
@@ -98,6 +99,7 @@ import pendulum
 from datetime import timedelta
 from pprint import PrettyPrinter
 from psycopg2 import OperationalError, InterfaceError, DatabaseError
+from sqlalchemy import text
 
 from plugins.utils import query_to_dict, add_note, readable_size, pool_slots # type: ignore #, on_callback
 from plugins.s3_utils import s3_IterStream
@@ -203,43 +205,18 @@ def log_retry_attempt(retry_state):
         f"Следующая попытка через {retry_state.next_action.sleep} сек..."
     )
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    # Ретраим на сетевые проблемы и обрывы соединений
-    retry=retry_if_exception_type((OperationalError, InterfaceError, ConnectionError)),
-    before_sleep=log_retry_attempt,
-    reraise=True
-)
-def pg_exe(sql='select 1', prm=None):
-    """Выполняет SQL в Airflow DB (PostgreSQL) и возвращает список dict-строк.
-
-    Retry на OperationalError/InterfaceError (до 3 раз, экспоненциальная задержка).
-    DatabaseError (синтаксис/права) → немедленный AirflowFailException без retry.
-    """
-    hook = PostgresHook(postgres_conn_id=get_config().get('conns', {}).get('pg', {}).get('conn_id', 'airflowdb'))
-    
+def pg_exe(sql='select 1', timeout=300):
+    """Выполняет SQL в Airflow DB (PostgreSQL) через create_session и возвращает список dict-строк."""
     ts_start = time.time()
-    try:
-        # Предполагаем, что prm передается в hook.get_records или query_to_dict
-        # Если query_to_dict — ваша обертка, передаем параметры туда
-        records = query_to_dict(hook, sql, prm) if prm else query_to_dict(hook, sql)
-        
-        duration = time.time() - ts_start
-        logger.info(f"✅ {len(records)} records loaded in {duration:.2f}s")
-        return records
-
-    except (OperationalError, InterfaceError) as e:
-        # Эти ошибки спровоцируют retry
-        logger.error(f"📡 Ошибка подключения к Postgres: {str(e)}")
-        raise e
-    except DatabaseError as e:
-        # Ошибки в SQL коде — валим таск сразу
-        logger.error(f"❌ Ошибка в SQL/Данных (ретрай невозможен): {str(e)}")
-        raise AirflowFailException(f"PG SQL Error: {e}")
-    except Exception as e:
-        logger.error(f"💥 Непредвиденная ошибка pg_exe: {str(e)}")
-        raise
+    with create_session() as session:
+        session.execute(text("SET LOCAL search_path = main"))
+        if timeout:
+            session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
+        result = session.execute(text(sql))
+        cols = [col for col in result.keys()]
+        records = [dict(zip(cols, row)) for row in result.fetchall()]
+    logger.info(f"✅ {len(records)} records loaded in {time.time() - ts_start:.2f}s")
+    return records
 
 
 import threading

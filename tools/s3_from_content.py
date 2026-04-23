@@ -99,7 +99,7 @@ def tools_s3_from_content():
     @task
     def s3_from_content(**context):
         from airflow.models import Connection
-        from airflow.exceptions import AirflowNotFoundException
+        from airflow.exceptions import AirflowNotFoundException, AirflowSkipException
 
         params = context['params']
         s3_conn_id = params['s3_conn_id']
@@ -111,14 +111,14 @@ def tools_s3_from_content():
         done_file = params.get('done_file', False)
 
         if not s3_conn_id or not s3_conn_id.strip():
-            raise ValueError("Параметр 's3_conn_id' не задан")
+            raise AirflowSkipException("Параметр 's3_conn_id' не задан")
         try:
             Connection.get_connection_from_secrets(s3_conn_id)
         except AirflowNotFoundException:
-            raise ValueError(f"Подключение '{s3_conn_id}' не найдено в Airflow")
+            raise AirflowSkipException(f"Подключение '{s3_conn_id}' не найдено в Airflow")
 
         if not bucket_name or not bucket_name.strip():
-            raise ValueError("Параметр 'bucket_name' не задан")
+            raise AirflowSkipException("Параметр 'bucket_name' не задан")
 
         logger.info(
             f"upload_string_to_s3 s3_conn_id={s3_conn_id}, bucket_name={bucket_name}, s3_key={s3_key}, content={content}"
@@ -127,7 +127,7 @@ def tools_s3_from_content():
         hook = S3Hook(aws_conn_id=s3_conn_id)
 
         if not hook.check_for_bucket(bucket_name):
-            raise ValueError(f"Бакет '{bucket_name}' не существует или недоступен для '{s3_conn_id}'")
+            raise AirflowSkipException(f"Бакет '{bucket_name}' не существует или недоступен для '{s3_conn_id}'")
 
         content = '\n'.join(content)
         content = content.replace('{{empty}}', '')

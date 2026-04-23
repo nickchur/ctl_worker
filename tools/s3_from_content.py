@@ -1,3 +1,19 @@
+"""
+## 🛠️ Загрузка контента в S3
+
+Загружает текстовый контент в S3 из параметров запуска DAG.
+
+| Параметр        | Описание                                                   |
+|-----------------|------------------------------------------------------------|
+| 📡 `s3_conn_id`  | ID подключения к S3 (тип `aws`)                            |
+| 🪣 `bucket_name` | Имя бакета                                                 |
+| 🔑 `s3_key`      | Путь / ключ объекта в S3                                   |
+| 📝 `content`     | Список строк или base64-текст; `{{empty}}` → пустая строка |
+| 🗜️ `compress`    | Сжатие: `none` \| `gz` \| `zip`                            |
+| 🔄 `replace`     | Перезаписать если существует *(default: `False`)*          |
+
+> **zip:** формат `s3_key` → `path/archive.zip/filename.ext`
+"""
 from airflow import DAG
 from airflow.models import Param, Connection
 from airflow.operators.python import PythonOperator
@@ -35,6 +51,7 @@ s3_conns=get_conns_by_type(conn_type='aws')
 
 @dag(
     # dag_id='tools_s3_from_content',
+    doc_md=__doc__,
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args = {
         'owner': 'DataLab (CI02420667)',
@@ -67,30 +84,9 @@ s3_conns=get_conns_by_type(conn_type='aws')
     },
 )
 def tools_s3_from_content():
-    """
-    Загружает текстовый контент в S3 из параметров запуска DAG.
-
-    Параметры:
-        s3_conn_id   — ID подключения к S3 (тип aws)
-        bucket_name  — имя бакета
-        s3_key       — путь/ключ объекта в S3
-        content      — список строк (или base64-encoded текст);
-                       напишите "{{empty}}" для пустой строки
-        compress     — сжатие: none | gz | zip
-                       для zip формат s3_key: path/archive.zip/filename.ext
-        replace      — перезаписать объект если уже существует (по умолчанию False)
-    """
 
     @task
     def s3_from_content(**context):
-        """
-        Uploads a string content to S3 bucket
-
-        :param s3_conn_id: S3 connection ID configured in Airflow
-        :param bucket_name: S3 bucket name
-        :param s3_key: S3 key (path) where to put the file
-        :param content: Text content to upload
-        """
         from airflow.models import Connection
         from airflow.exceptions import AirflowNotFoundException
 

@@ -11,6 +11,7 @@
 | 📝 `content`     | Список строк или base64-текст; `{{empty}}` → пустая строка |
 | 🗜️ `compress`    | Сжатие: `none` \| `gz` \| `zip`                            |
 | 🔄 `replace`     | Перезаписать если существует *(default: `False`)*          |
+| ✅ `done_file`   | Создать пустой `<s3_key>.done` после загрузки *(default: `False`)* |
 
 ### Режим `compress=zip`
 
@@ -90,6 +91,7 @@ s3_conns=get_conns_by_type(conn_type='aws')
             description="Архиватор: none — без сжатия, gz — gzip, zip — ZIP (s3_key: path/archive.zip/filename.ext)",
         ),
         "replace": Param(False, type="boolean", description="Перезаписать файл если существует"),
+        "done_file": Param(False, type="boolean", description="Создать пустой <s3_key>.done после загрузки"),
     },
 )
 def tools_s3_from_content():
@@ -106,6 +108,7 @@ def tools_s3_from_content():
         content = params['content']
         compress = params.get('compress', 'none')
         replace = params.get('replace', False)
+        done_file = params.get('done_file', False)
 
         if not s3_conn_id or not s3_conn_id.strip():
             raise ValueError("Параметр 's3_conn_id' не задан")
@@ -170,6 +173,11 @@ def tools_s3_from_content():
             hook.load_bytes(raw, bucket_name=bucket_name, key=s3_key, replace=replace)
 
         logger.info(f"Successfully uploaded to s3://{bucket_name}/{s3_key}")
+
+        if done_file:
+            done_key = zip_s3_key + '.done' if compress == 'zip' else s3_key + '.done'
+            hook.load_bytes(b'', bucket_name=bucket_name, key=done_key, replace=replace)
+            logger.info(f"Created done file s3://{bucket_name}/{done_key}")
 
     s3_from_content()
 

@@ -34,7 +34,7 @@ s3_conns=get_conns_by_type(conn_type='aws')
 
 
 @dag(
-    # dag_id='tools_s3_from_str',
+    # dag_id='tools_s3_from_content',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args = {
         'owner': 'DataLab (CI02420667)',
@@ -66,7 +66,7 @@ s3_conns=get_conns_by_type(conn_type='aws')
         "replace": Param(False, type="boolean", description="Перезаписать файл если существует"),
     },
 )
-def tools_s3_from_str():
+def tools_s3_from_content():
     """
     Загружает текстовый контент в S3 из параметров запуска DAG.
 
@@ -82,7 +82,7 @@ def tools_s3_from_str():
     """
 
     @task
-    def s3_from_str(**context):
+    def s3_from_content(**context):
         """
         Uploads a string content to S3 bucket
 
@@ -185,7 +185,7 @@ def tools_s3_from_str():
             )
         logger.info(f"Successfully uploaded content to s3://{bucket_name}/{s3_key}")
 
-    s3_from_str()
+    s3_from_content()
 
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()
@@ -194,4 +194,4 @@ if ENV_STAND == "prom":
     msg = "DAG upload_content_to_s3 is disabled on 'prom' stand. Skipping DAG registration."
     logger.warning(msg)
 else:
-    tools_s3_from_str()
+    tools_s3_from_content()

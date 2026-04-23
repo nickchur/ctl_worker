@@ -74,7 +74,8 @@ def tools_s3_from_str():
         s3_conn_id   — ID подключения к S3 (тип aws)
         bucket_name  — имя бакета
         s3_key       — путь/ключ объекта в S3
-        content      — список строк (или base64-encoded текст)
+        content      — список строк (или base64-encoded текст);
+                       напишите "{{empty}}" для пустой строки
         compress     — сжатие: none | gz | zip
                        для zip формат s3_key: path/archive.zip/filename.ext
         replace      — перезаписать объект если уже существует (по умолчанию False)

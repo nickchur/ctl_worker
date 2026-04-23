@@ -17,7 +17,7 @@
 | 1  | `callback_request`              | `created_at < cutoff`                 | Обработанные колбэки планировщика                            |
 | 2  | `celery_taskmeta`               | `date_done < cutoff`                  | Результаты Celery-задач (result backend)                     |
 | 3  | `celery_tasksetmeta`            | `date_done < cutoff`                  | Результаты Celery-групп (result backend)                     |
-| 4  | `session`                       | `expiry < NOW()`                      | Веб-сессии UI; не зависит от cutoff                          |
+| 4  | `session`                       | `expiry < current_date`                      | Веб-сессии UI; не зависит от cutoff                          |
 | 5  | `import_error`                  | `timestamp < cutoff`                  | Ошибки парсинга DAG-файлов                                   |
 | 6  | `sla_miss`                      | `timestamp < cutoff`                  | Нарушения SLA                                                |
 | 7  | `log`                           | `dttm < cutoff`                       | Audit-лог событий (не логи тасков)                           |
@@ -39,6 +39,7 @@ from airflow.decorators import task, dag
 from airflow.models import Param
 from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
 from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.utils.task_group import TaskGroup
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from psycopg2 import OperationalError, InterfaceError, DatabaseError
@@ -97,7 +98,7 @@ DELETE_SQLS = {
     'callback_request':   "DELETE FROM callback_request WHERE created_at < '{cutoff}'",
     'celery_taskmeta':    "DELETE FROM celery_taskmeta WHERE date_done < '{cutoff}'",
     'celery_tasksetmeta': "DELETE FROM celery_tasksetmeta WHERE date_done < '{cutoff}'",
-    'session':            "DELETE FROM session WHERE expiry < NOW()",
+    'session':            "DELETE FROM session WHERE expiry < current_date",
     'import_error':       "DELETE FROM import_error WHERE timestamp < '{cutoff}'",
     'sla_miss':           "DELETE FROM sla_miss WHERE timestamp < '{cutoff}'",
     'log':                "DELETE FROM log WHERE dttm < '{cutoff}'",
@@ -131,7 +132,7 @@ DELETE_SQLS = {
 
 # Кастомные COUNT для таблиц без колонки даты (не используют cutoff)
 COUNT_SQLS = {
-    'session': "SELECT COUNT(*) FROM session WHERE expiry < NOW()",
+    'session': "SELECT COUNT(*) FROM session WHERE expiry < current_date",
     'rendered_task_instance_fields': """
         SELECT COUNT(*) FROM rendered_task_instance_fields
         JOIN dag_run ON rendered_task_instance_fields.dag_id = dag_run.dag_id
@@ -271,66 +272,86 @@ for table in CLEANABLE_TABLES:
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
-    max_active_tasks=1,
+    max_active_tasks=len(CLEANABLE_TABLES),
     schedule_interval='@weekly',
     params=params,
 )
 def tools_db_cleanup():
 
-    @task
-    def check_retention(**context):
-        params = context['params']
-        retention_days = params['retention_days']
-        tables = [t for t in CLEANABLE_TABLES if params[t]]
+    def _cutoff(retention_days):
+        return pendulum.now('UTC').subtract(days=retention_days).format('YYYY-MM-DD HH:mm:ss')
 
-        if retention_days < 30:
-            raise AirflowFailException(f"retention_days={retention_days} меньше минимума (30)")
-
-        cutoff = pendulum.now('UTC').subtract(days=retention_days).format('YYYY-MM-DD HH:mm:ss')
-        logger.info(f"📝 Граница очистки: {cutoff} (retention_days={retention_days})")
-
-        for table in tables:
-            date_col = DATE_COLUMNS.get(table)
-            custom_sql = COUNT_SQLS.get(table)
+    def _make_check(tbl):
+        @task(task_id=f'check_{tbl}')
+        def _check(_tbl=tbl, **context):
+            params = context['params']
+            if not params.get(_tbl, True):
+                raise AirflowSkipException(f'Таблица {_tbl} отключена')
+            retention_days = params['retention_days']
+            if retention_days < 30:
+                raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
+            cutoff = _cutoff(retention_days)
+            date_col = DATE_COLUMNS.get(_tbl)
+            custom_sql = COUNT_SQLS.get(_tbl)
             if date_col is not None:
-                sql = f"SELECT COUNT(*) FROM {table} WHERE {date_col} < '{cutoff}'"
+                sql = f"SELECT COUNT(*) FROM {_tbl} WHERE {date_col} < '{cutoff}'"
             elif custom_sql is not None:
                 sql = custom_sql.format(cutoff=cutoff)
             else:
-                logger.info(f"⚠️  {table}: подсчёт не поддерживается")
-                continue
+                logger.info(f'⚠️  {_tbl}: подсчёт не поддерживается')
+                return
             try:
                 result = pg_exe(sql)
                 count = result[0]['count']
-                logger.info(f"🔍 {table}: {count} записей к удалению")
+                logger.info(f'🔍 {_tbl}: {count} записей к удалению')
             except Exception as e:
-                logger.warning(f"❌ {table}: ошибка подсчёта — {e}")
+                logger.warning(f'❌ {_tbl}: ошибка подсчёта — {e}')
+        return _check()
 
-    @task
-    def clean_metadata(**context):
-        params = context['params']
-        retention_days = params['retention_days']
-        dry_run = params['dry_run']
-        tables = [t for t in CLEANABLE_TABLES if params[t]]
-
-        if dry_run:
-            raise AirflowSkipException('🔒 dry_run=True — удаление пропущено')
-
-        if retention_days < 30:
-            raise AirflowFailException(f"retention_days={retention_days} меньше минимума (30)")
-
-        cutoff = pendulum.now('UTC').subtract(days=retention_days).format('YYYY-MM-DD HH:mm:ss')
-        logger.info(f"🗑️  Начало очистки. Граница: {cutoff}")
-
-        for table in tables:
-            sql = DELETE_SQLS[table].format(cutoff=cutoff)
-            logger.info(f"[УДАЛЕНИЕ] {table}")
+    def _make_clean(tbl):
+        @task(task_id=f'clean_{tbl}')
+        def _clean(_tbl=tbl, **context):
+            params = context['params']
+            if not params.get(_tbl, True):
+                raise AirflowSkipException(f'Таблица {_tbl} отключена')
+            if params['dry_run']:
+                raise AirflowSkipException('🔒 dry_run=True — удаление пропущено')
+            retention_days = params['retention_days']
+            if retention_days < 30:
+                raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
+            cutoff = _cutoff(retention_days)
+            sql = DELETE_SQLS[_tbl].format(cutoff=cutoff)
+            logger.info(f'[УДАЛЕНИЕ] {_tbl}')
             try:
                 pg_delete(sql)
             except Exception as e:
-                logger.error(f"❌ {table}: ошибка удаления — {e}")
+                logger.error(f'❌ {_tbl}: ошибка удаления — {e}')
+        return _clean()
 
-    check_retention() >> clean_metadata()
+    # --- check: все таски параллельно ---
+    with TaskGroup('check') as check_group:
+        for tbl in CLEANABLE_TABLES:
+            _make_check(tbl)
+
+    # --- clean: с зависимостями по каскадам ---
+    with TaskGroup('clean') as clean_group:
+        ct = {tbl: _make_clean(tbl) for tbl in CLEANABLE_TABLES}
+
+        # Фаза 1 (параллельно) >> task_instance
+        phase1 = [ct[t] for t in [
+            'callback_request', 'celery_taskmeta', 'celery_tasksetmeta', 'session',
+            'import_error', 'sla_miss', 'log', 'job',
+            'xcom', 'rendered_task_instance_fields', 'task_instance_history',
+        ]]
+        phase1 >> ct['task_instance']
+
+        # task_instance >> trigger, dag_run (параллельно)
+        ct['task_instance'] >> [ct['trigger'], ct['dag_run']]
+
+        # trigger, dag_run >> dataset_event, dataset, dataset_alias (параллельно)
+        [ct['trigger'], ct['dag_run']] >> [ct['dataset_event'], ct['dataset'], ct['dataset_alias']]
+
+    check_group >> clean_group
 
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()

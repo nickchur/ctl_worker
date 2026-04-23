@@ -46,6 +46,7 @@ from sqlalchemy import text
 
 from pprint import PrettyPrinter
 import pendulum
+import time
 import os
 
 from logging import getLogger
@@ -54,13 +55,16 @@ logger = getLogger("airflow.task")
 MAX_NOTE_LEN = 1000
 
 
-def add_note(msg, context=None, level='task', add=True, title='', compact=False):
+def add_note(msg, context=None, level='task', add=True, title='', compact=False, duration=None):
     if not context:
         context = get_current_context()
 
     if isinstance(msg, dict) and len(msg) == 1:
         t, msg = next(iter(msg.items()))
         title += str(t) + (f' ({len(msg)})' if isinstance(msg, (dict, list, tuple, set)) else '')
+
+    if duration is not None:
+        msg = f"{msg} ⏱ {duration:.2f}s"
 
     if type(msg) is not str:
         msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
@@ -202,7 +206,6 @@ def db_count(sql, timeout=300):
 
 
 def db_delete(sql, timeout=600):
-    import time
     ts = time.time()
     with create_session() as session:
         session.execute(text("SET LOCAL search_path = main"))
@@ -270,8 +273,9 @@ def tools_db_cleanup():
             else:
                 add_note('подсчёт не поддерживается', context=context, level='DAG,Task', title=f'⚠️ {_tbl}')
                 return
+            _ts = time.time()
             count = db_count(sql)
-            add_note(f'{count} записей к удалению', context=context, level='DAG,Task', title=f'🔍 {_tbl}')
+            add_note(f'{count} записей к удалению', context=context, level='DAG,Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
         return _check()
 
     # Таски downstream от потенциально пропущенных — none_failed чтобы не каскадить skip
@@ -295,8 +299,9 @@ def tools_db_cleanup():
                 raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
             cutoff = _cutoff(retention_days)
             sql = DELETE_SQLS[_tbl].format(cutoff=cutoff)
+            _ts = time.time()
             rowcount = db_delete(sql)
-            add_note(f'удалено {rowcount} строк', context=context, level='DAG,Task', title=f'🗑️ {_tbl}')
+            add_note(f'удалено {rowcount} строк', context=context, level='DAG,Task', title=f'🗑️ {_tbl}', duration=time.time() - _ts)
         return _clean()
 
     @task_group(group_id='check')

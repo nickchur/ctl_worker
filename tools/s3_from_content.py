@@ -12,7 +12,16 @@
 | 🗜️ `compress`    | Сжатие: `none` \| `gz` \| `zip`                            |
 | 🔄 `replace`     | Перезаписать если существует *(default: `False`)*          |
 
-> **zip:** формат `s3_key` → `path/archive.zip/filename.ext`
+### Режим `compress=zip`
+
+Имя архива и внутреннего файла выводятся из `s3_key` автоматически:
+
+| `s3_key`                        | Архив в S3                  | Файл внутри архива |
+|---------------------------------|-----------------------------|--------------------|
+| `path/archive.zip/data.csv`     | `path/archive.zip`          | `data.csv`         |
+| `path/archive.zip/` или `path/archive.zip` | `path/archive.zip` | `archive`          |
+| `path/data.csv.zip`             | `path/data.csv.zip`         | `data.csv`         |
+| `path/data.csv`                 | `path/data.csv.zip`         | `data.csv`         |
 """
 from airflow import DAG
 from airflow.models import Param, Connection
@@ -138,12 +147,18 @@ def tools_s3_from_content():
         elif compress == 'zip':
             zip_marker = '.zip/'
             pos = s3_key.lower().find(zip_marker)
-            if pos == -1:
-                raise ValueError(f"Для compress='zip' s3_key должен иметь формат 'path/archive.zip/filename.ext', получено: '{s3_key}'")
-            zip_s3_key = s3_key[:pos + len('.zip')]
-            internal_name = s3_key[pos + len(zip_marker):]
+            if pos != -1:
+                zip_s3_key = s3_key[:pos + len('.zip')]
+                internal_name = s3_key[pos + len(zip_marker):]
+            elif s3_key.lower().endswith('.zip'):
+                zip_s3_key = s3_key
+                internal_name = ''
+            else:
+                zip_s3_key = s3_key + '.zip'
+                internal_name = os.path.basename(s3_key)
             if not internal_name:
-                raise ValueError(f"Не задано имя файла внутри архива в s3_key: '{s3_key}'")
+                zip_basename = os.path.basename(zip_s3_key)
+                internal_name = zip_basename[:-4]
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr(internal_name, raw)

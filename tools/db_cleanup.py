@@ -41,13 +41,54 @@ from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.helpers import cross_downstream
 from airflow.utils.session import create_session
+from airflow.operators.python import get_current_context
 from sqlalchemy import text
 
+from pprint import PrettyPrinter
 import pendulum
 import os
 
 from logging import getLogger
 logger = getLogger("airflow.task")
+
+MAX_NOTE_LEN = 1000
+
+
+def add_note(msg, context=None, level='task', add=True, title='', compact=False):
+    if not context:
+        context = get_current_context()
+
+    if isinstance(msg, dict) and len(msg) == 1:
+        t, msg = next(iter(msg.items()))
+        title += str(t) + (f' ({len(msg)})' if isinstance(msg, (dict, list, tuple, set)) else '')
+
+    if type(msg) is not str:
+        msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
+        msg = '```\n' + msg + '\n```'
+
+    logger.info(f"📝 Note added to {level} {title}:\n{msg}")
+
+    with create_session() as session:
+        for l in list(set(level.upper().split(',')))[:2]:
+            new_note = msg.strip()
+            if l == 'DAG':
+                obj = session.merge(context['dag_run'])
+            else:
+                obj = session.merge(context['task_instance'])
+
+            if title:
+                import unicodedata
+                if not unicodedata.category(title[0]) == 'So':
+                    title = "📝 " + title
+                new_note = f"{title}\n---\n{new_note}"
+
+            if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
+                continue
+
+            if add:
+                new_note = f"{new_note}\n\n---\n{obj.note if obj.note else ''}"
+
+            obj.note = new_note[:MAX_NOTE_LEN]
 
 
 # Порядок важен: сначала независимые, потом дочерние, dag_run — последним
@@ -227,10 +268,10 @@ def tools_db_cleanup():
             elif custom_sql is not None:
                 sql = custom_sql.format(cutoff=cutoff)
             else:
-                logger.info(f'⚠️  {_tbl}: подсчёт не поддерживается')
+                add_note('подсчёт не поддерживается', context=context, level='DAG,Task', title=f'⚠️ {_tbl}')
                 return
             count = db_count(sql)
-            logger.info(f'🔍 {_tbl}: {count} записей к удалению')
+            add_note(f'{count} записей к удалению', context=context, level='DAG,Task', title=f'🔍 {_tbl}')
         return _check()
 
     def _make_clean(tbl):
@@ -246,8 +287,8 @@ def tools_db_cleanup():
                 raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
             cutoff = _cutoff(retention_days)
             sql = DELETE_SQLS[_tbl].format(cutoff=cutoff)
-            logger.info(f'[УДАЛЕНИЕ] {_tbl}')
-            db_delete(sql)
+            rowcount = db_delete(sql)
+            add_note(f'удалено {rowcount} строк', context=context, level='DAG,Task', title=f'🗑️ {_tbl}')
         return _clean()
 
     # --- check: все таски параллельно ---

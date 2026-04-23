@@ -37,14 +37,11 @@
 
 from airflow.decorators import task, dag
 from airflow.models import Param
-from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.utils.task_group import TaskGroup
+from airflow.utils.session import create_session
+from sqlalchemy import text
 
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from psycopg2 import OperationalError, InterfaceError, DatabaseError
-
-import time
 import pendulum
 import os
 
@@ -155,92 +152,23 @@ COUNT_SQLS = {
 }
 
 
-def _get_hook():
-    return PostgresHook(postgres_conn_id='airflowdb')
+def db_count(sql, timeout=300):
+    with create_session() as session:
+        session.execute(text("SET LOCAL search_path = main"))
+        session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
+        return session.execute(text(sql)).scalar()
 
 
-def _setup_session(cursor, timeout=300):
-    cursor.execute("SET search_path = main")
-    if timeout:
-        cursor.execute(f"SET statement_timeout TO {timeout * 1000}")
-
-
-def query_to_dict(gp_hook, sql, timeout=300):
-    with gp_hook.get_conn() as conn:
-        with conn.cursor() as cursor:
-            _setup_session(cursor, timeout)
-            cursor.execute(sql)
-            cols = [desc[0] for desc in cursor.description]
-            rows = cursor.fetchall()
-    return [dict(zip(cols, row)) for row in rows]
-
-
-def execute_dml(gp_hook, sql, timeout=300):
-    with gp_hook.get_conn() as conn:
-        with conn.cursor() as cursor:
-            _setup_session(cursor, timeout)
-            cursor.execute(sql)
-            rowcount = cursor.rowcount
-        conn.commit()
+def db_delete(sql, timeout=600):
+    import time
+    ts = time.time()
+    with create_session() as session:
+        session.execute(text("SET LOCAL search_path = main"))
+        session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
+        result = session.execute(text(sql))
+        rowcount = result.rowcount
+    logger.info(f"🗑️  Удалено {rowcount} строк за {time.time() - ts:.2f}s")
     return rowcount
-
-
-def log_retry_attempt(retry_state):
-    logger.warning(
-        f"⚠️ Попытка {retry_state.attempt_number} не удалась. "
-        f"Ошибка: {retry_state.outcome.exception()}. "
-        f"Следующая попытка через {retry_state.next_action.sleep} сек..."
-    )
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((OperationalError, InterfaceError, ConnectionError)),
-    before_sleep=log_retry_attempt,
-    reraise=True,
-)
-def pg_exe(sql='select 1'):
-    hook = _get_hook()
-    ts_start = time.time()
-    try:
-        records = query_to_dict(hook, sql)
-        logger.info(f"✅ {len(records)} records in {time.time() - ts_start:.2f}s")
-        return records
-    except (OperationalError, InterfaceError) as e:
-        logger.error(f"📡 Ошибка подключения к Postgres: {e}")
-        raise
-    except DatabaseError as e:
-        logger.error(f"❌ Ошибка SQL: {e}")
-        raise AirflowFailException(f"PG SQL Error: {e}")
-    except Exception as e:
-        logger.error(f"💥 Непредвиденная ошибка pg_exe: {e}")
-        raise
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((OperationalError, InterfaceError, ConnectionError)),
-    before_sleep=log_retry_attempt,
-    reraise=True,
-)
-def pg_delete(sql):
-    hook = _get_hook()
-    ts_start = time.time()
-    try:
-        rowcount = execute_dml(hook, sql)
-        logger.info(f"🗑️  Удалено {rowcount} строк за {time.time() - ts_start:.2f}s")
-        return rowcount
-    except (OperationalError, InterfaceError) as e:
-        logger.error(f"📡 Ошибка подключения к Postgres: {e}")
-        raise
-    except DatabaseError as e:
-        logger.error(f"❌ Ошибка SQL: {e}")
-        raise AirflowFailException(f"PG SQL Error: {e}")
-    except Exception as e:
-        logger.error(f"💥 Непредвиденная ошибка pg_delete: {e}")
-        raise
 
 
 params = {
@@ -300,12 +228,8 @@ def tools_db_cleanup():
             else:
                 logger.info(f'⚠️  {_tbl}: подсчёт не поддерживается')
                 return
-            try:
-                result = pg_exe(sql)
-                count = result[0]['count']
-                logger.info(f'🔍 {_tbl}: {count} записей к удалению')
-            except Exception as e:
-                logger.warning(f'❌ {_tbl}: ошибка подсчёта — {e}')
+            count = db_count(sql)
+            logger.info(f'🔍 {_tbl}: {count} записей к удалению')
         return _check()
 
     def _make_clean(tbl):
@@ -322,10 +246,7 @@ def tools_db_cleanup():
             cutoff = _cutoff(retention_days)
             sql = DELETE_SQLS[_tbl].format(cutoff=cutoff)
             logger.info(f'[УДАЛЕНИЕ] {_tbl}')
-            try:
-                pg_delete(sql)
-            except Exception as e:
-                logger.error(f'❌ {_tbl}: ошибка удаления — {e}')
+            db_delete(sql)
         return _clean()
 
     # --- check: все таски параллельно ---

@@ -1,4 +1,4 @@
-"""### Утилиты CTL (`plugins/ctl_utils.py`)
+"""### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
 
 Базовый модуль для всех DAG'ов CTL.
 

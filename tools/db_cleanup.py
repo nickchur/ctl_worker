@@ -40,7 +40,8 @@
 """
 
 from airflow.decorators import task, dag, task_group
-from airflow.models import Param
+from airflow.models import Param, TaskInstance
+from airflow.utils.state import TaskInstanceState
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.utils.helpers import cross_downstream
 from airflow.utils.trigger_rule import TriggerRule
@@ -395,6 +396,15 @@ def tools_db_cleanup():
                 raise AirflowSkipException('vacuum_mode=skip — пропущено')
             if not params.get(_tbl, True):
                 raise AirflowSkipException(f'Таблица {_tbl} отключена')
+            dag_run = context['dag_run']
+            with create_session() as session:
+                clean_state = session.query(TaskInstance.state).filter_by(
+                    dag_id=dag_run.dag_id,
+                    run_id=dag_run.run_id,
+                    task_id=f'clean.clean_{_tbl}',
+                ).scalar()
+            if clean_state != TaskInstanceState.SUCCESS:
+                raise AirflowSkipException(f'clean_{_tbl} не выполнен ({clean_state}) — vacuum пропущен')
             full = mode == 'full'
             label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
             _ts = time.time()

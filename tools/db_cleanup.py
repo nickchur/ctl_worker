@@ -256,10 +256,18 @@ def db_delete(sql, timeout=600):
 def db_vacuum(table, full=False, timeout=3600):
     ts = time.time()
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
-    with settings.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
-        conn.execute(text(f"VACUUM {mode} main.{table}"))
-    logger.info(f"✅ VACUUM {mode} main.{table} за {time.time() - ts:.2f}s")
+    sql = f"VACUUM {mode} main.{table}"
+    # Используем сырое psycopg2-соединение — VACUUM требует строгого autocommit,
+    # пул SQLAlchemy может держать открытую транзакцию
+    raw = settings.engine.raw_connection()
+    try:
+        raw.autocommit = True
+        with raw.cursor() as cur:
+            cur.execute(f"SET statement_timeout = '{timeout}s'")
+            cur.execute(sql)
+    finally:
+        raw.close()
+    logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 
 def readable_size(size_bytes, base=1024):

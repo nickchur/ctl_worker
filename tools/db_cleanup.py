@@ -497,8 +497,9 @@ def tools_db_cleanup():
             ] + [f"| `{r['table']}` | {r['mode']} | {r['duration']} |" for r in rows]
             total = round(sum(r['duration'] for r in rows), 2)
             lines.append(f"| **Итого** | | **{total} с** |")
-            add_note('\n'.join(lines), context=context, level='Task', title='🧹 Итог vacuum')
-            add_note(f'{len(rows)} таблиц за {total} с', context=context, level='DAG', title='🧹 Итог vacuum')
+            mode_label = 'FULL' if any('FULL' in r['mode'] for r in rows) else 'ANALYZE'
+            add_note('\n'.join(lines), context=context, level='Task', title=f'🧹 Итог vacuum ({mode_label})')
+            add_note(f'{len(rows)} таблиц за {total} с', context=context, level='DAG', title=f'🧹 Итог vacuum ({mode_label})')
 
         vacuums >> _vacuum_summary()
 

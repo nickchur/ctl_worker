@@ -388,8 +388,6 @@ def tools_db_cleanup():
                 raise AirflowSkipException('vacuum_mode=skip — пропущено')
             if not params.get(_tbl, True):
                 raise AirflowSkipException(f'Таблица {_tbl} отключена')
-            if params.get('dry_run', True):
-                raise AirflowSkipException('🔒 dry_run=True — vacuum пропущен')
             full = mode == 'full'
             label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
             _ts = time.time()

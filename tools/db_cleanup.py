@@ -9,9 +9,9 @@
 | 📅 `retention_days`  | Хранить записи не старше N дней *(default: `180` = 6 мес)*                                   |
 | 🔍 `dry_run`         | Только подсчёт без удаления *(default: `True`)*                                               |
 | 🧹 `vacuum_mode`     | `analyze` — VACUUM ANALYZE *(default)*, `full` — VACUUM FULL ANALYZE, `skip` — пропустить    |
-| ⏱️ `timeout_count`  | Таймаут подсчёта записей, сек *(default: `300`)*                                              |
-| ⏱️ `timeout_delete` | Таймаут удаления записей, сек *(default: `600`)*                                              |
-| ⏱️ `timeout_vacuum` | Таймаут VACUUM, сек *(default: `3600`)*                                                       |
+| ⏱️ `timeout_count`  | Таймаут подсчёта записей, мин *(default: `5`)*                                                |
+| ⏱️ `timeout_delete` | Таймаут удаления записей, мин *(default: `10`)*                                               |
+| ⏱️ `timeout_vacuum` | Таймаут VACUUM, мин *(default: `60`)*                                                         |
 | 📋 `tables`          | Список таблиц для очистки *(default: все)*                                                    |
 
 ---
@@ -281,22 +281,22 @@ params = {
         description='analyze — VACUUM ANALYZE, full — VACUUM FULL ANALYZE, skip — пропустить',
     ),
     'timeout_count': Param(
-        300,
+        5,
         type='integer',
-        minimum=10,
-        description='Таймаут подсчёта записей, сек',
+        minimum=1,
+        description='Таймаут подсчёта записей, мин',
     ),
     'timeout_delete': Param(
-        600,
+        10,
         type='integer',
-        minimum=10,
-        description='Таймаут удаления записей, сек',
+        minimum=1,
+        description='Таймаут удаления записей, мин',
     ),
     'timeout_vacuum': Param(
-        3600,
+        60,
         type='integer',
-        minimum=10,
-        description='Таймаут VACUUM, сек',
+        minimum=1,
+        description='Таймаут VACUUM, мин',
     ),
 }
 for table in CLEANABLE_TABLES:
@@ -344,7 +344,7 @@ def tools_db_cleanup():
                 add_note('подсчёт не поддерживается', context=context, level='Task', title=f'⚠️ {_tbl}')
                 return
             _ts = time.time()
-            count = db_count(sql, timeout=params.get('timeout_count', 300))
+            count = db_count(sql, timeout=params.get('timeout_count', 5) * 60)
             add_note(f'{readable_size(count, base=1000)} записей к удалению', context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
         return _check()
 
@@ -370,7 +370,7 @@ def tools_db_cleanup():
             cutoff = _cutoff(retention_days)
             sql = DELETE_SQLS[_tbl].format(cutoff=cutoff)
             _ts = time.time()
-            rowcount = db_delete(sql, timeout=params.get('timeout_delete', 600))
+            rowcount = db_delete(sql, timeout=params.get('timeout_delete', 10) * 60)
             add_note(f'удалено {readable_size(rowcount, base=1000)} строк', context=context, level='Task', title=f'🗑️ {_tbl}', duration=time.time() - _ts)
         return _clean()
 
@@ -412,7 +412,7 @@ def tools_db_cleanup():
             full = mode == 'full'
             label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
             _ts = time.time()
-            db_vacuum(_tbl, full=full, timeout=params.get('timeout_vacuum', 3600))
+            db_vacuum(_tbl, full=full, timeout=params.get('timeout_vacuum', 60) * 60)
             add_note(f'{label} выполнен', context=context, level='Task', title=f'🧹 {_tbl}', duration=time.time() - _ts)
         return _vacuum()
 

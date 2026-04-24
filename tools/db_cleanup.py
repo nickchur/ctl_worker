@@ -79,11 +79,6 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False,
     with create_session() as session:
         for l in list(set(level.upper().split(',')))[:2]:
             new_note = msg.strip()
-            if l == 'DAG':
-                obj = session.merge(context['dag_run'])
-            else:
-                obj = session.merge(context['task_instance'])
-            session.expire(obj)  # перечитать из БД: другой параллельный таск мог уже создать заметку
 
             if title:
                 import unicodedata
@@ -91,13 +86,31 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False,
                     title = "📝 " + title
                 new_note = f"{title}\n---\n{new_note}"
 
-            if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
-                continue
-
-            if add:
-                new_note = f"{new_note}\n\n---\n{obj.note if obj.note else ''}"
-
-            obj.note = new_note[:MAX_NOTE_LEN]
+            if l == 'DAG':
+                # Атомарный upsert — избегает UniqueViolation при параллельных тасках
+                dag_run_id = context['dag_run'].id
+                existing = session.execute(
+                    text("SELECT content FROM main.dag_run_note WHERE dag_run_id = :id"),
+                    {'id': dag_run_id}
+                ).scalar()
+                if existing and existing.startswith(new_note[:MAX_NOTE_LEN]):
+                    continue
+                if add and existing:
+                    new_note = f"{new_note}\n\n---\n{existing}"
+                session.execute(text("""
+                    INSERT INTO main.dag_run_note (dag_run_id, user_id, content, created_at, updated_at)
+                    VALUES (:id, NULL, :content, NOW(), NOW())
+                    ON CONFLICT (dag_run_id) DO UPDATE
+                    SET content = EXCLUDED.content, updated_at = NOW()
+                """), {'id': dag_run_id, 'content': new_note[:MAX_NOTE_LEN]})
+            else:
+                obj = session.merge(context['task_instance'])
+                session.expire(obj)
+                if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
+                    continue
+                if add:
+                    new_note = f"{new_note}\n\n---\n{obj.note if obj.note else ''}"
+                obj.note = new_note[:MAX_NOTE_LEN]
 
 
 # Порядок важен: сначала независимые, потом дочерние, dag_run — последним

@@ -495,8 +495,28 @@ def tools_db_cleanup():
 
         vacuums >> _vacuum_summary()
 
+    _SIZE_SQL = """
+        SELECT relname, pg_total_relation_size('main.' || relname) AS size_bytes
+        FROM pg_stat_user_tables
+        WHERE schemaname = 'main'
+    """
+
+    @task(task_id='snapshot')
+    def before_snapshot(**context):
+        with create_session() as session:
+            rows = session.execute(text(_SIZE_SQL)).fetchall()
+        sizes = {relname: (size or 0) for relname, size in rows}
+        add_note(
+            f"Снято {len(sizes)} таблиц, итого {readable_size(sum(sizes.values()))}",
+            context=context, level='Task', title='📸 Снимок до очистки',
+        )
+        return sizes
+
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
+        ti = context['ti']
+        before = ti.xcom_pull(task_ids='snapshot') or {}
+
         sql = """
             SELECT
                 relname,
@@ -512,49 +532,59 @@ def tools_db_cleanup():
         with create_session() as session:
             rows = session.execute(text(sql)).fetchall()
 
-        data = [
-            {
+        data = []
+        for relname, total_bytes, live, dead, last_vac, last_ana in rows:
+            after_b  = total_bytes or 0
+            before_b = before.get(relname, after_b)
+            delta_b  = after_b - before_b
+            data.append({
                 'table':        relname,
-                'size':         readable_size(total_bytes or 0),
-                'size_bytes':   total_bytes or 0,
+                'before':       readable_size(before_b),
+                'after':        readable_size(after_b),
+                'delta':        ('-' if delta_b < 0 else '+') + readable_size(abs(delta_b)) if before_b else '—',
+                'size_bytes':   after_b,
                 'live_rows':    readable_size(live or 0, base=1000),
                 'dead_rows':    readable_size(dead or 0, base=1000),
                 'last_vacuum':  str(last_vac)[:16] if last_vac else None,
                 'last_analyze': str(last_ana)[:16] if last_ana else None,
-            }
-            for relname, total_bytes, live, dead, last_vac, last_ana in rows
-        ]
+                '_delta_b':     delta_b,
+            })
 
         lines = [
-            '| Таблица | Размер | Записей | Удалённых | Последний вакуум | Последний анализ |',
-            '|---------|--------|---------|-----------|------------------|------------------|',
+            '| Таблица | До | После | Δ | Записей | Удалённых | Последний вакуум | Последний анализ |',
+            '|---------|-----|-------|---|---------|-----------|------------------|------------------|',
         ] + [
-            f"| `{r['table']}` | {r['size']} | {r['live_rows']} | {r['dead_rows']}"
+            f"| `{r['table']}` | {r['before']} | {r['after']} | {r['delta']}"
+            f" | {r['live_rows']} | {r['dead_rows']}"
             f" | {r['last_vacuum'] or '—'} | {r['last_analyze'] or '—'} |"
             for r in data
         ]
 
         report_md = '\n'.join(lines)
         logger.info(f"📊 Отчёт по схеме main:\n{report_md}")
-
-        # Полная таблица — только в таск-заметку
         add_note(report_md, context=context, level='Task', title='📊 Схема main')
 
-        # Саммери — в DAG-заметку (считаем из сырых rows, не из отформатированных строк)
-        total_size = sum(r[1] or 0 for r in rows)
-        total_live = sum(r[2] or 0 for r in rows)
-        total_dead = sum(r[3] or 0 for r in rows)
+        total_before = sum(before.get(r[0], r[1] or 0) for r in rows)
+        total_after  = sum(r[1] or 0 for r in rows)
+        total_delta  = total_after - total_before
+        total_live   = sum(r[2] or 0 for r in rows)
+        total_dead   = sum(r[3] or 0 for r in rows)
+        delta_str    = ('-' if total_delta < 0 else '+') + readable_size(abs(total_delta))
         summary = (
-            f"| Таблиц | Размер | Записей | Удалённых |\n"
-            f"|--------|--------|---------|----------|\n"
-            f"| {readable_size(len(rows), base=1000)} | {readable_size(total_size)} "
-            f"| {readable_size(total_live, base=1000)} "
-            f"| {readable_size(total_dead, base=1000)} |"
+            f"| Таблиц | До | После | Δ | Записей | Удалённых |\n"
+            f"|--------|-----|-------|---|---------|----------|\n"
+            f"| {readable_size(len(rows), base=1000)}"
+            f" | {readable_size(total_before)}"
+            f" | {readable_size(total_after)}"
+            f" | {delta_str}"
+            f" | {readable_size(total_live, base=1000)}"
+            f" | {readable_size(total_dead, base=1000)} |"
         )
         add_note(summary, context=context, level='DAG', title='📊 Схема main')
 
         return data
 
-    check_group() >> clean_group() >> vacuum_group() >> report()
+    snap = before_snapshot()
+    snap >> check_group() >> clean_group() >> vacuum_group() >> report()
 
 tools_db_cleanup()

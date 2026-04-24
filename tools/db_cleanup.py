@@ -320,11 +320,11 @@ def tools_db_cleanup():
             elif custom_sql is not None:
                 sql = custom_sql.format(cutoff=cutoff)
             else:
-                add_note('подсчёт не поддерживается', context=context, level='DAG,Task', title=f'⚠️ {_tbl}')
+                add_note('подсчёт не поддерживается', context=context, level='Task', title=f'⚠️ {_tbl}')
                 return
             _ts = time.time()
             count = db_count(sql)
-            add_note(f'{count} записей к удалению', context=context, level='DAG,Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
+            add_note(f'{count} записей к удалению', context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
         return _check()
 
     # Таски downstream от потенциально пропущенных — none_failed чтобы не каскадить skip
@@ -350,7 +350,7 @@ def tools_db_cleanup():
             sql = DELETE_SQLS[_tbl].format(cutoff=cutoff)
             _ts = time.time()
             rowcount = db_delete(sql)
-            add_note(f'удалено {rowcount} строк', context=context, level='DAG,Task', title=f'🗑️ {_tbl}', duration=time.time() - _ts)
+            add_note(f'удалено {rowcount} строк', context=context, level='Task', title=f'🗑️ {_tbl}', duration=time.time() - _ts)
         return _clean()
 
     @task_group(group_id='check')
@@ -394,7 +394,7 @@ def tools_db_cleanup():
             label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
             _ts = time.time()
             db_vacuum(_tbl, full=full)
-            add_note(f'{label} выполнен', context=context, level='DAG,Task', title=f'🧹 {_tbl}', duration=time.time() - _ts)
+            add_note(f'{label} выполнен', context=context, level='Task', title=f'🧹 {_tbl}', duration=time.time() - _ts)
         return _vacuum()
 
     @task_group(group_id='vacuum')
@@ -443,7 +443,23 @@ def tools_db_cleanup():
 
         report_md = '\n'.join(lines)
         logger.info(f"📊 Отчёт по схеме main:\n{report_md}")
-        add_note(report_md, context=context, level='DAG', title='📊 Схема main')
+
+        # Полная таблица — только в таск-заметку
+        add_note(report_md, context=context, level='Task', title='📊 Схема main')
+
+        # Саммери — в DAG-заметку (считаем из сырых rows, не из отформатированных строк)
+        total_size = sum(r[1] or 0 for r in rows)
+        total_live = sum(r[2] or 0 for r in rows)
+        total_dead = sum(r[3] or 0 for r in rows)
+        summary = (
+            f"| Таблиц | Размер | Записей | Удалённых |\n"
+            f"|--------|--------|---------|----------|\n"
+            f"| {len(rows)} | {readable_size(total_size)} "
+            f"| {readable_size(total_live, base=1000)} "
+            f"| {readable_size(total_dead, base=1000)} |"
+        )
+        add_note(summary, context=context, level='DAG', title='📊 Схема main')
+
         return data
 
     check_group() >> clean_group() >> vacuum_group() >> report()

@@ -4,9 +4,12 @@
 
 | Параметр           | Описание                                                          |
 |--------------------|-------------------------------------------------------------------|
-| 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес)*       |
-| 🔍 `dry_run`        | Только подсчёт без удаления *(default: `True`)*                   |
-| 📋 `tables`         | Список таблиц для очистки *(default: все)*                        |
+| Параметр            | Описание                                                                                      |
+|---------------------|-----------------------------------------------------------------------------------------------|
+| 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес)*                                   |
+| 🔍 `dry_run`        | Только подсчёт без удаления *(default: `True`)*                                               |
+| 🧹 `vacuum_mode`    | `analyze` — VACUUM ANALYZE *(default)*, `full` — VACUUM FULL ANALYZE, `skip` — пропустить    |
+| 📋 `tables`         | Список таблиц для очистки *(default: все)*                                                    |
 
 ---
 
@@ -217,12 +220,13 @@ def db_delete(sql, timeout=600):
     return rowcount
 
 
-def db_vacuum(table, timeout=3600):
+def db_vacuum(table, full=False, timeout=3600):
     ts = time.time()
+    mode = 'FULL ANALYZE' if full else 'ANALYZE'
     with settings.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
-        conn.execute(text(f"VACUUM ANALYZE main.{table}"))
-    logger.info(f"✅ VACUUM ANALYZE main.{table} за {time.time() - ts:.2f}s")
+        conn.execute(text(f"VACUUM {mode} main.{table}"))
+    logger.info(f"✅ VACUUM {mode} main.{table} за {time.time() - ts:.2f}s")
 
 
 params = {
@@ -237,10 +241,11 @@ params = {
         type='boolean',
         description='True — только подсчёт, False — реальное удаление',
     ),
-    'vacuum': Param(
-        True,
-        type='boolean',
-        description='Запустить VACUUM ANALYZE после очистки',
+    'vacuum_mode': Param(
+        'analyze',
+        type='string',
+        enum=['analyze', 'full', 'skip'],
+        description='analyze — VACUUM ANALYZE, full — VACUUM FULL ANALYZE, skip — пропустить',
     ),
 }
 for table in CLEANABLE_TABLES:
@@ -348,15 +353,18 @@ def tools_db_cleanup():
         @task(task_id=f'vacuum_{tbl}')
         def _vacuum(_tbl=tbl, **context):
             params = context['params']
-            if not params.get('vacuum', True):
-                raise AirflowSkipException('vacuum=False — пропущено')
+            mode = params.get('vacuum_mode', 'analyze')
+            if mode == 'skip':
+                raise AirflowSkipException('vacuum_mode=skip — пропущено')
             if not params.get(_tbl, True):
                 raise AirflowSkipException(f'Таблица {_tbl} отключена')
             if params.get('dry_run', True):
                 raise AirflowSkipException('🔒 dry_run=True — vacuum пропущен')
+            full = mode == 'full'
+            label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
             _ts = time.time()
-            db_vacuum(_tbl)
-            add_note(f'VACUUM ANALYZE выполнен', context=context, level='DAG,Task', title=f'🧹 {_tbl}', duration=time.time() - _ts)
+            db_vacuum(_tbl, full=full)
+            add_note(f'{label} выполнен', context=context, level='DAG,Task', title=f'🧹 {_tbl}', duration=time.time() - _ts)
         return _vacuum()
 
     @task_group(group_id='vacuum')

@@ -229,6 +229,22 @@ def db_vacuum(table, full=False, timeout=3600):
     logger.info(f"✅ VACUUM {mode} main.{table} за {time.time() - ts:.2f}s")
 
 
+def readable_size(size_bytes, base=1024):
+    if base == 1024:
+        units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    else:
+        units = ["ед", "тыс", "млн", "млрд", "трлн", "птлн"]
+    if not size_bytes or size_bytes == 0:
+        return f"0 {units[0]}"
+    import math
+    sign = "-" if size_bytes < 0 else ""
+    size_bytes = abs(size_bytes)
+    i = int(math.floor(math.log(size_bytes, base)))
+    if i >= len(units): i = len(units) - 1
+    if i < 0: i = 0
+    return f"{sign}{round(size_bytes / (base ** i), 2)} {units[i]}"
+
+
 params = {
     'retention_days': Param(
         180,
@@ -372,7 +388,42 @@ def tools_db_cleanup():
         for tbl in CLEANABLE_TABLES:
             _make_vacuum(tbl)
 
-    check_group() >> clean_group() >> vacuum_group()
+    @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
+    def report(**context):
+        sql = """
+            SELECT
+                relname,
+                pg_total_relation_size('main.' || relname)  AS total_bytes,
+                n_live_tup,
+                n_dead_tup,
+                COALESCE(last_vacuum, last_autovacuum)      AS last_vacuum,
+                COALESCE(last_analyze, last_autoanalyze)    AS last_analyze
+            FROM pg_stat_user_tables
+            WHERE schemaname = 'main'
+            ORDER BY total_bytes DESC
+        """
+        with create_session() as session:
+            rows = session.execute(text(sql)).fetchall()
+
+        lines = [
+            '| Таблица | Размер | Записей | Удалённых | Последний вакуум | Последний анализ |',
+            '|---------|--------|---------|-----------|------------------|------------------|',
+        ]
+        for relname, total_bytes, live, dead, last_vac, last_ana in rows:
+            lines.append(
+                f"| `{relname}` "
+                f"| {readable_size(total_bytes or 0)} "
+                f"| {readable_size(live or 0, base=1000)} "
+                f"| {readable_size(dead or 0, base=1000)} "
+                f"| {str(last_vac)[:16] if last_vac else '—'} "
+                f"| {str(last_ana)[:16] if last_ana else '—'} |"
+            )
+
+        report_md = '\n'.join(lines)
+        logger.info(f"📊 Отчёт по схеме main:\n{report_md}")
+        add_note(report_md, context=context, level='DAG', title='📊 Схема main')
+
+    check_group() >> clean_group() >> vacuum_group() >> report()
 
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()

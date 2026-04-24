@@ -46,7 +46,7 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):
     },
     start_date=pendulum.datetime(2026, 1, 22, tz=pendulum.UTC),
     schedule_interval='17 5 * * *',
-    tags=['EDP_ETL', 'tools'],
+    tags=['EDP_ETL', 'tools', 'maintenance'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

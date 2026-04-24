@@ -1,4 +1,4 @@
-# CTL Plugins для Apache Airflow
+#🛠️ CTL Plugins для Apache Airflow
 
 Этот модуль содержит набор плагинов для интеграции Apache Airflow с системой CTL (Control Layer) и управления ETL-процессами.
 

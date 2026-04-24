@@ -480,3 +480,5 @@ def tools_db_cleanup():
         return data
 
     check_group() >> clean_group() >> vacuum_group() >> report()
+
+tools_db_cleanup()

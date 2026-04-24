@@ -2,46 +2,45 @@
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами.
 
-| Параметр           | Описание                                                          |
-|--------------------|-------------------------------------------------------------------|
 | Параметр            | Описание                                                                                      |
 |---------------------|-----------------------------------------------------------------------------------------------|
-| 📅 `retention_days`  | Хранить записи не старше N дней *(default: `180` = 6 мес)*                                   |
-| 🔍 `dry_run`         | Только подсчёт без удаления *(default: `True`)*                                               |
-| 🧹 `vacuum_mode`     | `analyze` — VACUUM ANALYZE *(default)*, `full` — VACUUM FULL ANALYZE, `skip` — пропустить    |
+| Параметр            | Описание                                                                                      |
+|---------------------|-----------------------------------------------------------------------------------------------|
+| 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес)*                                    |
+| 🔍 `dry_run`        | Только подсчёт без удаления *(default: `True`)*                                               |
+| 🧹 `vacuum_mode`    | `analyze` — VACUUM ANALYZE *(default)*, `full` — VACUUM FULL ANALYZE, `skip` — пропустить     |
 | ⏱️ `timeout`        | Таймаут на каждую операцию, мин *(default: `15`)*                                             |
-| 📋 `tables`          | Список таблиц для очистки *(default: все)*                                                    |
+| 📋 `tables`         | Список таблиц для очистки *(default: все)*                                                    |
 
 ---
 
 #### Таблицы очистки и порядок удаления
 
-| #  | Таблица                         | Критерий                              | Заметки                                                      |
-|----|---------------------------------|---------------------------------------|--------------------------------------------------------------|
-| 1  | `callback_request`              | `created_at < cutoff`                 | Обработанные колбэки планировщика                            |
-| 2  | `celery_taskmeta`               | `date_done < cutoff`                  | Результаты Celery-задач (result backend)                     |
-| 3  | `celery_tasksetmeta`            | `date_done < cutoff`                  | Результаты Celery-групп (result backend)                     |
-| 4  | `session`                       | `expiry < current_date`                      | Веб-сессии UI; не зависит от cutoff                          |
-| 5  | `import_error`                  | `timestamp < cutoff`                  | Ошибки парсинга DAG-файлов                                   |
-| 6  | `sla_miss`                      | `timestamp < cutoff`                  | Нарушения SLA                                                |
-| 7  | `log`                           | `dttm < cutoff`                       | Audit-лог событий (не логи тасков)                           |
-| 8  | `job`                           | `latest_heartbeat < cutoff`           | Записи SchedulerJob / LocalTaskJob                           |
-| 9  | `xcom`                          | `timestamp < cutoff`                  | ↳ каскад от `task_instance`                                  |
-| 10 | `rendered_task_instance_fields` | via `dag_run.execution_date < cutoff` | ↳ каскад от `task_instance`; нет своей колонки даты          |
-| 11 | `task_instance_history`         | `updated_at < cutoff`                 | ↳ каскад от `task_instance`; чистим до TI чтобы управлять объёмом |
-| 12 | `task_instance`                 | `start_date < cutoff`                 | ↳ каскад от `dag_run`                                        |
-| 13 | `trigger`                       | `created_date < cutoff`               | Deferred tasks; только без активных `task_instance`          |
-| 14 | `dag_run`                       | `execution_date < cutoff`             | Каскадно удаляет TI, xcom, rtif, dagrun_dataset_event и др.  |
+| #  | Таблица                         | Критерий                              | Заметки                                                                |
+|----|---------------------------------|---------------------------------------|------------------------------------------------------------------------|
+| 1  | `callback_request`              | `created_at < cutoff`                 | Обработанные колбэки планировщика                                      |
+| 2  | `celery_taskmeta`               | `date_done < cutoff`                  | Результаты Celery-задач (result backend)                               |
+| 3  | `celery_tasksetmeta`            | `date_done < cutoff`                  | Результаты Celery-групп (result backend)                               |
+| 4  | `session`                       | `expiry < current_date`               | Веб-сессии UI; не зависит от cutoff                                    |
+| 5  | `import_error`                  | `timestamp < cutoff`                  | Ошибки парсинга DAG-файлов                                             |
+| 6  | `sla_miss`                      | `timestamp < cutoff`                  | Нарушения SLA                                                          |
+| 7  | `log`                           | `dttm < cutoff`                       | Audit-лог событий (не логи тасков)                                     |
+| 8  | `job`                           | `latest_heartbeat < cutoff`           | Записи SchedulerJob / LocalTaskJob                                     |
+| 9  | `xcom`                          | `timestamp < cutoff`                  | ↳ каскад от `task_instance`                                            |
+| 10 | `rendered_task_instance_fields` | via `dag_run.execution_date < cutoff` | ↳ каскад от `task_instance`; нет своей колонки даты                    |
+| 11 | `task_instance_history`         | `updated_at < cutoff`                 | ↳ каскад от `task_instance`; чистим до TI чтобы управлять объёмом      |
+| 12 | `task_instance`                 | `start_date < cutoff`                 | ↳ каскад от `dag_run`                                                  |
+| 13 | `trigger`                       | `created_date < cutoff`               | Deferred tasks; только без активных `task_instance`                    |
+| 14 | `dag_run`                       | `execution_date < cutoff`             | Каскадно удаляет TI, xcom, rtif, dagrun_dataset_event и др.            |
 | 15 | `dataset_event`                 | `timestamp < cutoff`                  | Каскадно удаляет `dagrun_dataset_event`, `dataset_alias_dataset_event` |
-| 16 | `dataset`                       | `is_orphaned = TRUE`                  | Флаг выставляется Airflow при удалении DAG                   |
-| 17 | `dataset_alias`                 | не в DAG-расписаниях и не в алиасах   | Каскадно удаляет `dag_schedule_dataset_alias_reference`      |
+| 16 | `dataset`                       | `is_orphaned = TRUE`                  | Флаг выставляется Airflow при удалении DAG                             |
+| 17 | `dataset_alias`                 | не в DAG-расписаниях и не в алиасах   | Каскадно удаляет `dag_schedule_dataset_alias_reference`                |
 > **dry_run=True** по умолчанию — первый запуск всегда безопасен.
 > Минимальный порог `retention_days` — 30 дней.
 """
 
 from airflow.decorators import task, dag, task_group
-from airflow.models import Param, TaskInstance
-from airflow.utils.state import TaskInstanceState
+from airflow.models import Param
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.utils.helpers import cross_downstream
 from airflow.utils.trigger_rule import TriggerRule
@@ -388,7 +387,7 @@ def tools_db_cleanup():
         )
 
     def _make_vacuum(tbl):
-        @task(task_id=f'vacuum_{tbl}', trigger_rule=TriggerRule.ALL_DONE)
+        @task(task_id=f'vacuum_{tbl}')
         def _vacuum(_tbl=tbl, **context):
             params = context['params']
             mode = params.get('vacuum_mode', 'analyze')
@@ -396,15 +395,6 @@ def tools_db_cleanup():
                 raise AirflowSkipException('vacuum_mode=skip — пропущено')
             if not params.get(_tbl, True):
                 raise AirflowSkipException(f'Таблица {_tbl} отключена')
-            dag_run = context['dag_run']
-            with create_session() as session:
-                clean_state = session.query(TaskInstance.state).filter_by(
-                    dag_id=dag_run.dag_id,
-                    run_id=dag_run.run_id,
-                    task_id=f'clean.clean_{_tbl}',
-                ).scalar()
-            if clean_state != TaskInstanceState.SUCCESS:
-                raise AirflowSkipException(f'clean_{_tbl} не выполнен ({clean_state}) — vacuum пропущен')
             full = mode == 'full'
             label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
             _ts = time.time()
@@ -478,11 +468,3 @@ def tools_db_cleanup():
         return data
 
     check_group() >> clean_group() >> vacuum_group() >> report()
-
-
-ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()
-
-if ENV_STAND == "prom":
-    logger.warning("DAG tools_db_cleanup is disabled on 'prom' stand. Skipping DAG registration.")
-else:
-    tools_db_cleanup()

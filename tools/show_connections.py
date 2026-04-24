@@ -1,4 +1,4 @@
-"""### Список Airflow Connections
+"""### 🔌 Список Airflow Connections
 
 Показывает все подключения из secret backend, сгруппированные по типу.
 """

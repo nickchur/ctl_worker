@@ -1,4 +1,4 @@
-"""### DAG: `CTL.{wf_name}` — Рабочий процесс
+"""### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.

@@ -1,4 +1,4 @@
-"""### DAG: События CTL → Airflow Dataset
+"""### 🔔 DAG: События CTL → Airflow Dataset
 
 Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
 

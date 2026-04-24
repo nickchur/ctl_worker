@@ -1,0 +1,70 @@
+{
+  "profile": "HR_Data",
+  "root_entity": "941010000",
+  "root_category": "p1080",
+  "ue_category": "p1080.sdpue",
+  "archive_category": "p1080.ARCHIVE",
+  "event_expire": "time=0:00",
+  "task_timeout": "hours=1",
+  "exe_timeout": "hours=4",
+  "sla_time": "hours=1",
+  "ctl_limit": 1000,
+  "ctl_days": 5,
+  "tz": "Europe/Moscow",
+  "conns": {
+    "ctl": {
+      "conn_id": "ctl",
+      "pool_slots": [10, 50],
+      "timeout": 30,
+      "type": "KerberosHttp",
+      "url": "https://ctl-dev.dev.df.sbrf.ru:9080"
+    },
+    "files": {
+      "bucket": "edpetl-files",
+      "conn_id": "s3-archive",
+      "pool_slots": 20,
+      "ttl": 90,
+      "type": "S3"
+    },
+    "gp": {
+      "conn_id": "alpha-adb_dev_comm-read",
+      "pool_slots": 20,
+      "schema": "s_grnplm_vd_hr_edp_srv_wf",
+      "timeout": 300,
+      "type": "Postgres"
+    },
+    "ppl": {
+      "conn_id": "alpha-adb_dev_comm-write",
+      "pool_slots": 20,
+      "schema": "s_grnplm_vd_hr_edp_srv_wf",
+      "timeout": 300,
+      "type": "Postgres"
+    },
+    "pg": {
+      "conn_id": "airflowdb",
+      "default": true,
+      "pool_slots": 25,
+      "type": "Postgres"
+    },
+    "s3": {
+      "bucket": "edpetl-ctl",
+      "conn_id": "s3",
+      "pool_slots": 20,
+      "ttl": 7,
+      "type": "S3"
+    },
+    "tfs_kap": {
+      "mask": "edpetl-tfs/kap/*.*.done",
+      "done": true,
+      "conn_id": "s3",
+      "type": "tfs-in"
+    },
+    "tfs_uvb": {
+      "mask": "edpetl-tfs/uvb/*.*",
+      "compress": true,
+      "conn_id": "s3",
+      "type": "tfs-in"
+    }
+  },
+  "test_mode": "event"
+}

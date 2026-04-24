@@ -224,6 +224,13 @@ def db_count(sql, timeout=300):
         return session.execute(text(sql)).scalar()
 
 
+def db_stats(sql, timeout=300):
+    with create_session() as session:
+        session.execute(text("SET LOCAL search_path = main"))
+        session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
+        return session.execute(text(sql)).fetchone()
+
+
 def db_delete(sql, timeout=600):
     ts = time.time()
     with create_session() as session:
@@ -322,16 +329,21 @@ def tools_db_cleanup():
             cutoff = _cutoff(retention_days)
             date_col = DATE_COLUMNS.get(_tbl)
             custom_sql = COUNT_SQLS.get(_tbl)
+            _ts = time.time()
+            timeout = params.get('timeout', 15) * 60
             if date_col is not None:
-                sql = f"SELECT COUNT(*) FROM {_tbl} WHERE {date_col} < '{cutoff}'"
+                sql = f"SELECT COUNT(*), MIN({date_col}), MAX({date_col}) FROM {_tbl} WHERE {date_col} < '{cutoff}'"
+                count, min_date, max_date = db_stats(sql, timeout=timeout)
+                min_s = str(min_date)[:16] if min_date else '—'
+                max_s = str(max_date)[:16] if max_date else '—'
+                msg = f'{readable_size(count, base=1000)} записей к удалению | min: {min_s} | max: {max_s}'
             elif custom_sql is not None:
-                sql = custom_sql.format(cutoff=cutoff)
+                count = db_count(custom_sql.format(cutoff=cutoff), timeout=timeout)
+                msg = f'{readable_size(count, base=1000)} записей к удалению'
             else:
                 add_note('подсчёт не поддерживается', context=context, level='Task', title=f'⚠️ {_tbl}')
                 return
-            _ts = time.time()
-            count = db_count(sql, timeout=params.get('timeout', 15) * 60)
-            add_note(f'{readable_size(count, base=1000)} записей к удалению', context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
+            add_note(msg, context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
         return _check()
 
     # Таски downstream от потенциально пропущенных — none_failed чтобы не каскадить skip

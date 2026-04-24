@@ -361,8 +361,14 @@ def tools_db_cleanup():
             else:
                 add_note('подсчёт не поддерживается', context=context, level='Task', title=f'⚠️ {_tbl}')
                 return None
+            dead = db_stats(
+                f"SELECT n_dead_tup FROM pg_stat_user_tables WHERE schemaname='main' AND relname='{_tbl}'",
+                timeout=30,
+            )
+            dead_tup = (dead[0] if dead else 0) or 0
+            msg += f' | мёртвых: {readable_size(dead_tup, base=1000)}'
             add_note(msg, context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
-            return {'table': _tbl, 'count': count, 'min': min_s, 'max': max_s}
+            return {'table': _tbl, 'count': count, 'min': min_s, 'max': max_s, 'dead': dead_tup}
         return _check()
 
     # Таски downstream от потенциально пропущенных — none_failed чтобы не каскадить skip
@@ -405,11 +411,12 @@ def tools_db_cleanup():
                 add_note('нет данных', context=context, level='DAG,Task', title='🔍 Итог check')
                 return
             lines = [
-                '| Таблица | К удалению | Min | Max |',
-                '|---------|-----------|-----|-----|',
-            ] + [f"| `{r['table']}` | {readable_size(r['count'], base=1000)} | {r['min']} | {r['max']} |" for r in rows]
+                '| Таблица | К удалению | Мёртвых | Min | Max |',
+                '|---------|-----------|---------|-----|-----|',
+            ] + [f"| `{r['table']}` | {readable_size(r['count'], base=1000)} | {readable_size(r.get('dead', 0), base=1000)} | {r['min']} | {r['max']} |" for r in rows]
             total = sum(r['count'] for r in rows)
-            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** | | |")
+            total_dead = sum(r.get('dead', 0) for r in rows)
+            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** | **{readable_size(total_dead, base=1000)}** | | |")
             add_note('\n'.join(lines), context=context, level='DAG,Task', title='🔍 Итог check')
 
         checks >> _check_summary()

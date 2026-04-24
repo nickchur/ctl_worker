@@ -257,16 +257,11 @@ def db_vacuum(table, full=False, timeout=3600):
     ts = time.time()
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
     sql = f"VACUUM {mode} main.{table}"
-    # Используем сырое psycopg2-соединение — VACUUM требует строгого autocommit,
-    # пул SQLAlchemy может держать открытую транзакцию
-    raw = settings.engine.raw_connection()
-    try:
-        raw.autocommit = True
-        with raw.cursor() as cur:
-            cur.execute(f"SET statement_timeout = '{timeout}s'")
-            cur.execute(sql)
-    finally:
-        raw.close()
+    # execution_options на engine (до connect) — единственный способ гарантировать
+    # autocommit ДО того как SQLAlchemy успеет выдать BEGIN
+    with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+        conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
+        conn.execute(text(sql))
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 

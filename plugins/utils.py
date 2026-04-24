@@ -144,6 +144,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
                 obj = session.merge(context['dag_run'])
             else:
                 obj = session.merge(context['task_instance'])
+            session.expire(obj)  # перечитать из БД: другой параллельный таск мог уже создать заметку
             
             # Логика заголовка
             if title:

@@ -257,11 +257,16 @@ def db_vacuum(table, full=False, timeout=3600):
     ts = time.time()
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
     sql = f"VACUUM {mode} main.{table}"
-    # execution_options на engine (до connect) — единственный способ гарантировать
-    # autocommit ДО того как SQLAlchemy успеет выдать BEGIN
     with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
         conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
         conn.execute(text(sql))
+        # Проверяем psycopg2-notices: PostgreSQL присылает NOTICE "skipping ..." если нет прав
+        pool_proxy = conn.connection
+        psy = getattr(pool_proxy, 'dbapi_connection', None) or getattr(pool_proxy, 'connection', None) or pool_proxy
+        notices = list(getattr(psy, 'notices', []))
+    skipped = next((n for n in notices if 'skipping' in n.lower()), None)
+    if skipped:
+        raise AirflowSkipException(skipped.strip())
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 

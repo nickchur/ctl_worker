@@ -38,7 +38,7 @@
 """
 
 from airflow.decorators import task, dag, task_group
-from airflow.models import Param
+from airflow.models import Param, DagRun, XCom
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.utils.helpers import cross_downstream
 from airflow.utils.trigger_rule import TriggerRule
@@ -495,27 +495,26 @@ def tools_db_cleanup():
 
         vacuums >> _vacuum_summary()
 
-    _SIZE_SQL = """
-        SELECT relname, pg_total_relation_size('main.' || relname) AS size_bytes
-        FROM pg_stat_user_tables
-        WHERE schemaname = 'main'
-    """
-
-    @task(task_id='snapshot')
-    def before_snapshot(**context):
-        with create_session() as session:
-            rows = session.execute(text(_SIZE_SQL)).fetchall()
-        sizes = {relname: (size or 0) for relname, size in rows}
-        add_note(
-            f"Снято {len(sizes)} таблиц, итого {readable_size(sum(sizes.values()))}",
-            context=context, level='Task', title='📸 Снимок до очистки',
-        )
-        return sizes
-
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
-        ti = context['ti']
-        before = ti.xcom_pull(task_ids='snapshot') or {}
+        dag_id = context['dag_run'].dag_id
+        run_id = context['dag_run'].run_id
+
+        # Размеры из предыдущего прогона берём из XCom таска report
+        with create_session() as session:
+            prev_run = (
+                session.query(DagRun)
+                .filter(DagRun.dag_id == dag_id, DagRun.run_id != run_id)
+                .order_by(DagRun.execution_date.desc())
+                .first()
+            )
+        prev_data = None
+        if prev_run:
+            prev_data = XCom.get_one(
+                run_id=prev_run.run_id, key='return_value',
+                task_id='report', dag_id=dag_id,
+            )
+        before = {r['table']: r['size_bytes'] for r in prev_data} if prev_data else {}
 
         sql = """
             SELECT
@@ -535,19 +534,19 @@ def tools_db_cleanup():
         data = []
         for relname, total_bytes, live, dead, last_vac, last_ana in rows:
             after_b  = total_bytes or 0
-            before_b = before.get(relname, after_b)
-            delta_b  = after_b - before_b
+            before_b = before.get(relname)
+            delta_b  = (after_b - before_b) if before_b is not None else None
+            delta_s  = (('-' if delta_b < 0 else '+') + readable_size(abs(delta_b))) if delta_b is not None else '—'
             data.append({
                 'table':        relname,
-                'before':       readable_size(before_b),
+                'before':       readable_size(before_b) if before_b is not None else '—',
                 'after':        readable_size(after_b),
-                'delta':        ('-' if delta_b < 0 else '+') + readable_size(abs(delta_b)) if before_b else '—',
+                'delta':        delta_s,
                 'size_bytes':   after_b,
                 'live_rows':    readable_size(live or 0, base=1000),
                 'dead_rows':    readable_size(dead or 0, base=1000),
                 'last_vacuum':  str(last_vac)[:16] if last_vac else None,
                 'last_analyze': str(last_ana)[:16] if last_ana else None,
-                '_delta_b':     delta_b,
             })
 
         lines = [
@@ -564,17 +563,22 @@ def tools_db_cleanup():
         logger.info(f"📊 Отчёт по схеме main:\n{report_md}")
         add_note(report_md, context=context, level='Task', title='📊 Схема main')
 
-        total_before = sum(before.get(r[0], r[1] or 0) for r in rows)
         total_after  = sum(r[1] or 0 for r in rows)
-        total_delta  = total_after - total_before
         total_live   = sum(r[2] or 0 for r in rows)
         total_dead   = sum(r[3] or 0 for r in rows)
-        delta_str    = ('-' if total_delta < 0 else '+') + readable_size(abs(total_delta))
+        if before:
+            total_before = sum(before.get(r[0], r[1] or 0) for r in rows)
+            total_delta  = total_after - total_before
+            delta_str    = ('-' if total_delta < 0 else '+') + readable_size(abs(total_delta))
+            before_str   = readable_size(total_before)
+        else:
+            delta_str  = '—'
+            before_str = '—'
         summary = (
             f"| Таблиц | До | После | Δ | Записей | Удалённых |\n"
             f"|--------|-----|-------|---|---------|----------|\n"
             f"| {readable_size(len(rows), base=1000)}"
-            f" | {readable_size(total_before)}"
+            f" | {before_str}"
             f" | {readable_size(total_after)}"
             f" | {delta_str}"
             f" | {readable_size(total_live, base=1000)}"
@@ -584,7 +588,6 @@ def tools_db_cleanup():
 
         return data
 
-    snap = before_snapshot()
-    snap >> check_group() >> clean_group() >> vacuum_group() >> report()
+    check_group() >> clean_group() >> vacuum_group() >> report()
 
 tools_db_cleanup()

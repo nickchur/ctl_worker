@@ -145,7 +145,7 @@ DATE_COLUMNS = {
     'xcom':                          'timestamp',
     'rendered_task_instance_fields': None,
     'task_instance_history':         'updated_at',
-    'task_instance':                 'start_date',
+    'task_instance':                 None,
     'trigger':                       'created_date',
     'dag_run':                       'execution_date',
     'dataset_event':                 'timestamp',
@@ -172,7 +172,13 @@ DELETE_SQLS = {
           AND dag_run.execution_date < '{cutoff}'
     """,
     'task_instance_history': "DELETE FROM task_instance_history WHERE updated_at < '{cutoff}'",
-    'task_instance':      "DELETE FROM task_instance WHERE start_date < '{cutoff}'",
+    'task_instance':      """
+        DELETE FROM task_instance
+        USING dag_run
+        WHERE task_instance.dag_id = dag_run.dag_id
+          AND task_instance.run_id = dag_run.run_id
+          AND dag_run.execution_date < '{cutoff}'
+    """,
     'trigger':            """
         DELETE FROM trigger
         WHERE created_date < '{cutoff}'
@@ -193,6 +199,13 @@ DELETE_SQLS = {
 # Кастомные COUNT для таблиц без колонки даты (не используют cutoff)
 COUNT_SQLS = {
     'session': "SELECT COUNT(*) FROM session WHERE expiry < current_date",
+    'task_instance': """
+        SELECT COUNT(*), MIN(dag_run.execution_date), MAX(dag_run.execution_date)
+        FROM task_instance
+        JOIN dag_run ON task_instance.dag_id = dag_run.dag_id
+          AND task_instance.run_id = dag_run.run_id
+        WHERE dag_run.execution_date < '{cutoff}'
+    """,
     'rendered_task_instance_fields': """
         SELECT COUNT(*) FROM rendered_task_instance_fields
         JOIN dag_run ON rendered_task_instance_fields.dag_id = dag_run.dag_id
@@ -336,8 +349,14 @@ def tools_db_cleanup():
                 max_s = str(max_date)[:16] if max_date else '—'
                 msg = f'{readable_size(count, base=1000)} записей к удалению | min: {min_s} | max: {max_s}'
             elif custom_sql is not None:
-                count = db_count(custom_sql.format(cutoff=cutoff), timeout=timeout)
-                msg = f'{readable_size(count, base=1000)} записей к удалению'
+                row = db_stats(custom_sql.format(cutoff=cutoff), timeout=timeout)
+                count = row[0] if row else 0
+                if row and len(row) == 3:
+                    min_s = str(row[1])[:16] if row[1] else '—'
+                    max_s = str(row[2])[:16] if row[2] else '—'
+                    msg = f'{readable_size(count, base=1000)} записей к удалению | min: {min_s} | max: {max_s}'
+                else:
+                    msg = f'{readable_size(count, base=1000)} записей к удалению'
             else:
                 add_note('подсчёт не поддерживается', context=context, level='Task', title=f'⚠️ {_tbl}')
                 return

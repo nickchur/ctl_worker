@@ -388,7 +388,7 @@ def tools_db_cleanup():
         )
 
     def _make_vacuum(tbl):
-        @task(task_id=f'vacuum_{tbl}')
+        @task(task_id=f'vacuum_{tbl}', trigger_rule=TriggerRule.ALL_DONE)
         def _vacuum(_tbl=tbl, **context):
             params = context['params']
             mode = params.get('vacuum_mode', 'analyze')

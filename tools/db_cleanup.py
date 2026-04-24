@@ -324,7 +324,7 @@ def tools_db_cleanup():
                 return
             _ts = time.time()
             count = db_count(sql)
-            add_note(f'{count} записей к удалению', context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
+            add_note(f'{readable_size(count, base=1000)} записей к удалению', context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
         return _check()
 
     # Таски downstream от потенциально пропущенных — none_failed чтобы не каскадить skip
@@ -350,7 +350,7 @@ def tools_db_cleanup():
             sql = DELETE_SQLS[_tbl].format(cutoff=cutoff)
             _ts = time.time()
             rowcount = db_delete(sql)
-            add_note(f'удалено {rowcount} строк', context=context, level='Task', title=f'🗑️ {_tbl}', duration=time.time() - _ts)
+            add_note(f'удалено {readable_size(rowcount, base=1000)} строк', context=context, level='Task', title=f'🗑️ {_tbl}', duration=time.time() - _ts)
         return _clean()
 
     @task_group(group_id='check')

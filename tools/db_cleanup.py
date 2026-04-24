@@ -399,7 +399,8 @@ def tools_db_cleanup():
         @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
         def _check_summary(**context):
             ti = context['ti']
-            results = ti.xcom_pull(task_ids=[f'check.check_{t}' for t in CLEANABLE_TABLES]) or []
+            _r = ti.xcom_pull(task_ids=[f'check.check_{t}' for t in CLEANABLE_TABLES])
+            results = _r if isinstance(_r, list) else []
             rows = [r for r in results if r]
             if not rows:
                 add_note('нет данных', context=context, level='DAG,Task', title='🔍 Итог check')
@@ -438,7 +439,8 @@ def tools_db_cleanup():
         @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
         def _clean_summary(**context):
             ti = context['ti']
-            results = ti.xcom_pull(task_ids=[f'clean.clean_{t}' for t in CLEANABLE_TABLES]) or []
+            _r = ti.xcom_pull(task_ids=[f'clean.clean_{t}' for t in CLEANABLE_TABLES])
+            results = _r if isinstance(_r, list) else []
             rows = [r for r in results if r]
             if not rows:
                 add_note('удалений не было', context=context, level='DAG,Task', title='🗑️ Итог clean')
@@ -479,7 +481,8 @@ def tools_db_cleanup():
         @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
         def _vacuum_summary(**context):
             ti = context['ti']
-            results = ti.xcom_pull(task_ids=[f'vacuum.vacuum_{t}' for t in CLEANABLE_TABLES]) or []
+            _r = ti.xcom_pull(task_ids=[f'vacuum.vacuum_{t}' for t in CLEANABLE_TABLES])
+            results = _r if isinstance(_r, list) else []
             rows = [r for r in results if r]
             if not rows:
                 add_note('вакуум не выполнялся', context=context, level='DAG,Task', title='🧹 Итог vacuum')

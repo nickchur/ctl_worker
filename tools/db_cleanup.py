@@ -356,11 +356,13 @@ def tools_db_cleanup():
                     max_s = str(row[2])[:16] if row[2] else '—'
                     msg = f'{readable_size(count, base=1000)} записей к удалению | min: {min_s} | max: {max_s}'
                 else:
+                    min_s = max_s = '—'
                     msg = f'{readable_size(count, base=1000)} записей к удалению'
             else:
                 add_note('подсчёт не поддерживается', context=context, level='Task', title=f'⚠️ {_tbl}')
-                return
+                return None
             add_note(msg, context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
+            return {'table': _tbl, 'count': count, 'min': min_s, 'max': max_s}
         return _check()
 
     # Таски downstream от потенциально пропущенных — none_failed чтобы не каскадить skip
@@ -387,12 +389,30 @@ def tools_db_cleanup():
             _ts = time.time()
             rowcount = db_delete(sql, timeout=params.get('timeout', 15) * 60)
             add_note(f'удалено {readable_size(rowcount, base=1000)} строк', context=context, level='Task', title=f'🗑️ {_tbl}', duration=time.time() - _ts)
+            return {'table': _tbl, 'deleted': rowcount}
         return _clean()
 
     @task_group(group_id='check')
     def check_group():
-        for tbl in CLEANABLE_TABLES:
-            _make_check(tbl)
+        checks = [_make_check(tbl) for tbl in CLEANABLE_TABLES]
+
+        @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
+        def _check_summary(**context):
+            ti = context['ti']
+            results = ti.xcom_pull(task_ids=[f'check.check_{t}' for t in CLEANABLE_TABLES]) or []
+            rows = [r for r in results if r]
+            if not rows:
+                add_note('нет данных', context=context, level='DAG,Task', title='🔍 Итог check')
+                return
+            lines = [
+                '| Таблица | К удалению | Min | Max |',
+                '|---------|-----------|-----|-----|',
+            ] + [f"| `{r['table']}` | {readable_size(r['count'], base=1000)} | {r['min']} | {r['max']} |" for r in rows]
+            total = sum(r['count'] for r in rows)
+            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** | | |")
+            add_note('\n'.join(lines), context=context, level='DAG,Task', title='🔍 Итог check')
+
+        checks >> _check_summary()
 
     @task_group(group_id='clean')
     def clean_group():
@@ -415,6 +435,24 @@ def tools_db_cleanup():
             [ct['dataset_event'], ct['dataset'], ct['dataset_alias']],
         )
 
+        @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
+        def _clean_summary(**context):
+            ti = context['ti']
+            results = ti.xcom_pull(task_ids=[f'clean.clean_{t}' for t in CLEANABLE_TABLES]) or []
+            rows = [r for r in results if r]
+            if not rows:
+                add_note('удалений не было', context=context, level='DAG,Task', title='🗑️ Итог clean')
+                return
+            lines = [
+                '| Таблица | Удалено |',
+                '|---------|---------|',
+            ] + [f"| `{r['table']}` | {readable_size(r['deleted'], base=1000)} |" for r in rows]
+            total = sum(r['deleted'] for r in rows)
+            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** |")
+            add_note('\n'.join(lines), context=context, level='DAG,Task', title='🗑️ Итог clean')
+
+        [ct['dataset_event'], ct['dataset'], ct['dataset_alias']] >> _clean_summary()
+
     def _make_vacuum(tbl):
         @task(task_id=f'vacuum_{tbl}', trigger_rule=TriggerRule.ALL_DONE)
         def _vacuum(_tbl=tbl, **context):
@@ -429,13 +467,32 @@ def tools_db_cleanup():
             label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
             _ts = time.time()
             db_vacuum(_tbl, full=full, timeout=params.get('timeout', 15) * 60)
-            add_note(f'{label} выполнен', context=context, level='Task', title=f'🧹 {_tbl}', duration=time.time() - _ts)
+            duration = round(time.time() - _ts, 2)
+            add_note(f'{label} выполнен', context=context, level='Task', title=f'🧹 {_tbl}', duration=duration)
+            return {'table': _tbl, 'mode': label, 'duration': duration}
         return _vacuum()
 
     @task_group(group_id='vacuum')
     def vacuum_group():
-        for tbl in CLEANABLE_TABLES:
-            _make_vacuum(tbl)
+        vacuums = [_make_vacuum(tbl) for tbl in CLEANABLE_TABLES]
+
+        @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
+        def _vacuum_summary(**context):
+            ti = context['ti']
+            results = ti.xcom_pull(task_ids=[f'vacuum.vacuum_{t}' for t in CLEANABLE_TABLES]) or []
+            rows = [r for r in results if r]
+            if not rows:
+                add_note('вакуум не выполнялся', context=context, level='DAG,Task', title='🧹 Итог vacuum')
+                return
+            lines = [
+                '| Таблица | Режим | Время, с |',
+                '|---------|-------|---------|',
+            ] + [f"| `{r['table']}` | {r['mode']} | {r['duration']} |" for r in rows]
+            total = round(sum(r['duration'] for r in rows), 2)
+            lines.append(f"| **Итого** | | **{total} с** |")
+            add_note('\n'.join(lines), context=context, level='DAG,Task', title='🧹 Итог vacuum')
+
+        vacuums >> _vacuum_summary()
 
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):

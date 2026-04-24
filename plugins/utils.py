@@ -1,4 +1,4 @@
-"""### Утилиты Airflow (`plugins/utils.py`)
+"""###🛠️ Утилиты Airflow (`plugins/utils.py`)
 
 Вспомогательные функции, используемые во всех DAG'ах CTL.
 

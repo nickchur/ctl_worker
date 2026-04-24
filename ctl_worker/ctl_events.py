@@ -18,7 +18,7 @@ from airflow.sensors.base import PokeReturnValue
 
 from plugins.utils import add_note, on_callback, str2timedelta  # type: ignore
 from plugins.ctl_utils import get_config, ctl_api, pg_exe, ctl_obj_load # type: ignore 
-from plugins.ctl_core import chk_any_conn, conns  # type: ignore
+from plugins.ctl_core import chk_any_conn  # type: ignore
 
 from datetime import timedelta
 import json
@@ -205,5 +205,5 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
     
     
     events = get_events()
-    task(task_id=f'chk_ctl')(chk_any_conn)(id='ctl', data=conns['ctl']) >> events >> set_events.expand(event = events)
+    task(task_id=f'chk_ctl')(chk_any_conn)(id='ctl') >> events >> set_events.expand(event = events)
 

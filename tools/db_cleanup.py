@@ -406,23 +406,32 @@ def tools_db_cleanup():
         with create_session() as session:
             rows = session.execute(text(sql)).fetchall()
 
+        data = [
+            {
+                'table':        relname,
+                'size':         readable_size(total_bytes or 0),
+                'size_bytes':   total_bytes or 0,
+                'live_rows':    readable_size(live or 0, base=1000),
+                'dead_rows':    readable_size(dead or 0, base=1000),
+                'last_vacuum':  str(last_vac)[:16] if last_vac else None,
+                'last_analyze': str(last_ana)[:16] if last_ana else None,
+            }
+            for relname, total_bytes, live, dead, last_vac, last_ana in rows
+        ]
+
         lines = [
             '| Таблица | Размер | Записей | Удалённых | Последний вакуум | Последний анализ |',
             '|---------|--------|---------|-----------|------------------|------------------|',
+        ] + [
+            f"| `{r['table']}` | {r['size']} | {r['live_rows']} | {r['dead_rows']}"
+            f" | {r['last_vacuum'] or '—'} | {r['last_analyze'] or '—'} |"
+            for r in data
         ]
-        for relname, total_bytes, live, dead, last_vac, last_ana in rows:
-            lines.append(
-                f"| `{relname}` "
-                f"| {readable_size(total_bytes or 0)} "
-                f"| {readable_size(live or 0, base=1000)} "
-                f"| {readable_size(dead or 0, base=1000)} "
-                f"| {str(last_vac)[:16] if last_vac else '—'} "
-                f"| {str(last_ana)[:16] if last_ana else '—'} |"
-            )
 
         report_md = '\n'.join(lines)
         logger.info(f"📊 Отчёт по схеме main:\n{report_md}")
         add_note(report_md, context=context, level='DAG', title='📊 Схема main')
+        return data
 
     check_group() >> clean_group() >> vacuum_group() >> report()
 

@@ -454,7 +454,7 @@ def tools_db_cleanup():
         summary = (
             f"| Таблиц | Размер | Записей | Удалённых |\n"
             f"|--------|--------|---------|----------|\n"
-            f"| {len(rows)} | {readable_size(total_size)} "
+            f"| {readable_size(len(rows), base=1000)} | {readable_size(total_size)} "
             f"| {readable_size(total_live, base=1000)} "
             f"| {readable_size(total_dead, base=1000)} |"
         )

@@ -190,8 +190,8 @@ def tools_db_cleanup():
         # принудительно патчим _do_delete чтобы archive-шаг всегда пропускался
         from airflow.utils import db_cleanup as _dbc
         _orig = _dbc._do_delete
-        _dbc._do_delete = lambda query, orm_model, skip_archive, session: \
-            _orig(query, orm_model, True, session)
+        _dbc._do_delete = lambda *, query, orm_model, skip_archive, session: \
+            _orig(query=query, orm_model=orm_model, skip_archive=True, session=session)
 
         _ts = time.time()
         try:

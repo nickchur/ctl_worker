@@ -204,16 +204,18 @@ def tools_db_cleanup():
             af_log.removeHandler(capture)
         duration = round(time.time() - _ts, 2)
 
-        # Парсим строки вида "Deleting 123 rows from 'dag_run'" или "Found 123 rows in 'dag_run'"
+        # Таблица и счётчик в разных строках:
+        # "Performing dry run for table xcom" / "Checking table xcom"  → current_table
+        # "Found 42722 rows meeting deletion criteria."                 → count
         counts = {}
+        current_table = None
         for line in capture.lines:
-            m = re.search(r'(\d+)\s+rows?\b.*?[\'"`](\w+)[\'"`]', line, re.IGNORECASE)
-            if not m:
-                m = re.search(r'[\'"`](\w+)[\'"`].*?\b(\d+)\s+rows?', line, re.IGNORECASE)
-                if m:
-                    m = type('m', (), {'group': lambda self, i: [None, m.group(2), m.group(1)][i]})()
-            if m:
-                counts[m.group(2)] = int(m.group(1))
+            tm = re.search(r'\btable\s+(\w+)', line, re.IGNORECASE)
+            if tm:
+                current_table = tm.group(1)
+            nm = re.search(r'\b(\d+)\s+rows?\b', line, re.IGNORECASE)
+            if nm and current_table:
+                counts[current_table] = int(nm.group(1))
 
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         if counts:

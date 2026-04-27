@@ -1,6 +1,6 @@
 """### 🧹 Очистка метадаты Airflow
 
-Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами.
+Удаляет устаревшие записи из метабазы Airflow через `airflow.utils.db_cleanup`.
 
 | Параметр            | Описание                                                                                      |
 |---------------------|-----------------------------------------------------------------------------------------------|
@@ -8,31 +8,7 @@
 | 🔍 `dry_run`        | Только подсчёт без удаления *(default: `True`)*                                               |
 | 🧹 `vacuum_mode`    | `analyze` — VACUUM ANALYZE *(default)*, `full` — VACUUM FULL ANALYZE, `skip` — пропустить     |
 | ⏱️ `timeout`        | Таймаут на каждую операцию, мин *(default: `15`)*                                             |
-| 📋 `tables`         | Список таблиц для очистки *(default: все)*                                                    |
 
----
-
-#### Таблицы очистки и порядок удаления
-
-| #  | Таблица                         | Критерий                              | Заметки                                                                |
-|----|---------------------------------|---------------------------------------|------------------------------------------------------------------------|
-| 1  | `callback_request`              | `created_at < cutoff`                 | Обработанные колбэки планировщика                                      |
-| 2  | `celery_taskmeta`               | `date_done < cutoff`                  | Результаты Celery-задач (result backend)                               |
-| 3  | `celery_tasksetmeta`            | `date_done < cutoff`                  | Результаты Celery-групп (result backend)                               |
-| 4  | `session`                       | `expiry < current_date`               | Веб-сессии UI; не зависит от cutoff                                    |
-| 5  | `import_error`                  | `timestamp < cutoff`                  | Ошибки парсинга DAG-файлов                                             |
-| 6  | `sla_miss`                      | `timestamp < cutoff`                  | Нарушения SLA                                                          |
-| 7  | `log`                           | `dttm < cutoff`                       | Audit-лог событий (не логи тасков)                                     |
-| 8  | `job`                           | `latest_heartbeat < cutoff`           | Записи SchedulerJob / LocalTaskJob                                     |
-| 9  | `xcom`                          | `timestamp < cutoff`                  | ↳ каскад от `task_instance`                                            |
-| 10 | `rendered_task_instance_fields` | via `dag_run.execution_date < cutoff` | ↳ каскад от `task_instance`; нет своей колонки даты                    |
-| 11 | `task_instance_history`         | `updated_at < cutoff`                 | ↳ каскад от `task_instance`; чистим до TI чтобы управлять объёмом      |
-| 12 | `task_instance`                 | `start_date < cutoff`                 | ↳ каскад от `dag_run`                                                  |
-| 13 | `trigger`                       | `created_date < cutoff`               | Deferred tasks; только без активных `task_instance`                    |
-| 14 | `dag_run`                       | `execution_date < cutoff`             | Каскадно удаляет TI, xcom, rtif, dagrun_dataset_event и др.            |
-| 15 | `dataset_event`                 | `timestamp < cutoff`                  | Каскадно удаляет `dagrun_dataset_event`, `dataset_alias_dataset_event` |
-| 16 | `dataset`                       | `is_orphaned = TRUE`                  | Флаг выставляется Airflow при удалении DAG                             |
-| 17 | `dataset_alias`                 | не в DAG-расписаниях и не в алиасах   | Каскадно удаляет `dag_schedule_dataset_alias_reference`                |
 > **dry_run=True** по умолчанию — первый запуск всегда безопасен.
 > Минимальный порог `retention_days` — 30 дней.
 """
@@ -40,22 +16,24 @@
 from airflow.decorators import task, dag, task_group
 from airflow.models import Param, DagRun, XCom
 from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.utils.helpers import cross_downstream
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.session import create_session
 from airflow.operators.python import get_current_context
 from airflow import settings
+from airflow.utils.db_cleanup import run_cleanup, config_dict as _cleanup_config
 from sqlalchemy import text
 
 from pprint import PrettyPrinter
 import pendulum
 import time
-import os
 
 from logging import getLogger
 logger = getLogger("airflow.task")
 
 MAX_NOTE_LEN = 1000
+
+# Таблицы для vacuum (run_cleanup знает свой список, здесь только для vacuum)
+CLEANABLE_TABLES = list(_cleanup_config.keys())
 
 
 def add_note(msg, context=None, level='task', add=True, title='', compact=False, duration=None):
@@ -86,7 +64,6 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False,
                 new_note = f"{title}\n---\n{new_note}"
 
             if l == 'DAG':
-                # Атомарный upsert — избегает UniqueViolation при параллельных тасках
                 dag_run_id = context['dag_run'].id
                 existing = session.execute(
                     text("SELECT content FROM main.dag_run_note WHERE dag_run_id = :id"),
@@ -112,147 +89,6 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False,
                 obj.note = new_note[:MAX_NOTE_LEN]
 
 
-# Порядок важен: сначала независимые, потом дочерние, dag_run — последним
-CLEANABLE_TABLES = [
-    'callback_request',
-    'celery_taskmeta',
-    'celery_tasksetmeta',
-    'session',
-    'import_error',
-    'sla_miss',
-    'log',
-    'job',
-    'xcom',
-    'rendered_task_instance_fields',
-    'task_instance_history',
-    'task_instance',
-    'trigger',
-    'dag_run',
-    'dataset_event',
-    'dataset',
-    'dataset_alias',
-]
-
-DATE_COLUMNS = {
-    'callback_request':              'created_at',
-    'celery_taskmeta':               'date_done',
-    'celery_tasksetmeta':            'date_done',
-    'session':                       None,
-    'import_error':                  'timestamp',
-    'sla_miss':                      'timestamp',
-    'log':                           'dttm',
-    'job':                           'latest_heartbeat',
-    'xcom':                          'timestamp',
-    'rendered_task_instance_fields': None,
-    'task_instance_history':         'updated_at',
-    'task_instance':                 None,
-    'trigger':                       'created_date',
-    'dag_run':                       'execution_date',
-    'dataset_event':                 'timestamp',
-    'dataset':                       None,
-    'dataset_alias':                 None,
-}
-
-# DELETE SQL для каждой таблицы; {cutoff} подставляется при выполнении
-DELETE_SQLS = {
-    'callback_request':   "DELETE FROM callback_request WHERE created_at < '{cutoff}'",
-    'celery_taskmeta':    "DELETE FROM celery_taskmeta WHERE date_done < '{cutoff}'",
-    'celery_tasksetmeta': "DELETE FROM celery_tasksetmeta WHERE date_done < '{cutoff}'",
-    'session':            "DELETE FROM session WHERE expiry < current_date",
-    'import_error':       "DELETE FROM import_error WHERE timestamp < '{cutoff}'",
-    'sla_miss':           "DELETE FROM sla_miss WHERE timestamp < '{cutoff}'",
-    'log':                "DELETE FROM log WHERE dttm < '{cutoff}'",
-    'job':                "DELETE FROM job WHERE latest_heartbeat < '{cutoff}'",
-    'xcom':               "DELETE FROM xcom WHERE timestamp < '{cutoff}'",
-    'rendered_task_instance_fields': """
-        DELETE FROM rendered_task_instance_fields
-        USING dag_run
-        WHERE rendered_task_instance_fields.dag_id = dag_run.dag_id
-          AND rendered_task_instance_fields.run_id = dag_run.run_id
-          AND dag_run.execution_date < '{cutoff}'
-    """,
-    'task_instance_history': "DELETE FROM task_instance_history WHERE updated_at < '{cutoff}'",
-    'task_instance':      """
-        DELETE FROM task_instance
-        USING dag_run
-        WHERE task_instance.dag_id = dag_run.dag_id
-          AND task_instance.run_id = dag_run.run_id
-          AND dag_run.execution_date < '{cutoff}'
-    """,
-    'trigger':            """
-        DELETE FROM trigger
-        WHERE created_date < '{cutoff}'
-          AND id NOT IN (
-              SELECT trigger_id FROM task_instance WHERE trigger_id IS NOT NULL
-          )
-    """,
-    'dag_run':            "DELETE FROM dag_run WHERE execution_date < '{cutoff}'",
-    'dataset_event':      "DELETE FROM dataset_event WHERE timestamp < '{cutoff}'",
-    'dataset':            "DELETE FROM dataset WHERE is_orphaned = TRUE",
-    'dataset_alias':      """
-        DELETE FROM dataset_alias
-        WHERE id NOT IN (SELECT alias_id FROM dag_schedule_dataset_alias_reference)
-          AND id NOT IN (SELECT alias_id FROM dataset_alias_dataset)
-    """,
-}
-
-# Кастомные COUNT для таблиц без колонки даты (не используют cutoff)
-COUNT_SQLS = {
-    'session': "SELECT COUNT(*) FROM session WHERE expiry < current_date",
-    'task_instance': """
-        SELECT COUNT(*), MIN(dag_run.execution_date), MAX(dag_run.execution_date)
-        FROM task_instance
-        JOIN dag_run ON task_instance.dag_id = dag_run.dag_id
-          AND task_instance.run_id = dag_run.run_id
-        WHERE dag_run.execution_date < '{cutoff}'
-    """,
-    'rendered_task_instance_fields': """
-        SELECT COUNT(*) FROM rendered_task_instance_fields
-        JOIN dag_run ON rendered_task_instance_fields.dag_id = dag_run.dag_id
-          AND rendered_task_instance_fields.run_id = dag_run.run_id
-        WHERE dag_run.execution_date < '{cutoff}'
-    """,
-    'trigger': """
-        SELECT COUNT(*) FROM trigger
-        WHERE created_date < '{cutoff}'
-          AND id NOT IN (
-              SELECT trigger_id FROM task_instance WHERE trigger_id IS NOT NULL
-          )
-    """,
-    'dataset':       "SELECT COUNT(*) FROM dataset WHERE is_orphaned = TRUE",
-    'dataset_alias': """
-        SELECT COUNT(*) FROM dataset_alias
-        WHERE id NOT IN (SELECT alias_id FROM dag_schedule_dataset_alias_reference)
-          AND id NOT IN (SELECT alias_id FROM dataset_alias_dataset)
-    """,
-}
-
-
-def db_count(sql, timeout=300):
-    with create_session() as session:
-        session.execute(text("SET LOCAL search_path = main"))
-        session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
-        return session.execute(text(sql)).scalar()
-
-
-def db_stats(sql, timeout=300):
-    with create_session() as session:
-        session.execute(text("SET LOCAL search_path = main"))
-        session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
-        return session.execute(text(sql)).fetchone()
-
-
-def db_delete(sql, timeout=600):
-    ts = time.time()
-    with create_session() as session:
-        session.execute(text("SET LOCAL search_path = main"))
-        session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
-        result = session.execute(text(sql))
-        rowcount = result.rowcount
-    logger.info(f"🗑️  Удалено {rowcount} строк за {time.time() - ts:.2f}s")
-    return rowcount
-
-
 def db_vacuum(table, full=False, timeout=3600):
     ts = time.time()
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
@@ -260,7 +96,6 @@ def db_vacuum(table, full=False, timeout=3600):
     with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
         conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
         conn.execute(text(sql))
-        # Проверяем psycopg2-notices: PostgreSQL присылает NOTICE "skipping ..." если нет прав
         pool_proxy = conn.connection
         psy = getattr(pool_proxy, 'dbapi_connection', None) or getattr(pool_proxy, 'connection', None) or pool_proxy
         notices = list(getattr(psy, 'notices', []))
@@ -333,155 +168,48 @@ for table in CLEANABLE_TABLES:
 )
 def tools_db_cleanup():
 
-    def _cutoff(retention_days):
-        return pendulum.now('UTC').subtract(days=retention_days).format('YYYY-MM-DD HH:mm:ss')
+    @task(task_id='clean')
+    def clean(**context):
+        p = context['params']
+        retention_days = p['retention_days']
+        if retention_days < 30:
+            raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
 
-    def _make_check(tbl):
-        @task(task_id=f'check_{tbl}')
-        def _check(_tbl=tbl, **context):
-            params = context['params']
-            if not params.get(_tbl, True):
-                raise AirflowSkipException(f'Таблица {_tbl} отключена')
-            retention_days = params['retention_days']
-            if retention_days < 30:
-                raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
-            cutoff = _cutoff(retention_days)
-            date_col = DATE_COLUMNS.get(_tbl)
-            custom_sql = COUNT_SQLS.get(_tbl)
-            _ts = time.time()
-            timeout = params.get('timeout', 15) * 60
-            if date_col is not None:
-                sql = f"SELECT COUNT(*), MIN({date_col}), MAX({date_col}) FROM {_tbl} WHERE {date_col} < '{cutoff}'"
-                count, min_date, max_date = db_stats(sql, timeout=timeout)
-                min_s = str(min_date)[:16] if min_date else '—'
-                max_s = str(max_date)[:16] if max_date else '—'
-                msg = f'{readable_size(count, base=1000)} записей к удалению | min: {min_s} | max: {max_s}'
-            elif custom_sql is not None:
-                row = db_stats(custom_sql.format(cutoff=cutoff), timeout=timeout)
-                count = row[0] if row else 0
-                if row and len(row) == 3:
-                    min_s = str(row[1])[:16] if row[1] else '—'
-                    max_s = str(row[2])[:16] if row[2] else '—'
-                    msg = f'{readable_size(count, base=1000)} записей к удалению | min: {min_s} | max: {max_s}'
-                else:
-                    min_s = max_s = '—'
-                    msg = f'{readable_size(count, base=1000)} записей к удалению'
-            else:
-                add_note('подсчёт не поддерживается', context=context, level='Task', title=f'⚠️ {_tbl}')
-                return None
-            dead = db_stats(
-                f"SELECT n_dead_tup FROM pg_stat_user_tables WHERE schemaname='main' AND relname='{_tbl}'",
-                timeout=30,
-            )
-            dead_tup = (dead[0] if dead else 0) or 0
-            msg += f' | мёртвых: {readable_size(dead_tup, base=1000)}'
-            add_note(msg, context=context, level='Task', title=f'🔍 {_tbl}', duration=time.time() - _ts)
-            return {'table': _tbl, 'count': count, 'min': min_s, 'max': max_s, 'dead': dead_tup}
-        return _check()
+        dry_run = p['dry_run']
+        cutoff = pendulum.now('UTC').subtract(days=retention_days)
+        table_names = [t for t in CLEANABLE_TABLES if p.get(t, True)]
 
-    # Таски downstream от потенциально пропущенных — none_failed чтобы не каскадить skip
-    _none_failed = {
-        'task_instance', 'trigger', 'dag_run',
-        'dataset_event', 'dataset', 'dataset_alias',
-    }
-
-    def _make_clean(tbl):
-        tr = TriggerRule.NONE_FAILED if tbl in _none_failed else TriggerRule.ALL_SUCCESS
-
-        @task(task_id=f'clean_{tbl}', trigger_rule=tr)
-        def _clean(_tbl=tbl, **context):
-            params = context['params']
-            if not params.get(_tbl, True):
-                raise AirflowSkipException(f'Таблица {_tbl} отключена')
-            if params['dry_run']:
-                raise AirflowSkipException('🔒 dry_run=True — удаление пропущено')
-            retention_days = params['retention_days']
-            if retention_days < 30:
-                raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
-            cutoff = _cutoff(retention_days)
-            sql = DELETE_SQLS[_tbl].format(cutoff=cutoff)
-            _ts = time.time()
-            rowcount = db_delete(sql, timeout=params.get('timeout', 15) * 60)
-            add_note(f'удалено {readable_size(rowcount, base=1000)} строк', context=context, level='Task', title=f'🗑️ {_tbl}', duration=time.time() - _ts)
-            return {'table': _tbl, 'deleted': rowcount}
-        return _clean()
-
-    @task_group(group_id='check')
-    def check_group():
-        checks = [_make_check(tbl) for tbl in CLEANABLE_TABLES]
-
-        @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
-        def _check_summary(**context):
-            ti = context['ti']
-            results = [ti.xcom_pull(task_ids=f'check.check_{t}') for t in CLEANABLE_TABLES]
-            rows = [r for r in results if r]
-            if not rows:
-                add_note('нет данных', context=context, level='DAG,Task', title='🔍 Итог check')
-                return
-            lines = [
-                '| Таблица | К удалению | Мёртвых | Min | Max |',
-                '|---------|-----------|---------|-----|-----|',
-            ] + [f"| `{r['table']}` | {readable_size(r['count'], base=1000)} | {readable_size(r.get('dead', 0), base=1000)} | {r['min']} | {r['max']} |" for r in rows]
-            total = sum(r['count'] for r in rows)
-            total_dead = sum(r.get('dead', 0) for r in rows)
-            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** | **{readable_size(total_dead, base=1000)}** | | |")
-            add_note('\n'.join(lines), context=context, level='DAG,Task', title='🔍 Итог check')
-
-        checks >> _check_summary()
-
-    @task_group(group_id='clean')
-    def clean_group():
-        ct = {tbl: _make_clean(tbl) for tbl in CLEANABLE_TABLES}
-
-        # Фаза 1 (параллельно) >> task_instance
-        phase1 = [ct[t] for t in [
-            'callback_request', 'celery_taskmeta', 'celery_tasksetmeta', 'session',
-            'import_error', 'sla_miss', 'log', 'job',
-            'xcom', 'rendered_task_instance_fields', 'task_instance_history',
-        ]]
-        phase1 >> ct['task_instance']
-
-        # task_instance >> trigger, dag_run (параллельно)
-        ct['task_instance'] >> [ct['trigger'], ct['dag_run']]
-
-        # trigger, dag_run >> dataset_event, dataset, dataset_alias (параллельно)
-        cross_downstream(
-            [ct['trigger'], ct['dag_run']],
-            [ct['dataset_event'], ct['dataset'], ct['dataset_alias']],
+        _ts = time.time()
+        run_cleanup(
+            clean_before_timestamp=cutoff,
+            table_names=table_names,
+            dry_run=dry_run,
+            verbose=True,
+            confirm=False,
         )
+        duration = round(time.time() - _ts, 2)
 
-        @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
-        def _clean_summary(**context):
-            ti = context['ti']
-            results = [ti.xcom_pull(task_ids=f'clean.clean_{t}') for t in CLEANABLE_TABLES]
-            rows = [r for r in results if r]
-            if not rows:
-                add_note('удалений не было', context=context, level='DAG,Task', title='🗑️ Итог clean')
-                return
-            lines = [
-                '| Таблица | Удалено |',
-                '|---------|---------|',
-            ] + [f"| `{r['table']}` | {readable_size(r['deleted'], base=1000)} |" for r in rows]
-            total = sum(r['deleted'] for r in rows)
-            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** |")
-            add_note('\n'.join(lines), context=context, level='DAG,Task', title='🗑️ Итог clean')
-
-        [ct['dataset_event'], ct['dataset'], ct['dataset_alias']] >> _clean_summary()
+        mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
+        add_note(
+            f'{mode} | cutoff: {cutoff.format("YYYY-MM-DD")} | таблиц: {len(table_names)}',
+            context=context, level='DAG,Task', title='🗑️ clean',
+            duration=duration,
+        )
 
     def _make_vacuum(tbl):
         @task(task_id=f'vacuum_{tbl}', trigger_rule=TriggerRule.ALL_DONE)
         def _vacuum(_tbl=tbl, **context):
-            params = context['params']
-            mode = params.get('vacuum_mode', 'analyze')
+            p = context['params']
+            mode = p.get('vacuum_mode', 'analyze')
             if mode == 'skip':
                 raise AirflowSkipException('vacuum_mode=skip — пропущено')
-            if not params.get(_tbl, True):
+            if not p.get(_tbl, True):
                 raise AirflowSkipException(f'Таблица {_tbl} отключена')
 
             full = mode == 'full'
             label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
             _ts = time.time()
-            db_vacuum(_tbl, full=full, timeout=params.get('timeout', 15) * 60)
+            db_vacuum(_tbl, full=full, timeout=p.get('timeout', 15) * 60)
             duration = round(time.time() - _ts, 2)
             add_note(f'{label} выполнен', context=context, level='Task', title=f'🧹 {_tbl}', duration=duration)
             return {'table': _tbl, 'mode': label, 'duration': duration}
@@ -516,7 +244,6 @@ def tools_db_cleanup():
         dag_id = context['dag_run'].dag_id
         run_id = context['dag_run'].run_id
 
-        # Размеры из предыдущего прогона берём из XCom таска report
         with create_session() as session:
             prev_run = (
                 session.query(DagRun)
@@ -537,9 +264,7 @@ def tools_db_cleanup():
                 relname,
                 pg_total_relation_size('main.' || relname)  AS total_bytes,
                 n_live_tup,
-                n_dead_tup,
-                COALESCE(last_vacuum, last_autovacuum)      AS last_vacuum,
-                COALESCE(last_analyze, last_autoanalyze)    AS last_analyze
+                n_dead_tup
             FROM pg_stat_user_tables
             WHERE schemaname = 'main'
             ORDER BY total_bytes DESC
@@ -548,21 +273,18 @@ def tools_db_cleanup():
             rows = session.execute(text(sql)).fetchall()
 
         data = []
-        for relname, total_bytes, live, dead, last_vac, last_ana in rows:
+        for relname, total_bytes, live, dead in rows:
             after_b  = total_bytes or 0
             before_b = before.get(relname)
             delta_b  = (after_b - before_b) if before_b is not None else None
             delta_s  = (('-' if delta_b < 0 else '+') + readable_size(abs(delta_b))) if delta_b is not None else '—'
             data.append({
-                'table':        relname,
-                'before':       readable_size(before_b) if before_b is not None else '—',
-                'after':        readable_size(after_b),
-                'delta':        delta_s,
-                'size_bytes':   after_b,
-                'live_rows':    readable_size(live or 0, base=1000),
-                'dead_rows':    readable_size(dead or 0, base=1000),
-                'last_vacuum':  str(last_vac)[:16] if last_vac else None,
-                'last_analyze': str(last_ana)[:16] if last_ana else None,
+                'table':      relname,
+                'after':      readable_size(after_b),
+                'delta':      delta_s,
+                'size_bytes': after_b,
+                'live_rows':  readable_size(live or 0, base=1000),
+                'dead_rows':  readable_size(dead or 0, base=1000),
             })
 
         lines = [
@@ -577,9 +299,9 @@ def tools_db_cleanup():
         logger.info(f"📊 Отчёт по схеме main:\n{report_md}")
         add_note(report_md, context=context, level='Task', title='📊 Схема main')
 
-        total_after  = sum(r[1] or 0 for r in rows)
-        total_live   = sum(r[2] or 0 for r in rows)
-        total_dead   = sum(r[3] or 0 for r in rows)
+        total_after = sum(r[1] or 0 for r in rows)
+        total_live  = sum(r[2] or 0 for r in rows)
+        total_dead  = sum(r[3] or 0 for r in rows)
         if before:
             total_before = sum(before.get(r[0], r[1] or 0) for r in rows)
             total_delta  = total_after - total_before
@@ -602,6 +324,6 @@ def tools_db_cleanup():
 
         return data
 
-    check_group() >> clean_group() >> vacuum_group() >> report()
+    clean() >> vacuum_group() >> report()
 
 tools_db_cleanup()

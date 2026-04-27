@@ -26,9 +26,19 @@ from sqlalchemy import text
 from pprint import PrettyPrinter
 import pendulum
 import time
+import re
+import logging
 
-from logging import getLogger
-logger = getLogger("airflow.task")
+logger = logging.getLogger("airflow.task")
+
+
+class _LogCapture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
 
 MAX_NOTE_LEN = 1000
 
@@ -178,22 +188,51 @@ def tools_db_cleanup():
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
         table_names = [t for t in CLEANABLE_TABLES if p.get(t, True)]
 
+        capture = _LogCapture()
+        af_log = logging.getLogger('airflow.utils.db_cleanup')
+        af_log.addHandler(capture)
         _ts = time.time()
-        run_cleanup(
-            clean_before_timestamp=cutoff,
-            table_names=table_names,
-            dry_run=dry_run,
-            verbose=True,
-            confirm=False,
-        )
+        try:
+            run_cleanup(
+                clean_before_timestamp=cutoff,
+                table_names=table_names,
+                dry_run=dry_run,
+                verbose=True,
+                confirm=False,
+            )
+        finally:
+            af_log.removeHandler(capture)
         duration = round(time.time() - _ts, 2)
 
+        # Парсим строки вида "Deleting 123 rows from 'dag_run'" или "Found 123 rows in 'dag_run'"
+        counts = {}
+        for line in capture.lines:
+            m = re.search(r'(\d+)\s+rows?\b.*?[\'"`](\w+)[\'"`]', line, re.IGNORECASE)
+            if not m:
+                m = re.search(r'[\'"`](\w+)[\'"`].*?\b(\d+)\s+rows?', line, re.IGNORECASE)
+                if m:
+                    m = type('m', (), {'group': lambda self, i: [None, m.group(2), m.group(1)][i]})()
+            if m:
+                counts[m.group(2)] = int(m.group(1))
+
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
-        add_note(
-            f'{mode} | cutoff: {cutoff.format("YYYY-MM-DD")} | таблиц: {len(table_names)}',
-            context=context, level='DAG,Task', title='🗑️ clean',
-            duration=duration,
-        )
+        if counts:
+            lines = [
+                '| Таблица | Строк |',
+                '|---------|-------|',
+            ] + [f"| `{t}` | {readable_size(n, base=1000)} |" for t, n in counts.items()]
+            total = sum(counts.values())
+            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** |")
+            add_note('\n'.join(lines), context=context, level='Task', title=f'🗑️ clean ({mode})', duration=duration)
+            add_note(
+                f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.format("YYYY-MM-DD")}',
+                context=context, level='DAG', title='🗑️ clean', duration=duration,
+            )
+        else:
+            add_note(
+                f'{mode} | cutoff: {cutoff.format("YYYY-MM-DD")} | таблиц: {len(table_names)}',
+                context=context, level='DAG,Task', title='🗑️ clean', duration=duration,
+            )
 
     @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
     def vacuum(**context):

@@ -436,6 +436,7 @@ _PARTS = (
     "MzA4LTQwNWYtOTU2Yi1jZjIyNTgwNjk3YmVcdDIyOGQ0NjA0LWFkMmMtNGY2NC04ZjNlLTQ3MThiNmU2MDg1Zlx0c2JlcmJhbmtc"
     "dHBhb3NiZXJiYW5rXHRJXHQyMDI2LTA0LTA3IDEwOjQ0OjAyLjAwMDExMiJd"
 )
+_PARTS_LINES: list[str] = json.loads(base64.b64decode(_PARTS))
 
 
 @dag(
@@ -460,7 +461,7 @@ _PARTS = (
         "conn_id": Param("s3-archive", type="string", description="Airflow S3 connection ID"),
         "meta": Param(_META, type="string", description="Содержимое .meta файла (JSON схема)"),
         "parts": Param(
-            json.loads(base64.b64decode(_PARTS)),
+            _PARTS_LINES,
             type="array",
             description="Список строк TSV (повтор заголовка = новая часть)",
         ),

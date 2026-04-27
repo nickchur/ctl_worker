@@ -187,11 +187,15 @@ def tools_db_cleanup():
         for _l in _patch:
             _l.addHandler(capture)
         # skip_archive=True в run_cleanup не срабатывает в этой версии Airflow —
-        # принудительно патчим _do_delete чтобы archive-шаг всегда пропускался
+        # _orig сам делает CTAS невзирая на флаг → заменяем целиком, делаем DELETE напрямую
         from airflow.utils import db_cleanup as _dbc
+        from sqlalchemy import delete as _sa_delete
+
+        def _patched_do_delete(*, query, orm_model, skip_archive, session):
+            session.execute(_sa_delete(orm_model).where(query.whereclause))
+
         _orig = _dbc._do_delete
-        _dbc._do_delete = lambda *, query, orm_model, skip_archive, session: \
-            _orig(query=query, orm_model=orm_model, skip_archive=True, session=session)
+        _dbc._do_delete = _patched_do_delete
 
         _ts = time.time()
         try:

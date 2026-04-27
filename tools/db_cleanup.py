@@ -42,8 +42,6 @@ class _LogCapture(logging.Handler):
 
 MAX_NOTE_LEN = 1000
 
-# Таблицы для vacuum (run_cleanup знает свой список, здесь только для vacuum)
-CLEANABLE_TABLES = list(_cleanup_config.keys())
 
 
 def add_note(msg, context=None, level='task', add=True, title='', compact=False, duration=None):
@@ -156,8 +154,6 @@ params = {
         description='Таймаут на каждую операцию, мин',
     ),
 }
-for table in CLEANABLE_TABLES:
-    params[table] = Param(True, type='boolean', title=f'Очистить {table}')
 
 
 @dag(
@@ -172,7 +168,6 @@ for table in CLEANABLE_TABLES:
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
-    max_active_tasks=len(CLEANABLE_TABLES),
     schedule_interval='@weekly',
     params=params,
 )
@@ -187,7 +182,6 @@ def tools_db_cleanup():
 
         dry_run = p['dry_run']
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
-        table_names = [t for t in CLEANABLE_TABLES if p.get(t, True)]
 
         capture = _LogCapture()
         # INFO-сообщения ("Found N rows", "Checking table") идут через StreamLogWriter
@@ -202,7 +196,7 @@ def tools_db_cleanup():
         try:
             run_cleanup(
                 clean_before_timestamp=cutoff,
-                table_names=table_names,
+                table_names=None,
                 dry_run=dry_run,
                 verbose=True,
                 confirm=False,
@@ -242,9 +236,11 @@ def tools_db_cleanup():
             )
         else:
             add_note(
-                f'{mode} | cutoff: {cutoff.format("YYYY-MM-DD")} | таблиц: {len(table_names)}',
+                f'{mode} | cutoff: {cutoff.format("YYYY-MM-DD")}',
                 context=context, level='DAG,Task', title='🗑️ clean', duration=duration,
             )
+
+        return list(counts.keys())
 
     @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
     def vacuum(**context):
@@ -253,7 +249,9 @@ def tools_db_cleanup():
             raise AirflowSkipException('vacuum=False — пропущено')
 
         timeout = p.get('timeout', 15) * 60
-        tables = [t for t in CLEANABLE_TABLES if p.get(t, True)]
+        tables = context['ti'].xcom_pull(task_ids='clean') or []
+        if not tables:
+            raise AirflowSkipException('нет таблиц из clean')
         results = []
         for tbl in tables:
             _ts = time.time()

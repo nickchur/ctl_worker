@@ -6,7 +6,7 @@
 |---------------------|-----------------------------------------------------------------------------------------------|
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес)*                                    |
 | 🔍 `dry_run`        | Только подсчёт без удаления *(default: `True`)*                                               |
-| 🧹 `vacuum_mode`    | `analyze` — VACUUM ANALYZE *(default)*, `skip` — пропустить                                   |
+| 🧹 `vacuum`         | `True` — VACUUM ANALYZE *(default)*, `False` — пропустить                                     |
 | ⏱️ `timeout`        | Таймаут на каждую операцию, мин *(default: `15`)*                                             |
 
 > **dry_run=True** по умолчанию — первый запуск всегда безопасен.
@@ -133,11 +133,10 @@ params = {
         type='boolean',
         description='True — только подсчёт, False — реальное удаление',
     ),
-    'vacuum_mode': Param(
-        'analyze',
-        type='string',
-        enum=['analyze', 'skip'],
-        description='analyze — VACUUM ANALYZE, skip — пропустить',
+    'vacuum': Param(
+        True,
+        type='boolean',
+        description='True — VACUUM ANALYZE, False — пропустить',
     ),
     'timeout': Param(
         15,
@@ -199,8 +198,8 @@ def tools_db_cleanup():
     @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
     def vacuum(**context):
         p = context['params']
-        if p.get('vacuum_mode', 'analyze') == 'skip':
-            raise AirflowSkipException('vacuum_mode=skip — пропущено')
+        if not p.get('vacuum', True):
+            raise AirflowSkipException('vacuum=False — пропущено')
 
         timeout = p.get('timeout', 15) * 60
         tables = [t for t in CLEANABLE_TABLES if p.get(t, True)]

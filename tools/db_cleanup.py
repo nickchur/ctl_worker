@@ -200,6 +200,7 @@ def tools_db_cleanup():
                 dry_run=dry_run,
                 verbose=True,
                 confirm=False,
+                skip_archive=True,
             )
         finally:
             for _l in _patch:

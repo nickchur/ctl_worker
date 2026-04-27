@@ -133,11 +133,9 @@ def tools_test_package():
             replace=True,
         )
 
-        import logging
-        log = logging.getLogger("airflow.task")
         for name in uploaded:
-            log.info("✅ uploaded: %s/%s", s3_prefix, name)
-        log.info("✅ summary tkt: %s/%s", s3_prefix, summary_tkt_name)
+            logger.info("✅ uploaded: %s/%s", s3_prefix, name)
+        logger.info("✅ summary tkt: %s/%s", s3_prefix, summary_tkt_name)
 
         return uploaded
 

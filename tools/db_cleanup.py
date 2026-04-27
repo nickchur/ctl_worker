@@ -336,7 +336,7 @@ def tools_db_cleanup():
             delta_str  = '—'
             before_str = '—'
         summary = (
-            f"| Таблиц | До | После | Δ | Записей | Удалённых |\n"
+            f"| Таблиц | Last | Current | Δ | Записей | Удалённых |\n"
             f"|--------|-----|-------|---|---------|----------|\n"
             f"| {readable_size(len(rows), base=1000)}"
             f" | {before_str}"

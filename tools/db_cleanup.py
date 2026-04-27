@@ -315,10 +315,10 @@ def tools_db_cleanup():
             })
 
         lines = [
-            '| Таблица | Current | Δ | Записей | Удалённых |',
-            '|---------|-------|---|---------|-----------|',
+            '|Таблица|Current|Δ|Записей|Удалённых|',
+            '|-|-|-|-|-|',
         ] + [
-            f"| `{r['table']}` | {r['after']} | {r['delta']} | {r['live_rows']} | {r['dead_rows']} |"
+            f"|{r['table']}|{r['after']}|{r['delta']}|{r['live_rows']}|{r['dead_rows']}|"
             for r in data
         ]
 

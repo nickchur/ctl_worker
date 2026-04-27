@@ -446,6 +446,12 @@ _PARTS: list[tuple[str, int]] = [
         ),
         "bucket": Param("edpetl-test", type="string", description="S3 бакет"),
         "conn_id": Param("s3-archive", type="string", description="Airflow S3 connection ID"),
+        "meta": Param(_META, type="string", description="base64-encoded .meta файл (JSON схема)"),
+        "parts": Param(
+            [[b64, rows] for b64, rows in _PARTS],
+            type="array",
+            description='Список частей: [[base64_csv, row_count], ...]',
+        ),
     },
 )
 def tools_test_package():
@@ -456,16 +462,18 @@ def tools_test_package():
         prefix = p["prefix"]
         full_table = p["table_name"]
         schema, _, table_name = full_table.partition("__")
-        s3_prefix = p["s3_prefix"].rstrip("/")
+        s3_prefix = (p["s3_prefix"] or "").rstrip("/")
         bucket = p["bucket"]
-        total = len(_PARTS)
+        parts = p["parts"]
+        total = len(parts)
 
         base_ts = pendulum.now("UTC")
         hook = S3Hook(aws_conn_id=p["conn_id"])
-        meta_bytes = base64.b64decode(_META)
+        meta_bytes = base64.b64decode(p["meta"])
         uploaded = []
 
-        for i, (csv_b64, rows) in enumerate(_PARTS):
+        for i, part in enumerate(parts):
+            csv_b64, rows = part[0], int(part[1])
             part = i + 1
             csv_bytes = base64.b64decode(csv_b64)
 
@@ -486,7 +494,7 @@ def tools_test_package():
                 zf.writestr(csv_name, csv_bytes)
             buf.seek(0)
 
-            s3_key = f"{s3_prefix}/{zip_name}"
+            s3_key = f"{s3_prefix}/{zip_name}" if s3_prefix else zip_name
             hook.load_bytes(buf.getvalue(), key=s3_key, bucket_name=bucket, replace=True)
             uploaded.append(zip_name)
 
@@ -496,7 +504,7 @@ def tools_test_package():
         summary_tkt_bytes = "\n".join(uploaded).encode()
         hook.load_bytes(
             summary_tkt_bytes,
-            key=f"{s3_prefix}/{summary_tkt_name}",
+            key=f"{s3_prefix}/{summary_tkt_name}" if s3_prefix else summary_tkt_name,
             bucket_name=bucket,
             replace=True,
         )

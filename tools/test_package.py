@@ -455,11 +455,7 @@ _PARTS_LINES: list[str] = json.loads(base64.b64decode(_PARTS))
     params={
         "prefix": Param("hrplatform_datalab", type="string", description="Префикс имени файла"),
         "table_name": Param("learning__lc_items_opened", type="string", description="Таблица в формате schema__table"),
-        "s3_prefix": Param(
-            "from/KAP802/hrpl_lm_er/hrplatform_datalab",
-            type="string",
-            description="Папка в бакете (без слэша в конце)",
-        ),
+        "s3_prefix": Param("", type=["string", "null"], description="Папка в бакете (без слэша в конце)"),
         "bucket": Param("edpetl-test", type="string", description="S3 бакет"),
         "conn_id": Param("s3-archive", type="string", description="Airflow S3 connection ID"),
         "meta": Param(_META, type="string", description="Содержимое .meta файла (JSON схема)"),

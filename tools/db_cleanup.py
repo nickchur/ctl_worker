@@ -191,8 +191,15 @@ def tools_db_cleanup():
         table_names = [t for t in CLEANABLE_TABLES if p.get(t, True)]
 
         capture = _LogCapture()
-        root_log = logging.getLogger()
-        root_log.addHandler(capture)
+        # airflow-логгеры настроены с propagate=False → root не получает ничего.
+        # Вешаемся на 'airflow' и напрямую на 'airflow.utils.db_cleanup' (на случай
+        # если где-то в цепочке тоже стоит propagate=False)
+        _patch = [
+            logging.getLogger('airflow'),
+            logging.getLogger('airflow.utils.db_cleanup'),
+        ]
+        for _l in _patch:
+            _l.addHandler(capture)
         _ts = time.time()
         try:
             run_cleanup(
@@ -203,7 +210,8 @@ def tools_db_cleanup():
                 confirm=False,
             )
         finally:
-            root_log.removeHandler(capture)
+            for _l in _patch:
+                _l.removeHandler(capture)
         duration = round(time.time() - _ts, 2)
 
         # Таблица и счётчик в разных строках:

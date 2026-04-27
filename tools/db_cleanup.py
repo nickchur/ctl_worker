@@ -186,6 +186,13 @@ def tools_db_cleanup():
         ]
         for _l in _patch:
             _l.addHandler(capture)
+        # skip_archive=True в run_cleanup не срабатывает в этой версии Airflow —
+        # принудительно патчим _do_delete чтобы archive-шаг всегда пропускался
+        from airflow.utils import db_cleanup as _dbc
+        _orig = _dbc._do_delete
+        _dbc._do_delete = lambda query, orm_model, skip_archive, session: \
+            _orig(query, orm_model, True, session)
+
         _ts = time.time()
         try:
             run_cleanup(
@@ -197,6 +204,7 @@ def tools_db_cleanup():
                 skip_archive=True,
             )
         finally:
+            _dbc._do_delete = _orig
             for _l in _patch:
                 _l.removeHandler(capture)
         duration = round(time.time() - _ts, 2)

@@ -1,15 +1,18 @@
 """### 📦 Тестовый пакет для единого репликатора / TFS
 
 Загружает тестовые ZIP-пакеты в S3 с актуальными таймштампами.
-Данные фиксированы (3 части, 36/37/38 строк), меняется только таймштамп.
+По умолчанию используются встроенные тестовые данные (3 части, 36/37/38 строк).
+Содержимое и схему можно переопределить через параметры `parts` и `meta`.
 
-| Параметр       | Описание                                              |
-|----------------|-------------------------------------------------------|
-| `prefix`       | Префикс имени файла *(default: hrplatform_datalab)*           |
-| `table_name`   | Таблица в формате schema__table *(default: learning__lc_items_opened)* |
-| `s3_prefix`    | Папка в бакете *(default: from/KAP802/...)*                   |
-| `bucket`       | S3 бакет *(default: edpetl-test)*                             |
-| `conn_id`      | Airflow S3 connection *(default: s3-archive)*                 |
+| Параметр       | Описание                                                              |
+|----------------|-----------------------------------------------------------------------|
+| `prefix`       | Префикс имени файла *(default: hrplatform_datalab)*                   |
+| `table_name`   | Таблица в формате schema__table *(default: learning__lc_items_opened)*|
+| `s3_prefix`    | Папка в бакете *(default: from/KAP802/...)*                           |
+| `bucket`       | S3 бакет *(default: edpetl-test)*                                     |
+| `conn_id`      | Airflow S3 connection *(default: s3-archive)*                         |
+| `meta`         | JSON-схема для .meta файла                                            |
+| `parts`        | Список строк CSV (повтор заголовка = новая часть)                     |
 """
 
 from __future__ import annotations

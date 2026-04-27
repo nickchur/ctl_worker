@@ -5,11 +5,11 @@
 | Параметр            | Описание                                                                                      |
 |---------------------|-----------------------------------------------------------------------------------------------|
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес)*                                    |
-| 🔍 `dry_run`        | Только подсчёт без удаления *(default: `True`)*                                               |
+| 🔍 `dry_run`        | Только подсчёт без удаления *(default: `False`)*                                              |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE *(default)*, `False` — пропустить                                     |
 | ⏱️ `timeout`        | Таймаут на каждую операцию, мин *(default: `15`)*                                             |
 
-> **dry_run=True** по умолчанию — первый запуск всегда безопасен.
+> **dry_run=False** по умолчанию — реальное удаление. Для проверки установите `dry_run=True`.
 > Минимальный порог `retention_days` — 30 дней.
 """
 
@@ -138,7 +138,7 @@ params = {
         description='Хранить записи не старше N дней (минимум 30)',
     ),
     'dry_run': Param(
-        True,
+        False,
         type='boolean',
         description='True — только подсчёт, False — реальное удаление',
     ),
@@ -174,8 +174,7 @@ def tools_db_cleanup():
         if retention_days < 30:
             raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
 
-        run_type = context['dag_run'].run_type
-        dry_run = p['dry_run'] if run_type != 'scheduled' else False
+        dry_run = p['dry_run']
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
 
         capture = _LogCapture()

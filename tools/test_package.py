@@ -18,11 +18,14 @@
 from __future__ import annotations
 import base64
 import json
+import logging
 import os
 import zipfile
 from io import BytesIO
 
 import pendulum
+
+logger = logging.getLogger(__name__)
 from airflow.decorators import dag, task
 from airflow.models import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -142,4 +145,9 @@ def tools_test_package():
     upload()
 
 
-tools_test_package()
+ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()
+
+if ENV_STAND == "prom":
+    logger.warning("DAG tools_test_package is disabled on 'prom' stand. Skipping DAG registration.")
+else:
+    tools_test_package()

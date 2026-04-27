@@ -25,7 +25,7 @@ from io import BytesIO
 
 import pendulum
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("airflow.task")
 from airflow.decorators import dag, task
 from airflow.models import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook

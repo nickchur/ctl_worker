@@ -38,8 +38,7 @@ class _LogCapture(logging.Handler):
         self.lines = []
 
     def emit(self, record):
-        if 'db_cleanup' in record.name or 'db_cleanup' in (record.pathname or ''):
-            self.lines.append(record.getMessage())
+        self.lines.append(record.getMessage())
 
 MAX_NOTE_LEN = 1000
 
@@ -191,11 +190,10 @@ def tools_db_cleanup():
         table_names = [t for t in CLEANABLE_TABLES if p.get(t, True)]
 
         capture = _LogCapture()
-        # airflow-логгеры настроены с propagate=False → root не получает ничего.
-        # Вешаемся на 'airflow' и напрямую на 'airflow.utils.db_cleanup' (на случай
-        # если где-то в цепочке тоже стоит propagate=False)
+        # INFO-сообщения ("Found N rows", "Checking table") идут через StreamLogWriter
+        # → airflow.task logger, а не через airflow.utils.db_cleanup
         _patch = [
-            logging.getLogger('airflow'),
+            logging.getLogger('airflow.task'),
             logging.getLogger('airflow.utils.db_cleanup'),
         ]
         for _l in _patch:

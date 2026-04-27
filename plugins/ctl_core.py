@@ -449,9 +449,17 @@ def chk_any_conn(id, data=None, **context):
     try:
     # if True:
         if data['type'] == 'Postgres':
-            from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
-            hook = PostgresHook(postgres_conn_id=data['conn_id'])
-            result = query_to_dict(hook, 'SELECT current_user, current_database(), inet_server_addr()', timeout=10)[0]
+            if data.get('default'):
+                from airflow.utils.session import create_session
+                from sqlalchemy import text
+                with create_session() as session:
+                    result = dict(session.execute(text(
+                        'SELECT current_user, current_database(), inet_server_addr()'
+                    )).fetchone())
+            else:
+                from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
+                hook = PostgresHook(postgres_conn_id=data['conn_id'])
+                result = query_to_dict(hook, 'SELECT current_user, current_database(), inet_server_addr()', timeout=10)[0]
             
         elif data['type'] == 'S3':
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook # type: ignore

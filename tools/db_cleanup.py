@@ -120,7 +120,7 @@ def readable_size(size_bytes, base=1024):
     if base == 1024:
         units = ["B", "KB", "MB", "GB", "TB", "PB"]
     else:
-        units = ["ед", "тыс", "млн", "млрд", "трлн", "птлн"]
+        units = ["", "тыс", "млн", "млрд", "трлн", "птлн"]
     if not size_bytes or size_bytes == 0:
         return f"0 {units[0]}"
     import math
@@ -129,7 +129,8 @@ def readable_size(size_bytes, base=1024):
     i = int(math.floor(math.log(size_bytes, base)))
     if i >= len(units): i = len(units) - 1
     if i < 0: i = 0
-    return f"{sign}{round(size_bytes / (base ** i), 2)} {units[i]}"
+    suffix = units[i]
+    return f"{sign}{round(size_bytes / (base ** i), 2)}" + (f" {suffix}" if suffix else "")
 
 
 params = {

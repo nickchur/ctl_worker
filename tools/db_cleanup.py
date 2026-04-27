@@ -229,7 +229,7 @@ def tools_db_cleanup():
             ] + [f"| `{t}` | {readable_size(n, base=1000)} |" for t, n in counts.items()]
             total = sum(counts.values())
             lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** |")
-            add_note('\n'.join(lines), context=context, level='Task', title=f'🗑️ clean ({mode})', duration=duration)
+            add_note('\n'.join(lines), context=context, level='Task', title=f'🗑️ clean ({mode}, {retention_days}d)', duration=duration)
             add_note(
                 f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.format("YYYY-MM-DD")}',
                 context=context, level='DAG', title='🗑️ clean', duration=duration,

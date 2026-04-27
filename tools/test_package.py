@@ -463,7 +463,7 @@ _PARTS_LINES: list[str] = json.loads(base64.b64decode(_PARTS))
         "parts": Param(
             _PARTS_LINES,
             type="array",
-            description="Список строк TSV (повтор заголовка = новая часть)",
+            description="Список строк CSV (повтор заголовка = новая часть)",
         ),
     },
 )

@@ -38,7 +38,8 @@ class _LogCapture(logging.Handler):
         self.lines = []
 
     def emit(self, record):
-        self.lines.append(record.getMessage())
+        if 'db_cleanup' in record.name or 'db_cleanup' in (record.pathname or ''):
+            self.lines.append(record.getMessage())
 
 MAX_NOTE_LEN = 1000
 
@@ -189,8 +190,8 @@ def tools_db_cleanup():
         table_names = [t for t in CLEANABLE_TABLES if p.get(t, True)]
 
         capture = _LogCapture()
-        af_log = logging.getLogger('airflow.utils.db_cleanup')
-        af_log.addHandler(capture)
+        root_log = logging.getLogger()
+        root_log.addHandler(capture)
         _ts = time.time()
         try:
             run_cleanup(
@@ -201,7 +202,7 @@ def tools_db_cleanup():
                 confirm=False,
             )
         finally:
-            af_log.removeHandler(capture)
+            root_log.removeHandler(capture)
         duration = round(time.time() - _ts, 2)
 
         # Таблица и счётчик в разных строках:

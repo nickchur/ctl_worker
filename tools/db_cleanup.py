@@ -147,12 +147,6 @@ params = {
         type='boolean',
         description='True — VACUUM ANALYZE, False — пропустить',
     ),
-    'timeout': Param(
-        15,
-        type='integer',
-        minimum=1,
-        description='Таймаут на каждую операцию, мин',
-    ),
 }
 
 
@@ -180,7 +174,8 @@ def tools_db_cleanup():
         if retention_days < 30:
             raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
 
-        dry_run = p['dry_run']
+        run_type = context['dag_run'].run_type
+        dry_run = p['dry_run'] if run_type != 'scheduled' else False
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
 
         capture = _LogCapture()
@@ -249,7 +244,7 @@ def tools_db_cleanup():
         if not p.get('vacuum', True):
             raise AirflowSkipException('vacuum=False — пропущено')
 
-        timeout = p.get('timeout', 15) * 60
+        timeout = 15 * 60
         tables = context['ti'].xcom_pull(task_ids='clean') or []
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')

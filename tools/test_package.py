@@ -448,9 +448,9 @@ _PARTS: list[tuple[str, int]] = [
         "conn_id": Param("s3-archive", type="string", description="Airflow S3 connection ID"),
         "meta": Param(_META, type="string", description="Содержимое .meta файла (JSON схема)"),
         "parts": Param(
-            [[b64, rows] for b64, rows in _PARTS],
+            [[base64.b64decode(b64).decode(), rows] for b64, rows in _PARTS],
             type="array",
-            description='Список частей: [[base64_csv, row_count], ...]',
+            description='Список частей: [[tsv_текст, row_count], ...]',
         ),
     },
 )
@@ -473,9 +473,9 @@ def tools_test_package():
         uploaded = []
 
         for i, part in enumerate(parts):
-            csv_b64, rows = part[0], int(part[1])
+            csv_text, rows = part[0], int(part[1])
             part = i + 1
-            csv_bytes = base64.b64decode(csv_b64)
+            csv_bytes = csv_text.encode()
 
             inner_ts = base_ts.add(seconds=i * 2).format("YYYYMMDDHHmmss")
             tkt_ts   = base_ts.add(seconds=i * 2 + 1).format("YYYYMMDDHHmmss")

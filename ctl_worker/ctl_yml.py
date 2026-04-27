@@ -260,6 +260,10 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
                 logger.debug(yaml_data)
                 find.append(data['wf']['name'])
         
-        add_note(find, context, level='DAG,Task', title='Find')
-    
+        add_note({'Find': find}, context, level='DAG,Task')
+
+        not_found = [w for w in wfs if w not in find]
+        if not_found:
+            add_note({'Not found': not_found}, context, level='DAG,Task')
+
     get_yml()

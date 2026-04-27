@@ -18,6 +18,7 @@
 from __future__ import annotations
 import base64
 import json
+import os
 import zipfile
 from io import BytesIO
 
@@ -441,6 +442,13 @@ _PARTS = (
 )
 _PARTS_LINES: list[str] = json.loads(base64.b64decode(_PARTS))
 
+if os.getenv("AIRFLOW__CTL_PIN"):
+    def_conn_id = "s3-archive"
+    def_bucket = "edpetl-test"
+else:
+    def_conn_id = "s3-tfs-hrplt"
+    def_bucket = "tfshrplt"
+
 
 @dag(
     doc_md=__doc__,
@@ -456,8 +464,8 @@ _PARTS_LINES: list[str] = json.loads(base64.b64decode(_PARTS))
         "prefix": Param("hrplatform_datalab", type="string", description="Префикс имени файла"),
         "table_name": Param("learning__lc_items_opened", type="string", description="Таблица в формате schema__table"),
         "s3_prefix": Param("", type=["string", "null"], description="Папка в бакете (без слэша в конце)"),
-        "bucket": Param("edpetl-test", type="string", description="S3 бакет"),
-        "conn_id": Param("s3-archive", type="string", description="Airflow S3 connection ID"),
+        "bucket": Param(def_bucket, type="string", description="S3 бакет"),
+        "conn_id": Param(def_conn_id, type="string", description="Airflow S3 connection ID"),
         "meta": Param(_META, type="string", description="Содержимое .meta файла (JSON схема)"),
         "parts": Param(
             _PARTS_LINES,

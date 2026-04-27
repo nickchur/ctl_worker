@@ -6,14 +6,14 @@
 |---------------------|-----------------------------------------------------------------------------------------------|
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес)*                                    |
 | 🔍 `dry_run`        | Только подсчёт без удаления *(default: `True`)*                                               |
-| 🧹 `vacuum_mode`    | `analyze` — VACUUM ANALYZE *(default)*, `full` — VACUUM FULL ANALYZE, `skip` — пропустить     |
+| 🧹 `vacuum_mode`    | `analyze` — VACUUM ANALYZE *(default)*, `skip` — пропустить                                   |
 | ⏱️ `timeout`        | Таймаут на каждую операцию, мин *(default: `15`)*                                             |
 
 > **dry_run=True** по умолчанию — первый запуск всегда безопасен.
 > Минимальный порог `retention_days` — 30 дней.
 """
 
-from airflow.decorators import task, dag, task_group
+from airflow.decorators import task, dag
 from airflow.models import Param, DagRun, XCom
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.utils.trigger_rule import TriggerRule
@@ -136,8 +136,8 @@ params = {
     'vacuum_mode': Param(
         'analyze',
         type='string',
-        enum=['analyze', 'full', 'skip'],
-        description='analyze — VACUUM ANALYZE, full — VACUUM FULL ANALYZE, skip — пропустить',
+        enum=['analyze', 'skip'],
+        description='analyze — VACUUM ANALYZE, skip — пропустить',
     ),
     'timeout': Param(
         15,
@@ -196,48 +196,35 @@ def tools_db_cleanup():
             duration=duration,
         )
 
-    def _make_vacuum(tbl):
-        @task(task_id=f'vacuum_{tbl}', trigger_rule=TriggerRule.ALL_DONE)
-        def _vacuum(_tbl=tbl, **context):
-            p = context['params']
-            mode = p.get('vacuum_mode', 'analyze')
-            if mode == 'skip':
-                raise AirflowSkipException('vacuum_mode=skip — пропущено')
-            if not p.get(_tbl, True):
-                raise AirflowSkipException(f'Таблица {_tbl} отключена')
+    @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
+    def vacuum(**context):
+        p = context['params']
+        if p.get('vacuum_mode', 'analyze') == 'skip':
+            raise AirflowSkipException('vacuum_mode=skip — пропущено')
 
-            full = mode == 'full'
-            label = 'VACUUM FULL ANALYZE' if full else 'VACUUM ANALYZE'
+        timeout = p.get('timeout', 15) * 60
+        tables = [t for t in CLEANABLE_TABLES if p.get(t, True)]
+        results = []
+        for tbl in tables:
             _ts = time.time()
-            db_vacuum(_tbl, full=full, timeout=p.get('timeout', 15) * 60)
-            duration = round(time.time() - _ts, 2)
-            add_note(f'{label} выполнен', context=context, level='Task', title=f'🧹 {_tbl}', duration=duration)
-            return {'table': _tbl, 'mode': label, 'duration': duration}
-        return _vacuum()
+            try:
+                db_vacuum(tbl, full=False, timeout=timeout)
+            except AirflowSkipException as e:
+                logger.warning(f"⚠️ {tbl}: {e}")
+                continue
+            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2)})
 
-    @task_group(group_id='vacuum')
-    def vacuum_group():
-        vacuums = [_make_vacuum(tbl) for tbl in CLEANABLE_TABLES]
-
-        @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
-        def _vacuum_summary(**context):
-            ti = context['ti']
-            results = [ti.xcom_pull(task_ids=f'vacuum.vacuum_{t}') for t in CLEANABLE_TABLES]
-            rows = [r for r in results if r]
-            if not rows:
-                add_note('вакуум не выполнялся', context=context, level='DAG,Task', title='🧹 Итог vacuum')
-                return
-            lines = [
-                '| Таблица | Режим | Время, с |',
-                '|---------|-------|---------|',
-            ] + [f"| `{r['table']}` | {r['mode']} | {r['duration']} |" for r in rows]
-            total = round(sum(r['duration'] for r in rows), 2)
-            lines.append(f"| **Итого** | | **{total} с** |")
-            mode_label = 'FULL' if any('FULL' in r['mode'] for r in rows) else 'ANALYZE'
-            add_note('\n'.join(lines), context=context, level='Task', title=f'🧹 Итог vacuum ({mode_label})')
-            add_note(f'{len(rows)} таблиц за {total} с', context=context, level='DAG', title=f'🧹 Итог vacuum ({mode_label})')
-
-        vacuums >> _vacuum_summary()
+        if not results:
+            add_note('нет таблиц для вакуума', context=context, level='DAG,Task', title='🧹 vacuum')
+            return
+        lines = [
+            '| Таблица | Время, с |',
+            '|---------|---------|',
+        ] + [f"| `{r['table']}` | {r['duration']} |" for r in results]
+        total = round(sum(r['duration'] for r in results), 2)
+        lines.append(f"| **Итого** | **{total} с** |")
+        add_note('\n'.join(lines), context=context, level='Task', title='🧹 vacuum')
+        add_note(f'{len(results)} таблиц за {total} с', context=context, level='DAG', title='🧹 vacuum')
 
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
@@ -324,6 +311,6 @@ def tools_db_cleanup():
 
         return data
 
-    clean() >> vacuum_group() >> report()
+    clean() >> vacuum() >> report()
 
 tools_db_cleanup()

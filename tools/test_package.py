@@ -488,11 +488,24 @@ def tools_test_package():
 
             s3_key = f"{s3_prefix}/{zip_name}"
             hook.load_bytes(buf.getvalue(), key=s3_key, bucket_name=bucket, replace=True)
-            uploaded.append(s3_key)
+            uploaded.append(zip_name)
 
-        for key in uploaded:
-            import logging
-            logging.getLogger("airflow.task").info("✅ uploaded: %s", key)
+        # итоговый .tkt: список всех zip-файлов, ts = last_outer_ts + 1s
+        summary_ts = base_ts.add(seconds=(total - 1) * 2 + 3).format("YYYYMMDDHHmmss")
+        summary_tkt_name = f"{prefix}__{summary_ts}.tkt"
+        summary_tkt_bytes = "\n".join(uploaded).encode()
+        hook.load_bytes(
+            summary_tkt_bytes,
+            key=f"{s3_prefix}/{summary_tkt_name}",
+            bucket_name=bucket,
+            replace=True,
+        )
+
+        import logging
+        log = logging.getLogger("airflow.task")
+        for name in uploaded:
+            log.info("✅ uploaded: %s/%s", s3_prefix, name)
+        log.info("✅ summary tkt: %s/%s", s3_prefix, summary_tkt_name)
 
         return uploaded
 

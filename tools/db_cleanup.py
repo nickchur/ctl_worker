@@ -227,6 +227,8 @@ def tools_db_cleanup():
             if nm and current_table:
                 counts[current_table] = int(nm.group(1))
 
+        logger.info(f"🔎 capture.lines({len(capture.lines)}): {capture.lines[:10]}")
+
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         if counts:
             lines = [

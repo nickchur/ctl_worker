@@ -5,9 +5,11 @@
 
 | Параметр       | Описание                                              |
 |----------------|-------------------------------------------------------|
-| `prefix`       | Префикс имени файла *(default: hrplatform_datalab)*   |
-| `table_name`   | Название таблицы *(default: lc_items_opened)*         |
-| `s3_prefix`    | Папка в бакете *(default: from/KAP802/...)*           |
+| `prefix`       | Префикс имени файла *(default: hrplatform_datalab)*           |
+| `table_name`   | Таблица в формате schema__table *(default: learning__lc_items_opened)* |
+| `s3_prefix`    | Папка в бакете *(default: from/KAP802/...)*                   |
+| `bucket`       | S3 бакет *(default: edpetl-test)*                             |
+| `conn_id`      | Airflow S3 connection *(default: s3-archive)*                 |
 """
 
 from __future__ import annotations
@@ -20,9 +22,6 @@ from airflow.decorators import dag, task
 from airflow.models import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
-_SCHEMA = "learning"
-_BUCKET = "edpetl-test"
-_CONN_ID = "s3-archive"
 
 _META = "eyJzY2hlbWFfbmFtZSI6ImxlYXJuaW5nIiwidGFibGVfbmFtZSI6ImxjX2l0ZW1zX29wZW5lZCIsInN0cmF0ZWd5IjoiRlVMTF9VSyIsIlBLIjpbXSwiVUsiOlsicGVyc29uX3V1aWQiLCJpdGVtX2lkIl0sInBhcmFtcyI6eyJzZXBhcmF0aW9uIjoiXHQiLCJlc2NhcGVzeW1ib2wiOiJcIiJ9LCJjb2x1bW5zIjpbeyJjb2x1bW5fbmFtZSI6ImV4cG9ydF90aW1lIiwic291cmNlX3R5cGUiOiJUSU1FU1RBTVAiLCJsZW5ndGgiOm51bGwsIm5vdG51bGwiOmZhbHNlLCJwcmVjaXNpb24iOm51bGwsInNjYWxlIjpudWxsLCJkZXNjcmlwdGlvbiI6ItCU0LDRgtCwINCy0YvQs9GA0YPQt9C60LgifSx7ImNvbHVtbl9uYW1lIjoiaW5zZXJ0X3RpbWUiLCJzb3VyY2VfdHlwZSI6IlRJTUVTVEFNUCIsImxlbmd0aCI6bnVsbCwibm90bnVsbCI6ZmFsc2UsInByZWNpc2lvbiI6bnVsbCwic2NhbGUiOm51bGwsImRlc2NyaXB0aW9uIjoi0JTQsNGC0LAg0LLRgdGC0LDQstC60LgifSx7ImNvbHVtbl9uYW1lIjoiaGVhZGVyX2lkIiwic291cmNlX3R5cGUiOiJTVFJJTkciLCJsZW5ndGgiOm51bGwsIm5vdG51bGwiOmZhbHNlLCJwcmVjaXNpb24iOjM4LCJzY2FsZSI6MTAsImRlc2NyaXB0aW9uIjoi0KPQvdC40LrQsNC70YzQvdGL0Lkg0LjQtNC10L3RgtC40YTQuNC60LDRgtC+0YAg0LjQstC10L3RgtCwIn0seyJjb2x1bW5fbmFtZSI6ImhlYWRlcl9wZXJzb25faWQiLCJzb3VyY2VfdHlwZSI6IlNUUklORyIsImxlbmd0aCI6NDA5Niwibm90bnVsbCI6ZmFsc2UsInByZWNpc2lvbiI6bnVsbCwic2NhbGUiOm51bGwsImRlc2NyaXB0aW9uIjoiSUQg0YHQvtGC0YDRg9C00L3QuNC60LAsINC40LfRg9GH0LDRjtGJ0LXQs9C+INC80LDRgtC10YDQuNCw0LsifSx7ImNvbHVtbl9uYW1lIjoiaGVhZGVyX2V2ZW50X3R5cGUiLCJzb3VyY2VfdHlwZSI6IlNUUklORyIsImxlbmd0aCI6NDA5Niwibm90bnVsbCI6ZmFsc2UsInByZWNpc2lvbiI6bnVsbCwic2NhbGUiOm51bGwsImRlc2NyaXB0aW9uIjoi0KLQuNC/INC40LLQtdC90YLQsCJ9LHsiY29sdW1uX25hbWUiOiJoZWFkZXJfY3JlYXRlZF9kdCIsInNvdXJjZV90eXBlIjoiREFURSIsImxlbmd0aCI6NDA5Niwibm90bnVsbCI6ZmFsc2UsInByZWNpc2lvbiI6bnVsbCwic2NhbGUiOm51bGwsImRlc2NyaXB0aW9uIjoi0JTQsNGC0LAg0LPQtdC90LXRgNCw0YbQuNC4INC40LLQtdC90YLQsCJ9LHsiY29sdW1uX25hbWUiOiJpdGVtX2lkIiwic291cmNlX3R5cGUiOiJJTlQiLCJsZW5ndGgiOjI1LCJub3RudWxsIjp0cnVlLCJwcmVjaXNpb24iOm51bGwsInNjYWxlIjpudWxsLCJkZXNjcmlwdGlvbiI6IklEINC80LDRgtC10YDQuNCw0LvQsCJ9LHsiY29sdW1uX25hbWUiOiJwZXJzb25fdXVpZCIsInNvdXJjZV90eXBlIjoiSU5UIiwibGVuZ3RoIjoyNSwibm90bnVsbCI6dHJ1ZSwicHJlY2lzaW9uIjpudWxsLCJzY2FsZSI6bnVsbCwiZGVzY3JpcHRpb24iOiJJRCDRgdC+0YLRgNGD0LTQvdC40LrQsCwg0LjQt9GD0YfQsNGO0YnQtdCz0L4g0LzQsNGC0LXRgNC40LDQuyJ9LHsiY29sdW1uX25hbWUiOiJ0ZW5hbnQiLCJzb3VyY2VfdHlwZSI6IlNUUklORyIsImxlbmd0aCI6NDA5Niwibm90bnVsbCI6ZmFsc2UsInByZWNpc2lvbiI6bnVsbCwic2NhbGUiOm51bGwsImRlc2NyaXB0aW9uIjoi0YLQtdC90LDQvdGCIn0seyJjb2x1bW5fbmFtZSI6ImNvbXBhbnkiLCJzb3VyY2VfdHlwZSI6IlNUUklORyIsImxlbmd0aCI6NDA5Niwibm90bnVsbCI6ZmFsc2UsInByZWNpc2lvbiI6bnVsbCwic2NhbGUiOm51bGwsImRlc2NyaXB0aW9uIjoi0LrQvtC80L/QsNC90LjRjyJ9LHsiY29sdW1uX25hbWUiOiJjdGxfYWN0aW9uIiwic291cmNlX3R5cGUiOiJWQVJDSEFSIiwibGVuZ3RoIjoxMCwibm90bnVsbCI6ZmFsc2UsInByZWNpc2lvbiI6bnVsbCwic2NhbGUiOm51bGwsImRlc2NyaXB0aW9uIjpudWxsfSx7ImNvbHVtbl9uYW1lIjoiY3RsX3ZhbGlkZnJvbSIsInNvdXJjZV90eXBlIjoiVElNRVNUQU1QIiwibGVuZ3RoIjpudWxsLCJub3RudWxsIjpmYWxzZSwicHJlY2lzaW9uIjpudWxsLCJzY2FsZSI6bnVsbCwiZGVzY3JpcHRpb24iOm51bGx9XX0="
 
@@ -439,12 +438,14 @@ _PARTS: list[tuple[str, int]] = [
     schedule_interval=None,
     params={
         "prefix": Param("hrplatform_datalab", type="string", description="Префикс имени файла"),
-        "table_name": Param("lc_items_opened", type="string", description="Название таблицы"),
+        "table_name": Param("learning__lc_items_opened", type="string", description="Таблица в формате schema__table"),
         "s3_prefix": Param(
             "from/KAP802/hrpl_lm_er/hrplatform_datalab",
             type="string",
             description="Папка в бакете (без слэша в конце)",
         ),
+        "bucket": Param("edpetl-test", type="string", description="S3 бакет"),
+        "conn_id": Param("s3-archive", type="string", description="Airflow S3 connection ID"),
     },
 )
 def tools_test_package():
@@ -453,12 +454,14 @@ def tools_test_package():
     def upload(**context):
         p = context["params"]
         prefix = p["prefix"]
-        table_name = p["table_name"]
+        full_table = p["table_name"]
+        schema, _, table_name = full_table.partition("__")
         s3_prefix = p["s3_prefix"].rstrip("/")
+        bucket = p["bucket"]
         total = len(_PARTS)
 
         base_ts = pendulum.now("UTC")
-        hook = S3Hook(aws_conn_id=_CONN_ID)
+        hook = S3Hook(aws_conn_id=p["conn_id"])
         meta_bytes = base64.b64decode(_META)
         uploaded = []
 
@@ -470,8 +473,8 @@ def tools_test_package():
             tkt_ts   = base_ts.add(seconds=i * 2 + 1).format("YYYYMMDDHHmmss")
             outer_ts = base_ts.add(seconds=i * 2 + 2).format("YYYYMMDDHHmmss")
 
-            csv_name  = f"{_SCHEMA}__{table_name}__{inner_ts}__{part}_{total}_{rows}.csv"
-            meta_name = f"{_SCHEMA}__{table_name}__{inner_ts}__{part}_{total}_{rows}.meta"
+            csv_name  = f"{schema}__{table_name}__{inner_ts}__{part}_{total}_{rows}.csv"
+            meta_name = f"{schema}__{table_name}__{inner_ts}__{part}_{total}_{rows}.meta"
             tkt_name  = f"{prefix}__{tkt_ts}.tkt"
             tkt_bytes = f"{csv_name};{rows}".encode()
             zip_name  = f"{prefix}__{outer_ts}__{table_name}__{part}_{total}_{rows}.csv.zip"
@@ -484,7 +487,7 @@ def tools_test_package():
             buf.seek(0)
 
             s3_key = f"{s3_prefix}/{zip_name}"
-            hook.load_bytes(buf.getvalue(), key=s3_key, bucket_name=_BUCKET, replace=True)
+            hook.load_bytes(buf.getvalue(), key=s3_key, bucket_name=bucket, replace=True)
             uploaded.append(s3_key)
 
         for key in uploaded:

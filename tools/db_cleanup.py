@@ -30,6 +30,7 @@ from airflow.utils.db_cleanup import config_dict as _cleanup_config
 from sqlalchemy import text
 
 from pprint import PrettyPrinter
+import unicodedata
 import pendulum
 import time
 import logging
@@ -84,6 +85,7 @@ _EXTRA_COND = {
 # удаляем через ORDER BY pk LIMIT batch_size чтобы использовать PK-индекс.
 _PK_BATCH = {
     'celery_tasksetmeta': 'id',
+    'celery_taskmeta':    'id',
     'callback_request':   'id',
     'import_error':       'id',
 }
@@ -94,14 +96,14 @@ _CUSTOM_TABLES = {
     'dag_code': {
         'col': 'last_updated',
         'safe_where': (
-            'fileloc_hash NOT IN (SELECT fileloc_hash FROM main.serialized_dag)'
+            'NOT EXISTS (SELECT 1 FROM main.serialized_dag sd WHERE sd.fileloc_hash = fileloc_hash)'
         ),
     },
     # Устаревший pickle-формат — нельзя трогать то, на что ссылается dag.pickle_id
     'dag_pickle': {
         'col': 'created_dttm',
         'safe_where': (
-            'id NOT IN (SELECT pickle_id FROM main.dag WHERE pickle_id IS NOT NULL)'
+            'NOT EXISTS (SELECT 1 FROM main.dag d WHERE d.pickle_id = id)'
         ),
     },
 }
@@ -129,7 +131,6 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False,
             new_note = msg.strip()
 
             if title:
-                import unicodedata
                 if not unicodedata.category(title[0]) == 'So':
                     title = "📝 " + title
                 new_note = f"{title}\n---\n{new_note}"
@@ -182,7 +183,7 @@ def readable_size(size_bytes, base=1024):
     else:
         units = ["", "тыс", "млн", "млрд", "трлн", "птлн"]
     if not size_bytes or size_bytes == 0:
-        return f"0 {units[0]}"
+        return f"0{' ' + units[0] if units[0] else ''}"
     import math
     sign = "-" if size_bytes < 0 else ""
     size_bytes = abs(size_bytes)
@@ -389,7 +390,7 @@ def tools_db_cleanup():
         HDR = ['|Таблица|Строк|Min|Idx|Время|',
                '|-|-|-|-|-|']
 
-        custom = p.get('custom', True)
+        custom = p.get('custom', False)
         table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
         results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'

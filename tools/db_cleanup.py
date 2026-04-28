@@ -260,8 +260,10 @@ def tools_db_cleanup():
             """), {'tbl': tbl, 'col': col}).scalar()
             if n:
                 return '✅'
-            if tbl in _EXTRA_COND or tbl in _PK_BATCH:
+            if tbl in _EXTRA_COND:
                 return '↗'
+            if tbl in _PK_BATCH:
+                return '🔑'
             return '❌'
 
         def _do_cleanup(tbl, session, on_batch=None):

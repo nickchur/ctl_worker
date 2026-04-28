@@ -104,6 +104,15 @@ _CUSTOM_TABLES = {
             'id NOT IN (SELECT pickle_id FROM main.dag WHERE pickle_id IS NOT NULL)'
         ),
     },
+    # Нет колонки даты — orphaned записи (CASCADE не сработал) чистим через dag_run
+    'rendered_task_instance_fields': {
+        'col': None,
+        'safe_where': (
+            'EXISTS (SELECT 1 FROM main.dag_run dr'
+            ' WHERE dr.dag_id = {t}.dag_id AND dr.run_id = {t}.run_id'
+            ' AND dr.execution_date < :cutoff)'
+        ),
+    },
 }
 
 
@@ -256,16 +265,17 @@ def tools_db_cleanup():
             return str(d)[:10] if d else '—'
 
         def _idx_label(tbl, col, session):
-            """✅ прямой индекс / ↗ косвенный / ❌ seq scan."""
-            n = session.execute(text("""
-                SELECT COUNT(*) FROM pg_index i
-                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                JOIN pg_class c ON c.oid = i.indrelid
-                JOIN pg_namespace ns ON ns.oid = c.relnamespace
-                WHERE ns.nspname = 'main' AND c.relname = :tbl AND a.attname = :col
-            """), {'tbl': tbl, 'col': col}).scalar()
-            if n:
-                return '✅'
+            """✅ прямой индекс / ↗ косвенный / 🔑 PK-batch / ❌ seq scan."""
+            if col:
+                n = session.execute(text("""
+                    SELECT COUNT(*) FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    JOIN pg_class c ON c.oid = i.indrelid
+                    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+                    WHERE ns.nspname = 'main' AND c.relname = :tbl AND a.attname = :col
+                """), {'tbl': tbl, 'col': col}).scalar()
+                if n:
+                    return '✅'
             if tbl in _EXTRA_COND:
                 return '↗'
             if tbl in _PK_BATCH:
@@ -277,16 +287,25 @@ def tools_db_cleanup():
             bind = {'cutoff': cutoff}
 
             if tbl in _CUSTOM_TABLES:
-                # Таблицы вне стандартного Airflow cleanup — простой WHERE + safety-фильтр
                 custom = _CUSTOM_TABLES[tbl]
                 col = custom['col']
-                idx = _idx_label(tbl, col, session)
+                safe = custom['safe_where'].format(t=t)
                 p = ''
-                base_where = f"{col} < :cutoff AND {custom['safe_where']}"
-                count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {base_where}")
-                def make_delete(batch_extra=''):
-                    w = base_where + (f' AND {batch_extra}' if batch_extra else '')
-                    return text(f"DELETE FROM {t} WHERE {w}")
+
+                if col is None:
+                    # Нет колонки даты — WHERE целиком из safe_where
+                    idx = '↗'
+                    base_where = safe
+                    count_sql = text(f"SELECT COUNT(*), NULL, NULL FROM {t} WHERE {base_where}")
+                    def make_delete(batch_extra=''):
+                        return text(f"DELETE FROM {t} WHERE {base_where}")
+                else:
+                    idx = _idx_label(tbl, col, session)
+                    base_where = f"{col} < :cutoff AND {safe}"
+                    count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {base_where}")
+                    def make_delete(batch_extra=''):
+                        w = base_where + (f' AND {batch_extra}' if batch_extra else '')
+                        return text(f"DELETE FROM {t} WHERE {w}")
             else:
                 cfg = _cleanup_config[tbl]
                 col = cfg.recency_column_name

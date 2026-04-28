@@ -87,7 +87,7 @@ _EXTRA_TABLES = {
     # col=None: нет date-колонки с индексом; фильтр через task_id (unique) → external_executor_id join.
     # Батчинг по PK id (см. _PK_BATCH).
     'celery_taskmeta': {
-        'col': None,
+        'col': 'date_done',
         'safe_where': (
             'EXISTS (SELECT 1 FROM main.task_instance ti'
             ' JOIN main.dag_run dr ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id'

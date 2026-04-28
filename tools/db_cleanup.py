@@ -335,15 +335,15 @@ def tools_db_cleanup():
 
         def _note_rows(res):
             return [
-                f"| `{t}` | {readable_size(r['count'], base=1000)}"
-                f" | {_fmt_date(r['min_date'])} | {_fmt_date(r['max_date'])}"
-                f" | {r['idx']}"
-                f" | {r.get('duration', '')} |"
+                f"|{t}|{readable_size(r['count'], base=1000)}"
+                f"|{_fmt_date(r['min_date'])}"
+                f"|{r['idx']}"
+                f"|{r.get('duration', '')}|"
                 for t, r in res.items()
             ]
 
-        HDR = ['| Таблица | Строк | Min | Max | Idx | Время, с |',
-               '|---------|-------|-----|-----|-----|---------|']
+        HDR = ['|Таблица|Строк|Min|Idx|Время|',
+               '|-|-|-|-|-|']
 
         custom = p.get('custom', True)
         table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
@@ -369,7 +369,7 @@ def tools_db_cleanup():
 
             subtotal = sum(r['count'] for r in results.values())
             elapsed = round(time.time() - _ts_total, 2)
-            progress = f"| *{i}/{len(table_names)}* | *{readable_size(subtotal, base=1000)}* | | | | *{elapsed}* |"
+            progress = f"|*{i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
             add_note('\n'.join(HDR + _note_rows(results) + [progress]),
                      context=context, level='Task',
                      title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
@@ -378,7 +378,7 @@ def tools_db_cleanup():
 
         if results:
             total = sum(r['count'] for r in results.values())
-            footer = f"| **Итого** | **{readable_size(total, base=1000)}** | | | | **{duration}** |"
+            footer = f"|**Итого**|**{readable_size(total, base=1000)}**|||**{duration}**|"
             lines = HDR + _note_rows(results) + [footer]
             add_note('\n'.join(lines), context=context, level='Task',
                      title=f'🗑️ clean ({mode}, {retention_days}d)', duration=duration, add=False)

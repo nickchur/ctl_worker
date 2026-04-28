@@ -9,7 +9,7 @@
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
-| ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle` *(default)*, `False` — только стандартные     |
+| ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
 
 **Таски:**
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
@@ -71,13 +71,6 @@ _EXTRA_COND = {
         '{p}dag_run_id IN'
         ' (SELECT id FROM main.dag_run WHERE execution_date < :cutoff)'
     ),
-    # task_id (unique index) → external_executor_id в task_instance → dag_run
-    'celery_taskmeta': (
-        '{p}task_id IN ('
-        'SELECT ti.external_executor_id FROM main.task_instance ti'
-        ' JOIN main.dag_run dr ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id'
-        ' WHERE dr.execution_date < :cutoff AND ti.external_executor_id IS NOT NULL)'
-    ),
 }
 
 # Таблицы без индекса на recency-колонке но с integer PK —
@@ -86,9 +79,25 @@ _PK_BATCH = {
     'celery_tasksetmeta': 'id',
     'callback_request':   'id',
     'import_error':       'id',
+    'celery_taskmeta':    'id',
 }
 
-# Таблицы вне стандартного _cleanup_config с дополнительным safety-фильтром.
+# Таблицы вне стандартного _cleanup_config, включаемые всегда.
+_EXTRA_TABLES = {
+    # col=None: нет date-колонки с индексом; фильтр через task_id (unique) → external_executor_id join.
+    # Батчинг по PK id (см. _PK_BATCH).
+    'celery_taskmeta': {
+        'col': None,
+        'safe_where': (
+            'EXISTS (SELECT 1 FROM main.task_instance ti'
+            ' JOIN main.dag_run dr ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id'
+            ' WHERE ti.external_executor_id = {t}.task_id'
+            ' AND dr.execution_date < :cutoff)'
+        ),
+    },
+}
+
+# Таблицы вне стандартного _cleanup_config с дополнительным safety-фильтром (opt-in через custom=True).
 _CUSTOM_TABLES = {
     # Исходники DAG-файлов — нельзя трогать то, на что ссылается serialized_dag
     'dag_code': {
@@ -262,17 +271,18 @@ def tools_db_cleanup():
             return str(d)[:10] if d else '—'
 
         def _idx_label(tbl, col, session):
-            """✅ прямой индекс / ↗ косвенный / ❌ seq scan."""
-            n = session.execute(text("""
-                SELECT COUNT(*) FROM pg_index i
-                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                JOIN pg_class c ON c.oid = i.indrelid
-                JOIN pg_namespace ns ON ns.oid = c.relnamespace
-                WHERE ns.nspname = 'main' AND c.relname = :tbl AND a.attname = :col
-            """), {'tbl': tbl, 'col': col}).scalar()
-            if n:
-                return '✅'
-            if tbl in _EXTRA_COND:
+            """✅ прямой индекс / ↗ косвенный / 🔑 PK-батч / ❌ seq scan."""
+            if col:
+                n = session.execute(text("""
+                    SELECT COUNT(*) FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    JOIN pg_class c ON c.oid = i.indrelid
+                    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+                    WHERE ns.nspname = 'main' AND c.relname = :tbl AND a.attname = :col
+                """), {'tbl': tbl, 'col': col}).scalar()
+                if n:
+                    return '✅'
+            if tbl in _EXTRA_COND or tbl in _EXTRA_TABLES:
                 return '↗'
             if tbl in _PK_BATCH:
                 return '🔑'
@@ -283,17 +293,25 @@ def tools_db_cleanup():
             t = f'main.{tbl}'
             bind = {'cutoff': cutoff}
 
-            if tbl in _CUSTOM_TABLES:
-                # Таблицы вне стандартного Airflow cleanup — простой WHERE + safety-фильтр
-                custom = _CUSTOM_TABLES[tbl]
-                col = custom['col']
+            _extra_conf = _EXTRA_TABLES.get(tbl) or _CUSTOM_TABLES.get(tbl)
+            if _extra_conf:
+                # Таблицы вне стандартного Airflow cleanup — WHERE + safety-фильтр
+                col = _extra_conf['col']
+                safe_where = _extra_conf['safe_where'].format(t=t)
                 idx = _idx_label(tbl, col, session)
                 p = ''
-                base_where = f"{col} < :cutoff AND {custom['safe_where']}"
-                count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {base_where}")
-                def make_delete(batch_extra=''):
-                    w = base_where + (f' AND {batch_extra}' if batch_extra else '')
-                    return text(f"DELETE FROM {t} WHERE {w}")
+                if col is None:
+                    # Нет date-колонки: только safety-фильтр; min/max недоступны
+                    base_where = safe_where
+                    count_sql = text(f"SELECT COUNT(*), NULL, NULL FROM {t} WHERE {base_where}")
+                    def make_delete(batch_extra=''):
+                        return text(f"DELETE FROM {t} WHERE {base_where}")
+                else:
+                    base_where = f"{col} < :cutoff AND {safe_where}"
+                    count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {base_where}")
+                    def make_delete(batch_extra=''):
+                        w = base_where + (f' AND {batch_extra}' if batch_extra else '')
+                        return text(f"DELETE FROM {t} WHERE {w}")
             else:
                 cfg = _cleanup_config[tbl]
                 col = cfg.recency_column_name
@@ -389,7 +407,7 @@ def tools_db_cleanup():
                '|-|-|-|-|-|']
 
         custom = p.get('custom', True)
-        table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
+        table_names = list(_cleanup_config.keys()) + list(_EXTRA_TABLES.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
         results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()

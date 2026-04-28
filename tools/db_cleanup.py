@@ -73,6 +73,15 @@ _EXTRA_COND = {
     ),
 }
 
+# Таблицы без индекса на recency-колонке но с integer PK —
+# удаляем через ORDER BY pk LIMIT batch_size чтобы использовать PK-индекс.
+_PK_BATCH = {
+    'celery_taskmeta':    'id',
+    'celery_tasksetmeta': 'id',
+    'callback_request':   'id',
+    'import_error':       'id',
+}
+
 # Таблицы вне стандартного _cleanup_config с дополнительным safety-фильтром.
 _CUSTOM_TABLES = {
     # Исходники DAG-файлов — нельзя трогать то, на что ссылается serialized_dag
@@ -251,7 +260,7 @@ def tools_db_cleanup():
             """), {'tbl': tbl, 'col': col}).scalar()
             if n:
                 return '✅'
-            if tbl in _EXTRA_COND:
+            if tbl in _EXTRA_COND or tbl in _PK_BATCH:
                 return '↗'
             return '❌'
 
@@ -314,7 +323,24 @@ def tools_db_cleanup():
             batches = 0
             if count and not dry_run:
                 n_batches = (count + batch_size - 1) // batch_size
-                if n_batches > 1 and min_date is not None:
+                pk = _PK_BATCH.get(tbl)
+                if pk and n_batches > 1:
+                    # Нет индекса на recency-колонке — используем PK-индекс:
+                    # DELETE WHERE pk IN (SELECT pk WHERE ... ORDER BY pk LIMIT batch_size)
+                    pk_delete = text(
+                        f"DELETE FROM {t} WHERE {pk} IN"
+                        f" (SELECT {pk} FROM {t} WHERE {base_where}"
+                        f" ORDER BY {pk} LIMIT :lim)"
+                    )
+                    while True:
+                        res = session.execute(pk_delete, {**bind, 'lim': batch_size})
+                        session.commit()
+                        if res.rowcount == 0:
+                            break
+                        batches += 1
+                        if on_batch:
+                            on_batch(batches, n_batches, count, min_date, idx)
+                elif n_batches > 1 and min_date is not None:
                     start = pendulum.instance(min_date)
                     diff = (cutoff - start).total_seconds()
                     step = diff / n_batches

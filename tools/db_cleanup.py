@@ -9,7 +9,7 @@
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
-| ➕ `additional`     | `True` — включить `dag_code` и `dag_pickle` *(default)*, `False` — только стандартные     |
+| ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle` *(default)*, `False` — только стандартные     |
 
 **Таски:**
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
@@ -195,7 +195,7 @@ params = {
         type='boolean',
         description='True — VACUUM ANALYZE, False — пропустить',
     ),
-    'additional': Param(
+    'custom': Param(
         True,
         type='boolean',
         description='True — включить dag_code и dag_pickle, False — только стандартные таблицы',
@@ -338,8 +338,8 @@ def tools_db_cleanup():
         HDR = ['| Таблица | Строк | Min | Max | Idx | Время, с |',
                '|---------|-------|-----|-----|-----|---------|']
 
-        additional = p.get('additional', True)
-        table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if additional else [])
+        custom = p.get('custom', True)
+        table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
         results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()

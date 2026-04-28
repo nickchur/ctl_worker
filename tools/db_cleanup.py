@@ -32,6 +32,7 @@ logger = logging.getLogger("airflow.task")
 
 
 MAX_NOTE_LEN = 1000
+BATCH_SIZE = 50_000
 
 
 
@@ -168,40 +169,86 @@ def tools_db_cleanup():
         dry_run = p['dry_run']
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
 
+        def _fmt_date(d):
+            return str(d)[:10] if d else '—'
+
+        def _has_index(tbl, col, session):
+            n = session.execute(text("""
+                SELECT COUNT(*) FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                JOIN pg_class c ON c.oid = i.indrelid
+                JOIN pg_namespace ns ON ns.oid = c.relnamespace
+                WHERE ns.nspname = 'main' AND c.relname = :tbl AND a.attname = :col
+            """), {'tbl': tbl, 'col': col}).scalar()
+            return bool(n)
+
         def _do_cleanup(tbl, session):
-            """COUNT + optional DELETE for one table. Returns row count."""
             cfg = _cleanup_config[tbl]
             col = cfg.recency_column_name
             t = f'main.{tbl}'
             bind = {'cutoff': cutoff}
+            has_idx = _has_index(tbl, col, session)
 
             if cfg.keep_last and cfg.keep_last_group_by:
-                # Единственный такой случай — dag_run: сохраняем последний прогон на каждый dag_id
                 grp = cfg.keep_last_group_by[0]
                 keep_sub = (
                     f"SELECT {grp}, MAX({col}) AS _max FROM {t} "
                     f"WHERE external_trigger = false GROUP BY {grp}"
                 )
-                join_cond = f"base.{grp} = _l.{grp} AND base.{col} = _l._max"
-                where = f"base.{col} < :cutoff AND _l._max IS NULL"
+                jc = f"base.{grp} = _l.{grp} AND base.{col} = _l._max"
+                base_where = f"base.{col} < :cutoff AND _l._max IS NULL"
+                from_clause = f"{t} base LEFT JOIN ({keep_sub}) _l ON {jc}"
                 count_sql = text(
-                    f"SELECT COUNT(*) FROM {t} base "
-                    f"LEFT JOIN ({keep_sub}) _l ON {join_cond} WHERE {where}"
+                    f"SELECT COUNT(*), MIN(base.{col}), MAX(base.{col}) "
+                    f"FROM {from_clause} WHERE {base_where}"
                 )
-                delete_sql = text(
-                    f"DELETE FROM {t} WHERE id IN ("
-                    f"SELECT base.id FROM {t} base "
-                    f"LEFT JOIN ({keep_sub}) _l ON {join_cond} WHERE {where})"
-                )
+                def make_delete(extra=''):
+                    w = base_where + (f' AND {extra}' if extra else '')
+                    return text(f"DELETE FROM {t} WHERE id IN (SELECT base.id FROM {from_clause} WHERE {w})")
+                col_prefix = 'base.'
             else:
-                count_sql  = text(f"SELECT COUNT(*) FROM {t} WHERE {col} < :cutoff")
-                delete_sql = text(f"DELETE FROM {t} WHERE {col} < :cutoff")
+                count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {col} < :cutoff")
+                def make_delete(extra=''):
+                    w = f"{col} < :cutoff" + (f' AND {extra}' if extra else '')
+                    return text(f"DELETE FROM {t} WHERE {w}")
+                col_prefix = ''
 
-            count = session.execute(count_sql, bind).scalar() or 0
+            row = session.execute(count_sql, bind).fetchone()
+            count, min_date, max_date = row[0] or 0, row[1], row[2]
+
+            batches = 0
             if count and not dry_run:
-                session.execute(delete_sql, bind)
-                session.commit()
-            return count
+                n_batches = (count + BATCH_SIZE - 1) // BATCH_SIZE
+                if n_batches > 1 and min_date is not None:
+                    start = pendulum.instance(min_date)
+                    diff = (cutoff - start).total_seconds()
+                    step = diff / n_batches
+                    for j in range(n_batches):
+                        b_s = start.add(seconds=step * j)
+                        b_e = cutoff if j == n_batches - 1 else start.add(seconds=step * (j + 1))
+                        extra = f"{col_prefix}{col} >= :b_s AND {col_prefix}{col} < :b_e"
+                        session.execute(make_delete(extra), {**bind, 'b_s': b_s, 'b_e': b_e})
+                        session.commit()
+                        batches += 1
+                else:
+                    session.execute(make_delete(), bind)
+                    session.commit()
+                    batches = 1
+
+            return {'count': count, 'min_date': min_date, 'max_date': max_date,
+                    'has_idx': has_idx, 'batches': batches}
+
+        def _note_rows(res):
+            return [
+                f"| `{t}` | {readable_size(r['count'], base=1000)}"
+                f" | {_fmt_date(r['min_date'])} | {_fmt_date(r['max_date'])}"
+                f" | {'✅' if r['has_idx'] else '❌'}"
+                f" | {r.get('duration', '')} |"
+                for t, r in res.items()
+            ]
+
+        HDR = ['| Таблица | Строк | Min | Max | Idx | Время, с |',
+               '|---------|-------|-----|-----|-----|---------|']
 
         table_names = list(_cleanup_config.keys())
         results = {}
@@ -212,39 +259,31 @@ def tools_db_cleanup():
             _ts = time.time()
             try:
                 with create_session() as session:
-                    count = _do_cleanup(tbl, session)
+                    info = _do_cleanup(tbl, session)
             except Exception as e:
                 logger.warning(f"⚠️ {tbl}: {e}")
                 continue
-            dur = round(time.time() - _ts, 2)
-            results[tbl] = {'count': count, 'duration': dur}
-            logger.info(f"🔎 {tbl}: {count} rows, {dur}s")
+            info['duration'] = round(time.time() - _ts, 2)
+            results[tbl] = info
+            logger.info(
+                f"🔎 {tbl}: {info['count']} rows "
+                f"[{_fmt_date(info['min_date'])}…{_fmt_date(info['max_date'])}] "
+                f"idx={'✅' if info['has_idx'] else '❌'} batches={info['batches']} {info['duration']}s"
+            )
 
-            done_lines = [
-                '| Таблица | Строк | Время, с |',
-                '|---------|-------|---------|',
-            ] + [
-                f"| `{t}` | {readable_size(r['count'], base=1000)} | {r['duration']} |"
-                for t, r in results.items()
-            ]
             subtotal = sum(r['count'] for r in results.values())
             elapsed = round(time.time() - _ts_total, 2)
-            done_lines.append(f"| *{i}/{len(table_names)}* | *{readable_size(subtotal, base=1000)}* | *{elapsed}* |")
-            add_note('\n'.join(done_lines), context=context, level='Task',
+            progress = f"| *{i}/{len(table_names)}* | *{readable_size(subtotal, base=1000)}* | | | | *{elapsed}* |"
+            add_note('\n'.join(HDR + _note_rows(results) + [progress]),
+                     context=context, level='Task',
                      title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
 
         duration = round(time.time() - _ts_total, 2)
 
         if results:
-            lines = [
-                '| Таблица | Строк | Время, с |',
-                '|---------|-------|---------|',
-            ] + [
-                f"| `{t}` | {readable_size(r['count'], base=1000)} | {r['duration']} |"
-                for t, r in results.items()
-            ]
             total = sum(r['count'] for r in results.values())
-            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** | **{duration}** |")
+            footer = f"| **Итого** | **{readable_size(total, base=1000)}** | | | | **{duration}** |"
+            lines = HDR + _note_rows(results) + [footer]
             add_note('\n'.join(lines), context=context, level='Task',
                      title=f'🗑️ clean ({mode}, {retention_days}d)', duration=duration, add=False)
             add_note(

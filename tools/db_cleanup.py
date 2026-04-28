@@ -189,6 +189,11 @@ params = {
         type='boolean',
         description='True — VACUUM ANALYZE, False — пропустить',
     ),
+    'additional': Param(
+        True,
+        type='boolean',
+        description='True — включить dag_code и dag_pickle, False — только стандартные таблицы',
+    ),
 }
 
 
@@ -327,7 +332,8 @@ def tools_db_cleanup():
         HDR = ['| Таблица | Строк | Min | Max | Idx | Время, с |',
                '|---------|-------|-----|-----|-----|---------|']
 
-        table_names = list(_cleanup_config.keys()) + list(_CUSTOM_TABLES.keys())
+        additional = p.get('additional', True)
+        table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if additional else [])
         results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()

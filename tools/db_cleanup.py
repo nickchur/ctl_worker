@@ -196,9 +196,10 @@ def tools_db_cleanup():
         # Запускаем по одной таблице чтобы мерить время каждой
         table_names = list(_cleanup_config.keys())
         results = {}  # table -> {'count': int, 'duration': float}
+        mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()
         try:
-            for tbl in table_names:
+            for i, tbl in enumerate(table_names, 1):
                 capture = _LogCapture()
                 for _l in _patch:
                     _l.addHandler(capture)
@@ -225,11 +226,24 @@ def tools_db_cleanup():
                 if count is not None:
                     results[tbl] = {'count': count, 'duration': dur}
                     logger.info(f"🔎 {tbl}: {count} rows, {dur}s")
+
+                # Промежуточная заметка: текущая таблица + уже обработанные
+                done_lines = [
+                    '| Таблица | Строк | Время, с |',
+                    '|---------|-------|---------|',
+                ] + [
+                    f"| `{t}` | {readable_size(r['count'], base=1000)} | {r['duration']} |"
+                    for t, r in results.items()
+                ]
+                subtotal = sum(r['count'] for r in results.values())
+                elapsed = round(time.time() - _ts_total, 2)
+                done_lines.append(f"| *{i}/{len(table_names)}* | *{readable_size(subtotal, base=1000)}* | *{elapsed}* |")
+                add_note('\n'.join(done_lines), context=context, level='Task',
+                         title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
         finally:
             _dbc._do_delete = _orig
         duration = round(time.time() - _ts_total, 2)
 
-        mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         if results:
             lines = [
                 '| Таблица | Строк | Время, с |',
@@ -240,7 +254,8 @@ def tools_db_cleanup():
             ]
             total = sum(r['count'] for r in results.values())
             lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** | **{duration}** |")
-            add_note('\n'.join(lines), context=context, level='Task', title=f'🗑️ clean ({mode}, {retention_days}d)', duration=duration)
+            add_note('\n'.join(lines), context=context, level='Task',
+                     title=f'🗑️ clean ({mode}, {retention_days}d)', duration=duration, add=False)
             add_note(
                 f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.format("YYYY-MM-DD")}',
                 context=context, level='DAG', title='🗑️ clean', duration=duration,

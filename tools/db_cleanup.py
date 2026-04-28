@@ -221,6 +221,11 @@ params = {
         minimum=1000,
         description='Максимальный размер порции при удалении (строк)',
     ),
+    'lock_timeout': Param(
+        '10min',
+        type='string',
+        description='Таймаут ожидания блокировки (например: 10min, 30s)',
+    ),
 }
 
 
@@ -250,6 +255,7 @@ def tools_db_cleanup():
 
         dry_run = p['dry_run']
         batch_size = p.get('batch_size', BATCH_SIZE)
+        lock_timeout = p.get('lock_timeout', '10min')
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
 
         def _fmt_date(d):
@@ -273,7 +279,7 @@ def tools_db_cleanup():
             return '❌'
 
         def _do_cleanup(tbl, session, on_batch=None):
-            session.execute(text("SET lock_timeout = '10min'"))
+            session.execute(text(f"SET lock_timeout = '{lock_timeout}'"))
             t = f'main.{tbl}'
             bind = {'cutoff': cutoff}
 

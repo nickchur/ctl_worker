@@ -273,6 +273,7 @@ def tools_db_cleanup():
             return '❌'
 
         def _do_cleanup(tbl, session, on_batch=None):
+            session.execute(text("SET lock_timeout = '10min'"))
             t = f'main.{tbl}'
             bind = {'cutoff': cutoff}
 

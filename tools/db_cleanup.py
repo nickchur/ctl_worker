@@ -20,25 +20,16 @@ from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.session import create_session
 from airflow.operators.python import get_current_context
 from airflow import settings
-from airflow.utils.db_cleanup import run_cleanup, config_dict as _cleanup_config
+from airflow.utils.db_cleanup import config_dict as _cleanup_config
 from sqlalchemy import text
 
 from pprint import PrettyPrinter
 import pendulum
 import time
-import re
 import logging
 
 logger = logging.getLogger("airflow.task")
 
-
-class _LogCapture(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.lines = []
-
-    def emit(self, record):
-        self.lines.append(record.getMessage())
 
 MAX_NOTE_LEN = 1000
 
@@ -177,71 +168,71 @@ def tools_db_cleanup():
         dry_run = p['dry_run']
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
 
-        # skip_archive=True в run_cleanup не срабатывает в этой версии Airflow —
-        # _orig сам делает CTAS невзирая на флаг → заменяем целиком, делаем DELETE напрямую
-        from airflow.utils import db_cleanup as _dbc
-        from sqlalchemy import delete as _sa_delete
+        def _do_cleanup(tbl, session):
+            """COUNT + optional DELETE for one table. Returns row count."""
+            cfg = _cleanup_config[tbl]
+            col = cfg.recency_column_name
+            t = f'main.{tbl}'
+            bind = {'cutoff': cutoff}
 
-        def _patched_do_delete(*, query, orm_model, skip_archive, session):
-            session.execute(_sa_delete(orm_model).where(query.whereclause))
+            if cfg.keep_last and cfg.keep_last_group_by:
+                # Единственный такой случай — dag_run: сохраняем последний прогон на каждый dag_id
+                grp = cfg.keep_last_group_by[0]
+                keep_sub = (
+                    f"SELECT {grp}, MAX({col}) AS _max FROM {t} "
+                    f"WHERE external_trigger = false GROUP BY {grp}"
+                )
+                join_cond = f"base.{grp} = _l.{grp} AND base.{col} = _l._max"
+                where = f"base.{col} < :cutoff AND _l._max IS NULL"
+                count_sql = text(
+                    f"SELECT COUNT(*) FROM {t} base "
+                    f"LEFT JOIN ({keep_sub}) _l ON {join_cond} WHERE {where}"
+                )
+                delete_sql = text(
+                    f"DELETE FROM {t} WHERE id IN ("
+                    f"SELECT base.id FROM {t} base "
+                    f"LEFT JOIN ({keep_sub}) _l ON {join_cond} WHERE {where})"
+                )
+            else:
+                count_sql  = text(f"SELECT COUNT(*) FROM {t} WHERE {col} < :cutoff")
+                delete_sql = text(f"DELETE FROM {t} WHERE {col} < :cutoff")
 
-        _orig = _dbc._do_delete
-        _dbc._do_delete = _patched_do_delete
+            count = session.execute(count_sql, bind).scalar() or 0
+            if count and not dry_run:
+                session.execute(delete_sql, bind)
+                session.commit()
+            return count
 
-        _patch = [
-            logging.getLogger('airflow.task'),
-            logging.getLogger('airflow.utils.db_cleanup'),
-        ]
-
-        # Запускаем по одной таблице чтобы мерить время каждой
         table_names = list(_cleanup_config.keys())
-        results = {}  # table -> {'count': int, 'duration': float}
+        results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()
-        try:
-            for i, tbl in enumerate(table_names, 1):
-                capture = _LogCapture()
-                for _l in _patch:
-                    _l.addHandler(capture)
-                _ts = time.time()
-                try:
-                    run_cleanup(
-                        clean_before_timestamp=cutoff,
-                        table_names=[tbl],
-                        dry_run=dry_run,
-                        verbose=True,
-                        confirm=False,
-                        skip_archive=True,
-                    )
-                finally:
-                    for _l in _patch:
-                        _l.removeHandler(capture)
-                dur = round(time.time() - _ts, 2)
 
-                count = None
-                for line in capture.lines:
-                    nm = re.search(r'\b(\d+)\s+rows?\b', line, re.IGNORECASE)
-                    if nm:
-                        count = int(nm.group(1))
-                if count is not None:
-                    results[tbl] = {'count': count, 'duration': dur}
-                    logger.info(f"🔎 {tbl}: {count} rows, {dur}s")
+        for i, tbl in enumerate(table_names, 1):
+            _ts = time.time()
+            try:
+                with create_session() as session:
+                    count = _do_cleanup(tbl, session)
+            except Exception as e:
+                logger.warning(f"⚠️ {tbl}: {e}")
+                continue
+            dur = round(time.time() - _ts, 2)
+            results[tbl] = {'count': count, 'duration': dur}
+            logger.info(f"🔎 {tbl}: {count} rows, {dur}s")
 
-                # Промежуточная заметка: текущая таблица + уже обработанные
-                done_lines = [
-                    '| Таблица | Строк | Время, с |',
-                    '|---------|-------|---------|',
-                ] + [
-                    f"| `{t}` | {readable_size(r['count'], base=1000)} | {r['duration']} |"
-                    for t, r in results.items()
-                ]
-                subtotal = sum(r['count'] for r in results.values())
-                elapsed = round(time.time() - _ts_total, 2)
-                done_lines.append(f"| *{i}/{len(table_names)}* | *{readable_size(subtotal, base=1000)}* | *{elapsed}* |")
-                add_note('\n'.join(done_lines), context=context, level='Task',
-                         title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
-        finally:
-            _dbc._do_delete = _orig
+            done_lines = [
+                '| Таблица | Строк | Время, с |',
+                '|---------|-------|---------|',
+            ] + [
+                f"| `{t}` | {readable_size(r['count'], base=1000)} | {r['duration']} |"
+                for t, r in results.items()
+            ]
+            subtotal = sum(r['count'] for r in results.values())
+            elapsed = round(time.time() - _ts_total, 2)
+            done_lines.append(f"| *{i}/{len(table_names)}* | *{readable_size(subtotal, base=1000)}* | *{elapsed}* |")
+            add_note('\n'.join(done_lines), context=context, level='Task',
+                     title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+
         duration = round(time.time() - _ts_total, 2)
 
         if results:

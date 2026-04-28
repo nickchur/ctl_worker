@@ -230,7 +230,7 @@ params = {
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
-    schedule_interval='@weekly',
+    schedule_interval='0 2 * * *',
     params=params,
 )
 def tools_db_cleanup():

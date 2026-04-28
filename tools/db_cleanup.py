@@ -255,7 +255,7 @@ def tools_db_cleanup():
                 return '↗'
             return '❌'
 
-        def _do_cleanup(tbl, session):
+        def _do_cleanup(tbl, session, on_batch=None):
             t = f'main.{tbl}'
             bind = {'cutoff': cutoff}
 
@@ -325,6 +325,8 @@ def tools_db_cleanup():
                         session.execute(make_delete(batch_extra), {**bind, 'b_s': b_s, 'b_e': b_e})
                         session.commit()
                         batches += 1
+                        if on_batch:
+                            on_batch(batches, n_batches, count, min_date, idx)
                 else:
                     session.execute(make_delete(), bind)
                     session.commit()
@@ -353,9 +355,20 @@ def tools_db_cleanup():
 
         for i, tbl in enumerate(table_names, 1):
             _ts = time.time()
+
+            def _on_batch(done, total, count, min_date, idx, _tbl=tbl, _i=i):
+                elapsed = round(time.time() - _ts_total, 2)
+                cur = {'count': count, 'min_date': min_date, 'idx': idx,
+                       'duration': f'{done}/{total}'}
+                subtotal = sum(r['count'] for r in results.values()) + count
+                prog = f"|*{_i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
+                add_note('\n'.join(HDR + _note_rows(results) + _note_rows({_tbl: cur}) + [prog]),
+                         context=context, level='Task',
+                         title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+
             try:
                 with create_session() as session:
-                    info = _do_cleanup(tbl, session)
+                    info = _do_cleanup(tbl, session, on_batch=_on_batch)
             except Exception as e:
                 logger.warning(f"⚠️ {tbl}: {e}")
                 continue

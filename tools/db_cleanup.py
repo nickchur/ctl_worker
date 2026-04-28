@@ -298,7 +298,7 @@ def tools_db_cleanup():
                     return text(f"DELETE FROM {t} WHERE {w}")
             else:
                 cfg = _cleanup_config[tbl]
-                col = cfg.recency_column_name
+                col = str(cfg.recency_column_name)
                 idx = _idx_label(tbl, col, session)
 
                 if cfg.keep_last and cfg.keep_last_group_by:

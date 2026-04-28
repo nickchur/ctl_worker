@@ -406,6 +406,14 @@ def tools_db_cleanup():
                     info = _do_cleanup(tbl, session, on_batch=_on_batch)
             except Exception as e:
                 logger.warning(f"⚠️ {tbl}: {e}")
+                results[tbl] = {'count': 0, 'min_date': None, 'idx': '⚠️',
+                                 'duration': str(e)[:40], 'batches': 0}
+                elapsed = round(time.time() - _ts_total, 2)
+                subtotal = sum(r['count'] for r in results.values())
+                prog = f"|*{i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
+                add_note('\n'.join(HDR + _note_rows(results) + [prog]),
+                         context=context, level='Task',
+                         title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
                 continue
             info['duration'] = round(time.time() - _ts, 2)
             results[tbl] = info

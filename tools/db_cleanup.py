@@ -205,7 +205,7 @@ params = {
         description='True — VACUUM ANALYZE, False — пропустить',
     ),
     'custom': Param(
-        True,
+        False,
         type='boolean',
         description='True — включить dag_code и dag_pickle, False — только стандартные таблицы',
     ),

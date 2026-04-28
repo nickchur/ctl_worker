@@ -177,15 +177,6 @@ def tools_db_cleanup():
         dry_run = p['dry_run']
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
 
-        capture = _LogCapture()
-        # INFO-сообщения ("Found N rows", "Checking table") идут через StreamLogWriter
-        # → airflow.task logger, а не через airflow.utils.db_cleanup
-        _patch = [
-            logging.getLogger('airflow.task'),
-            logging.getLogger('airflow.utils.db_cleanup'),
-        ]
-        for _l in _patch:
-            _l.addHandler(capture)
         # skip_archive=True в run_cleanup не срабатывает в этой версии Airflow —
         # _orig сам делает CTAS невзирая на флаг → заменяем целиком, делаем DELETE напрямую
         from airflow.utils import db_cleanup as _dbc
@@ -197,45 +188,58 @@ def tools_db_cleanup():
         _orig = _dbc._do_delete
         _dbc._do_delete = _patched_do_delete
 
-        _ts = time.time()
+        _patch = [
+            logging.getLogger('airflow.task'),
+            logging.getLogger('airflow.utils.db_cleanup'),
+        ]
+
+        # Запускаем по одной таблице чтобы мерить время каждой
+        table_names = list(_cleanup_config.keys())
+        results = {}  # table -> {'count': int, 'duration': float}
+        _ts_total = time.time()
         try:
-            run_cleanup(
-                clean_before_timestamp=cutoff,
-                table_names=None,
-                dry_run=dry_run,
-                verbose=True,
-                confirm=False,
-                skip_archive=True,
-            )
+            for tbl in table_names:
+                capture = _LogCapture()
+                for _l in _patch:
+                    _l.addHandler(capture)
+                _ts = time.time()
+                try:
+                    run_cleanup(
+                        clean_before_timestamp=cutoff,
+                        table_names=[tbl],
+                        dry_run=dry_run,
+                        verbose=True,
+                        confirm=False,
+                        skip_archive=True,
+                    )
+                finally:
+                    for _l in _patch:
+                        _l.removeHandler(capture)
+                dur = round(time.time() - _ts, 2)
+
+                count = None
+                for line in capture.lines:
+                    nm = re.search(r'\b(\d+)\s+rows?\b', line, re.IGNORECASE)
+                    if nm:
+                        count = int(nm.group(1))
+                if count is not None:
+                    results[tbl] = {'count': count, 'duration': dur}
+                    logger.info(f"🔎 {tbl}: {count} rows, {dur}s")
         finally:
             _dbc._do_delete = _orig
-            for _l in _patch:
-                _l.removeHandler(capture)
-        duration = round(time.time() - _ts, 2)
-
-        # Таблица и счётчик в разных строках:
-        # "Performing dry run for table xcom" / "Checking table xcom"  → current_table
-        # "Found 42722 rows meeting deletion criteria."                 → count
-        counts = {}
-        current_table = None
-        for line in capture.lines:
-            tm = re.search(r'\btable\s+(\w+)', line, re.IGNORECASE)
-            if tm:
-                current_table = tm.group(1)
-            nm = re.search(r'\b(\d+)\s+rows?\b', line, re.IGNORECASE)
-            if nm and current_table:
-                counts[current_table] = int(nm.group(1))
-
-        logger.info(f"🔎 capture.lines({len(capture.lines)}): {capture.lines[:10]}")
+        duration = round(time.time() - _ts_total, 2)
 
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
-        if counts:
+        if results:
             lines = [
-                '| Таблица | Строк |',
-                '|---------|-------|',
-            ] + [f"| `{t}` | {readable_size(n, base=1000)} |" for t, n in counts.items()]
-            total = sum(counts.values())
-            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** |")
+                '| Таблица | Строк | Время, с |',
+                '|---------|-------|---------|',
+            ] + [
+                f"| `{t}` | {readable_size(r['count'], base=1000)} | {r['duration']} |"
+                for t, r in results.items()
+            ]
+            total = sum(r['count'] for r in results.values())
+            lines.append(f"| **Итого** | **{readable_size(total, base=1000)}** | **{duration}** |")
             add_note('\n'.join(lines), context=context, level='Task', title=f'🗑️ clean ({mode}, {retention_days}d)', duration=duration)
             add_note(
                 f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.format("YYYY-MM-DD")}',
@@ -247,7 +251,7 @@ def tools_db_cleanup():
                 context=context, level='DAG,Task', title='🗑️ clean', duration=duration,
             )
 
-        return list(counts.keys())
+        return list(results.keys())
 
     @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
     def vacuum(**context):

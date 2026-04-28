@@ -34,6 +34,39 @@ logger = logging.getLogger("airflow.task")
 MAX_NOTE_LEN = 1000
 BATCH_SIZE = 50_000
 
+# Дополнительные условия для использования существующих индексов без создания новых.
+# {p} — префикс алиаса таблицы ('' или 'base.').
+# Опираемся на idx_dag_run_execution_date: execution_date ≤ start_date всегда,
+# поэтому start_date < cutoff ⟹ execution_date < cutoff (безопасное добавление).
+_EXTRA_COND = {
+    'dag_run': '{p}execution_date < :cutoff',
+    'task_instance': (
+        'EXISTS (SELECT 1 FROM main.dag_run _dr'
+        ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
+        ' AND _dr.execution_date < :cutoff)'
+    ),
+    'task_instance_history': (
+        'EXISTS (SELECT 1 FROM main.dag_run _dr'
+        ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
+        ' AND _dr.execution_date < :cutoff)'
+    ),
+    'task_fail': (
+        'EXISTS (SELECT 1 FROM main.dag_run _dr'
+        ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
+        ' AND _dr.execution_date < :cutoff)'
+    ),
+    'task_reschedule': (
+        'EXISTS (SELECT 1 FROM main.dag_run _dr'
+        ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
+        ' AND _dr.execution_date < :cutoff)'
+    ),
+    # dag_run_id — FK на dag_run.id; подзапрос использует idx_dag_run_execution_date
+    'xcom': (
+        '{p}dag_run_id IN'
+        ' (SELECT id FROM main.dag_run WHERE execution_date < :cutoff)'
+    ),
+}
+
 
 
 def add_note(msg, context=None, level='task', add=True, title='', compact=False, duration=None):
@@ -172,7 +205,8 @@ def tools_db_cleanup():
         def _fmt_date(d):
             return str(d)[:10] if d else '—'
 
-        def _has_index(tbl, col, session):
+        def _idx_label(tbl, col, session):
+            """✅ прямой индекс / ↗ косвенный / ❌ seq scan."""
             n = session.execute(text("""
                 SELECT COUNT(*) FROM pg_index i
                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
@@ -180,16 +214,21 @@ def tools_db_cleanup():
                 JOIN pg_namespace ns ON ns.oid = c.relnamespace
                 WHERE ns.nspname = 'main' AND c.relname = :tbl AND a.attname = :col
             """), {'tbl': tbl, 'col': col}).scalar()
-            return bool(n)
+            if n:
+                return '✅'
+            if tbl in _EXTRA_COND:
+                return '↗'
+            return '❌'
 
         def _do_cleanup(tbl, session):
             cfg = _cleanup_config[tbl]
             col = cfg.recency_column_name
             t = f'main.{tbl}'
             bind = {'cutoff': cutoff}
-            has_idx = _has_index(tbl, col, session)
+            idx = _idx_label(tbl, col, session)
 
             if cfg.keep_last and cfg.keep_last_group_by:
+                p = 'base.'
                 grp = cfg.keep_last_group_by[0]
                 keep_sub = (
                     f"SELECT {grp}, MAX({col}) AS _max FROM {t} "
@@ -198,20 +237,29 @@ def tools_db_cleanup():
                 jc = f"base.{grp} = _l.{grp} AND base.{col} = _l._max"
                 base_where = f"base.{col} < :cutoff AND _l._max IS NULL"
                 from_clause = f"{t} base LEFT JOIN ({keep_sub}) _l ON {jc}"
+            else:
+                p = ''
+                base_where = f"{col} < :cutoff"
+                from_clause = t
+
+            # Дополнительное условие для использования существующего индекса
+            extra_cond = _EXTRA_COND.get(tbl, '').format(p=p)
+            if extra_cond:
+                base_where += f' AND {extra_cond}'
+
+            if cfg.keep_last and cfg.keep_last_group_by:
                 count_sql = text(
                     f"SELECT COUNT(*), MIN(base.{col}), MAX(base.{col}) "
                     f"FROM {from_clause} WHERE {base_where}"
                 )
-                def make_delete(extra=''):
-                    w = base_where + (f' AND {extra}' if extra else '')
+                def make_delete(batch_extra=''):
+                    w = base_where + (f' AND {batch_extra}' if batch_extra else '')
                     return text(f"DELETE FROM {t} WHERE id IN (SELECT base.id FROM {from_clause} WHERE {w})")
-                col_prefix = 'base.'
             else:
-                count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {col} < :cutoff")
-                def make_delete(extra=''):
-                    w = f"{col} < :cutoff" + (f' AND {extra}' if extra else '')
+                count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {base_where}")
+                def make_delete(batch_extra=''):
+                    w = base_where + (f' AND {batch_extra}' if batch_extra else '')
                     return text(f"DELETE FROM {t} WHERE {w}")
-                col_prefix = ''
 
             row = session.execute(count_sql, bind).fetchone()
             count, min_date, max_date = row[0] or 0, row[1], row[2]
@@ -226,8 +274,8 @@ def tools_db_cleanup():
                     for j in range(n_batches):
                         b_s = start.add(seconds=step * j)
                         b_e = cutoff if j == n_batches - 1 else start.add(seconds=step * (j + 1))
-                        extra = f"{col_prefix}{col} >= :b_s AND {col_prefix}{col} < :b_e"
-                        session.execute(make_delete(extra), {**bind, 'b_s': b_s, 'b_e': b_e})
+                        batch_extra = f"{p}{col} >= :b_s AND {p}{col} < :b_e"
+                        session.execute(make_delete(batch_extra), {**bind, 'b_s': b_s, 'b_e': b_e})
                         session.commit()
                         batches += 1
                 else:
@@ -236,13 +284,13 @@ def tools_db_cleanup():
                     batches = 1
 
             return {'count': count, 'min_date': min_date, 'max_date': max_date,
-                    'has_idx': has_idx, 'batches': batches}
+                    'idx': idx, 'batches': batches}
 
         def _note_rows(res):
             return [
                 f"| `{t}` | {readable_size(r['count'], base=1000)}"
                 f" | {_fmt_date(r['min_date'])} | {_fmt_date(r['max_date'])}"
-                f" | {'✅' if r['has_idx'] else '❌'}"
+                f" | {r['idx']}"
                 f" | {r.get('duration', '')} |"
                 for t, r in res.items()
             ]
@@ -268,7 +316,7 @@ def tools_db_cleanup():
             logger.info(
                 f"🔎 {tbl}: {info['count']} rows "
                 f"[{_fmt_date(info['min_date'])}…{_fmt_date(info['max_date'])}] "
-                f"idx={'✅' if info['has_idx'] else '❌'} batches={info['batches']} {info['duration']}s"
+                f"idx={info['idx']} batches={info['batches']} {info['duration']}s"
             )
 
             subtotal = sum(r['count'] for r in results.values())

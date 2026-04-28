@@ -953,6 +953,23 @@ ALTER TABLE dag ADD COLUMN ci VARCHAR(50) DEFAULT '';
 
 CREATE INDEX idx_dag_run_execution_date ON main.dag_run(execution_date);
 
+-- Indexes for db_cleanup recency columns
+CREATE INDEX IF NOT EXISTS idx_callback_request_created_at      ON main.callback_request      (created_at);
+CREATE INDEX IF NOT EXISTS idx_celery_taskmeta_date_done        ON main.celery_taskmeta        (date_done);
+CREATE INDEX IF NOT EXISTS idx_celery_tasksetmeta_date_done     ON main.celery_tasksetmeta     (date_done);
+CREATE INDEX IF NOT EXISTS idx_dag_last_parsed_time             ON main.dag                    (last_parsed_time);
+CREATE INDEX IF NOT EXISTS idx_dag_run_start_date               ON main.dag_run                (start_date);
+CREATE INDEX IF NOT EXISTS idx_dataset_event_timestamp          ON main.dataset_event          (timestamp);
+CREATE INDEX IF NOT EXISTS idx_import_error_timestamp           ON main.import_error           (timestamp);
+CREATE INDEX IF NOT EXISTS idx_job_latest_heartbeat             ON main.job                    (latest_heartbeat);
+CREATE INDEX IF NOT EXISTS idx_sla_miss_timestamp               ON main.sla_miss               (timestamp);
+CREATE INDEX IF NOT EXISTS idx_task_fail_start_date             ON main.task_fail              (start_date);
+CREATE INDEX IF NOT EXISTS idx_task_instance_start_date         ON main.task_instance          (start_date);
+CREATE INDEX IF NOT EXISTS idx_task_instance_history_start_date ON main.task_instance_history  (start_date);
+CREATE INDEX IF NOT EXISTS idx_task_reschedule_start_date       ON main.task_reschedule        (start_date);
+CREATE INDEX IF NOT EXISTS idx_trigger_created_date             ON main.trigger                (created_date);
+CREATE INDEX IF NOT EXISTS idx_xcom_timestamp                   ON main.xcom                   (timestamp);
+
 create table if not exists main.user_constraints
 (
     id uuid

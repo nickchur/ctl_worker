@@ -67,6 +67,23 @@ _EXTRA_COND = {
     ),
 }
 
+# Таблицы вне стандартного _cleanup_config с дополнительным safety-фильтром.
+_CUSTOM_TABLES = {
+    # Исходники DAG-файлов — нельзя трогать то, на что ссылается serialized_dag
+    'dag_code': {
+        'col': 'last_updated',
+        'safe_where': (
+            'fileloc_hash NOT IN (SELECT fileloc_hash FROM main.serialized_dag)'
+        ),
+    },
+    # Устаревший pickle-формат — нельзя трогать то, на что ссылается dag.pickle_id
+    'dag_pickle': {
+        'col': 'created_dttm',
+        'safe_where': (
+            'id NOT IN (SELECT pickle_id FROM main.dag WHERE pickle_id IS NOT NULL)'
+        ),
+    },
+}
 
 
 def add_note(msg, context=None, level='task', add=True, title='', compact=False, duration=None):
@@ -221,45 +238,57 @@ def tools_db_cleanup():
             return '❌'
 
         def _do_cleanup(tbl, session):
-            cfg = _cleanup_config[tbl]
-            col = cfg.recency_column_name
             t = f'main.{tbl}'
             bind = {'cutoff': cutoff}
-            idx = _idx_label(tbl, col, session)
 
-            if cfg.keep_last and cfg.keep_last_group_by:
-                p = 'base.'
-                grp = cfg.keep_last_group_by[0]
-                keep_sub = (
-                    f"SELECT {grp}, MAX({col}) AS _max FROM {t} "
-                    f"WHERE external_trigger = false GROUP BY {grp}"
-                )
-                jc = f"base.{grp} = _l.{grp} AND base.{col} = _l._max"
-                base_where = f"base.{col} < :cutoff AND _l._max IS NULL"
-                from_clause = f"{t} base LEFT JOIN ({keep_sub}) _l ON {jc}"
-            else:
+            if tbl in _CUSTOM_TABLES:
+                # Таблицы вне стандартного Airflow cleanup — простой WHERE + safety-фильтр
+                custom = _CUSTOM_TABLES[tbl]
+                col = custom['col']
+                idx = _idx_label(tbl, col, session)
                 p = ''
-                base_where = f"{col} < :cutoff"
-                from_clause = t
-
-            # Дополнительное условие для использования существующего индекса
-            extra_cond = _EXTRA_COND.get(tbl, '').format(p=p)
-            if extra_cond:
-                base_where += f' AND {extra_cond}'
-
-            if cfg.keep_last and cfg.keep_last_group_by:
-                count_sql = text(
-                    f"SELECT COUNT(*), MIN(base.{col}), MAX(base.{col}) "
-                    f"FROM {from_clause} WHERE {base_where}"
-                )
-                def make_delete(batch_extra=''):
-                    w = base_where + (f' AND {batch_extra}' if batch_extra else '')
-                    return text(f"DELETE FROM {t} WHERE id IN (SELECT base.id FROM {from_clause} WHERE {w})")
-            else:
+                base_where = f"{col} < :cutoff AND {custom['safe_where']}"
                 count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {base_where}")
                 def make_delete(batch_extra=''):
                     w = base_where + (f' AND {batch_extra}' if batch_extra else '')
                     return text(f"DELETE FROM {t} WHERE {w}")
+            else:
+                cfg = _cleanup_config[tbl]
+                col = cfg.recency_column_name
+                idx = _idx_label(tbl, col, session)
+
+                if cfg.keep_last and cfg.keep_last_group_by:
+                    p = 'base.'
+                    grp = cfg.keep_last_group_by[0]
+                    keep_sub = (
+                        f"SELECT {grp}, MAX({col}) AS _max FROM {t} "
+                        f"WHERE external_trigger = false GROUP BY {grp}"
+                    )
+                    jc = f"base.{grp} = _l.{grp} AND base.{col} = _l._max"
+                    base_where = f"base.{col} < :cutoff AND _l._max IS NULL"
+                    from_clause = f"{t} base LEFT JOIN ({keep_sub}) _l ON {jc}"
+                else:
+                    p = ''
+                    base_where = f"{col} < :cutoff"
+                    from_clause = t
+
+                extra_cond = _EXTRA_COND.get(tbl, '').format(p=p)
+                if extra_cond:
+                    base_where += f' AND {extra_cond}'
+
+                if cfg.keep_last and cfg.keep_last_group_by:
+                    count_sql = text(
+                        f"SELECT COUNT(*), MIN(base.{col}), MAX(base.{col}) "
+                        f"FROM {from_clause} WHERE {base_where}"
+                    )
+                    def make_delete(batch_extra=''):
+                        w = base_where + (f' AND {batch_extra}' if batch_extra else '')
+                        return text(f"DELETE FROM {t} WHERE id IN (SELECT base.id FROM {from_clause} WHERE {w})")
+                else:
+                    count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {base_where}")
+                    def make_delete(batch_extra=''):
+                        w = base_where + (f' AND {batch_extra}' if batch_extra else '')
+                        return text(f"DELETE FROM {t} WHERE {w}")
 
             row = session.execute(count_sql, bind).fetchone()
             count, min_date, max_date = row[0] or 0, row[1], row[2]
@@ -298,7 +327,7 @@ def tools_db_cleanup():
         HDR = ['| Таблица | Строк | Min | Max | Idx | Время, с |',
                '|---------|-------|-----|-----|-----|---------|']
 
-        table_names = list(_cleanup_config.keys())
+        table_names = list(_cleanup_config.keys()) + list(_CUSTOM_TABLES.keys())
         results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()

@@ -200,6 +200,12 @@ params = {
         type='boolean',
         description='True — включить dag_code и dag_pickle, False — только стандартные таблицы',
     ),
+    'batch_size': Param(
+        BATCH_SIZE,
+        type='integer',
+        minimum=1000,
+        description='Максимальный размер порции при удалении (строк)',
+    ),
 }
 
 
@@ -228,6 +234,7 @@ def tools_db_cleanup():
             raise AirflowFailException(f'retention_days={retention_days} меньше минимума (30)')
 
         dry_run = p['dry_run']
+        batch_size = p.get('batch_size', BATCH_SIZE)
         cutoff = pendulum.now('UTC').subtract(days=retention_days)
 
         def _fmt_date(d):
@@ -306,7 +313,7 @@ def tools_db_cleanup():
 
             batches = 0
             if count and not dry_run:
-                n_batches = (count + BATCH_SIZE - 1) // BATCH_SIZE
+                n_batches = (count + batch_size - 1) // batch_size
                 if n_batches > 1 and min_date is not None:
                     start = pendulum.instance(min_date)
                     diff = (cutoff - start).total_seconds()

@@ -68,8 +68,8 @@ _EXTRA_COND = {
     ),
     # dag_run_id — FK на dag_run.id; подзапрос использует idx_dag_run_execution_date
     'xcom': (
-        '{p}dag_run_id IN'
-        ' (SELECT id FROM main.dag_run WHERE execution_date < :cutoff)'
+        'EXISTS (SELECT 1 FROM main.dag_run _dr'
+        ' WHERE _dr.id = {p}dag_run_id AND _dr.execution_date < :cutoff)'
     ),
     # task_id — уникальный индекс; EXISTS через external_executor_id → dag_run.execution_date
     'celery_taskmeta': (

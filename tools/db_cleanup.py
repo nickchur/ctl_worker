@@ -71,12 +71,18 @@ _EXTRA_COND = {
         '{p}dag_run_id IN'
         ' (SELECT id FROM main.dag_run WHERE execution_date < :cutoff)'
     ),
+    # task_id (unique index) → external_executor_id в task_instance → dag_run
+    'celery_taskmeta': (
+        '{p}task_id IN ('
+        'SELECT ti.external_executor_id FROM main.task_instance ti'
+        ' JOIN main.dag_run dr ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id'
+        ' WHERE dr.execution_date < :cutoff AND ti.external_executor_id IS NOT NULL)'
+    ),
 }
 
 # Таблицы без индекса на recency-колонке но с integer PK —
 # удаляем через ORDER BY pk LIMIT batch_size чтобы использовать PK-индекс.
 _PK_BATCH = {
-    'celery_taskmeta':    'id',
     'celery_tasksetmeta': 'id',
     'callback_request':   'id',
     'import_error':       'id',

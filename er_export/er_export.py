@@ -279,7 +279,7 @@ for _table_key, _params in tables.items():
             (колонки из CH + extra_columns из конфига) и кладёт его в XCom под ключом meta_json."""
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-            rows = hook.get_records(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}")
+            rows = hook.run(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}")
             columns = []
             for row in rows:
                 source_type, notnull = parse_ch_type(row[1])

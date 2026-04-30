@@ -244,7 +244,7 @@ for _table_key, _params in tables.items():
             task_id='check_need_auto_confirm_delta',
             sql=f"select auto_confirm_delta from export.extract_registry_vw where extract_name = '{_tbl}'",
             follow_task_ids_if_true=['auto_confirm_delta'],
-            follow_task_ids_if_false=['not_need_auto_confirm'],
+            follow_task_ids_if_false=['get_delta_params'],
             do_xcom_push=True,
         )
 
@@ -263,8 +263,6 @@ for _table_key, _params in tables.items():
                       and sent is not null and confirmed is null
             """,
         )
-
-        not_need_auto_confirm = DummyOperator(task_id='not_need_auto_confirm')
 
         get_delta_params = ClickHouseOperator(
             task_id='get_delta_params',
@@ -488,7 +486,8 @@ for _table_key, _params in tables.items():
 
         # ── task dependencies ────────────────────────────────────────────────
         create_bucket >> check_need_auto_confirm_delta
-        check_need_auto_confirm_delta >> [auto_confirm_delta, not_need_auto_confirm] >> get_delta_params
+        check_need_auto_confirm_delta >> auto_confirm_delta >> get_delta_params
+        check_need_auto_confirm_delta >> get_delta_params
         get_delta_params >> [select_extract_params, t_get_metadata]
         [select_extract_params, t_get_metadata] >> copy_clickhouse_query
         copy_clickhouse_query >> t_package >> notify_tfs_kafka >> t_update >> t_check_next

@@ -432,7 +432,7 @@ for _table_key, _params in tables.items():
             total_rows = ti.xcom_pull(task_ids='package_zip_parts', key='total_row_count')
             zip_names  = ti.xcom_pull(task_ids='package_zip_parts', key='zip_name_list')
             hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-            hook.run(f"""
+            hook.execute(f"""
                 insert into export.extract_history (
                     extract_name, extract_time, extract_count,
                     loaded, sent, confirmed,

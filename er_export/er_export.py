@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import namedtuple
 import logging
 import time
 import uuid
@@ -29,6 +30,20 @@ from er_export.er_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+DeltaParams = namedtuple('DeltaParams', [
+    'num_state', 'extract_time', 'extract_count',
+    'loaded', 'sent', 'confirmed',
+    'increment', 'overlap', 'time_field',
+    'time_from', 'time_to', 'condition',
+    'is_current', 'recent_interval',
+])
+
+ExtractParams = namedtuple('ExtractParams', [
+    'lower_bound', 'selfrun_timeout', 'compression_type', 'compression_ext',
+    'max_file_size', 'xstream_sanitize', 'sanitize_array', 'sanitize_list',
+    'pg_array_format', 'format_params',
+])
 
 TFS_KAFKA_CALLBACK = 'er_export.er_export.tfs_message_delivery_callback'
 
@@ -298,20 +313,20 @@ for _table_key, _params in tables.items():
 
         def _pre_execute_copy(context):
             ti = context['ti']
-            dp = ti.xcom_pull(task_ids='init')[0]
-            ep = ti.xcom_pull(task_ids='get_params')[0]
+            dp = DeltaParams(*ti.xcom_pull(task_ids='init')[0])
+            ep = ExtractParams(*ti.xcom_pull(task_ids='get_params')[0])
             op = context['task']
-            op.sql              = op.sql.format(export_time=dp[1], condition=dp[11])
-            op.max_size         = ep[4]
-            op.xstream_sanitize = ep[5] == 'True'
-            op.sanitize_array   = ep[6] == 'True'
-            op.sanitize_list    = ep[7]
-            op.pg_array_format  = ep[8] == 'True'
+            op.sql              = op.sql.format(export_time=dp.extract_time, condition=dp.condition)
+            op.max_size         = ep.max_file_size
+            op.xstream_sanitize = ep.xstream_sanitize == 'True'
+            op.sanitize_array   = ep.sanitize_array == 'True'
+            op.sanitize_list    = ep.sanitize_list
+            op.pg_array_format  = ep.pg_array_format == 'True'
             try:
                 import ast
-                op.format_params = ast.literal_eval(ep[9]) if ep[9] else {}
+                op.format_params = ast.literal_eval(ep.format_params) if ep.format_params else {}
             except (ValueError, TypeError):
-                logger.warning("Unparseable format_params: %r", ep[9])
+                logger.warning("Unparseable format_params: %r", ep.format_params)
                 op.format_params = {}
 
         export_to_s3 = HrpClickNativeToS3ListOperator(
@@ -405,7 +420,7 @@ for _table_key, _params in tables.items():
         def save_status(cfg, **context):
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             ti         = context['ti']
-            dp         = ti.xcom_pull(task_ids='init')[0]
+            dp         = DeltaParams(*ti.xcom_pull(task_ids='init')[0])
             total_rows = ti.xcom_pull(task_ids='pack_zip', key='total_row_count')
             zip_names  = ti.xcom_pull(task_ids='pack_zip', key='zip_name_list')
             hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
@@ -417,11 +432,11 @@ for _table_key, _params in tables.items():
                     time_field, time_from, time_to, exported_files
                 ) select
                     '{cfg['tbl']}',
-                    {dp[1]},
+                    {dp.extract_time},
                     {total_rows},
                     now(), now(), null,
-                    {dp[6]}, {dp[7]}, {dp[13]},
-                    {dp[8]}, {dp[9]}, {dp[10]},
+                    {dp.increment}, {dp.overlap}, {dp.recent_interval},
+                    {dp.time_field}, {dp.time_from}, {dp.time_to},
                     {zip_names!r}
             """)
 
@@ -431,11 +446,11 @@ for _table_key, _params in tables.items():
         def schedule_next(cfg, **context):
             from airflow.api.common.trigger_dag import trigger_dag
             ti = context['ti']
-            dp = ti.xcom_pull(task_ids='init')[0]
-            if str(dp[12]).lower() in ('true', 't', '1'):
+            dp = DeltaParams(*ti.xcom_pull(task_ids='init')[0])
+            if str(dp.is_current).lower() in ('true', 't', '1'):
                 return
-            ep = ti.xcom_pull(task_ids='get_params')[0]
-            run_date = pendulum.now('UTC').add(minutes=int(ep[1]))
+            ep = ExtractParams(*ti.xcom_pull(task_ids='get_params')[0])
+            run_date = pendulum.now('UTC').add(minutes=int(ep.selfrun_timeout))
             trigger_dag(dag_id=cfg['dag_id'], execution_date=run_date, replace_microseconds=False)
 
         t_schedule = schedule_next(cfg=_task_cfg)

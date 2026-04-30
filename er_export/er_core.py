@@ -14,6 +14,7 @@ from airflow.utils.task_group import TaskGroup
 from airflow.exceptions import AirflowSkipException
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator # type: ignore
 from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
+from plugins.utils import add_note
 
 logger = logging.getLogger(__name__)
 
@@ -220,8 +221,14 @@ def make_er_export_task_group(
                 cur_res = select_dic(hook, cfg['sql_get_current'])
                 if not cur_res:
                     raise ValueError(f"No delta state found for {cfg['tbl']}")
-                return {**reg, **cur_res[0]}
-            return reg
+                result = {**reg, **cur_res[0]}
+            else:
+                result = reg
+            add_note(
+                {k: result.get(k) for k in ('extract_time', 'condition', 'is_current', 'increment', 'selfrun_timeout')},
+                level='Task,DAG', title='Delta',
+            )
+            return result
 
         t_init = init(cfg=task_cfg)
 
@@ -367,9 +374,14 @@ def make_er_export_task_group(
             )
             logger.info("Created summary tkt: %s", summary_tkt)
 
+            total_rows = sum(int(r) for r in row_count_list)
+            add_note(
+                {'rows': total_rows, 'parts': total, 'files': uploaded_zips},
+                level='Task,DAG', title='Exported',
+            )
             ti.xcom_push(key="zip_name_list",    value=uploaded_zips)
             ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
-            ti.xcom_push(key="total_row_count",  value=sum(int(r) for r in row_count_list))
+            ti.xcom_push(key="total_row_count",  value=total_rows)
 
         t_pack = pack_zip(cfg=task_cfg)
 
@@ -406,6 +418,7 @@ def make_er_export_task_group(
                     {dp['time_field']}, {dp['time_from']}, {dp['time_to']},
                     {zip_names!r}
             """)
+            add_note({'rows': total_rows, 'files': zip_names}, level='Task', title='Saved')
 
         t_save = save_status(cfg=task_cfg)
 
@@ -415,9 +428,11 @@ def make_er_export_task_group(
             ti = context['ti']
             dp = ti.xcom_pull(task_ids=f"{group_id}.init")
             if str(dp['is_current']).lower() in ('true', 't', '1'):
+                add_note('already current', level='Task,DAG', title='Schedule')
                 return
             run_date = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
             trigger_dag(dag_id=cfg['dag_id'], execution_date=run_date, replace_microseconds=False)
+            add_note(str(run_date), level='Task,DAG', title='Next run')
 
         t_schedule = schedule_next(cfg=task_cfg)
 

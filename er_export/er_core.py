@@ -16,9 +16,6 @@ import pendulum
 from airflow.decorators import task
 from airflow.utils.task_group import TaskGroup
 from airflow.exceptions import AirflowSkipException
-from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator # type: ignore
-from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor # type: ignore
-from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
 from plugins.utils import add_note
 
 logger = logging.getLogger(__name__)
@@ -199,6 +196,10 @@ def export_tg(
     pool: str
 ) -> TaskGroup:
     
+    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
+    from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor  # type: ignore
+    from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
+
     with TaskGroup(group_id=gid) as tg:
 
         @task(task_id='init')

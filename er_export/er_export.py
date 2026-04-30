@@ -12,23 +12,23 @@ from airflow.models import Param
 
 from er_export.er_config import (
     CH_ID,
-    CH_TYPE_MAP,
-    DEFAULT_ARGS,
+    TYPE_MAP,
+    DEF_ARGS,
     ENV_STAND,
-    ER_EXTRA_COLUMNS,
-    ER_MANDATORY_FIELDS_PREFIX,
-    ER_MANDATORY_FIELDS_SUFFIX,
+    EXTRA_COLS,
+    MANDATORY_PRE,
+    MANDATORY_SUF,
     MODE,
-    ROW_COUNT_LIMIT_MAP,
-    TFS_OUT_BUCKET,
-    TFS_OUT_CONFIG_MAP,
-    TFS_OUT_CONN_ID,
+    LIMITS,
+    BUCKET,
+    TFS_MAP,
+    S3_CONN,
 )
 from er_export.er_core import (
-    make_er_export_task_group,
-    build_registry_sql_delta,
-    build_registry_sql_recent,
-    build_dynamic_select
+    export_tg,
+    sql_reg_delta,
+    sql_reg_recent,
+    build_sql
 )
 
 # Пытаемся импортировать ctl_obj_load из общих утилит
@@ -37,29 +37,29 @@ from plugins.ctl_utils import ctl_obj_load
 logger = logging.getLogger(__name__)
 
 # Load metadata
-VARIABLE_NAME = "datalab_er_wfs"
-wfs = ctl_obj_load(VARIABLE_NAME, s3_id='s3', bucket='datalab-er')
+VAR_NAME = "datalab_er_wfs"
+wfs = ctl_obj_load(VAR_NAME, s3_id='s3', bucket='datalab-er')
 
 # ── DAG factory ──────────────────────────────────────────────────────────────
 
 for table_key, params in wfs.items():
     db, tbl = table_key.split(".", maxsplit=1)
-    dag_id      = f"export_er__{params['replica']}__{tbl}"
-    replica     = params['replica']
-    schema_name = params['schema']
-    export_fmt  = params.get('format', 'TSVWithNames')
+    dag_id  = f"export_er__{params['replica']}__{tbl}"
+    replica = params['replica']
+    schema  = params['schema']
+    fmt     = params.get('format', 'TSVWithNames')
 
-    if export_fmt != 'TSVWithNames':
-        raise ValueError(f"Unsupported format: {export_fmt!r}. Only TSVWithNames is supported.")
+    if fmt != 'TSVWithNames':
+        raise ValueError(f"Unsupported format: {fmt!r}. Only TSVWithNames is supported.")
 
-    scenario, tfs_prefix, tfs_out_pool = TFS_OUT_CONFIG_MAP[replica]
-    s3_prefix = f"{tfs_prefix}/{replica}"
+    scen, prefix, pool = TFS_MAP[replica]
+    s3_prefix = f"{prefix}/{replica}"
 
     def _prepare_sql(sql_key):
-        sql_meta = params.get(sql_key)
-        if isinstance(sql_meta, dict) and "fields" not in sql_meta:
-            sql_meta["fields"] = ER_MANDATORY_FIELDS_PREFIX + params.get("fields", []) + ER_MANDATORY_FIELDS_SUFFIX
-        return build_dynamic_select(sql_meta)
+        meta = params.get(sql_key)
+        if isinstance(meta, dict) and "fields" not in meta:
+            meta["fields"] = MANDATORY_PRE + params.get("fields", []) + MANDATORY_SUF
+        return build_sql(meta)
 
     sql_delta  = _prepare_sql('sql_stmt_export_delta')
     sql_recent = _prepare_sql('sql_stmt_export_recent')
@@ -70,13 +70,13 @@ for table_key, params in wfs.items():
         raise RuntimeError("Only one of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' can be specified!")
 
     sql_export = sql_delta or sql_recent
-    row_limit  = ROW_COUNT_LIMIT_MAP.get(ENV_STAND, 0)
+    row_limit  = LIMITS.get(ENV_STAND, 0)
     if row_limit > 0:
         sql_export = f"select * from ({sql_export}) limit {row_limit}"
 
     if sql_delta:
-        sql_get_registry = build_registry_sql_delta(tbl)
-        sql_get_current  = build_dynamic_select({
+        sql_reg = sql_reg_delta(tbl)
+        sql_cur = build_sql({
             "with": f"""WITH data AS (
                 SELECT
                     num_state       as num_state_v,
@@ -113,19 +113,19 @@ for table_key, params in wfs.items():
             "from": "data"
         })
     else:
-        sql_get_registry = build_registry_sql_recent(tbl)
-        sql_get_current  = None
+        sql_reg = sql_reg_recent(tbl)
+        sql_cur = None
 
-    task_cfg = {
+    cfg = {
         'db':          db,
         'tbl':         tbl,
         'dag_id':      dag_id,
-        'schema_name': schema_name,
+        'schema_name': schema,
         'replica':     replica,
-        'scenario':    scenario,
+        'scenario':    scen,
         's3_prefix':   s3_prefix,
-        'bucket':      TFS_OUT_BUCKET,
-        'topic':       DEFAULT_ARGS.get('topic', 'TFS.HRPLT.IN'),
+        'bucket':      BUCKET,
+        'topic':       DEF_ARGS.get('topic', 'TFS.HRPLT.IN'),
         'sql_auto_confirm': f"""
             insert into export.extract_history (
                 extract_name, extract_time, extract_count, loaded, sent, confirmed,
@@ -138,9 +138,9 @@ for table_key, params in wfs.items():
             where extract_name = '{tbl}'
                   and sent is not null and confirmed is null
         """,
-        'sql_get_registry': sql_get_registry,
-        'sql_get_current':  sql_get_current,
-        'extra_columns': ER_EXTRA_COLUMNS,
+        'sql_get_registry': sql_reg,
+        'sql_get_current':  sql_cur,
+        'extra_columns': EXTRA_COLS,
         'strategy':      params.get('strategy', 'FULL_UK'),
         'PK':            params.get('PK', []),
         'UK':            params.get('UK', []),
@@ -150,7 +150,7 @@ for table_key, params in wfs.items():
         dag_id=dag_id,
         description=params.get('description') or f"ER-выгрузка {table_key} → S3 ZIP → TFS Kafka",
         doc_md=json.dumps(params, ensure_ascii=False, indent=2, default=str),
-        default_args=DEFAULT_ARGS,
+        default_args=DEF_ARGS,
         start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone('UTC')),
         schedule_interval='55 0 * * *',
         max_active_tasks=1,
@@ -169,16 +169,16 @@ for table_key, params in wfs.items():
     )
 
     with dag:
-        make_er_export_task_group(
-            group_id='er_export',
-            task_cfg=task_cfg,
-            sql_export=sql_export,
-            ch_id=CH_ID,
-            tfs_out_conn_id=TFS_OUT_CONN_ID,
-            tfs_out_bucket=TFS_OUT_BUCKET,
-            ch_type_map=CH_TYPE_MAP,
+        export_tg(
+            gid='er_export',
+            cfg=cfg,
+            sql=sql_export,
+            cid=CH_ID,
+            s3_conn=S3_CONN,
+            bucket=BUCKET,
+            type_map=TYPE_MAP,
             mode=MODE,
-            tfs_out_pool=tfs_out_pool
+            pool=pool
         )
 
     globals()[dag_id] = dag

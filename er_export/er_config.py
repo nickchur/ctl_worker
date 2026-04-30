@@ -30,33 +30,34 @@ if os.getenv("AIRFLOW__CTL_PIN"):
         "extra":     {"verify": False, "secure": True},
     }
     os.environ[f'AIRFLOW_CONN_{CH_ID.upper()}'] = json.dumps(conn_json)
-    TFS_OUT_CONN_ID = 's3-archive'
+    S3_CONN = 's3-archive'
     MODE = 'test'
 else:
-    CH_ID           = 'dlab-click'
-    TFS_OUT_CONN_ID = 's3-tfs-hrplt'
-    MODE = 'prod'
-TFS_OUT_BUCKET  = 'tfshrplt'
-TFS_OUT_TOPIC   = 'TFS.HRPLT.IN'
+    CH_ID   = 'dlab-click'
+    S3_CONN = 's3-tfs-hrplt'
+    MODE    = 'prod'
+
+BUCKET = 'tfshrplt'
+TOPIC  = 'TFS.HRPLT.IN'
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()
 
-TFS_OUT_CONFIG_MAP = {
+TFS_MAP = {
     "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er", "tfs_HRPLATFORM-2100"),
 }
 
-DEFAULT_ARGS = {
+DEF_ARGS = {
     "owner":               "DataLab (CI02420667)",
     "retries":             3,
     "retry_delay":         timedelta(minutes=5),
-    "aws_conn_id":         TFS_OUT_CONN_ID,
+    "aws_conn_id":         S3_CONN,
     "clickhouse_conn_id":  CH_ID,
     "conn_id":             CH_ID,
     "kafka_config_id":     "tfs-kafka-out",
-    "topic":               TFS_OUT_TOPIC,
+    "topic":               TOPIC,
 }
 
-ROW_COUNT_LIMIT_MAP = {
+LIMITS = {
     "prom": 0,
     "uat":  100,
     "qa":   100,
@@ -64,7 +65,7 @@ ROW_COUNT_LIMIT_MAP = {
     "dev":  100,
 }
 
-CH_TYPE_MAP: dict[str, str] = {
+TYPE_MAP: dict[str, str] = {
     "DateTime":    "TIMESTAMP",
     "DateTime64":  "TIMESTAMP",
     "Date":        "DATE",
@@ -86,10 +87,10 @@ CH_TYPE_MAP: dict[str, str] = {
     "Array":       "STRING",
 }
 
-ER_MANDATORY_FIELDS_PREFIX = ["{export_time} as export_time"]
-ER_MANDATORY_FIELDS_SUFFIX = ["'I' as ctl_action", "now() as ctl_validfrom"]
+MANDATORY_PRE = ["{export_time} as export_time"]
+MANDATORY_SUF = ["'I' as ctl_action", "now() as ctl_validfrom"]
 
-ER_EXTRA_COLUMNS = [
+EXTRA_COLS = [
     {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
     {"column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None},
     {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},

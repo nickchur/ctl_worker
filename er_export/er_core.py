@@ -22,9 +22,9 @@ from plugins.utils import add_note
 
 logger = logging.getLogger(__name__)
 
-TFS_KAFKA_CALLBACK = 'er_export.er_core.tfs_message_delivery_callback'
+ON_DELIVERY = 'er_export.er_core.on_delivery'
 
-def select_dic(ch_hook, sql):
+def get_dict(ch_hook, sql):
     res, cols = ch_hook.execute(sql, with_column_types=True)
     if res:
         cols = [col[0] for col in cols]
@@ -32,7 +32,7 @@ def select_dic(ch_hook, sql):
     else:
         return []
 
-def build_dynamic_select(sql_meta: str | dict, indent: str = "    ") -> str:
+def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
     if not sql_meta:
         return ""
     if isinstance(sql_meta, str):
@@ -61,7 +61,7 @@ def build_dynamic_select(sql_meta: str | dict, indent: str = "    ") -> str:
     
     return sql
 
-def parse_ch_type(ch_type: str, ch_type_map: dict) -> tuple[str, bool]:
+def parse_type(ch_type: str, type_map: dict) -> tuple[str, bool]:
     notnull = True
     if ch_type.startswith("LowCardinality(") and ch_type.endswith(")"):
         ch_type = ch_type[15:-1]
@@ -69,9 +69,9 @@ def parse_ch_type(ch_type: str, ch_type_map: dict) -> tuple[str, bool]:
         ch_type = ch_type[9:-1]
         notnull = False
     base = ch_type.split("(")[0]
-    return ch_type_map.get(base, "STRING"), notnull
+    return type_map.get(base, "STRING"), notnull
 
-def produce_tfs_kafka_notification(scenario_id: str, file_name: str, throttle_delay: int = 1):
+def produce_msg(scenario_id: str, file_name: str, throttle_delay: int = 1):
     time.sleep(throttle_delay)
     rq_uuid = str(uuid.uuid4()).replace('-', '')
     message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -90,7 +90,7 @@ def produce_tfs_kafka_notification(scenario_id: str, file_name: str, throttle_de
     logger.info("Prepare message to send:\n%s", message)
     yield None, message
 
-def tfs_message_delivery_callback(err, msg) -> None:
+def on_delivery(err, msg) -> None:
     if err is not None:
         raise RuntimeError(f"Failed to deliver message: {err}")
     logger.info(
@@ -98,18 +98,18 @@ def tfs_message_delivery_callback(err, msg) -> None:
         msg.topic(), msg.partition(), msg.offset(), msg.value(),
     )
 
-def _make_pre_execute_kafka(scenario: str, mode: str):
+def _pre_kafka(scenario: str, mode: str):
     def pre_execute(context):
         if mode != 'prod':
             raise AirflowSkipException("Kafka notification skipped in test mode")
-        group_id = context['task'].task_group.group_id
-        summary_tkt = context['ti'].xcom_pull(task_ids=f"{group_id}.pack_zip", key='summary_tkt_name')
+        gid = context['task'].task_group.group_id
+        summary_tkt = context['ti'].xcom_pull(task_ids=f"{gid}.pack_zip", key='summary_tkt_name')
         if not summary_tkt:
             raise AirflowSkipException("No data exported, skipping notification")
         context['task'].producer_function_args = [scenario, summary_tkt]
     return pre_execute
 
-_SQL_REGISTRY_WITH = """WITH aggr AS (
+_REG_WITH = """WITH aggr AS (
     SELECT
         argMinIf(extract_name, prio, prio=1)                                       as extract_name,
         argMinIf(auto_confirm_delta, prio, prio=1)                                 as auto_confirm_delta_v,
@@ -133,9 +133,9 @@ _SQL_REGISTRY_WITH = """WITH aggr AS (
     )
 )"""
 
-def build_registry_sql_delta(tbl: str) -> str:
-    return build_dynamic_select({
-        "with": _SQL_REGISTRY_WITH.format(tbl=tbl, extra_aggr=''),
+def sql_reg_delta(tbl: str) -> str:
+    return build_sql({
+        "with": _REG_WITH.format(tbl=tbl, extra_aggr=''),
         "fields": [
             "auto_confirm_delta_v                       as auto_confirm_delta",
             "concat('\\'', toString(toDateTimeOrDefault(lower_bound_v)), '\\'') as lower_bound",
@@ -154,14 +154,14 @@ def build_registry_sql_delta(tbl: str) -> str:
         "settings": "enable_global_with_statement = 1"
     })
 
-def build_registry_sql_recent(tbl: str) -> str:
+def sql_reg_recent(tbl: str) -> str:
     extra_aggr = """,
         argMinIf(increment, prio, prio = 1)       as increment_v,
         argMinIf(overlap, prio, prio = 1)         as overlap_v,
         argMinIf(time_field, prio, prio = 1)      as time_field_v,
         argMinIf(recent_interval, prio, prio = 1) as recent_interval_v"""
-    return build_dynamic_select({
-        "with": _SQL_REGISTRY_WITH.format(tbl=tbl, extra_aggr=extra_aggr),
+    return build_sql({
+        "with": _REG_WITH.format(tbl=tbl, extra_aggr=extra_aggr),
         "fields": [
             "auto_confirm_delta_v                       as auto_confirm_delta",
             "concat('\\'', toString(toDateTimeOrDefault(lower_bound_v)), '\\'') as lower_bound",
@@ -195,34 +195,34 @@ def build_registry_sql_recent(tbl: str) -> str:
         "settings": "enable_global_with_statement = 1"
     })
 
-def make_er_export_task_group(
-    group_id: str,
-    task_cfg: dict,
-    sql_export: str,
-    ch_id: str,
-    tfs_out_conn_id: str,
-    tfs_out_bucket: str,
-    ch_type_map: dict,
+def export_tg(
+    gid: str,
+    cfg: dict,
+    sql: str,
+    cid: str,
+    s3_conn: str,
+    bucket: str,
+    type_map: dict,
     mode: str,
-    tfs_out_pool: str
+    pool: str
 ) -> TaskGroup:
     
-    with TaskGroup(group_id=group_id) as tg:
+    with TaskGroup(group_id=gid) as tg:
 
         @task(task_id='init')
         def init(cfg, **context):
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-            S3Hook(aws_conn_id=tfs_out_conn_id).create_bucket(bucket_name=tfs_out_bucket)
-            hook = ClickHouseHook(clickhouse_conn_id=ch_id)
-            reg_res = select_dic(hook, cfg['sql_get_registry'])
+            S3Hook(aws_conn_id=s3_conn).create_bucket(bucket_name=bucket)
+            hook = ClickHouseHook(clickhouse_conn_id=cid)
+            reg_res = get_dict(hook, cfg['sql_get_registry'])
             if not reg_res:
                 raise ValueError(f"No registry entry found for {cfg['tbl']}")
             reg = reg_res[0]
             if reg['auto_confirm_delta']:
                 hook.execute(cfg['sql_auto_confirm'])
             if cfg['sql_get_current']:
-                cur_res = select_dic(hook, cfg['sql_get_current'])
+                cur_res = get_dict(hook, cfg['sql_get_current'])
                 if not cur_res:
                     raise ValueError(f"No delta state found for {cfg['tbl']}")
                 result = {**reg, **cur_res[0]}
@@ -245,16 +245,16 @@ def make_er_export_task_group(
             )
             return result
 
-        t_init = init(cfg=task_cfg)
+        t_init = init(cfg=cfg)
 
         @task(task_id='build_meta')
         def build_meta(cfg, **context):
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-            hook = ClickHouseHook(clickhouse_conn_id=ch_id)
+            hook = ClickHouseHook(clickhouse_conn_id=cid)
             rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
             columns = []
             for row in rows:
-                source_type, notnull = parse_ch_type(row[1], ch_type_map)
+                source_type, notnull = parse_type(row[1], type_map)
                 columns.append({
                     "column_name": row[0],
                     "source_type": source_type,
@@ -275,11 +275,11 @@ def make_er_export_task_group(
             }
             context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
 
-        t_build_meta = build_meta(cfg=task_cfg)
+        t_build_meta = build_meta(cfg=cfg)
 
         def _pre_execute_copy(context):
             ti = context['ti']
-            dp = ti.xcom_pull(task_ids=f"{group_id}.init")
+            dp = ti.xcom_pull(task_ids=f"{gid}.init")
             op = context['task']
             
             op.sql              = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
@@ -318,9 +318,9 @@ def make_er_export_task_group(
 
         export_to_s3 = HrpClickNativeToS3ListOperator(
             task_id='export_to_s3',
-            s3_bucket=tfs_out_bucket,
-            s3_key=f"{task_cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
-            sql=sql_export,
+            s3_bucket=bucket,
+            s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
+            sql=sql,
             compression=None,
             replace=True,
             post_file_check=False,
@@ -333,9 +333,9 @@ def make_er_export_task_group(
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
             ti = context["ti"]
 
-            s3_key_list    = ti.xcom_pull(task_ids=f"{group_id}.export_to_s3", key='s3_key_list')
-            row_count_list = ti.xcom_pull(task_ids=f"{group_id}.export_to_s3", key='row_count_list')
-            meta_json_str  = ti.xcom_pull(task_ids=f"{group_id}.build_meta", key='meta_json')
+            s3_key_list    = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='s3_key_list')
+            row_count_list = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='row_count_list')
+            meta_json_str  = ti.xcom_pull(task_ids=f"{gid}.build_meta", key='meta_json')
 
             if not s3_key_list:
                 logger.warning("No CSV parts exported — skipping ZIP packaging")
@@ -345,7 +345,7 @@ def make_er_export_task_group(
                 return
 
             meta_bytes = meta_json_str.encode()
-            hook    = S3Hook(aws_conn_id=tfs_out_conn_id)
+            hook    = S3Hook(aws_conn_id=s3_conn)
             total   = len(s3_key_list)
             base_ts = pendulum.now("UTC")
             uploaded_zips = []
@@ -362,7 +362,7 @@ def make_er_export_task_group(
                 tkt_name  = f"{cfg['replica']}__{tkt_ts}.tkt"
                 zip_name  = f"{cfg['replica']}__{outer_ts}__{cfg['tbl']}__{part}_{total}_{rows}.csv.zip"
 
-                csv_bytes = hook.get_key(key=s3_key, bucket_name=tfs_out_bucket).get()["Body"].read()
+                csv_bytes = hook.get_key(key=s3_key, bucket_name=bucket).get()["Body"].read()
 
                 buf = BytesIO()
                 with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -372,10 +372,10 @@ def make_er_export_task_group(
                 hook.load_bytes(
                     buf.getvalue(),
                     key=f"{cfg['s3_prefix']}/{zip_name}",
-                    bucket_name=tfs_out_bucket,
+                    bucket_name=bucket,
                     replace=True,
                 )
-                hook.delete_objects(bucket=tfs_out_bucket, keys=[s3_key])
+                hook.delete_objects(bucket=bucket, keys=[s3_key])
                 uploaded_zips.append(zip_name)
                 logger.info("Packaged %d/%d: %s", part, total, zip_name)
 
@@ -384,7 +384,7 @@ def make_er_export_task_group(
             hook.load_bytes(
                 "\n".join(uploaded_zips).encode(),
                 key=f"{cfg['s3_prefix']}/{summary_tkt}",
-                bucket_name=tfs_out_bucket,
+                bucket_name=bucket,
                 replace=True,
             )
             logger.info("Created summary tkt: %s", summary_tkt)
@@ -398,26 +398,26 @@ def make_er_export_task_group(
             ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
             ti.xcom_push(key="total_row_count",  value=total_rows)
 
-        t_pack = pack_zip(cfg=task_cfg)
+        t_pack = pack_zip(cfg=cfg)
 
         notify_tfs = ProduceToTopicOperator(
             task_id='notify_tfs',
-            topic=task_cfg.get('topic', 'TFS.HRPLT.IN'),
-            producer_function=produce_tfs_kafka_notification,
-            producer_function_args=[task_cfg['scenario'], ''],
-            delivery_callback=TFS_KAFKA_CALLBACK,
-            pool=tfs_out_pool,
-            pre_execute=_make_pre_execute_kafka(task_cfg['scenario'], mode),
+            topic=cfg.get('topic', 'TFS.HRPLT.IN'),
+            producer_function=produce_msg,
+            producer_function_args=[cfg['scenario'], ''],
+            delivery_callback=ON_DELIVERY,
+            pool=pool,
+            pre_execute=_pre_kafka(cfg['scenario'], mode),
         )
 
         @task(task_id='save_status', trigger_rule='none_failed')
         def save_status(cfg, **context):
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             ti         = context['ti']
-            dp         = ti.xcom_pull(task_ids=f"{group_id}.init")
-            total_rows = ti.xcom_pull(task_ids=f"{group_id}.pack_zip", key='total_row_count')
-            zip_names  = ti.xcom_pull(task_ids=f"{group_id}.pack_zip", key='zip_name_list')
-            hook = ClickHouseHook(clickhouse_conn_id=ch_id)
+            dp         = ti.xcom_pull(task_ids=f"{gid}.init")
+            total_rows = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='total_row_count')
+            zip_names  = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='zip_name_list')
+            hook = ClickHouseHook(clickhouse_conn_id=cid)
             hook.execute(f"""
                 insert into export.extract_history (
                     extract_name, extract_time, extract_count,
@@ -435,13 +435,13 @@ def make_er_export_task_group(
             """)
             add_note({'rows': total_rows, 'files': zip_names}, level='Task', title='Saved')
 
-        t_save = save_status(cfg=task_cfg)
+        t_save = save_status(cfg=cfg)
 
         @task(task_id='schedule_next')
         def schedule_next(cfg, **context):
             from airflow.api.common.trigger_dag import trigger_dag
             ti = context['ti']
-            dp = ti.xcom_pull(task_ids=f"{group_id}.init")
+            dp = ti.xcom_pull(task_ids=f"{gid}.init")
             if str(dp['is_current']).lower() in ('true', 't', '1'):
                 add_note('already current', level='Task,DAG', title='Schedule')
                 return
@@ -449,7 +449,7 @@ def make_er_export_task_group(
             trigger_dag(dag_id=cfg['dag_id'], execution_date=run_date, replace_microseconds=False)
             add_note(str(run_date), level='Task,DAG', title='Next run')
 
-        t_schedule = schedule_next(cfg=task_cfg)
+        t_schedule = schedule_next(cfg=cfg)
 
         t_init >> [t_build_meta, export_to_s3]
         [t_build_meta, export_to_s3] >> t_pack

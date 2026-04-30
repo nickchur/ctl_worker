@@ -8,20 +8,20 @@ import logging
 import pendulum
 from airflow.decorators import dag, task
 
-from er_export.er_config import CH_ID, DEFAULT_ARGS
-from er_export.er_core import select_dic
+from er_export.er_config import CH_ID, DEF_ARGS
+from er_export.er_core import get_dict
 from plugins.ctl_utils import ctl_obj_save
 
 logger = logging.getLogger(__name__)
 
-VARIABLE_NAME = "datalab_er_wfs"
-BUCKET        = "datalab-er"
+VAR_NAME = "datalab_er_wfs"
+BUCKET   = "datalab-er"
 
 
 @dag(
     dag_id="er_sync__datalab_er_wfs",
     description="Sync export.er_wf_meta → Airflow Variable datalab_er_wfs",
-    default_args=DEFAULT_ARGS,
+    default_args=DEF_ARGS,
     start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone("UTC")),
     schedule_interval="*/5 * * * *",
     max_active_runs=1,
@@ -36,7 +36,7 @@ def er_sync_dag():
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
         hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-        rows = select_dic(
+        rows = get_dict(
             hook,
             "SELECT * FROM export.er_wf_meta FINAL WHERE is_active = 1",
         )
@@ -69,7 +69,7 @@ def er_sync_dag():
             wfs[table_key] = entry
 
         logger.info("Loaded %d workflow(s) from export.er_wf_meta", len(wfs))
-        ctl_obj_save(VARIABLE_NAME, wfs, var=True, s3_id="s3", bucket=BUCKET)
+        ctl_obj_save(VAR_NAME, wfs, var=True, s3_id="s3", bucket=BUCKET)
 
     sync()
 

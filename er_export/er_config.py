@@ -82,11 +82,8 @@ CH_TYPE_MAP: dict[str, str] = {
     "Array":       "STRING",
 }
 
-ER_MANDATORY_FIELDS = [
-    "{export_time} as export_time",
-    "'I' as ctl_action",
-    "now() as ctl_validfrom",
-]
+ER_MANDATORY_FIELDS_PREFIX = ["{export_time} as export_time"]
+ER_MANDATORY_FIELDS_SUFFIX = ["'I' as ctl_action", "now() as ctl_validfrom"]
 
 ER_EXTRA_COLUMNS = [
     {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},

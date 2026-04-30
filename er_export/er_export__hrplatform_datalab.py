@@ -36,8 +36,8 @@ TFS_KAFKA_CALLBACK = 'er_export.er_export__hrplatform_datalab.tfs_message_delive
 
 
 def parse_ch_type(ch_type: str) -> tuple[str, bool]:
-    """Strips Nullable/LowCardinality wrappers, maps ClickHouse type to ER source_type.
-    Returns (source_type, notnull)."""
+    """Снимает обёртки Nullable/LowCardinality и приводит тип ClickHouse к source_type формата ER.
+    Возвращает (source_type, notnull): notnull=False если тип был Nullable."""
     notnull = True
 
     if ch_type.startswith("LowCardinality(") and ch_type.endswith(")"):
@@ -53,6 +53,8 @@ def parse_ch_type(ch_type: str) -> tuple[str, bool]:
 
 
 def produce_tfs_kafka_notification(scenario_id: str, file_name: str, throttle_delay: int = 1):
+    """Генератор для ProduceToTopicOperator: формирует XML-сообщение TransferFileCephRq
+    и отправляет его в Kafka TFS для инициации передачи файла по сценарию scenario_id."""
     time.sleep(throttle_delay)
     rq_uuid = str(uuid.uuid4()).replace('-', '')
     message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -73,6 +75,7 @@ def produce_tfs_kafka_notification(scenario_id: str, file_name: str, throttle_de
 
 
 def tfs_message_delivery_callback(err, msg) -> None:
+    """Callback подтверждения доставки Kafka-сообщения. При ошибке бросает RuntimeError."""
     if err is not None:
         raise RuntimeError(f"Failed to deliver message: {err}")
     logger.info(
@@ -262,6 +265,8 @@ def make_er_export_task_group(
 
         # ── get metadata via DESCRIBE TABLE ─────────────────────────────────
         def _get_metadata(db_name, tbl_name, tbl_params, clickhouse_conn_id, **context):
+            """Получает схему таблицы через DESCRIBE TABLE, строит .meta JSON
+            (колонки из CH + extra_columns из конфига) и кладёт его в XCom под ключом meta_json."""
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             hook = ClickHouseHook(clickhouse_conn_id=clickhouse_conn_id)
             rows = hook.get_records(f"DESCRIBE TABLE {db_name}.{tbl_name}")
@@ -327,6 +332,9 @@ def make_er_export_task_group(
                 outer_tg_id, inner_tg_id, tbl_name, schema, prefix,
                 s3_prefix_path, s3_bucket, aws_conn_id, **context
             ):
+                """Скачивает промежуточные CSV из S3, упаковывает каждый в ZIP вместе с .meta и .tkt,
+                удаляет исходные CSV. Создаёт итоговый summary.tkt со списком ZIP-файлов.
+                Результаты (zip_name_list, summary_tkt_name, total_row_count) кладёт в XCom."""
                 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
                 ti = context["ti"]
 
@@ -446,6 +454,8 @@ def make_er_export_task_group(
 
         # ── loop / self-trigger ──────────────────────────────────────────────
         def _get_task_next_run(end_loop, **context):
+            """Определяет следующую ветку: если end_loop=True — завершает цикл (→ fin),
+            иначе планирует повторный запуск (→ set_next_run_date)."""
             if isinstance(end_loop, str):
                 end_loop = end_loop.lower() in ('true', 't', '1')
             group_id = context["ti"].task_id.rsplit(".", maxsplit=1)[0]
@@ -459,6 +469,8 @@ def make_er_export_task_group(
         )
 
         def _get_next_run_date(timeout_str: str, **context):
+            """Вычисляет дату следующего запуска DAG как now() + selfrun_timeout минут
+            и кладёт её в XCom под ключом next_run_date."""
             run_date = pendulum.now('UTC').add(minutes=int(timeout_str))
             context['ti'].xcom_push(key='next_run_date', value=run_date)
 
@@ -492,6 +504,7 @@ def make_er_export_task_group(
 
 
 def create_er_dag(dag_id: str, table_key: str, params: dict) -> DAG:
+    """Создаёт DAG для ER-выгрузки одной таблицы: бакет S3 → TaskGroup выгрузки."""
     database_name, table_name = table_key.split(".", maxsplit=1)
 
     dag = DAG(

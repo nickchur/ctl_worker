@@ -136,7 +136,6 @@ def make_er_export_task_group(
 
         # ── check auto-confirm ──────────────────────────────────────────────
         check_need_auto_confirm_delta = ClickHouseBranchSQLOperator(
-            dag=dag,
             task_id='check_need_auto_confirm_delta',
             sql=f"select auto_confirm_delta from export.extract_registry_vw where extract_name = '{table_name}'",
             follow_task_ids_if_true=[f"{tg.group_id}.auto_confirm_delta"],
@@ -145,7 +144,6 @@ def make_er_export_task_group(
         )
 
         auto_confirm_delta = ClickHouseOperator(
-            dag=dag,
             task_id='auto_confirm_delta',
             sql=f"""
                 insert into export.extract_history (
@@ -161,7 +159,7 @@ def make_er_export_task_group(
             """,
         )
 
-        not_need_auto_confirm = DummyOperator(dag=dag, task_id='not_need_auto_confirm')
+        not_need_auto_confirm = DummyOperator(task_id='not_need_auto_confirm')
 
         # ── delta params ────────────────────────────────────────────────────
         if sql_stmt_export_delta:
@@ -203,7 +201,6 @@ def make_er_export_task_group(
             """
 
         get_delta_params = ClickHouseOperator(
-            dag=dag,
             task_id='get_delta_params',
             sql=sql_get_delta_params,
             trigger_rule='one_success',
@@ -212,7 +209,6 @@ def make_er_export_task_group(
 
         # ── extract params (compression, max_size, sanitize settings) ──────
         select_extract_params = ClickHouseOperator(
-            dag=dag,
             task_id='select_extract_params',
             sql=f"""
                 with
@@ -262,7 +258,7 @@ def make_er_export_task_group(
         )
 
         # ── get metadata via DESCRIBE TABLE ─────────────────────────────────
-        @task(dag=dag, task_id='get_metadata')
+        @task(task_id='get_metadata')
         def _get_metadata(**context):
             """Получает схему таблицы через DESCRIBE TABLE, строит .meta JSON
             (колонки из CH + extra_columns из конфига) и кладёт его в XCom под ключом meta_json."""
@@ -314,7 +310,6 @@ def make_er_export_task_group(
                 op.format_params   = ep[9]
 
             copy_clickhouse_query = HrpClickNativeToS3ListOperator(
-                dag=dag,
                 task_id='copy_clickhouse_query',
                 s3_bucket=bucket,
                 s3_key=f"{s3_prefix}/{{{{ ts_nodash }}}}.csv",  # ts_nodash — стандартный Airflow-макрос
@@ -325,7 +320,7 @@ def make_er_export_task_group(
                 pre_execute=_pre_execute_copy,
             )
 
-            @task(dag=dag, task_id='package_zip_parts')
+            @task(task_id='package_zip_parts')
             def _package_zip_parts(**context):
                 """Скачивает промежуточные CSV из S3, упаковывает каждый в ZIP вместе с .meta и .tkt,
                 удаляет исходные CSV. Создаёт итоговый summary.tkt со списком ZIP-файлов.
@@ -401,7 +396,6 @@ def make_er_export_task_group(
                 context['task'].producer_function_args = [scenario, summary_tkt]
 
             notify_tfs_kafka = ProduceToTopicOperator(
-                dag=dag,
                 task_id='notify_tfs_kafka',
                 producer_function=produce_tfs_kafka_notification,
                 producer_function_args=[scenario, ''],  # заполняется в pre_execute
@@ -413,7 +407,7 @@ def make_er_export_task_group(
             copy_clickhouse_query >> package_zip_parts >> notify_tfs_kafka
 
         # ── update send status ───────────────────────────────────────────────
-        @task(dag=dag, task_id='update_send_status')
+        @task(task_id='update_send_status')
         def _update_send_status(**context):
             """Фиксирует результат выгрузки в export.extract_history через ClickHouseHook,
             используя значения из XCom задач get_delta_params и package_zip_parts."""
@@ -442,7 +436,7 @@ def make_er_export_task_group(
         update_send_status = _update_send_status()
 
         # ── loop / self-trigger ──────────────────────────────────────────────
-        @task.branch(dag=dag, task_id='check_need_next_run')
+        @task.branch(task_id='check_need_next_run')
         def _check_need_next_run(**context):
             """Определяет следующую ветку: если end_loop=True — завершает цикл (→ fin),
             иначе планирует повторный запуск (→ set_next_run_date)."""
@@ -452,7 +446,7 @@ def make_er_export_task_group(
 
         check_need_next_run = _check_need_next_run()
 
-        @task(dag=dag, task_id='set_next_run_date')
+        @task(task_id='set_next_run_date')
         def _set_next_run_date(**context):
             """Вычисляет дату следующего запуска DAG как now() + selfrun_timeout минут
             и кладёт её в XCom под ключом next_run_date."""
@@ -472,7 +466,6 @@ def make_er_export_task_group(
             context['task'].logical_date = next_run
 
         trigger_self = TriggerDagRunOperator(
-            dag=dag,
             task_id='trigger_self',
             trigger_dag_id=dag.dag_id,
             logical_date=None,  # заполняется в pre_execute
@@ -480,7 +473,7 @@ def make_er_export_task_group(
             pre_execute=_pre_execute_trigger,
         )
 
-        fin = DummyOperator(dag=dag, task_id='fin')
+        fin = DummyOperator(task_id='fin')
 
         # ── task dependencies ────────────────────────────────────────────────
         check_need_auto_confirm_delta >> [auto_confirm_delta, not_need_auto_confirm] >> get_delta_params

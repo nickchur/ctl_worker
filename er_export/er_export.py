@@ -172,8 +172,6 @@ for table_key, params in wfs.items():
             'max_file_size':   Param(None, type=['integer', 'null'], title='Max file size', description='Максимальный размер одного CSV файла (байт). По умолчанию из реестра.'),
             'pool':            Param(pool, type='string', title='Kafka Pool', description='Пул Airflow для задач Kafka'),
             'topic':           Param(cfg['topic'], type='string', title='Kafka Topic', description='Топик для отправки уведомлений'),
-            'sanitize':        Param(None, type=['boolean', 'null'], title='Sanitize', description='Очистка спецсимволов'),
-            'sanitize_array':  Param(None, type=['boolean', 'null'], title='Sanitize Array', description='Очистка массивов'),
         },
     )
 

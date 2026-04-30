@@ -119,9 +119,6 @@ _REG_WITH = """WITH aggr AS (
         argMinIf(compression_type, prio, lower(compression_type) <> 'default')    as compression_type_v,
         argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext_v,
         argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size_v,
-        argMinIf(xstream_sanitize, prio, prio=1)                                   as xstream_sanitize_v,
-        argMinIf(sanitize_array, prio, prio=1)                                     as sanitize_array_v,
-        argMinIf(sanitize_list, prio, lower(sanitize_list) <> 'default')           as sanitize_list_v,
         argMinIf(pg_array_format, prio, prio=1)                                    as pg_array_format_v,
         argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params_v
         {extra_aggr}
@@ -144,9 +141,6 @@ def sql_reg_delta(tbl: str) -> str:
             "compression_type_v                         as compression_type",
             "compression_ext_v                          as compression_ext",
             "max_file_size_v                            as max_file_size",
-            "If(xstream_sanitize_v = 1, 'True', 'False') as sanitize",
-            "If(sanitize_array_v = 1, 'True', 'False')   as sanitize_array",
-            "sanitize_list_v                            as sanitize_list",
             "If(pg_array_format_v = 1, 'True', 'False')  as pg_array_format",
             "csv_format_params_v                        as format_params"
         ],
@@ -170,9 +164,6 @@ def sql_reg_recent(tbl: str) -> str:
             "compression_type_v                         as compression_type",
             "compression_ext_v                          as compression_ext",
             "max_file_size_v                            as max_file_size",
-            "If(xstream_sanitize_v = 1, 'True', 'False') as sanitize",
-            "If(sanitize_array_v = 1, 'True', 'False')   as sanitize_array",
-            "sanitize_list_v                            as sanitize_list",
             "If(pg_array_format_v = 1, 'True', 'False')  as pg_array_format",
             "csv_format_params_v                        as format_params",
             "now()                                      as cur_time",
@@ -246,11 +237,6 @@ def export_tg(
                 result['auto_confirm'] = 1 if p['auto_confirm'] else 0
             if p.get('max_file_size') is not None:
                 result['max_file_size'] = str(p['max_file_size'])
-            if p.get('sanitize') is not None:
-                result['sanitize'] = 'True' if p['sanitize'] else 'False'
-            if p.get('sanitize_array') is not None:
-                result['sanitize_array'] = 'True' if p['sanitize_array'] else 'False'
-                
             add_note(
                 {k: result.get(k) for k in (
                     'extract_time', 'condition', 'is_current', 'increment', 
@@ -311,21 +297,6 @@ def export_tg(
                     logger.warning("Invalid max_file_size: %r, using None", raw_max_size)
                     op.max_size = None
 
-            op.xstream_sanitize = dp['xstream_sanitize'] == 'True'
-            op.sanitize_array   = dp['sanitize_array'] == 'True'
-            
-            raw_sl = dp.get('sanitize_list')
-            try:
-                if not raw_sl or str(raw_sl).strip().lower() in ('none', 'null', '', 'default'):
-                    op.sanitize_list = '[]'
-                else:
-                    test_val = str(raw_sl).strip()
-                    json.loads(test_val)
-                    op.sanitize_list = test_val
-            except Exception:
-                logger.warning("Invalid sanitize_list in XCom: %r, falling back to []", raw_sl)
-                op.sanitize_list = '[]'
-            
             op.pg_array_format  = dp['pg_array_format'] == 'True'
             try:
                 op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}
@@ -342,7 +313,6 @@ def export_tg(
             replace=True,
             post_file_check=False,
             pre_execute=_pre_execute_copy,
-            sanitize_list='[]',
         )
 
         @task(task_id='pack_zip')

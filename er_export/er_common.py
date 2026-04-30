@@ -271,7 +271,17 @@ def make_er_export_task_group(
             dp = ti.xcom_pull(task_ids=f"{group_id}.init")
             op = context['task']
             op.sql              = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
-            op.max_size         = dp['max_file_size']
+            
+            raw_max_size = dp.get('max_file_size')
+            if str(raw_max_size).lower() in ('default', 'none', 'null', ''):
+                op.max_size = None
+            else:
+                try:
+                    op.max_size = int(raw_max_size)
+                except (ValueError, TypeError):
+                    logger.warning("Invalid max_file_size: %r, using None", raw_max_size)
+                    op.max_size = None
+
             op.xstream_sanitize = dp['xstream_sanitize'] == 'True'
             op.sanitize_array   = dp['sanitize_array'] == 'True'
             op.sanitize_list    = dp['sanitize_list']

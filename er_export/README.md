@@ -34,7 +34,7 @@
 
 ```sql
 INSERT INTO export.er_wf_meta 
-    (extract_name, db_name, replica, schema_name, strategy, uk, fields, sql_from, sql_where)
+    (extract_name, db_name, replica, schema_name, strategy, uk, fields, sql_from, sql_where, increment, selfrun_timeout, auto_confirm)
 VALUES (
     'my_table_name',           -- Имя выгрузки
     'my_database',             -- БД в ClickHouse
@@ -42,15 +42,18 @@ VALUES (
     'target_schema',           -- Схема в целевой системе
     'FULL_UK',                 -- Стратегия (FULL_UK/DELTA_UK/...)
     ['id'],                    -- Unique Key
-    ['col1', 'col2', 'col3'],  -- Список полей (системные добавятся сами)
-    'my_database.my_table',    -- Источник (таблица или подзапрос)
-    '{condition}'              -- Условие (плейсхолдер для дельты)
+    ['col1', 'col2', 'col3'],  -- Список полей
+    'my_database.my_table',    -- Источник
+    '{condition}',             -- Условие
+    60,                        -- Инкремент дельты (сек)
+    10,                        -- Таймаут автозапуска (мин)
+    1                          -- 1 = автоподтверждение, 0 = ждать Kafka
 );
 ```
 
 После вставки данных:
 1.  DAG `er_sync__datalab_er_wfs` подхватит изменения (запускается каждые 5 минут).
-2.  Новый DAG вида `export_er__hrplatform_datalab__my_table_name` автоматически появится в интерфейсе Airflow.
+2.  Новый DAG вида `export_er__hrplatform_datalab__my_table_name` автоматически появится в интерфейсе Airflow. Параметры `increment` и `selfrun_timeout` будут предзаполнены значениями из таблицы.
 
 ---
 
@@ -59,12 +62,13 @@ VALUES (
 Каждый сгенерированный DAG выполняет следующие шаги:
 
 1.  **init**: Читает состояние дельты из реестра (`export.extract_current_vw`). Определяет временной интервал для выгрузки.
-2.  **build_meta**: На лету анализирует структуру таблицы в ClickHouse и формирует `.meta` файл (JSON) для xStream/TFS.
-3.  **export_to_s3**: Стримит данные напрямую из ClickHouse в S3 в формате CSV (используется `HrpClickNativeToS3ListOperator`).
-4.  **pack_zip**: Собирает пакет: `CSV` + `.meta` + `.tkt` (билет) -> `ZIP`. Удаляет временные CSV.
-5.  **notify_tfs**: Формирует XML и отправляет в Kafka топик уведомление о готовности файла.
-6.  **save_status**: Записывает результат выгрузки в историю (`export.extract_history`).
-7.  **schedule_next**: Если это дельта-выгрузка и данных много, планирует следующий запуск немедленно.
+2.  **build_meta**: На лету анализирует структуру таблицы в ClickHouse и формирует `.meta` файл (JSON).
+3.  **export_to_s3**: Стримит данные напрямую из ClickHouse в S3 (используется `HrpClickNativeToS3ListOperator`).
+4.  **pack_zip**: Собирает пакет через `HrpS3ArchiveOperator` (S3-to-S3), не загружая CSV в память воркера.
+5.  **notify_tfs**: Формирует XML и отправляет в Kafka (топик `TFS.HRPLT.IN`).
+6.  **wait_for_confirmation** (опционально): Если `auto_confirm = 0`, DAG переходит в режим ожидания (сенсор) сообщения из Kafka (топик `TFS.HRPLT.OUT`).
+7.  **save_status**: Записывает результат выгрузки в историю (`export.extract_history`).
+8.  **schedule_next**: Если это дельта-выгрузка и данных много, планирует следующий запуск через `selfrun_timeout` минут.
 
 ---
 

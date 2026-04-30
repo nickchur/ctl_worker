@@ -1,3 +1,7 @@
+"""
+Synchronization DAG for ER export metadata.
+Syncs configuration from the ClickHouse `export.er_wf_meta` table to Airflow Variables/S3.
+"""
 from __future__ import annotations
 
 import logging
@@ -37,25 +41,28 @@ def er_sync_dag():
             "SELECT * FROM export.er_wf_meta FINAL WHERE is_active = 1",
         )
 
+        if not rows:
+            raise ValueError("No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")
+
         wfs = {}
         for row in rows:
             table_key = f"{row['db_name']}.{row['extract_name']}"
             sql_key   = "sql_stmt_export_recent" if row["is_recent"] else "sql_stmt_export_delta"
-            sql_val: dict = {"from": row["sql_from"]}
+            sql_val   = {"from": row["sql_from"]}
             if row["sql_where"]:
                 sql_val["where"] = row["sql_where"]
 
-            entry: dict = {
-                "replica":     row["replica"],
-                "schema":      row["schema_name"],
-                "format":      row["format"],
-                "strategy":    row["strategy"],
-                "PK":          list(row["pk"]),
-                "UK":          list(row["uk"]),
-                sql_key:       sql_val,
+            entry = {
+                "replica":  row["replica"],
+                "schema":   row["schema_name"],
+                "format":   row["format"],
+                "strategy": row["strategy"],
+                "PK":       row["pk"],
+                "UK":       row["uk"],
+                sql_key:    sql_val,
             }
             if row["fields"]:
-                entry["fields"] = list(row["fields"])
+                entry["fields"] = row["fields"]
             if row["description"]:
                 entry["description"] = row["description"]
 

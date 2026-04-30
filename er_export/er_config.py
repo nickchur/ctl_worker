@@ -1,3 +1,7 @@
+"""
+Configuration and constants for the ER export framework.
+Includes environment-specific settings, connection IDs, and data type mappings.
+"""
 from __future__ import annotations
 
 import base64

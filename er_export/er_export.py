@@ -1,3 +1,7 @@
+"""
+DAG Factory for ER exports.
+Dynamically generates Airflow DAGs based on metadata loaded from ClickHouse.
+"""
 from __future__ import annotations
 
 import json

@@ -1,3 +1,7 @@
+"""
+Core logic and utilities for the ER export process.
+Contains task group definitions, SQL builders, and helper functions for packaging and notification.
+"""
 from __future__ import annotations
 
 import json

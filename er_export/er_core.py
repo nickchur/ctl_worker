@@ -341,7 +341,7 @@ def export_tg(
         @task(task_id='pack_zip')
         def pack_zip(cfg, **context):
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-            from sber_app_dataplatform_etl_core.hrp_operators.s3_archive import HrpS3ArchiveOperator
+            from hrp_operators import HrpS3ArchiveOperator  # type: ignore
             ti = context["ti"]
 
             s3_key_list    = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='s3_key_list')

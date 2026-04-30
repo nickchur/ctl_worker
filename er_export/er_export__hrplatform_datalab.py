@@ -9,8 +9,8 @@ from io import BytesIO
 
 import pendulum
 from airflow import DAG
+from airflow.decorators import task
 from airflow.operators.dummy_operator import DummyOperator
-from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
@@ -20,6 +20,7 @@ from airflow_clickhouse_plugin.operators.clickhouse_dbapi import ClickHouseBranc
 from hrp_operators import HrpClickNativeToS3ListOperator
 
 from er_export.er_config import (
+    CH_ID,
     CH_TYPE_MAP,
     DEFAULT_ARGS,
     ENV_STAND,
@@ -125,10 +126,7 @@ def make_er_export_task_group(
     if sql_stmt_export_delta and sql_stmt_export_recent:
         raise RuntimeError("Only one of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' can be specified!")
 
-    if sql_stmt_export_delta:
-        sql_stmt_export = sql_stmt_export_delta
-    else:
-        sql_stmt_export = sql_stmt_export_recent
+    sql_stmt_export = sql_stmt_export_delta or sql_stmt_export_recent
 
     row_count_limit = ROW_COUNT_LIMIT_MAP.get(ENV_STAND, 0)
     if row_count_limit > 0:
@@ -264,12 +262,13 @@ def make_er_export_task_group(
         )
 
         # ── get metadata via DESCRIBE TABLE ─────────────────────────────────
-        def _get_metadata(db_name, tbl_name, tbl_params, clickhouse_conn_id, **context):
+        @task(dag=dag, task_id='get_metadata')
+        def _get_metadata(**context):
             """Получает схему таблицы через DESCRIBE TABLE, строит .meta JSON
             (колонки из CH + extra_columns из конфига) и кладёт его в XCom под ключом meta_json."""
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-            hook = ClickHouseHook(clickhouse_conn_id=clickhouse_conn_id)
-            rows = hook.get_records(f"DESCRIBE TABLE {db_name}.{tbl_name}")
+            hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+            rows = hook.get_records(f"DESCRIBE TABLE {database_name}.{table_name}")
             columns = []
             for row in rows:
                 source_type, notnull = parse_ch_type(row[1])
@@ -281,66 +280,62 @@ def make_er_export_task_group(
                     "precision":   None,
                     "scale":       None,
                 })
-            columns.extend(tbl_params.get("extra_columns", []))
+            columns.extend(params.get("extra_columns", []))
             meta = {
-                "schema_name": tbl_params["schema"],
-                "table_name":  tbl_name,
-                "strategy":    tbl_params.get("strategy", "FULL_UK"),
-                "PK":          tbl_params.get("PK", []),
-                "UK":          tbl_params.get("UK", []),
+                "schema_name": params["schema"],
+                "table_name":  table_name,
+                "strategy":    params.get("strategy", "FULL_UK"),
+                "PK":          params.get("PK", []),
+                "UK":          params.get("UK", []),
                 "params":      {"separation": "\t", "escapesymbol": "\""},
                 "columns":     columns,
             }
             context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
 
-        get_metadata = PythonOperator(
-            dag=dag,
-            task_id='get_metadata',
-            python_callable=_get_metadata,
-            op_kwargs={
-                "db_name":            database_name,
-                "tbl_name":           table_name,
-                "tbl_params":         params,
-                "clickhouse_conn_id": "dlab-click",
-            },
-        )
+        get_metadata = _get_metadata()
 
         # ── TFS task group: export → zip → kafka ────────────────────────────
         tg_tfs_id = "prepare_and_send_files_via_tfs_route"
         with TaskGroup(dag=dag, group_id=tg_tfs_id) as tg_tfs:
 
-            xp = f"{{{{ ti.xcom_pull(task_ids='{tg.group_id}.select_extract_params')[0]"
+            def _pre_execute_copy(context):
+                """Инжектирует export_time и condition из get_delta_params в SQL выгрузки,
+                а также параметры файла (max_size, sanitize и др.) из select_extract_params."""
+                ti = context['ti']
+                dp = ti.xcom_pull(task_ids=f'{tg.group_id}.get_delta_params')[0]
+                ep = ti.xcom_pull(task_ids=f'{tg.group_id}.select_extract_params')[0]
+                op = context['task']
+                op.sql             = op.sql.format(export_time=dp[1], condition=dp[11])
+                op.max_size        = ep[4]
+                op.xstream_sanitize = ep[5] == 'True'
+                op.sanitize_array  = ep[6] == 'True'
+                op.sanitize_list   = ep[7]
+                op.pg_array_format = ep[8] == 'True'
+                op.format_params   = ep[9]
 
             copy_clickhouse_query = HrpClickNativeToS3ListOperator(
                 dag=dag,
                 task_id='copy_clickhouse_query',
                 s3_bucket=bucket,
-                s3_key=f"{s3_prefix}/{{{{ ts_nodash }}}}.csv",
+                s3_key=f"{s3_prefix}/{{{{ ts_nodash }}}}.csv",  # ts_nodash — стандартный Airflow-макрос
                 sql=sql_stmt_export,
                 compression=None,       # ZIP упаковываем сами
-                max_size=f"{xp}[4] }}}}",
                 replace=True,
                 post_file_check=False,  # баг в hash-check при compression=None
-                xstream_sanitize=f"{xp}[5] }}}}",
-                sanitize_array=f"{xp}[6] }}}}",
-                sanitize_list=f"{xp}[7] }}}}",
-                pg_array_format=f"{xp}[8] }}}}",
-                format_params=f"{xp}[9] }}}}",
+                pre_execute=_pre_execute_copy,
             )
 
-            def _package_zip_parts(
-                outer_tg_id, inner_tg_id, tbl_name, schema, prefix,
-                s3_prefix_path, s3_bucket, aws_conn_id, **context
-            ):
+            @task(dag=dag, task_id='package_zip_parts')
+            def _package_zip_parts(**context):
                 """Скачивает промежуточные CSV из S3, упаковывает каждый в ZIP вместе с .meta и .tkt,
                 удаляет исходные CSV. Создаёт итоговый summary.tkt со списком ZIP-файлов.
                 Результаты (zip_name_list, summary_tkt_name, total_row_count) кладёт в XCom."""
                 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
                 ti = context["ti"]
 
-                s3_key_list    = ti.xcom_pull(task_ids=f"{outer_tg_id}.{inner_tg_id}.copy_clickhouse_query", key="s3_key_list")
-                row_count_list = ti.xcom_pull(task_ids=f"{outer_tg_id}.{inner_tg_id}.copy_clickhouse_query", key="row_count_list")
-                meta_json_str  = ti.xcom_pull(task_ids=f"{outer_tg_id}.get_metadata", key="meta_json")
+                s3_key_list    = ti.xcom_pull(task_ids=f'{tg.group_id}.{tg_tfs_id}.copy_clickhouse_query', key='s3_key_list')
+                row_count_list = ti.xcom_pull(task_ids=f'{tg.group_id}.{tg_tfs_id}.copy_clickhouse_query', key='row_count_list')
+                meta_json_str  = ti.xcom_pull(task_ids=f'{tg.group_id}.get_metadata', key='meta_json')
 
                 if not s3_key_list:
                     logger.warning("No CSV parts exported — skipping ZIP packaging")
@@ -350,7 +345,7 @@ def make_er_export_task_group(
                     return
 
                 meta_bytes = meta_json_str.encode()
-                hook  = S3Hook(aws_conn_id=aws_conn_id)
+                hook  = S3Hook(aws_conn_id=TFS_OUT_CONN_ID)
                 total = len(s3_key_list)
                 base_ts = pendulum.now("UTC")
                 uploaded_zips = []
@@ -362,12 +357,12 @@ def make_er_export_task_group(
                     tkt_ts   = base_ts.add(seconds=i * 2 + 1).format("YYYYMMDDHHmmss")
                     outer_ts = base_ts.add(seconds=i * 2 + 2).format("YYYYMMDDHHmmss")
 
-                    csv_name  = f"{schema}__{tbl_name}__{inner_ts}__{part}_{total}_{rows}.csv"
-                    meta_name = f"{schema}__{tbl_name}__{inner_ts}__{part}_{total}_{rows}.meta"
-                    tkt_name  = f"{prefix}__{tkt_ts}.tkt"
-                    zip_name  = f"{prefix}__{outer_ts}__{tbl_name}__{part}_{total}_{rows}.csv.zip"
+                    csv_name  = f"{schema_name}__{table_name}__{inner_ts}__{part}_{total}_{rows}.csv"
+                    meta_name = f"{schema_name}__{table_name}__{inner_ts}__{part}_{total}_{rows}.meta"
+                    tkt_name  = f"{replica_name}__{tkt_ts}.tkt"
+                    zip_name  = f"{replica_name}__{outer_ts}__{table_name}__{part}_{total}_{rows}.csv.zip"
 
-                    csv_bytes = hook.get_key(key=s3_key, bucket_name=s3_bucket).get()["Body"].read()
+                    csv_bytes = hook.get_key(key=s3_key, bucket_name=bucket).get()["Body"].read()
 
                     buf = BytesIO()
                     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -376,17 +371,17 @@ def make_er_export_task_group(
                         zf.writestr(csv_name,  csv_bytes)
                     buf.seek(0)
 
-                    hook.load_bytes(buf.getvalue(), key=f"{s3_prefix_path}/{zip_name}", bucket_name=s3_bucket, replace=True)
-                    hook.delete_objects(bucket=s3_bucket, keys=[s3_key])
+                    hook.load_bytes(buf.getvalue(), key=f"{s3_prefix}/{zip_name}", bucket_name=bucket, replace=True)
+                    hook.delete_objects(bucket=bucket, keys=[s3_key])
                     uploaded_zips.append(zip_name)
                     logger.info("Packaged %d/%d: %s", part, total, zip_name)
 
                 summary_ts  = base_ts.add(seconds=(total - 1) * 2 + 3).format("YYYYMMDDHHmmss")
-                summary_tkt = f"{prefix}__{summary_ts}.tkt"
+                summary_tkt = f"{replica_name}__{summary_ts}.tkt"
                 hook.load_bytes(
                     "\n".join(uploaded_zips).encode(),
-                    key=f"{s3_prefix_path}/{summary_tkt}",
-                    bucket_name=s3_bucket,
+                    key=f"{s3_prefix}/{summary_tkt}",
+                    bucket_name=bucket,
                     replace=True,
                 )
                 logger.info("Created summary tkt: %s", summary_tkt)
@@ -395,99 +390,94 @@ def make_er_export_task_group(
                 ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
                 ti.xcom_push(key="total_row_count",  value=sum(int(r) for r in row_count_list))
 
-            package_zip_parts = PythonOperator(
-                dag=dag,
-                task_id='package_zip_parts',
-                python_callable=_package_zip_parts,
-                op_kwargs={
-                    "outer_tg_id":    tg.group_id,
-                    "inner_tg_id":    tg_tfs_id,
-                    "tbl_name":       table_name,
-                    "schema":         schema_name,
-                    "prefix":         replica_name,
-                    "s3_prefix_path": s3_prefix,
-                    "s3_bucket":      bucket,
-                    "aws_conn_id":    TFS_OUT_CONN_ID,
-                },
-            )
+            package_zip_parts = _package_zip_parts()
 
-            tkt_xcom = f"{{{{ ti.xcom_pull(task_ids='{tg.group_id}.{tg_tfs_id}.package_zip_parts', key='summary_tkt_name') }}}}"
+            def _pre_execute_kafka(context):
+                """Инжектирует имя summary .tkt файла в продюсер Kafka перед отправкой."""
+                summary_tkt = context['ti'].xcom_pull(
+                    task_ids=f'{tg.group_id}.{tg_tfs_id}.package_zip_parts',
+                    key='summary_tkt_name',
+                )
+                context['task'].producer_function_args = [scenario, summary_tkt]
 
             notify_tfs_kafka = ProduceToTopicOperator(
                 dag=dag,
                 task_id='notify_tfs_kafka',
                 producer_function=produce_tfs_kafka_notification,
-                producer_function_args=[scenario, tkt_xcom],
+                producer_function_args=[scenario, ''],  # заполняется в pre_execute
                 delivery_callback=TFS_KAFKA_CALLBACK,
                 pool=tfs_out_pool,
+                pre_execute=_pre_execute_kafka,
             )
 
             copy_clickhouse_query >> package_zip_parts >> notify_tfs_kafka
 
         # ── update send status ───────────────────────────────────────────────
-        dp = f"{{{{ ti.xcom_pull(task_ids='{tg.group_id}.get_delta_params')[0]"
-
-        update_send_status = ClickHouseOperator(
-            dag=dag,
-            task_id='update_send_status',
-            sql=f"""
+        @task(dag=dag, task_id='update_send_status')
+        def _update_send_status(**context):
+            """Фиксирует результат выгрузки в export.extract_history через ClickHouseHook,
+            используя значения из XCom задач get_delta_params и package_zip_parts."""
+            from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+            ti  = context['ti']
+            dp  = ti.xcom_pull(task_ids=f'{tg.group_id}.get_delta_params')[0]
+            total_rows = ti.xcom_pull(task_ids=f'{tg.group_id}.{tg_tfs_id}.package_zip_parts', key='total_row_count')
+            zip_names  = ti.xcom_pull(task_ids=f'{tg.group_id}.{tg_tfs_id}.package_zip_parts', key='zip_name_list')
+            hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+            hook.run(f"""
                 insert into export.extract_history (
                     extract_name, extract_time, extract_count,
                     loaded, sent, confirmed,
                     increment, overlap, recent_interval,
                     time_field, time_from, time_to, exported_files
-                )
-                select
+                ) select
                     '{table_name}',
-                    {dp}[1] }}}},
-                    {{{{ ti.xcom_pull(task_ids='{tg.group_id}.{tg_tfs_id}.package_zip_parts', key='total_row_count') }}}},
+                    {dp[1]},
+                    {total_rows},
                     now(), now(), null,
-                    {dp}[6] }}}},
-                    {dp}[7] }}}},
-                    {dp}[13] }}}},
-                    {dp}[8] }}}},
-                    {dp}[9] }}}},
-                    {dp}[10] }}}},
-                    {{{{ ti.xcom_pull(task_ids='{tg.group_id}.{tg_tfs_id}.package_zip_parts', key='zip_name_list') }}}}
-            """,
-        )
+                    {dp[6]}, {dp[7]}, {dp[13]},
+                    {dp[8]}, {dp[9]}, {dp[10]},
+                    {zip_names!r}
+            """)
+
+        update_send_status = _update_send_status()
 
         # ── loop / self-trigger ──────────────────────────────────────────────
-        def _get_task_next_run(end_loop, **context):
+        @task.branch(dag=dag, task_id='check_need_next_run')
+        def _check_need_next_run(**context):
             """Определяет следующую ветку: если end_loop=True — завершает цикл (→ fin),
             иначе планирует повторный запуск (→ set_next_run_date)."""
-            if isinstance(end_loop, str):
-                end_loop = end_loop.lower() in ('true', 't', '1')
-            group_id = context["ti"].task_id.rsplit(".", maxsplit=1)[0]
-            return f"{group_id}.fin" if end_loop else f"{group_id}.set_next_run_date"
+            dp = context['ti'].xcom_pull(task_ids=f'{tg.group_id}.get_delta_params')[0]
+            end_loop = str(dp[12]).lower() in ('true', 't', '1')
+            return f'{tg.group_id}.fin' if end_loop else f'{tg.group_id}.set_next_run_date'
 
-        check_need_next_run = BranchPythonOperator(
-            dag=dag,
-            task_id='check_need_next_run',
-            python_callable=_get_task_next_run,
-            op_args=[f"{dp}[12] }}}}"],
-        )
+        check_need_next_run = _check_need_next_run()
 
-        def _get_next_run_date(timeout_str: str, **context):
+        @task(dag=dag, task_id='set_next_run_date')
+        def _set_next_run_date(**context):
             """Вычисляет дату следующего запуска DAG как now() + selfrun_timeout минут
             и кладёт её в XCom под ключом next_run_date."""
-            run_date = pendulum.now('UTC').add(minutes=int(timeout_str))
-            context['ti'].xcom_push(key='next_run_date', value=run_date)
+            ti = context['ti']
+            ep = ti.xcom_pull(task_ids=f'{tg.group_id}.select_extract_params')[0]
+            run_date = pendulum.now('UTC').add(minutes=int(ep[1]))
+            ti.xcom_push(key='next_run_date', value=run_date)
 
-        set_next_run_date = PythonOperator(
-            dag=dag,
-            task_id='set_next_run_date',
-            python_callable=_get_next_run_date,
-            op_args=[f"{{{{ ti.xcom_pull(task_ids='{tg.group_id}.select_extract_params')[0][1] }}}}"],
-            provide_context=True,
-        )
+        set_next_run_date = _set_next_run_date()
+
+        def _pre_execute_trigger(context):
+            """Инжектирует дату следующего запуска из XCom в TriggerDagRunOperator."""
+            next_run = context['ti'].xcom_pull(
+                task_ids=f'{tg.group_id}.set_next_run_date',
+                key='next_run_date',
+            )
+            context['task'].logical_date = next_run
 
         trigger_self = TriggerDagRunOperator(
             dag=dag,
             task_id='trigger_self',
             trigger_dag_id=dag.dag_id,
-            logical_date=f"{{{{ ti.xcom_pull(task_ids='{tg.group_id}.set_next_run_date', key='next_run_date') }}}}",
+            logical_date=None,  # заполняется в pre_execute
             reset_dag_run=False,
+            pre_execute=_pre_execute_trigger,
         )
 
         fin = DummyOperator(dag=dag, task_id='fin')

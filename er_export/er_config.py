@@ -88,19 +88,6 @@ ER_EXTRA_COLUMNS = [
 ]
 
 
-def get_export_time_placeholder(table_name: str) -> str:
-    """Возвращает Jinja-шаблон, который подставляет метку времени среза (extract_time)
-    из XCom задачи get_delta_params в SQL выгрузки."""
-    return f"{{{{ ti.xcom_pull(task_ids='{table_name}.get_delta_params')[0][1] }}}}"
-
-
-def get_delta_condition_placeholder(table_name: str) -> str:
-    """Возвращает Jinja-шаблон, который подставляет условие WHERE для инкремента
-    (например: '2024-01-01' < insert_time and insert_time <= '2024-01-02')
-    из XCom задачи get_delta_params в SQL выгрузки."""
-    return f"{{{{ ti.xcom_pull(task_ids='{table_name}.get_delta_params')[0][11] }}}}"
-
-
 tables = {
     "evolution.lc_items_opened": {
         "replica":  "hrplatform_datalab",
@@ -110,9 +97,11 @@ tables = {
         "PK":       [],
         "UK":            ["person_uuid", "item_id"],
         "extra_columns": ER_EXTRA_COLUMNS,
-        "sql_stmt_export_delta": f"""
+        # {export_time} и {condition} — Python-плейсхолдеры, заполняются в pre_execute
+        # значениями из XCom задачи get_delta_params (индексы [1] и [11])
+        "sql_stmt_export_delta": """
             select
-                {get_export_time_placeholder('lc_items_opened')} as export_time,
+                {export_time} as export_time,
                 insert_time,
                 header_id,
                 header_person_id,
@@ -125,7 +114,7 @@ tables = {
                 'I'   as ctl_action,
                 now() as ctl_validfrom
             from evolution.lc_items_opened
-            where {get_delta_condition_placeholder('lc_items_opened')}
+            where {condition}
         """,
     },
 }

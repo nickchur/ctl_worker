@@ -26,22 +26,31 @@ from er_export.er_common import (
     build_dynamic_select
 )
 
+# Пытаемся импортировать ctl_obj_load из общих утилит
+try:
+    from plugins.ctl_utils import ctl_obj_load
+except ImportError:
+    try:
+        from ctl.plugins.ctl_utils import ctl_obj_load
+    except ImportError:
+        # Резервный вариант, если плагин недоступен (например, локально)
+        def ctl_obj_load(key):
+            from airflow.models import Variable
+            return Variable.get(key, default_var={}, deserialize_json=True)
+
 logger = logging.getLogger(__name__)
 
-# Load metadata from Airflow Variable or fallback to local file
+# Load metadata
 VARIABLE_NAME = "datalab_er_wfs"
-META_FILE = os.path.join(os.path.dirname(__file__), "er_meta.json")
+tables = ctl_obj_load(VARIABLE_NAME)
 
-try:
-    tables = Variable.get(VARIABLE_NAME, deserialize_json=True)
-    logger.info(f"Loaded metadata from Airflow Variable: {VARIABLE_NAME}")
-except Exception as e:
-    logger.warning(f"Could not load Variable {VARIABLE_NAME}: {e}. Falling back to {META_FILE}")
+if not tables:
+    # Если из Variable/S3 ничего не пришло, пробуем локальный файл (для тестов)
+    META_FILE = os.path.join(os.path.dirname(__file__), "er_meta.json")
     if os.path.exists(META_FILE):
         with open(META_FILE, 'r') as f:
             tables = json.load(f)
-    else:
-        tables = {}
+        logger.info(f"Loaded metadata from local fallback: {META_FILE}")
 
 # ── DAG factory ──────────────────────────────────────────────────────────────
 

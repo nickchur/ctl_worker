@@ -22,29 +22,6 @@ logger = logging.getLogger(__name__)
 
 ON_DELIVERY = 'er_export.er_core.on_delivery'
 
-def _fmt_dt(v):
-    return 'null' if v is None else f"'{v}'"
-
-def _format_cur(cur: dict) -> dict:
-    tf = cur['time_field']
-    ec = cur['extract_count']
-    return {
-        'num_state':      str(cur['num_state']),
-        'extract_time':   _fmt_dt(cur['extract_time']),
-        'extract_count':  'null' if ec is None else str(ec),
-        'loaded':         'null' if ec is None else _fmt_dt(cur['loaded']),
-        'sent':           'null' if ec is None else _fmt_dt(cur['sent']),
-        'confirmed':      'null' if ec is None else _fmt_dt(cur['confirmed']),
-        'increment':      str(cur['increment']),
-        'overlap':        str(cur['overlap']),
-        'time_field':     f"'{tf}'",
-        'time_from':      _fmt_dt(cur['time_from']),
-        'time_to':        _fmt_dt(cur['time_to']),
-        'condition':      f"{_fmt_dt(cur['time_from'])} < {tf} and {tf} <= {_fmt_dt(cur['time_to'])}",
-        'is_current':     'True' if cur['current_time'] == cur['extract_time'] else 'False',
-        'recent_interval': '0',
-    }
-
 def get_dict(ch_hook, sql):
     res, cols = ch_hook.execute(sql, with_column_types=True)
     if res:
@@ -240,7 +217,7 @@ def export_tg(
                 cur_res = get_dict(hook, cfg['sql_get_current'])
                 if not cur_res:
                     raise ValueError(f"No delta state found for {cfg['tbl']}")
-                result = {**reg, **_format_cur(cur_res[0])}
+                result = {**reg, **cur_res[0]}
             else:
                 result = reg
             p = context['params']

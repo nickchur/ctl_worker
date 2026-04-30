@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import time
@@ -319,8 +320,8 @@ for _table_key, _params in tables.items():
             op.sanitize_list    = ep[7]
             op.pg_array_format  = ep[8] == 'True'
             try:
-                op.format_params = json.loads(ep[9]) if ep[9] else {}
-            except (json.JSONDecodeError, TypeError):
+                op.format_params = ast.literal_eval(ep[9]) if ep[9] else {}
+            except (ValueError, TypeError):
                 logger.warning("Unparseable format_params: %r", ep[9])
                 op.format_params = {}
 

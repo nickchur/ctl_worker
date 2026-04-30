@@ -125,8 +125,8 @@ for table_key, params in wfs.items():
         's3_prefix':   s3_prefix,
         'bucket':      BUCKET,
         'topic':              DEF_ARGS['topic'],
-        'kafka_sensor_conn_id': DEF_ARGS['kafka_sensor_conn_id'],
-        'kafka_sensor_topic':   DEF_ARGS['kafka_sensor_topic'],
+        'kafka_in_conn': DEF_ARGS['kafka_in_conn'],
+        'kafka_in_topic':   DEF_ARGS['kafka_in_topic'],
         'sql_auto_confirm': f"""
             insert into export.extract_history (
                 extract_name, extract_time, extract_count, loaded, sent, confirmed,

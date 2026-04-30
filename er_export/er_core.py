@@ -434,8 +434,8 @@ def export_tg(
 
         t_wait_confirm = KafkaConsumeSensor(
             task_id='wait_for_confirm',
-            kafka_config_id=cfg['kafka_sensor_conn_id'],
-            topics=[cfg['kafka_sensor_topic']],
+            kafka_config_id=cfg['kafka_in_conn'],
+            topics=[cfg['kafka_in_topic']],
             apply_function=_handle_confirm,
             poke_interval=60,
             timeout=3600,

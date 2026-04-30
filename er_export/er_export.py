@@ -76,40 +76,23 @@ for table_key, params in wfs.items():
     if sql_delta:
         sql_reg = sql_reg_delta(tbl)
         sql_cur = build_sql({
-            "with": f"""WITH data AS (
-                SELECT
-                    num_state       as num_state,
-                    extract_time    as extract_time,
-                    current_time    as current_time,
-                    extract_count   as extract_count,
-                    loaded          as loaded,
-                    sent            as sent,
-                    confirmed       as confirmed,
-                    increment       as increment,
-                    overlap         as overlap,
-                    time_field      as time_field,
-                    time_from       as time_from,
-                    time_to         as time_to
-                FROM export.extract_current_vw
-                WHERE extract_name = '{tbl}'
-            )""",
             "fields": [
-                "toString(num_state)                                                               as num_state",
-                "concat('\\'', toString(extract_time), '\\'')                                      as extract_time",
-                "ifNull(toString(extract_count), 'null')                                           as extract_count",
-                "if(extract_count is null, 'null', concat('\\'', toString(loaded), '\\''))       as loaded",
-                "if(extract_count is null, 'null', concat('\\'', toString(sent), '\\''))         as sent",
-                "if(extract_count is null, 'null', concat('\\'', toString(confirmed), '\\''))    as confirmed",
-                "toString(increment)                                                               as increment",
-                "toString(overlap)                                                                 as overlap",
-                "concat('\\'', time_field, '\\'')                                                  as time_field",
-                "concat('\\'', toString(time_from), '\\'')                                         as time_from",
-                "concat('\\'', toString(time_to), '\\'')                                           as time_to",
+                "toString(num_state)                                                                   as num_state",
+                "concat('\\'', toString(extract_time), '\\'')                                          as extract_time",
+                "ifNull(toString(extract_count), 'null')                                               as extract_count",
+                "if(extract_count is null, 'null', concat('\\'', toString(loaded), '\\''))             as loaded",
+                "if(extract_count is null, 'null', concat('\\'', toString(sent), '\\''))               as sent",
+                "if(extract_count is null, 'null', concat('\\'', toString(confirmed), '\\''))          as confirmed",
+                "toString(increment)                                                                    as increment",
+                "toString(overlap)                                                                      as overlap",
+                "concat('\\'', time_field, '\\'')                                                       as time_field",
+                "concat('\\'', toString(time_from), '\\'')                                              as time_from",
+                "concat('\\'', toString(time_to), '\\'')                                                as time_to",
                 "concat('\\'', toString(time_from), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(time_to), '\\'') as condition",
-                "if(current_time = extract_time, 'True', 'False')                               as is_current",
-                "toString(0)                                                                         as recent_interval"
+                "if(current_time = extract_time, 'True', 'False')                                     as is_current",
+                "toString(0)                                                                            as recent_interval"
             ],
-            "from": "data"
+            "from": f"(SELECT * FROM export.extract_current_vw WHERE extract_name = '{tbl}')"
         })
     else:
         sql_reg = sql_reg_recent(tbl)

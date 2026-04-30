@@ -11,6 +11,7 @@ from io import BytesIO
 import pendulum
 from airflow import DAG
 from airflow.decorators import task
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.dummy_operator import DummyOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
@@ -84,8 +85,11 @@ def tfs_message_delivery_callback(err, msg) -> None:
 
 def _make_pre_execute_kafka(scenario: str):
     """Фабрика замыкания pre_execute для notify_tfs_kafka: захватывает scenario по значению,
-    чтобы избежать переопределения переменной при итерации цикла фабрики DAG-ов."""
+    чтобы избежать переопределения переменной при итерации цикла фабрики DAG-ов.
+    В test-режиме бросает AirflowSkipException."""
     def _pre_execute(context):
+        if MODE != 'prod':
+            raise AirflowSkipException("Kafka notification skipped in test mode")
         summary_tkt = context['ti'].xcom_pull(task_ids='package_zip_parts', key='summary_tkt_name')
         context['task'].producer_function_args = [scenario, summary_tkt]
     return _pre_execute
@@ -409,13 +413,6 @@ for _table_key, _params in tables.items():
 
         t_package = package_zip_parts(cfg=_task_cfg)
 
-        @task.branch(task_id='check_kafka_needed')
-        def check_kafka_needed(**context):
-            """В test-режиме пропускает отправку в Kafka, переходя сразу к update_send_status."""
-            return 'notify_tfs_kafka' if MODE == 'prod' else 'update_send_status'
-
-        t_check_kafka = check_kafka_needed()
-
         notify_tfs_kafka = ProduceToTopicOperator(
             task_id='notify_tfs_kafka',
             producer_function=produce_tfs_kafka_notification,
@@ -425,7 +422,7 @@ for _table_key, _params in tables.items():
             pre_execute=_make_pre_execute_kafka(_scenario),
         )
 
-        @task(task_id='update_send_status', trigger_rule='one_success')
+        @task(task_id='update_send_status', trigger_rule='none_failed')
         def update_send_status(cfg, **context):
             """Фиксирует результат выгрузки в export.extract_history через ClickHouseHook,
             используя значения из XCom задач get_delta_params и package_zip_parts."""
@@ -494,10 +491,7 @@ for _table_key, _params in tables.items():
         check_need_auto_confirm_delta >> [auto_confirm_delta, not_need_auto_confirm] >> get_delta_params
         get_delta_params >> [select_extract_params, t_get_metadata]
         [select_extract_params, t_get_metadata] >> copy_clickhouse_query
-        copy_clickhouse_query >> t_package >> t_check_kafka
-        t_check_kafka >> notify_tfs_kafka >> t_update
-        t_check_kafka >> t_update
-        t_update >> t_check_next
+        copy_clickhouse_query >> t_package >> notify_tfs_kafka >> t_update >> t_check_next
         t_check_next >> t_set_next >> trigger_self >> fin.as_teardown(setups=t_set_next)
         t_check_next >> fin
 

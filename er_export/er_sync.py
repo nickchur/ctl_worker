@@ -41,24 +41,24 @@ def er_sync_dag():
             hook.execute("""
                 CREATE TABLE IF NOT EXISTS export.er_wf_meta
                 (
-                    extract_name    String,
-                    db_name         String,
-                    replica         String,
-                    schema_name     String,
-                    format          String        DEFAULT 'TSVWithNames',
-                    strategy        String        DEFAULT 'FULL_UK',
-                    pk              Array(String) DEFAULT [],
-                    uk              Array(String) DEFAULT [],
-                    fields          Array(String) DEFAULT [],
-                    sql_from        String        DEFAULT '',
-                    sql_where       String        DEFAULT '',
-                    increment       Int32         DEFAULT 60,
-                    selfrun_timeout Int32         DEFAULT 10,
-                    auto_confirm    UInt8         DEFAULT 1,
-                    description     String        DEFAULT '',
-                    is_recent       UInt8         DEFAULT 0,
-                    is_active       UInt8         DEFAULT 1,
-                    updated_at      DateTime      DEFAULT now()
+                    extract_name    String                    COMMENT 'Имя выгрузки (table name без схемы)',
+                    db_name         String                    COMMENT 'База данных источника в ClickHouse (левая часть "db.table")',
+                    replica         String                    COMMENT 'Реплика-маршрутизатор TFS (ключ в TFS_OUT_CONFIG_MAP)',
+                    schema_name     String                    COMMENT 'Целевая схема в .meta-файле для TFS',
+                    format          String        DEFAULT 'TSVWithNames' COMMENT 'Формат выгрузки ClickHouse',
+                    strategy        String        DEFAULT 'FULL_UK'      COMMENT 'Стратегия merge: FULL_UK, FULL_PK, DELTA_UK и др.',
+                    pk              Array(String) DEFAULT []             COMMENT 'Список колонок первичного ключа',
+                    uk              Array(String) DEFAULT []             COMMENT 'Список колонок уникального ключа',
+                    fields          Array(String) DEFAULT []             COMMENT 'SELECT-выражения (export_time, ctl_action, ctl_validfrom добавляются автоматически)',
+                    sql_from        String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос',
+                    sql_where       String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; {condition} подставляется рантаймом',
+                    increment       Int32         DEFAULT 60             COMMENT 'Инкремент дельты (сек)',
+                    selfrun_timeout Int32         DEFAULT 10             COMMENT 'Таймаут перед авто-запуском следующей дельты (мин)',
+                    auto_confirm    UInt8         DEFAULT 1              COMMENT '1 = авто-подтверждение дельты, 0 = ждать уведомления в Kafka',
+                    description     String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
+                    is_recent       UInt8         DEFAULT 0             COMMENT '0 = delta (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent)',
+                    is_active       UInt8         DEFAULT 1             COMMENT '0 = запись игнорируется при синхронизации в Variable',
+                    updated_at      DateTime      DEFAULT now()         COMMENT 'Версия строки для ReplacingMergeTree'
                 )
                 ENGINE = ReplacingMergeTree(updated_at)
                 ORDER BY (db_name, extract_name)

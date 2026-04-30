@@ -1,13 +1,17 @@
 -- DDL for export.er_wf_meta
 -- Flat config table for ER export workflows (no JSON columns)
 -- Synced to Airflow Variable "datalab_er_wfs" every 5 min by er_sync__datalab_er_wfs DAG
+--
+-- ВАЖНО: выполнять через clickhouse-client или HTTP-интерфейс, НЕ через JDBC.
+-- JDBC-драйвер интерпретирует {shard} и {replica} как именованные параметры → ошибка.
+-- Пример: clickhouse-client --multiquery < er_wf_meta.sql
 
 CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
 (
     extract_name  String                    COMMENT 'Имя выгрузки (table name без схемы), соответствует extract_name в extract_registry_vw',
     db_name       String                    COMMENT 'База данных источника в ClickHouse (левая часть "db.table")',
     replica       String                    COMMENT 'Реплика-маршрутизатор TFS (ключ в TFS_OUT_CONFIG_MAP)',
-    schema_name   String                    COMMENT 'Целевая схема в .meta-файле для xStream',
+    schema_name   String                    COMMENT 'Целевая схема в .meta-файле для TFS',
     format        String        DEFAULT 'TSVWithNames' COMMENT 'Формат выгрузки ClickHouse',
     strategy      String        DEFAULT 'FULL_UK'      COMMENT 'Стратегия merge в .meta: FULL_UK, FULL_PK, DELTA_UK и др.',
     pk            Array(String) DEFAULT []             COMMENT 'Список колонок первичного ключа',

@@ -24,6 +24,7 @@ from er_export.er_config import (
     CH_TYPE_MAP,
     DEFAULT_ARGS,
     ENV_STAND,
+    MODE,
     ROW_COUNT_LIMIT_MAP,
     TFS_OUT_BUCKET,
     TFS_OUT_CONFIG_MAP,
@@ -408,6 +409,13 @@ for _table_key, _params in tables.items():
 
         t_package = package_zip_parts(cfg=_task_cfg)
 
+        @task.branch(task_id='check_kafka_needed')
+        def check_kafka_needed(**context):
+            """В test-режиме пропускает отправку в Kafka, переходя сразу к update_send_status."""
+            return 'notify_tfs_kafka' if MODE == 'prod' else 'update_send_status'
+
+        t_check_kafka = check_kafka_needed()
+
         notify_tfs_kafka = ProduceToTopicOperator(
             task_id='notify_tfs_kafka',
             producer_function=produce_tfs_kafka_notification,
@@ -417,7 +425,7 @@ for _table_key, _params in tables.items():
             pre_execute=_make_pre_execute_kafka(_scenario),
         )
 
-        @task(task_id='update_send_status')
+        @task(task_id='update_send_status', trigger_rule='one_success')
         def update_send_status(cfg, **context):
             """Фиксирует результат выгрузки в export.extract_history через ClickHouseHook,
             используя значения из XCom задач get_delta_params и package_zip_parts."""
@@ -486,7 +494,10 @@ for _table_key, _params in tables.items():
         check_need_auto_confirm_delta >> [auto_confirm_delta, not_need_auto_confirm] >> get_delta_params
         get_delta_params >> [select_extract_params, t_get_metadata]
         [select_extract_params, t_get_metadata] >> copy_clickhouse_query
-        copy_clickhouse_query >> t_package >> notify_tfs_kafka >> t_update >> t_check_next
+        copy_clickhouse_query >> t_package >> t_check_kafka
+        t_check_kafka >> notify_tfs_kafka >> t_update
+        t_check_kafka >> t_update
+        t_update >> t_check_next
         t_check_next >> t_set_next >> trigger_self >> fin.as_teardown(setups=t_set_next)
         t_check_next >> fin
 

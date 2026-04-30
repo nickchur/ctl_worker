@@ -2,12 +2,6 @@
   "export_xs_hrpl_lm_mt_user_stat_by_test": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "36 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_user_stat_by_test",
@@ -80,12 +74,6 @@
   "export_xs_hrpl_lm_mt_knowledge_book": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "18 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_knowledge_book",
@@ -167,12 +155,6 @@
   "export_xs_hrplatform_learning_history_recent": {
     "description": "DAG выгружает данные из таблицы learning_history схемы evolution (актуальные данные за ограниченный период)",
     "schedule_interval": "3 9,13,18 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.learning_history_recent",
@@ -186,12 +168,6 @@
   "export_xs_hrpl_lm_gigachat_request": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "46 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_request",
@@ -261,12 +237,6 @@
   "export_xs_hrpl_lm_speechsim_walkthrough_client_diagnostic_report": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_walkthrough_client_diagnostic_report",
@@ -322,12 +292,6 @@
   "export_xs_hrpl_lm_ls_stream": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "5 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.ls_stream",
@@ -491,12 +455,6 @@
   "export_xs_hrpl_lm_plan_budget": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "5 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.plan_budget",
@@ -559,12 +517,6 @@
   "export_xs_hrpl_lm_lf_user_reaction": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "5 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.lf_user_reaction",
@@ -625,12 +577,6 @@
   "export_xs_hrpl_re_referral_info": {
     "description": "DAG выгружает данные из таблиц схемы recruitment (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "recruitment.referral_info",
@@ -718,12 +664,6 @@
   "export_xs_hrpl_lm_learning_history": {
     "description": "DAG выгружает данные из таблицы learning_history схемы evolution (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.learning_history",
@@ -787,12 +727,6 @@
   "export_xs_hrpl_lm_ai_log_daily_question": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.ai_log_daily_question",
@@ -880,12 +814,6 @@
   "export_xs_hrpl_pr_p_badges_tags": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_badges_tags",
@@ -955,12 +883,6 @@
   "export_xs_hrpl_lm_speechsim_admin_script_v2": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_admin_script",
@@ -1022,12 +944,6 @@
   "export_xs_hrpl_lm_kb_user_log": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "0 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.kb_user_log",
@@ -1079,12 +995,6 @@
   "export_xs_hrpl_re_c_socialnetworks": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_socialnetworks",
@@ -1160,12 +1070,6 @@
   "export_xs_hrpl_lm_speechsim_dynamic_walkthrough": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_dynamic_walkthrough",
@@ -1239,12 +1143,6 @@
   "export_xs_hrpl_re_c_history_v2": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_history",
@@ -1332,12 +1230,6 @@
   "export_xs_hrpl_pr_j_position_profile": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "40 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_position_profile",
@@ -1443,12 +1335,6 @@
   "export_xs_hrpl_pd_smart_salary": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "motivation.smart_salary",
@@ -1499,12 +1385,6 @@
   "export_xs_hrpl_re_job_application_large": {
     "description": "DAG выгружает данные из таблиц схемы recruitment (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "recruitment.job_application_large",
@@ -1628,12 +1508,6 @@
   "export_xs_hrpl_re_recruitment_funnel_history": {
     "description": "DAG выгружает данные из таблиц схемы stable (поток через xStream)",
     "schedule_interval": "7 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "stable.recruitment_funnel_history",
@@ -1739,12 +1613,6 @@
   "export_xs_hrpl_pr_p_additionalinfo": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_additionalinfo",
@@ -1820,12 +1688,6 @@
   "export_xs_hrpl_re_recruitment_published_requisition_history": {
     "description": "DAG выгружает данные из таблиц схемы stable (поток через xStream)",
     "schedule_interval": "6 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "stable.recruitment_published_requisition_history",
@@ -1899,12 +1761,6 @@
   "export_xs_hrpl_lm_mt_question_status": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "26 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_question_status",
@@ -1959,12 +1815,6 @@
   "export_xs_hrpl_bd_perftracker_v2": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "32 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.perftracker",
@@ -2049,12 +1899,6 @@
   "export_xs_hrpl_lm_speechsim_admin_script": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_admin_script",
@@ -2112,12 +1956,6 @@
   "export_xs_hrpl_re_c_tags": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_tags",
@@ -2187,12 +2025,6 @@
   "export_xs_hrpl_re_rec_job_application_tests": {
     "description": "DAG выгружает данные из таблиц схемы recruitment (поток через xStream)",
     "schedule_interval": "3 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "recruitment.rec_job_application_tests",
@@ -2273,12 +2105,6 @@
   "export_xs_hrpl_lm_mt_session": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "30 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_session",
@@ -2357,12 +2183,6 @@
   "export_xs_hrpl_lm_product_document": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.product_document",
@@ -2420,12 +2240,6 @@
   "export_xs_hrpl_lm_mt_test_v1": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "50 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_test",
@@ -2558,12 +2372,6 @@
   "export_xs_hrpl_lm_map_test2product": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.map_test2product",
@@ -2615,12 +2423,6 @@
   "export_xs_hrplatform_pp_j_model_it_pao_survey": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_model_it_pao_survey",
@@ -2735,12 +2537,6 @@
   "export_xs_hrpl_lm_question_form": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "52 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.question_form",
@@ -2795,12 +2591,6 @@
   "export_xs_hrpl_re_c_address": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "40 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_address",
@@ -2885,12 +2675,6 @@
   "export_xs_hrpl_lm_lc_playlists": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_playlists",
@@ -2981,12 +2765,6 @@
   "export_xs_hrpl_lm_gigachat_daily_request": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_daily_request",
@@ -3062,12 +2840,6 @@
   "export_xs_hrpl_lm_speechsim_user_action": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_user_action",
@@ -3143,12 +2915,6 @@
   "export_xs_hrpl_pr_pp_c_security_form_snapshots": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "12 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.pp_c_security_form_snapshots",
@@ -3239,12 +3005,6 @@
   "export_xs_hrpl_lm_map_product2sales_channel": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.map_product2sales_channel",
@@ -3296,12 +3056,6 @@
   "export_xs_hrpl_lm_speechsim_admin_dict_client_avatar": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_admin_dict_client_avatar",
@@ -3369,12 +3123,6 @@
   "export_xs_hrpl_pr_p_profile_score": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_profile_score",
@@ -3480,12 +3228,6 @@
   "export_xs_hrpl_lm_ai_log_question": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "42 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.ai_log_question",
@@ -3567,12 +3309,6 @@
   "export_xs_hrpl_lm_speechsim_walkthrough_infinite_client_report": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_walkthrough_infinite_client_report",
@@ -3616,12 +3352,6 @@
   "export_xs_hrpl_lm_gigachat_prompt": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_prompt",
@@ -3679,12 +3409,6 @@
   "export_xs_hrpl_lm_mt_job_position": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "12 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_job_position",
@@ -3742,12 +3466,6 @@
   "export_xs_hrpl_lm_gigachat_daily_hint": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_daily_hint",
@@ -3817,12 +3535,6 @@
   "export_xs_hrpl_lm_speechsim_walkthrough_client_diagnostic_report_v1": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_walkthrough_client_diagnostic_report",
@@ -3884,12 +3596,6 @@
   "export_xs_hrpl_lm_mt_question": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_question",
@@ -4007,12 +3713,6 @@
   "export_xs_hrpl_lm_speechsim_walkthrough_report": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_walkthrough_report",
@@ -4062,12 +3762,6 @@
   "export_xs_hrpl_lm_mt_answer": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "2 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_answer",
@@ -4128,12 +3822,6 @@
   "export_xs_hrpl_re_c_additional_info": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "38 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_additional_info",
@@ -4200,12 +3888,6 @@
   "export_xs_hrpl_bd_perftracker": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "32 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.perftracker",
@@ -4290,12 +3972,6 @@
   "export_xs_hrpl_pr_pp_j_social_subscription": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "40 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_social_subscription",
@@ -4383,12 +4059,6 @@
   "export_xs_hrpl_re_c_language": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_language",
@@ -4467,12 +4137,6 @@
   "export_xs_hrpl_pr_p_bio": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_bio",
@@ -4535,12 +4199,6 @@
   "export_xs_hrpl_re_publication": {
     "description": "DAG выгружает данные из таблиц схемы recruitment (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "recruitment.publication",
@@ -4703,12 +4361,6 @@
   "export_xs_hrpl_re_c_history": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_history",
@@ -4796,12 +4448,6 @@
   "export_xs_hrpl_lm_mt_map_test2sales_channel": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "25 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_map_test2sales_channel",
@@ -4856,12 +4502,6 @@
   "export_xs_hrpl_pr_pp_j_social_follower": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "40 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_social_follower",
@@ -4949,12 +4589,6 @@
   "export_xs_hrpl_lm_direction_document": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.direction_document",
@@ -5015,12 +4649,6 @@
   "export_xs_hrpl_lm_lc_playlist_progress_changed": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_playlist_progress_changed",
@@ -5117,12 +4745,6 @@
   "export_xs_hrpl_lm_mt_user": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "34 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_user",
@@ -5192,12 +4814,6 @@
   "export_xs_hrpl_lm_speechsim_replica_feedback": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_replica_feedback",
@@ -5247,12 +4863,6 @@
   "export_xs_hrpl_an_an_prod_event": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "30 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.an_prod_event",
@@ -5457,12 +5067,6 @@
   "export_xs_hrpl_re_c_contacts_externalemail": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_contacts_externalemail",
@@ -5532,12 +5136,6 @@
   "export_xs_hrpl_re_c_basic": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "42 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_basic",
@@ -5625,12 +5223,6 @@
   "export_xs_hrpl_pr_j_awards_v2": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "34 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_awards",
@@ -5721,12 +5313,6 @@
   "export_xs_hrpl_lm_mt_knowledge_book_master": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_knowledge_book_master",
@@ -5790,12 +5376,6 @@
   "export_xs_hrpl_lm_pp_j_psychotests_team_roles": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_psychotests_team_roles",
@@ -5883,12 +5463,6 @@
   "export_xs_hrplatform_extract_history": {
     "description": "DAG выгружает данные из таблиц схемы export (поток через xStream)",
     "schedule_interval": "0 9,13,18 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "export.extract_history",
@@ -5925,12 +5499,6 @@
   "export_xs_hrpl_re_c_desired_position": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_desired_position",
@@ -5997,12 +5565,6 @@
   "export_xs_hrpl_as_assessment_dm.py": {
     "description": "DAG выгружает данные из таблиц схемы stable (поток через xStream)",
     "schedule_interval": "55 0 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "stable.assessment_dm",
@@ -6074,12 +5636,6 @@
   "export_xs_hrpl_lm_mt_sales_channel": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "28 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_sales_channel",
@@ -6134,12 +5690,6 @@
   "export_xs_hrpl_lm_pp_j_psychotests_peoplipro": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_psychotests_peoplipro",
@@ -6224,12 +5774,6 @@
   "export_xs_hrpl_pr_p_badges": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_badges",
@@ -6314,12 +5858,6 @@
   "export_xs_hrpl_lm_question_type": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "56 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.question_type",
@@ -6374,12 +5912,6 @@
   "export_xs_hrpl_lm_mt_feedback": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "6 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_feedback",
@@ -6440,12 +5972,6 @@
   "export_xs_hrpl_pr_p_skills": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_skills",
@@ -6530,12 +6056,6 @@
   "export_xs_hrpl_re_adaptation_progress_changed_items": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "18 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.adaptation_progress_changed_items",
@@ -6680,12 +6200,6 @@
   "export_xs_hrpl_lm_pp_j_learningspecialtags": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_learningspecialtags",
@@ -6767,12 +6281,6 @@
   "export_xs_hrpl_lm_mt_feedback_type": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "10 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_feedback_type",
@@ -6833,12 +6341,6 @@
   "export_xs_hrpl_lm_product_type": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.product_type",
@@ -6899,12 +6401,6 @@
   "export_xs_hrpl_lm_ai_log_daily_answer": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.ai_log_daily_answer",
@@ -6959,12 +6455,6 @@
   "export_xs_hrpl_lm_lc_playlist_progress_changed_v2": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_playlist_progress_changed",
@@ -7064,12 +6554,6 @@
   "export_xs_hrpl_as_j_estimate360_result": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "0 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_estimate360_result",
@@ -7211,12 +6695,6 @@
   "export_xs_hrpl_pr_pp_j_address_addressbook": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "40 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_address_addressbook",
@@ -7295,12 +6773,6 @@
   "export_xs_hrpl_pr_j_corporate_activity": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_corporate_activity",
@@ -7382,12 +6854,6 @@
   "export_xs_hrpl_lm_j_psychotests_abilities": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_psychotests_abilities",
@@ -7484,12 +6950,6 @@
   "export_xs_hrpl_lm_question_free_answers": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "54 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.question_free_answers",
@@ -7550,12 +7010,6 @@
   "export_xs_hrpl_lm_speechsim_walkthrough_info": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_walkthrough_info",
@@ -7613,12 +7067,6 @@
   "export_xs_hrpl_lm_map_question2criteria": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.map_question2criteria",
@@ -7673,12 +7121,6 @@
   "export_xs_hrpl_lm_onsiteactivities_workload": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.onsiteactivities_workload",
@@ -7733,12 +7175,6 @@
   "export_xs_hrplatform_lc_items_recent": {
     "description": "DAG выгружает данные из таблицы lc_items схемы evolution (актуальные данные за ограниченный период)",
     "schedule_interval": "2 9,13,18 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_items_recent",
@@ -7752,12 +7188,6 @@
   "export_xs_hrpl_as_j_psychotests_characteristics_v2": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "7 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_psychotests_characteristics",
@@ -7835,12 +7265,6 @@
   "export_xs_hrpl_lm_mt_question_daily": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "46 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_question_daily",
@@ -7934,12 +7358,6 @@
   "export_xs_hrplatform_ch_from_kurs": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "17 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.ch_from_kurs",
@@ -7994,12 +7412,6 @@
   "export_xs_hrpl_lm_lc_recommended": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_recommended",
@@ -8075,12 +7487,6 @@
   "export_xs_hrpl_re_c_skills": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "52 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_skills",
@@ -8150,12 +7556,6 @@
   "export_xs_hrpl_pr_p_basic": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "34 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_basic",
@@ -8249,12 +7649,6 @@
   "export_xs_hrpl_re_adaptation_progress_changed": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "18 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.adaptation_progress_changed",
@@ -8372,12 +7766,6 @@
   "export_xs_hrpl_lm_gigachat_daily_question": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_daily_question",
@@ -8459,12 +7847,6 @@
   "export_xs_hrpl_lm_lc_items": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "18 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_items",
@@ -8672,12 +8054,6 @@
   "export_xs_hrpl_lm_mt_log_question": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "20 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_log_question",
@@ -8759,12 +8135,6 @@
   "export_xs_hrpl_lm_speechsim_stat_walkthrough_diagnostic": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_stat_walkthrough_diagnostic",
@@ -8824,12 +8194,6 @@
   "export_xs_hrpl_pr_p_profile_score_v2": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_profile_score",
@@ -9085,12 +8449,6 @@
   "export_xs_hrpl_lm_test_topic": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "58 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.test_topic",
@@ -9145,12 +8503,6 @@
   "export_xs_hrpl_lm_speechsim_admin_direction": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_admin_direction",
@@ -9190,12 +8542,6 @@
   "export_xs_hrpl_re_j_badge_status_beginner": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_badge_status_beginner",
@@ -9265,12 +8611,6 @@
   "export_xs_hrpl_lm_mt_log_aux": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "19 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_log_aux",
@@ -9328,12 +8668,6 @@
   "export_xs_hrpl_pr_p_funcexperience": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "32 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_funcexperience",
@@ -9415,12 +8749,6 @@
   "export_xs_hrpl_pr_p_prof_tags": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_prof_tags",
@@ -9493,12 +8821,6 @@
   "export_xs_hrpl_pr_p_career_status": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_career_status",
@@ -9574,12 +8896,6 @@
   "export_xs_hrpl_pr_p_language": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "32 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_language",
@@ -9682,12 +8998,6 @@
   "export_xs_hrpl_lm_map_product2product_type": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.map_product2product_type",
@@ -9739,12 +9049,6 @@
   "export_xs_hrpl_lm_lc_bookmarks": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_bookmarks",
@@ -9817,12 +9121,6 @@
   "export_xs_hrpl_lm_speechsim_bestpractise_solution": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_bestpractise_solution",
@@ -9888,12 +9186,6 @@
   "export_xs_hrpl_lm_mt_datalab_deleted": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "5 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_datalab_deleted",
@@ -9945,12 +9237,6 @@
   "export_xs_hrpl_pr_j_contacts_externalemail": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "36 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_contacts_externalemail",
@@ -10017,12 +9303,6 @@
   "export_xs_hrpl_lm_pp_j_psychotests_learning_agility": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_psychotests_learning_agility",
@@ -10125,12 +9405,6 @@
   "export_xs_hrpl_lm_book_reading_statistic": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.book_reading_statistic",
@@ -10206,12 +9480,6 @@
   "export_xs_hrpl_lm_ai_log_answer": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.ai_log_answer",
@@ -10266,12 +9534,6 @@
   "export_xs_hrpl_lm_gigachat_question": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "45 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_question",
@@ -10344,12 +9606,6 @@
   "export_xs_hrpl_lm_gigachat_answer": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "43 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_answer",
@@ -10404,12 +9660,6 @@
   "export_xs_hrplatform_lc_item_progress_changed_recent": {
     "description": "DAG выгружает данные из таблицы lc_item_progress_changed схемы evolution (актуальные данные за ограниченный период)",
     "schedule_interval": "1 9,13,18 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_item_progress_changed_recent",
@@ -10423,12 +9673,6 @@
   "export_xs_hrpl_pr_p_othereducation": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_othereducation",
@@ -10504,12 +9748,6 @@
   "export_xs_hrplatform_widget_event": {
     "description": "DAG выгружает данные из таблиц схемы core_ui (поток через xStream)",
     "schedule_interval": "8 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "core_ui.widget_event",
@@ -10588,12 +9826,6 @@
   "export_xs_hrpl_lm_mt_kb_subject": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "16 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_kb_subject",
@@ -10648,12 +9880,6 @@
   "export_xs_hrpl_lm_lc_items_completed": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_items_completed",
@@ -10750,12 +9976,6 @@
   "export_xs_hrpl_re_content": {
     "description": "DAG выгружает данные из таблиц схемы recruitment (поток через xStream)",
     "schedule_interval": "20 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "recruitment.content",
@@ -10876,12 +10096,6 @@
   "export_xs_hrpl_lm_speechsim_admin_dict_client_avatar_attribute": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_admin_dict_client_avatar_attribute",
@@ -10921,12 +10135,6 @@
   "export_xs_hrpl_re_job_candidate_large": {
     "description": "DAG выгружает данные из таблиц схемы recruitment (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "recruitment.job_candidate_large",
@@ -11020,12 +10228,6 @@
   "export_xs_hrpl_re_rec_job_application_tests_v2": {
     "description": "DAG выгружает данные из таблиц схемы recruitment (поток через xStream)",
     "schedule_interval": "3 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "recruitment.rec_job_application_tests",
@@ -11106,12 +10308,6 @@
   "export_xs_hrpl_pr_p_achievements": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_achievements",
@@ -11190,12 +10386,6 @@
   "export_xs_hrpl_lm_speechsim_replica_compare": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_replica_compare",
@@ -11305,12 +10495,6 @@
   "export_xs_hrpl_lm_lf_user_welcome": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lf_user_welcome",
@@ -11365,12 +10549,6 @@
   "export_xs_hrpl_lm_mt_map_kb2sales_channel": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "22 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_map_kb2sales_channel",
@@ -11425,12 +10603,6 @@
   "export_xs_hrpl_pr_j_contacts_companyemail": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_contacts_companyemail",
@@ -11497,12 +10669,6 @@
   "export_xs_hrpl_pr_j_contacts_interofficeemail": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "38 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_contacts_interofficeemail",
@@ -11569,12 +10735,6 @@
   "export_xs_hrpl_pr_p_mobility": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "31 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_mobility",
@@ -11653,12 +10813,6 @@
   "export_xs_hrpl_pd_ybonus_bonus_employee": {
     "description": "DAG выгружает данные из таблицы motivation.ybonus_bonus_employee(Список сотрудников для премирования)",
     "schedule_interval": "30 23 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "motivation.ybonus_bonus_employee",
@@ -11709,12 +10863,6 @@
   "export_xs_hrpl_lm_speechsim_walkthrough_infinite": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_walkthrough_infinite",
@@ -11760,12 +10908,6 @@
   "export_xs_hrpl_lm_lc_ratings": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_ratings",
@@ -11841,12 +10983,6 @@
   "export_xs_hrpl_lm_gigachat_hint": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_hint",
@@ -11913,12 +11049,6 @@
   "export_xs_hrpl_lm_mt_question_status_history": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "27 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_question_status_history",
@@ -11979,12 +11109,6 @@
   "export_xs_hrpl_re_c_wage_expectations": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_wage_expectations",
@@ -12051,12 +11175,6 @@
   "export_xs_hrpl_pr_pp_j_achievments": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "40 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.pp_j_achievments",
@@ -12159,12 +11277,6 @@
   "export_xs_hrpl_pr_j_awards": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "34 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_awards",
@@ -12255,12 +11367,6 @@
   "export_xs_hrpl_lm_speechsim_stat_walkthrough_diagnostic_v1": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_stat_walkthrough_diagnostic",
@@ -12322,12 +11428,6 @@
   "export_xs_hrpl_lm_lc_items_opened": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_items_opened",
@@ -12391,12 +11491,6 @@
   "export_xs_hrpl_pr_j_position": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "39 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_position",
@@ -12562,12 +11656,6 @@
   "export_xs_hrpl_lm_mt_map_test2job_position": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "24 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_map_test2job_position",
@@ -12622,12 +11710,6 @@
   "export_xs_hrpl_re_c_contacts_mobile": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_contacts_mobile",
@@ -12697,12 +11779,6 @@
   "export_xs_hrpl_pr_j_basic_employee_info": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_basic_employee_info",
@@ -12820,12 +11896,6 @@
   "export_xs_hrpl_re_adaptation_progress_deleted": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "16 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.adaptation_progress_deleted",
@@ -12895,12 +11965,6 @@
   "export_xs_hrpl_lm_ls_stream_registration": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "5 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.ls_stream_registration",
@@ -12976,12 +12040,6 @@
   "export_xs_hrpl_lm_gigachat_daily_tag": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_daily_tag",
@@ -13045,12 +12103,6 @@
   "export_xs_hrpl_lm_mt_test_folder": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "33 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_test_folder",
@@ -13102,12 +12154,6 @@
   "export_xs_hrpl_lm_speechsim_stat_diagnostic_plan": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_stat_diagnostic_plan",
@@ -13163,12 +12209,6 @@
   "export_xs_hrpl_lm_mt_test": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "50 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_test",
@@ -13298,12 +12338,6 @@
   "export_xs_hrpl_re_c_mobility": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_mobility",
@@ -13373,12 +12407,6 @@
   "export_xs_hrpl_lm_mt_answer_status": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "4 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_answer_status",
@@ -13433,12 +12461,6 @@
   "export_xs_hrpl_pr_p_certificates": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "27 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_certificates",
@@ -13541,12 +12563,6 @@
   "export_xs_hrplatform_ch_cv_skud": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "17 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.ch_cv_skud",
@@ -13628,12 +12644,6 @@
   "export_xs_hrpl_lm_product": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.product",
@@ -13685,12 +12695,6 @@
   "export_xs_hrpl_pr_j_successors_appointed": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "40 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_successors_appointed",
@@ -13766,12 +12770,6 @@
   "export_xs_hrpl_lm_mt_feedback_attr": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "8 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_feedback_attr",
@@ -13829,12 +12827,6 @@
   "export_xs_hrpl_lm_speechsim_stat_walkthrough_free_dialogue": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_stat_walkthrough_free_dialogue",
@@ -13880,12 +12872,6 @@
   "export_xs_hrpl_lm_mt_session_status": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "32 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_session_status",
@@ -13940,12 +12926,6 @@
   "export_xs_hrpl_re_recruitment_requisition_history": {
     "description": "DAG выгружает данные из таблиц схемы stable (поток через xStream)",
     "schedule_interval": "9 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "stable.recruitment_requisition_history",
@@ -14037,12 +13017,6 @@
   "export_xs_hrpl_pr_p_scientific_activity": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "34 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_scientific_activity",
@@ -14199,12 +13173,6 @@
   "export_xs_hrpl_lm_teacher_certificate": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.teacher_certificate",
@@ -14253,12 +13221,6 @@
   "export_xs_hrpl_pd_ybonus_bonus_employee_v2": {
     "description": "DAG выгружает данные из таблицы motivation.ybonus_bonus_employee(Список сотрудников для премирования)",
     "schedule_interval": "30 23 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "motivation.ybonus_bonus_employee",
@@ -14309,12 +13271,6 @@
   "export_xs_hrpl_re_j_beginner_buddy": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "22 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_beginner_buddy",
@@ -14411,12 +13367,6 @@
   "export_xs_hrpl_pr_p_lead_experience": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.p_lead_experience",
@@ -14510,12 +13460,6 @@
   "export_xs_hrpl_lm_lc_item_progress_changed": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lc_item_progress_changed",
@@ -14588,12 +13532,6 @@
   "export_xs_hrpl_lm_mt_kb_acquainted": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "14 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_kb_acquainted",
@@ -14648,12 +13586,6 @@
   "export_xs_hrpl_as_j_psychotests_characteristics": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "7 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.j_psychotests_characteristics",
@@ -14731,12 +13663,6 @@
   "export_xs_hrpl_an_an_prod_event_v2": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "30 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "default.an_prod_event",
@@ -14941,12 +13867,6 @@
   "export_xs_hrpl_lm_onsiteactivities_registration": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.onsiteactivities_registration",
@@ -15055,12 +13975,6 @@
   "export_xs_hrpl_lm_ai_log_answer_v2": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.ai_log_answer",
@@ -15115,12 +14029,6 @@
   "export_xs_hrplatform_widget_lake": {
     "description": "DAG выгружает данные из таблиц схемы core_ui (поток через xStream)",
     "schedule_interval": "4 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "core_ui.widget_lake",
@@ -15205,12 +14113,6 @@
   "export_xs_hrpl_lm_speechsim_admin_script_v1": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_admin_script",
@@ -15270,12 +14172,6 @@
   "export_xs_hrpl_lm_speechsim_walkthrough_feedback": {
     "description": "DAG выгружает данные из таблиц схемы default (поток через xStream)",
     "schedule_interval": "0 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.speechsim_walkthrough_feedback",
@@ -15321,12 +14217,6 @@
   "export_xs_hrpl_lm_onsiteactivities_activity": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.onsiteactivities_activity",
@@ -15510,12 +14400,6 @@
   "export_xs_hrpl_lm_mt_kb_category": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "15 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.mt_kb_category",
@@ -15570,12 +14454,6 @@
   "export_xs_hrpl_re_job_requisition_large": {
     "description": "DAG выгружает данные из таблиц схемы recruitment (поток через xStream)",
     "schedule_interval": "2 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "recruitment.job_requisition_large",
@@ -15762,12 +14640,6 @@
   "export_xs_hrpl_lm_gigachat_daily_answer": {
     "description": "DAG выгружает данные из таблиц схемы virtual_trainer (поток через xStream)",
     "schedule_interval": "41 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "virtual_trainer.gigachat_daily_answer",
@@ -15834,12 +14706,6 @@
   "export_xs_hrpl_re_c_basic_citizenship": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "47 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_basic_citizenship",
@@ -15906,12 +14772,6 @@
   "export_xs_hrpl_lm_lr_education_outside_request": {
     "description": "DAG выгружает данные из таблиц схемы evolution (поток через xStream)",
     "schedule_interval": "5 22 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "evolution.lr_education_outside_request",
@@ -16092,12 +14952,6 @@
   "export_xs_hrpl_re_c_education": {
     "description": "DAG выгружает данные из таблиц схемы person_profile (поток через xStream)",
     "schedule_interval": "44 21 * * *",
-    "tags": [
-      "DataLab",
-      "CI02420667",
-      "ClickHouse",
-      "xStream"
-    ],
     "tables": [
       {
         "full_table_name": "person_profile.c_education",

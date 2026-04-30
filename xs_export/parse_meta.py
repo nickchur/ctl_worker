@@ -99,7 +99,6 @@ for dag_id, dag_data in meta.items():
     structured[dag_id] = {
         "description": dag_data.get("description"),
         "schedule_interval": dag_data.get("schedule_interval"),
-        "tags": dag_data.get("tags"),
         "tables": []
     }
     

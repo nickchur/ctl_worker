@@ -53,7 +53,6 @@ for dag_id, dag_meta in data.items():
     optimized_data[dag_id] = {
         "description": dag_meta.get("description"),
         "schedule_interval": dag_meta.get("schedule_interval"),
-        "tags": dag_meta.get("tags"),
         "tables": [optimize_table(t) for t in dag_meta["tables"]]
     }
 

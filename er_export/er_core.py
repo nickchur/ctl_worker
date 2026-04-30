@@ -113,14 +113,14 @@ def _pre_kafka(scenario: str, mode: str):
 _REG_WITH = """WITH aggr AS (
     SELECT
         argMinIf(extract_name, prio, prio=1)                                       as extract_name,
-        argMinIf(auto_confirm_delta, prio, prio=1)                                 as auto_confirm_delta_v,
-        argMinIf(lower_bound, prio, prio=1)                                        as lower_bound_v,
-        argMinIf(selfrun_timeout, prio, prio=1)                                    as selfrun_timeout_v,
-        argMinIf(compression_type, prio, lower(compression_type) <> 'default')    as compression_type_v,
-        argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext_v,
-        argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size_v,
-        argMinIf(pg_array_format, prio, prio=1)                                    as pg_array_format_v,
-        argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params_v
+        argMinIf(auto_confirm_delta, prio, prio=1)                                 as auto_confirm_delta,
+        argMinIf(lower_bound, prio, prio=1)                                        as lower_bound,
+        argMinIf(selfrun_timeout, prio, prio=1)                                    as selfrun_timeout,
+        argMinIf(compression_type, prio, lower(compression_type) <> 'default')    as compression_type,
+        argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext,
+        argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size,
+        argMinIf(pg_array_format, prio, prio=1)                                    as pg_array_format,
+        argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params
         {extra_aggr}
     FROM (
         SELECT 1 as prio, *
@@ -135,14 +135,14 @@ def sql_reg_delta(tbl: str) -> str:
     return build_sql({
         "with": _REG_WITH.format(tbl=tbl, extra_aggr=''),
         "fields": [
-            "auto_confirm_delta_v                       as auto_confirm_delta",
-            "concat('\\'', toString(toDateTimeOrDefault(lower_bound_v)), '\\'') as lower_bound",
-            "toString(selfrun_timeout_v)                as selfrun_timeout",
-            "compression_type_v                         as compression_type",
-            "compression_ext_v                          as compression_ext",
-            "max_file_size_v                            as max_file_size",
-            "If(pg_array_format_v = 1, 'True', 'False')  as pg_array_format",
-            "csv_format_params_v                        as format_params"
+            "auto_confirm_delta                       as auto_confirm_delta",
+            "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'') as lower_bound",
+            "toString(selfrun_timeout)                as selfrun_timeout",
+            "compression_type                         as compression_type",
+            "compression_ext                          as compression_ext",
+            "max_file_size                            as max_file_size",
+            "If(pg_array_format = 1, 'True', 'False')  as pg_array_format",
+            "csv_format_params                        as format_params"
         ],
         "from": "aggr",
         "where": f"extract_name = '{tbl}'",
@@ -151,35 +151,35 @@ def sql_reg_delta(tbl: str) -> str:
 
 def sql_reg_recent(tbl: str) -> str:
     extra_aggr = """,
-        argMinIf(increment, prio, prio = 1)       as increment_v,
-        argMinIf(overlap, prio, prio = 1)         as overlap_v,
-        argMinIf(time_field, prio, prio = 1)      as time_field_v,
-        argMinIf(recent_interval, prio, prio = 1) as recent_interval_v"""
+        argMinIf(increment, prio, prio = 1)       as increment,
+        argMinIf(overlap, prio, prio = 1)         as overlap,
+        argMinIf(time_field, prio, prio = 1)      as time_field,
+        argMinIf(recent_interval, prio, prio = 1) as recent_interval"""
     return build_sql({
         "with": _REG_WITH.format(tbl=tbl, extra_aggr=extra_aggr),
         "fields": [
-            "auto_confirm_delta_v                       as auto_confirm_delta",
-            "concat('\\'', toString(toDateTimeOrDefault(lower_bound_v)), '\\'') as lower_bound",
-            "toString(selfrun_timeout_v)                as selfrun_timeout",
-            "compression_type_v                         as compression_type",
-            "compression_ext_v                          as compression_ext",
-            "max_file_size_v                            as max_file_size",
-            "If(pg_array_format_v = 1, 'True', 'False')  as pg_array_format",
-            "csv_format_params_v                        as format_params",
+            "auto_confirm_delta                       as auto_confirm_delta",
+            "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'') as lower_bound",
+            "toString(selfrun_timeout)                as selfrun_timeout",
+            "compression_type                         as compression_type",
+            "compression_ext                          as compression_ext",
+            "max_file_size                            as max_file_size",
+            "If(pg_array_format = 1, 'True', 'False')  as pg_array_format",
+            "csv_format_params                        as format_params",
             "now()                                      as cur_time",
             "concat('\\'', toString(cur_time), '\\'')   as extract_time",
             "'null'                                     as extract_count",
             "'null'                                     as loaded",
             "'null'                                     as sent",
             "'null'                                     as confirmed",
-            "toString(increment_v)                      as increment",
-            "toString(overlap_v)                        as overlap",
-            "concat('\\'', time_field_v, '\\'')         as time_field",
-            "concat('\\'', toString(cur_time - recent_interval_v), '\\'') as time_from",
+            "toString(increment)                      as increment",
+            "toString(overlap)                        as overlap",
+            "concat('\\'', time_field, '\\'')         as time_field",
+            "concat('\\'', toString(cur_time - recent_interval), '\\'') as time_from",
             "concat('\\'', toString(cur_time), '\\'')   as time_to",
-            "concat('\\'', toString(cur_time - recent_interval_v), '\\' < ', time_field_v, ' and ', time_field_v, ' <= \\'', toString(cur_time), '\\'') as condition",
+            "concat('\\'', toString(cur_time - recent_interval), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(cur_time), '\\'') as condition",
             "'True'                                     as is_current",
-            "toString(recent_interval_v)                as recent_interval",
+            "toString(recent_interval)                as recent_interval",
             "toString(0)                                as num_state"
         ],
         "from": "aggr",

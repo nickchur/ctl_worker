@@ -27,16 +27,7 @@ from er_export.er_common import (
 )
 
 # Пытаемся импортировать ctl_obj_load из общих утилит
-try:
-    from plugins.ctl_utils import ctl_obj_load
-except ImportError:
-    try:
-        from ctl.plugins.ctl_utils import ctl_obj_load
-    except ImportError:
-        # Резервный вариант, если плагин недоступен (например, локально)
-        def ctl_obj_load(key):
-            from airflow.models import Variable
-            return Variable.get(key, default_var={}, deserialize_json=True)
+from plugins.ctl_utils import ctl_obj_load
 
 logger = logging.getLogger(__name__)
 

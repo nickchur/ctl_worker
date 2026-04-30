@@ -59,6 +59,8 @@ def er_sync_dag():
                 "strategy": row["strategy"],
                 "PK":       row["pk"],
                 "UK":       row["uk"],
+                "increment": row["increment"],
+                "selfrun_timeout": row["selfrun_timeout"],
                 sql_key:    sql_val,
             }
             if row["fields"]:

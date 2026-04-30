@@ -72,24 +72,39 @@ for table_key, params in wfs.items():
     if sql_delta:
         sql_get_registry = build_registry_sql_delta(tbl)
         sql_get_current  = build_dynamic_select({
+            "with": f"""WITH data AS (
+                SELECT
+                    num_state       as num_state_v,
+                    extract_time    as extract_time_v,
+                    extract_count   as extract_count_v,
+                    loaded          as loaded_v,
+                    sent            as sent_v,
+                    confirmed       as confirmed_v,
+                    increment       as increment_v,
+                    overlap         as overlap_v,
+                    time_field      as time_field_v,
+                    time_from       as time_from_v,
+                    time_to         as time_to_v
+                FROM export.extract_current_vw
+                WHERE extract_name = '{tbl}'
+            )""",
             "fields": [
-                "toString(num_state)                                                                 as num_state",
-                "concat('\\'', toString(extract_time), '\\'')                                         as extract_time",
-                "ifNull(toString(extract_count), 'null')                                             as extract_count",
-                "ifNull(concat('\\'', toString(loaded), '\\''), 'null')                               as loaded",
-                "ifNull(concat('\\'', toString(sent), '\\''), 'null')                                 as sent",
-                "ifNull(concat('\\'', toString(confirmed), '\\''), 'null')                            as confirmed",
-                "toString(increment)                                                                 as increment",
-                "toString(overlap)                                                                   as overlap",
-                "concat('\\'', time_field, '\\'')                                                     as time_field",
-                "concat('\\'', toString(time_from), '\\'')                                            as time_from",
-                "concat('\\'', toString(time_to), '\\'')                                              as time_to",
-                "concat('\\'', toString(time_from), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(time_to), '\\'') as condition",
+                "toString(num_state_v)                                                               as num_state",
+                "concat('\\'', toString(extract_time_v), '\\'')                                      as extract_time",
+                "ifNull(toString(extract_count_v), 'null')                                           as extract_count",
+                "if(extract_count_v is null, 'null', concat('\\'', toString(loaded_v), '\\''))       as loaded",
+                "if(extract_count_v is null, 'null', concat('\\'', toString(sent_v), '\\''))         as sent",
+                "if(extract_count_v is null, 'null', concat('\\'', toString(confirmed_v), '\\''))    as confirmed",
+                "toString(increment_v)                                                               as increment",
+                "toString(overlap_v)                                                                 as overlap",
+                "concat('\\'', time_field_v, '\\'')                                                  as time_field",
+                "concat('\\'', toString(time_from_v), '\\'')                                         as time_from",
+                "concat('\\'', toString(time_to_v), '\\'')                                           as time_to",
+                "concat('\\'', toString(time_from_v), '\\' < ', time_field_v, ' and ', time_field_v, ' <= \\'', toString(time_to_v), '\\'') as condition",
                 "'False'                                                                             as is_current",
                 "toString(0)                                                                         as recent_interval"
             ],
-            "from": "export.extract_current_vw",
-            "where": f"extract_name = '{tbl}'"
+            "from": "data"
         })
     else:
         sql_get_registry = build_registry_sql_recent(tbl)

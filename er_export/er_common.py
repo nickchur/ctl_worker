@@ -284,7 +284,13 @@ def make_er_export_task_group(
 
             op.xstream_sanitize = dp['xstream_sanitize'] == 'True'
             op.sanitize_array   = dp['sanitize_array'] == 'True'
-            op.sanitize_list    = dp['sanitize_list']
+            
+            raw_sanitize_list = dp.get('sanitize_list')
+            if not raw_sanitize_list or str(raw_sanitize_list).lower() in ('none', 'null', ''):
+                op.sanitize_list = '[]'
+            else:
+                op.sanitize_list = raw_sanitize_list
+
             op.pg_array_format  = dp['pg_array_format'] == 'True'
             try:
                 op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}

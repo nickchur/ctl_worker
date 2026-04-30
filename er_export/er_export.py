@@ -48,8 +48,14 @@ for table_key, params in tables.items():
     scenario, tfs_prefix, tfs_out_pool = TFS_OUT_CONFIG_MAP[replica]
     s3_prefix = f"{tfs_prefix}/{replica}"
 
-    sql_delta  = build_dynamic_select(params.get('sql_stmt_export_delta'))
-    sql_recent = build_dynamic_select(params.get('sql_stmt_export_recent'))
+    def _prepare_sql(sql_key):
+        sql_meta = params.get(sql_key)
+        if isinstance(sql_meta, dict) and "fields" not in sql_meta:
+            sql_meta["fields"] = params.get("fields", [])
+        return build_dynamic_select(sql_meta)
+
+    sql_delta  = _prepare_sql('sql_stmt_export_delta')
+    sql_recent = _prepare_sql('sql_stmt_export_recent')
 
     if not (sql_delta or sql_recent):
         raise RuntimeError("One of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' must be specified!")

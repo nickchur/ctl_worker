@@ -289,10 +289,16 @@ def make_er_export_task_group(
             op.sanitize_array   = dp['sanitize_array'] == 'True'
             
             raw_sl = dp.get('sanitize_list')
-            if not raw_sl or str(raw_sl).strip().lower() in ('none', 'null', ''):
+            try:
+                if not raw_sl or str(raw_sl).strip().lower() in ('none', 'null', '', 'default'):
+                    op.sanitize_list = '[]'
+                else:
+                    test_val = str(raw_sl).strip()
+                    json.loads(test_val)
+                    op.sanitize_list = test_val
+            except Exception:
+                logger.warning("Invalid sanitize_list in XCom: %r, falling back to []", raw_sl)
                 op.sanitize_list = '[]'
-            else:
-                op.sanitize_list = str(raw_sl)
             
             logger.info("PRE_EXECUTE_COPY: final sanitize_list=%r", op.sanitize_list)
 

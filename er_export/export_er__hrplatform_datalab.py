@@ -2,7 +2,7 @@ import pendulum
 from airflow import DAG
 from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
 
-from er_export.er_common import (
+from er_export.er_config import (
     DEFAULT_ARGS,
     TFS_OUT_BUCKET,
     get_export_time_placeholder,

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 TFS_OUT_CONN_ID    = 's3-tfs-hrplt'
 TFS_OUT_BUCKET     = 'tfshrplt'
 TFS_OUT_TOPIC      = 'TFS.HRPLT.IN'
-TFS_KAFKA_CALLBACK = 'er_export.er_common.tfs_message_delivery_callback'
+TFS_KAFKA_CALLBACK = 'er_export.er_config.tfs_message_delivery_callback'
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()
 

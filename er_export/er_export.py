@@ -12,12 +12,9 @@ import pendulum
 from airflow import DAG
 from airflow.decorators import task
 from airflow.exceptions import AirflowSkipException
-from airflow.operators.dummy_operator import DummyOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseOperator
-from airflow_clickhouse_plugin.operators.clickhouse_dbapi import ClickHouseBranchSQLOperator
 from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
 
 from er_export.er_config import (
@@ -84,8 +81,7 @@ def tfs_message_delivery_callback(err, msg) -> None:
 
 
 def _make_pre_execute_kafka(scenario: str):
-    """Фабрика замыкания pre_execute для notify_tfs_kafka: захватывает scenario по значению,
-    чтобы избежать переопределения переменной при итерации цикла фабрики DAG-ов.
+    """Фабрика замыкания pre_execute для notify_tfs_kafka: захватывает scenario по значению.
     В test-режиме бросает AirflowSkipException."""
     def _pre_execute(context):
         if MODE != 'prod':
@@ -96,9 +92,6 @@ def _make_pre_execute_kafka(scenario: str):
 
 
 # ── DAG factory ──────────────────────────────────────────────────────────────
-# Каждая запись в tables порождает отдельный DAG (аналогично ctl_worker).
-# Конфиг таблицы передаётся в @task-функции явным аргументом cfg,
-# а не через замыкание, чтобы исключить захват переменных цикла.
 
 for _table_key, _params in tables.items():
     _db, _tbl = _table_key.split(".", maxsplit=1)
@@ -209,16 +202,33 @@ for _table_key, _params in tables.items():
         settings enable_global_with_statement = 1
     """
 
-    # конфиг таблицы, передаётся явным аргументом в @task-функции
     _task_cfg = {
         'db':          _db,
         'tbl':         _tbl,
+        'dag_id':      _dag_id,
         'schema_name': _schema_name,
         'replica':     _replica,
         'scenario':    _scenario,
         's3_prefix':   _s3_prefix,
         'bucket':      TFS_OUT_BUCKET,
         'params':      _params,
+        'sql_check_auto_confirm': (
+            f"select auto_confirm_delta from export.extract_registry_vw"
+            f" where extract_name = '{_tbl}'"
+        ),
+        'sql_auto_confirm': f"""
+            insert into export.extract_history (
+                extract_name, extract_time, extract_count, loaded, sent, confirmed,
+                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
+            )
+            select
+                extract_name, extract_time, extract_count, loaded, sent, now(),
+                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
+            from export.extract_history_vw
+            where extract_name = '{_tbl}'
+                  and sent is not null and confirmed is null
+        """,
+        'sql_get_delta_params': _sql_get_delta_params,
     }
 
     with DAG(
@@ -240,36 +250,19 @@ for _table_key, _params in tables.items():
             bucket_name=TFS_OUT_BUCKET,
         )
 
-        check_need_auto_confirm_delta = ClickHouseBranchSQLOperator(
-            task_id='check_need_auto_confirm_delta',
-            sql=f"select auto_confirm_delta from export.extract_registry_vw where extract_name = '{_tbl}'",
-            follow_task_ids_if_true=['auto_confirm_delta'],
-            follow_task_ids_if_false=['get_delta_params'],
-            do_xcom_push=True,
-        )
+        @task(task_id='get_delta_params')
+        def get_delta_params(cfg, **context):
+            """Опционально подтверждает предыдущий дельта-интервал (auto_confirm),
+            затем получает параметры текущего интервала из export.extract_current_vw."""
+            from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+            hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+            need_confirm, _ = hook.execute(cfg['sql_check_auto_confirm'], with_column_types=True)
+            if need_confirm and need_confirm[0][0]:
+                hook.execute(cfg['sql_auto_confirm'])
+            rows, _ = hook.execute(cfg['sql_get_delta_params'], with_column_types=True)
+            return rows
 
-        auto_confirm_delta = ClickHouseOperator(
-            task_id='auto_confirm_delta',
-            sql=f"""
-                insert into export.extract_history (
-                    extract_name, extract_time, extract_count, loaded, sent, confirmed,
-                    increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
-                )
-                select
-                    extract_name, extract_time, extract_count, loaded, sent, now(),
-                    increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
-                from export.extract_history_vw
-                where extract_name = '{_tbl}'
-                      and sent is not null and confirmed is null
-            """,
-        )
-
-        get_delta_params = ClickHouseOperator(
-            task_id='get_delta_params',
-            sql=_sql_get_delta_params,
-            trigger_rule='one_success',
-            do_xcom_push=True,
-        )
+        t_get_delta = get_delta_params(cfg=_task_cfg)
 
         select_extract_params = ClickHouseOperator(
             task_id='select_extract_params',
@@ -448,50 +441,25 @@ for _table_key, _params in tables.items():
 
         t_update = update_send_status(cfg=_task_cfg)
 
-        @task.branch(task_id='check_need_next_run')
-        def check_need_next_run(**context):
-            """Определяет следующую ветку: если end_loop=True — завершает цикл (→ fin),
-            иначе планирует повторный запуск (→ set_next_run_date)."""
-            dp = context['ti'].xcom_pull(task_ids='get_delta_params')[0]
-            end_loop = str(dp[12]).lower() in ('true', 't', '1')
-            return 'fin' if end_loop else 'set_next_run_date'
-
-        t_check_next = check_need_next_run()
-
-        @task(task_id='set_next_run_date')
-        def set_next_run_date(**context):
-            """Вычисляет дату следующего запуска DAG как now() + selfrun_timeout минут
-            и кладёт её в XCom под ключом next_run_date."""
+        @task(task_id='trigger_next_run')
+        def trigger_next_run(cfg, **context):
+            """Если дельта-цикл не завершён — вычисляет дату следующего запуска
+            и триггерит этот же DAG через Airflow API."""
+            from airflow.api.common.trigger_dag import trigger_dag
             ti = context['ti']
+            dp = ti.xcom_pull(task_ids='get_delta_params')[0]
+            if str(dp[12]).lower() in ('true', 't', '1'):
+                return
             ep = ti.xcom_pull(task_ids='select_extract_params')[0]
             run_date = pendulum.now('UTC').add(minutes=int(ep[1]))
-            ti.xcom_push(key='next_run_date', value=run_date)
+            trigger_dag(dag_id=cfg['dag_id'], execution_date=run_date, replace_microseconds=False)
 
-        t_set_next = set_next_run_date()
-
-        def _pre_execute_trigger(context):
-            """Инжектирует дату следующего запуска из XCom в TriggerDagRunOperator."""
-            next_run = context['ti'].xcom_pull(task_ids='set_next_run_date', key='next_run_date')
-            context['task'].logical_date = next_run
-
-        trigger_self = TriggerDagRunOperator(
-            task_id='trigger_self',
-            trigger_dag_id=_dag_id,
-            logical_date=None,  # заполняется в pre_execute
-            reset_dag_run=False,
-            pre_execute=_pre_execute_trigger,
-        )
-
-        fin = DummyOperator(task_id='fin')
+        t_trigger_next = trigger_next_run(cfg=_task_cfg)
 
         # ── task dependencies ────────────────────────────────────────────────
-        create_bucket >> check_need_auto_confirm_delta
-        check_need_auto_confirm_delta >> auto_confirm_delta >> get_delta_params
-        check_need_auto_confirm_delta >> get_delta_params
-        get_delta_params >> [select_extract_params, t_get_metadata]
+        create_bucket >> t_get_delta
+        t_get_delta >> [select_extract_params, t_get_metadata]
         [select_extract_params, t_get_metadata] >> copy_clickhouse_query
-        copy_clickhouse_query >> t_package >> notify_tfs_kafka >> t_update >> t_check_next
-        t_check_next >> t_set_next >> trigger_self >> fin.as_teardown(setups=t_set_next)
-        t_check_next >> fin
+        copy_clickhouse_query >> t_package >> notify_tfs_kafka >> t_update >> t_trigger_next
 
     globals()[_dag_id] = dag

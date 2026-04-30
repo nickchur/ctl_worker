@@ -12,8 +12,8 @@ import pendulum
 from airflow.decorators import task
 from airflow.utils.task_group import TaskGroup
 from airflow.exceptions import AirflowSkipException
-from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
-from hrp_operators import HrpClickNativeToS3ListOperator
+from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator # type: ignore
+from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
 
 logger = logging.getLogger(__name__)
 

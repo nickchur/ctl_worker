@@ -17,7 +17,7 @@ from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
 
 logger = logging.getLogger(__name__)
 
-TFS_KAFKA_CALLBACK = 'er_export.er_common.tfs_message_delivery_callback'
+TFS_KAFKA_CALLBACK = 'er_export.er_core.tfs_message_delivery_callback'
 
 def select_dic(ch_hook, sql):
     res, cols = ch_hook.execute(sql, with_column_types=True)

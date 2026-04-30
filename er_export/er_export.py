@@ -19,7 +19,7 @@ from er_export.er_config import (
     TFS_OUT_CONFIG_MAP,
     TFS_OUT_CONN_ID,
 )
-from er_export.er_common import (
+from er_export.er_core import (
     make_er_export_task_group,
     build_registry_sql_delta,
     build_registry_sql_recent,

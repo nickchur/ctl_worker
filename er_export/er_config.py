@@ -6,7 +6,7 @@ import os
 from datetime import timedelta
 
 VAULT_PATH = '/vault/secrets/application'
-CH_BD      = 'evolution'
+CH_BD      = 'export'
 
 if os.getenv("AIRFLOW__CTL_PIN"):
     CH_ID = 'dlab-click-test'

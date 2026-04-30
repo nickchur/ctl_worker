@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta
     sql_from      String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос',
     sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; плейсхолдер {condition} подставляется рантаймом',
     is_recent     UInt8         DEFAULT 0             COMMENT '0 = дельта-выгрузка (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent)',
+    description   String        DEFAULT ''             COMMENT 'Произвольное описание DAG-а (отображается в Airflow UI)',
     is_active     UInt8         DEFAULT 1             COMMENT '0 = запись игнорируется при синхронизации в Variable',
     updated_at    DateTime      DEFAULT now()         COMMENT 'Версия строки для ReplacingMergeTree'
 )

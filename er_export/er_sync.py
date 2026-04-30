@@ -46,16 +46,18 @@ def er_sync_dag():
                 sql_val["where"] = row["sql_where"]
 
             entry: dict = {
-                "replica":  row["replica"],
-                "schema":   row["schema_name"],
-                "format":   row["format"],
-                "strategy": row["strategy"],
-                "PK":       list(row["pk"]),
-                "UK":       list(row["uk"]),
-                sql_key:    sql_val,
+                "replica":     row["replica"],
+                "schema":      row["schema_name"],
+                "format":      row["format"],
+                "strategy":    row["strategy"],
+                "PK":          list(row["pk"]),
+                "UK":          list(row["uk"]),
+                sql_key:       sql_val,
             }
             if row["fields"]:
                 entry["fields"] = list(row["fields"])
+            if row["description"]:
+                entry["description"] = row["description"]
 
             wfs[table_key] = entry
 

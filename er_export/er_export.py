@@ -141,7 +141,7 @@ for table_key, params in wfs.items():
 
     dag = DAG(
         dag_id=dag_id,
-        description=f"ER-выгрузка {table_key} → S3 ZIP → TFS Kafka",
+        description=params.get('description') or f"ER-выгрузка {table_key} → S3 ZIP → TFS Kafka",
         default_args=DEFAULT_ARGS,
         start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone('UTC')),
         schedule_interval='55 0 * * *',

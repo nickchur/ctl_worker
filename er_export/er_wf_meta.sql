@@ -2,6 +2,10 @@
 -- Flat config table for ER export workflows (no JSON columns)
 -- Synced to Airflow Variable "datalab_er_wfs" every 5 min by er_sync__datalab_er_wfs DAG
 --
+-- ВАЖНО: выполнять через clickhouse-client или HTTP-интерфейс, НЕ через JDBC.
+-- JDBC-драйвер интерпретирует {shard} и {replica} как именованные параметры → ошибка.
+-- Пример: clickhouse-client --multiquery < er_wf_meta.sql
+--
 
 
 CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
@@ -25,7 +29,7 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     is_active     UInt8         DEFAULT 1             COMMENT '0 = запись игнорируется при синхронизации в Variable',
     updated_at    DateTime      DEFAULT now()         COMMENT 'Версия строки для ReplacingMergeTree'
 )
-ENGINE = ReplacingMergeTree(updated_at)
+ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/export/er_wf_meta', '{replica}', updated_at)
 ORDER BY (db_name, extract_name);
 
 -- Example row for evolution.lc_items_opened

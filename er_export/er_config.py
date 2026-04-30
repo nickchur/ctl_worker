@@ -81,3 +81,9 @@ CH_TYPE_MAP: dict[str, str] = {
     "Decimal":     "NUMERIC",
     "Array":       "STRING",
 }
+
+ER_EXTRA_COLUMNS = [
+    {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
+    {"column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None},
+    {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
+]

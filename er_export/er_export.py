@@ -77,22 +77,22 @@ for table_key, params in wfs.items():
         sql_reg = sql_reg_delta(tbl)
         sql_cur = build_sql({
             "fields": [
-                "toString(num_state)                                                                   as num_state",
-                "concat('\\'', toString(extract_time), '\\'')                                          as extract_time",
-                "ifNull(toString(extract_count), 'null')                                               as extract_count",
-                "if(extract_count is null, 'null', concat('\\'', toString(loaded), '\\''))             as loaded",
-                "if(extract_count is null, 'null', concat('\\'', toString(sent), '\\''))               as sent",
-                "if(extract_count is null, 'null', concat('\\'', toString(confirmed), '\\''))          as confirmed",
-                "toString(increment)                                                                    as increment",
-                "toString(overlap)                                                                      as overlap",
-                "concat('\\'', time_field, '\\'')                                                       as time_field",
-                "concat('\\'', toString(time_from), '\\'')                                              as time_from",
-                "concat('\\'', toString(time_to), '\\'')                                                as time_to",
-                "concat('\\'', toString(time_from), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(time_to), '\\'') as condition",
-                "if(current_time = extract_time, 'True', 'False')                                     as is_current",
-                "toString(0)                                                                            as recent_interval"
+                "toString(a.num_state)                                                                   as num_state",
+                "concat('\\'', toString(a.extract_time), '\\'')                                          as extract_time",
+                "ifNull(toString(a.extract_count), 'null')                                               as extract_count",
+                "if(a.extract_count is null, 'null', concat('\\'', toString(a.loaded), '\\''))           as loaded",
+                "if(a.extract_count is null, 'null', concat('\\'', toString(a.sent), '\\''))             as sent",
+                "if(a.extract_count is null, 'null', concat('\\'', toString(a.confirmed), '\\''))        as confirmed",
+                "toString(a.increment)                                                                    as increment",
+                "toString(a.overlap)                                                                      as overlap",
+                "concat('\\'', a.time_field, '\\'')                                                       as time_field",
+                "concat('\\'', toString(a.time_from), '\\'')                                              as time_from",
+                "concat('\\'', toString(a.time_to), '\\'')                                                as time_to",
+                "concat('\\'', toString(a.time_from), '\\' < ', a.time_field, ' and ', a.time_field, ' <= \\'', toString(a.time_to), '\\'') as condition",
+                "if(a.current_time = a.extract_time, 'True', 'False')                                   as is_current",
+                "toString(0)                                                                              as recent_interval"
             ],
-            "from": f"(SELECT * FROM export.extract_current_vw WHERE extract_name = '{tbl}')"
+            "from": f"(SELECT * FROM export.extract_current_vw WHERE extract_name = '{tbl}') as a"
         })
     else:
         sql_reg = sql_reg_recent(tbl)

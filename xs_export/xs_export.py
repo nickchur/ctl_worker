@@ -7,9 +7,12 @@ from airflow import DAG
 
 # Импортируем стандартные компоненты из xStream common
 try:
-    from export.export_xs.xs_common import make_xs_export_task_group, DEFAULT_ARGS
+    from xs_export.xs_common import make_xs_export_task_group, DEFAULT_ARGS
 except ImportError:
-    from xs_common import make_xs_export_task_group, DEFAULT_ARGS
+    try:
+        from export.export_xs.xs_common import make_xs_export_task_group, DEFAULT_ARGS
+    except ImportError:
+        from xs_common import make_xs_export_task_group, DEFAULT_ARGS
 
 logger = logging.getLogger("airflow.task")
 

@@ -197,7 +197,6 @@ def export_tg(
 ) -> TaskGroup:
     
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
-    from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor  # type: ignore
     from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
 
     with TaskGroup(group_id=gid) as tg:
@@ -423,26 +422,25 @@ def export_tg(
             pre_execute=_pre_kafka(cfg['scenario'], mode),
         )
 
-        def _handle_confirm(message):
-            logger.info("Received confirmation from Kafka: %s", message.value())
-            return True
+        if not cfg.get('auto_confirm', 1):
+            from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor  # type: ignore
 
-        def _pre_wait(context):
-            ti = context['ti']
-            dp = ti.xcom_pull(task_ids=f"{gid}.init")
-            if dp.get('auto_confirm'):
-                raise AirflowSkipException("Auto-confirm is enabled, skipping sensor")
+            def _handle_confirm(message):
+                logger.info("Received confirmation from Kafka: %s", message.value())
+                return True
 
-        t_wait_confirm = KafkaConsumeSensor(
-            task_id='wait_for_confirm',
-            kafka_config_id=cfg['kafka_in_conn'],
-            topics=[cfg['kafka_in_topic']],
-            apply_function=_handle_confirm,
-            poke_interval=60,
-            timeout=3600,
-            mode='reschedule',
-            pre_execute=_pre_wait,
-        )
+            t_wait_confirm = KafkaConsumeSensor(
+                task_id='wait_for_confirm',
+                kafka_config_id=cfg['kafka_in_conn'],
+                topics=[cfg['kafka_in_topic']],
+                apply_function=_handle_confirm,
+                poke_interval=60,
+                timeout=3600,
+                mode='reschedule',
+            )
+        else:
+            from airflow.operators.empty import EmptyOperator
+            t_wait_confirm = EmptyOperator(task_id='wait_for_confirm')
 
         @task(task_id='save_status', trigger_rule='none_failed_min_one_success')
         def save_status(cfg, **context):

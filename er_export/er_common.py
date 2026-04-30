@@ -113,12 +113,6 @@ def _make_pre_execute_kafka(scenario: str, mode: str):
 
 _SQL_REGISTRY_WITH = """WITH aggr AS (
     SELECT
-        argMinIf(replica, prio, prio = 1)          as replica,
-        argMinIf(schema, prio, prio = 1)           as schema,
-        argMinIf(format, prio, prio = 1)           as format,
-        argMinIf(strategy, prio, prio = 1)         as strategy,
-        argMinIf(PK, prio, prio = 1)               as PK,
-        argMinIf(UK, prio, prio = 1)               as UK,
         argMinIf(auto_confirm_delta, prio, prio=1) as auto_confirm_delta,
         argMinIf(lower_bound, prio, prio=1)        as lower_bound,
         argMinIf(selfrun_timeout, prio, prio=1)    as selfrun_timeout,

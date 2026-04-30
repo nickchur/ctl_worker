@@ -489,7 +489,7 @@ def export_tg(
                 return True
 
             t_wait_kafka = KafkaConsumeSensor(
-                task_id='wait_for_confirmation',
+                task_id='wait_for_confirm',
                 kafka_config_id=cfg.get('kafka_sensor_conn_id', 'tfs-kafka-in'),
                 topics=[cfg.get('kafka_sensor_topic', 'TFS.HRPLT.OUT')],
                 apply_function=_handle_confirm,

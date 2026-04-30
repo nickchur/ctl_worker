@@ -66,7 +66,7 @@ VALUES (
 3.  **export_to_s3**: Стримит данные напрямую из ClickHouse в S3 (используется `HrpClickNativeToS3ListOperator`).
 4.  **pack_zip**: Собирает пакет через `HrpS3ArchiveOperator` (S3-to-S3), не загружая CSV в память воркера.
 5.  **notify_tfs**: Формирует XML и отправляет в Kafka (топик `TFS.HRPLT.IN`).
-6.  **wait_for_confirmation** (опционально): Если `auto_confirm = 0`, DAG переходит в режим ожидания (сенсор) сообщения из Kafka (топик `TFS.HRPLT.OUT`).
+6.  **wait_for_confirm** (опционально): Если `auto_confirm = 0`, DAG переходит в режим ожидания (сенсор) сообщения из Kafka (топик `TFS.HRPLT.OUT`).
 7.  **save_status**: Записывает результат выгрузки в историю (`export.extract_history`).
 8.  **schedule_next**: Если это дельта-выгрузка и данных много, планирует следующий запуск через `selfrun_timeout` минут.
 

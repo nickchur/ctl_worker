@@ -478,6 +478,25 @@ def export_tg(
 
         t_init >> [t_build_meta, export_to_s3]
         [t_build_meta, export_to_s3] >> t_pack
-        t_pack >> notify_tfs >> t_save >> t_schedule
+
+        if cfg.get('auto_confirm_delta'):
+            t_pack >> notify_tfs >> t_save >> t_schedule
+        else:
+            from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor
+            
+            def _handle_confirm(message):
+                logger.info("Received confirmation from Kafka: %s", message.value())
+                return True
+
+            t_wait_kafka = KafkaConsumeSensor(
+                task_id='wait_for_confirmation',
+                kafka_config_id=cfg.get('kafka_sensor_conn_id', 'tfs-kafka-in'),
+                topics=[cfg.get('kafka_sensor_topic', 'TFS.HRPLT.OUT')],
+                apply_function=_handle_confirm,
+                poke_interval=60,
+                timeout=3600,
+                mode='reschedule',
+            )
+            t_pack >> notify_tfs >> t_wait_kafka >> t_save >> t_schedule
 
     return tg

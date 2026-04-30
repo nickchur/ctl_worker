@@ -54,6 +54,8 @@ DEF_ARGS = {
     "clickhouse_conn_id":  CH_ID,
     "conn_id":             CH_ID,
     "kafka_config_id":     "tfs-kafka-out",
+    "kafka_sensor_conn_id":"tfs-kafka-in",
+    "kafka_sensor_topic":  "TFS.HRPLT.OUT",
     "topic":               TOPIC,
 }
 

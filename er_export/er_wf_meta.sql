@@ -49,5 +49,17 @@ VALUES (
     'evolution.lc_items_opened',
     '{condition}',
     60,
+    10,
+    1
+);
+_dt',
+        'item_id',
+        'person_uuid',
+        'tenant',
+        'company'
+    ],
+    'evolution.lc_items_opened',
+    '{condition}',
+    60,
     10
 );

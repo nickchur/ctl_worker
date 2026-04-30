@@ -12,7 +12,6 @@ import pendulum
 from airflow import DAG
 from airflow.decorators import task
 from airflow.exceptions import AirflowSkipException
-from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseOperator
 from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
@@ -245,16 +244,13 @@ for _table_key, _params in tables.items():
         render_template_as_native_obj=True,
     ) as dag:
 
-        create_bucket = S3CreateBucketOperator(
-            task_id='create_bucket',
-            bucket_name=TFS_OUT_BUCKET,
-        )
-
         @task(task_id='get_delta_params')
         def get_delta_params(cfg, **context):
-            """Опционально подтверждает предыдущий дельта-интервал (auto_confirm),
+            """Создаёт S3-бакет, опционально подтверждает предыдущий дельта-интервал (auto_confirm),
             затем получает параметры текущего интервала из export.extract_current_vw."""
+            from airflow.providers.amazon.aws.hooks.s3 import S3Hook
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+            S3Hook(aws_conn_id=TFS_OUT_CONN_ID).create_bucket(bucket_name=cfg['bucket'])
             hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
             need_confirm, _ = hook.execute(cfg['sql_check_auto_confirm'], with_column_types=True)
             if need_confirm and need_confirm[0][0]:
@@ -457,7 +453,6 @@ for _table_key, _params in tables.items():
         t_trigger_next = trigger_next_run(cfg=_task_cfg)
 
         # ── task dependencies ────────────────────────────────────────────────
-        create_bucket >> t_get_delta
         t_get_delta >> [select_extract_params, t_get_metadata]
         [select_extract_params, t_get_metadata] >> copy_clickhouse_query
         copy_clickhouse_query >> t_package >> notify_tfs_kafka >> t_update >> t_trigger_next

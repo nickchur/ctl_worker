@@ -431,7 +431,7 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_obj_load(key):
+def ctl_obj_load(key, s3_id=None, bucket=None):
     """Загружает объект по ключу: сначала из Airflow Variable, затем из S3 (JSON).
 
     Возвращает dict или {} при отсутствии объекта.
@@ -448,10 +448,11 @@ def ctl_obj_load(key):
         return data #, new_md5
     
     s3 = get_config().get('conns', {}).get('s3', {})
-    bucket = s3.get('bucket', 'edpetl-ctl')
+    s3_id = s3_id or s3.get('conn_id', 's3')
+    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
 
     if bucket:
-        hook = S3Hook(aws_conn_id=s3.get('conn_id', 's3'))
+        hook = S3Hook(aws_conn_id=s3_id)
         try:
             # Получаем объект из S3
             s3_obj = hook.get_key(key=key_ext, bucket_name=bucket)

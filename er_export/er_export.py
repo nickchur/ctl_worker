@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import pendulum
 from airflow import DAG
+from airflow.models import Param
 
 from er_export.er_config import (
     CH_ID,
@@ -150,6 +151,13 @@ for table_key, params in wfs.items():
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'xStream', 'ER'],
         is_paused_upon_creation=True,
         render_template_as_native_obj=True,
+        params={
+            'extract_time':    Param('',   type=['string', 'null'],  title='Extract time',       description='Перезаписать: 2024-01-01 00:00:00'),
+            'condition':       Param('',   type=['string', 'null'],  title='Condition',           description='Перезаписать SQL-условие WHERE'),
+            'is_current':      Param(None, type=['boolean', 'null'], title='Is current'),
+            'increment':       Param(None, type=['integer', 'null'], title='Increment (сек)'),
+            'selfrun_timeout': Param(None, type=['integer', 'null'], title='Selfrun timeout (мин)'),
+        },
     )
 
     with dag:

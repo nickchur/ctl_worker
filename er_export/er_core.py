@@ -206,7 +206,7 @@ def make_er_export_task_group(
     with TaskGroup(group_id=group_id) as tg:
 
         @task(task_id='init')
-        def init(cfg):
+        def init(cfg, **context):
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             S3Hook(aws_conn_id=tfs_out_conn_id).create_bucket(bucket_name=tfs_out_bucket)
@@ -224,6 +224,17 @@ def make_er_export_task_group(
                 result = {**reg, **cur_res[0]}
             else:
                 result = reg
+            p = context['params']
+            if p.get('extract_time'):
+                result['extract_time'] = f"'{p['extract_time']}'"
+            if p.get('condition'):
+                result['condition'] = p['condition']
+            if p.get('is_current') is not None:
+                result['is_current'] = 'True' if p['is_current'] else 'False'
+            if p.get('increment') is not None:
+                result['increment'] = str(p['increment'])
+            if p.get('selfrun_timeout') is not None:
+                result['selfrun_timeout'] = str(p['selfrun_timeout'])
             add_note(
                 {k: result.get(k) for k in ('extract_time', 'condition', 'is_current', 'increment', 'selfrun_timeout')},
                 level='Task,DAG', title='Delta',

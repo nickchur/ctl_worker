@@ -156,7 +156,7 @@ for table_key, params in wfs.items():
         max_active_tasks=1,
         max_active_runs=1,
         catchup=False,
-        tags=['DataLab', 'CI02420667', 'ClickHouse', 'xStream', 'ER', replica, schema],
+        tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema],
         is_paused_upon_creation=True,
         render_template_as_native_obj=True,
         params={

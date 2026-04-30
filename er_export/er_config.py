@@ -27,9 +27,11 @@ if os.getenv("AIRFLOW__CTL_PIN"):
     }
     os.environ[f'AIRFLOW_CONN_{CH_ID.upper()}'] = json.dumps(conn_json)
     TFS_OUT_CONN_ID = 's3-archive'
+    MODE = 'test'
 else:
     CH_ID           = 'dlab-click'
     TFS_OUT_CONN_ID = 's3-tfs-hrplt'
+    MODE = 'prod'
 TFS_OUT_BUCKET  = 'tfshrplt'
 TFS_OUT_TOPIC   = 'TFS.HRPLT.IN'
 

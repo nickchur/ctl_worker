@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import json
 import logging
 import time
@@ -156,7 +155,7 @@ for _table_key, _params in tables.items():
             where extract_name = '{_tbl}'
         """
 
-    _sql_select_extract_params = f"""
+    _sql_get_params = f"""
         with
             '{_tbl}' AS extr_name,
             compare_params as (
@@ -210,7 +209,6 @@ for _table_key, _params in tables.items():
         'scenario':    _scenario,
         's3_prefix':   _s3_prefix,
         'bucket':      TFS_OUT_BUCKET,
-        'params':      _params,
         'sql_check_auto_confirm': (
             f"select auto_confirm_delta from export.extract_registry_vw"
             f" where extract_name = '{_tbl}'"
@@ -228,6 +226,10 @@ for _table_key, _params in tables.items():
                   and sent is not null and confirmed is null
         """,
         'sql_get_delta_params': _sql_get_delta_params,
+        'extra_columns': _params.get('extra_columns', []),
+        'strategy':      _params.get('strategy', 'FULL_UK'),
+        'PK':            _params.get('PK', []),
+        'UK':            _params.get('UK', []),
     }
 
     with DAG(
@@ -246,8 +248,6 @@ for _table_key, _params in tables.items():
 
         @task(task_id='init')
         def init(cfg, **context):
-            """Создаёт S3-бакет, опционально подтверждает предыдущий дельта-интервал (auto_confirm),
-            затем получает параметры текущего интервала из export.extract_current_vw."""
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             S3Hook(aws_conn_id=TFS_OUT_CONN_ID).create_bucket(bucket_name=cfg['bucket'])
@@ -262,14 +262,12 @@ for _table_key, _params in tables.items():
 
         get_params = ClickHouseOperator(
             task_id='get_params',
-            sql=_sql_select_extract_params,
+            sql=_sql_get_params,
             do_xcom_push=True,
         )
 
         @task(task_id='build_meta')
         def build_meta(cfg, **context):
-            """Получает схему таблицы через DESCRIBE TABLE, строит .meta JSON
-            (колонки из CH + extra_columns из конфига) и кладёт его в XCom под ключом meta_json."""
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
             rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
@@ -284,13 +282,13 @@ for _table_key, _params in tables.items():
                     "precision":   None,
                     "scale":       None,
                 })
-            columns.extend(cfg['params'].get("extra_columns", []))
+            columns.extend(cfg['extra_columns'])
             meta = {
                 "schema_name": cfg['schema_name'],
                 "table_name":  cfg['tbl'],
-                "strategy":    cfg['params'].get("strategy", "FULL_UK"),
-                "PK":          cfg['params'].get("PK", []),
-                "UK":          cfg['params'].get("UK", []),
+                "strategy":    cfg['strategy'],
+                "PK":          cfg['PK'],
+                "UK":          cfg['UK'],
                 "params":      {"separation": "\t", "escapesymbol": "\""},
                 "columns":     columns,
             }
@@ -299,8 +297,6 @@ for _table_key, _params in tables.items():
         t_build_meta = build_meta(cfg=_task_cfg)
 
         def _pre_execute_copy(context):
-            """Инжектирует export_time и condition из get_delta_params в SQL выгрузки,
-            а также параметры файла (max_size, sanitize и др.) из get_params."""
             ti = context['ti']
             dp = ti.xcom_pull(task_ids='init')[0]
             ep = ti.xcom_pull(task_ids='get_params')[0]
@@ -312,6 +308,7 @@ for _table_key, _params in tables.items():
             op.sanitize_list    = ep[7]
             op.pg_array_format  = ep[8] == 'True'
             try:
+                import ast
                 op.format_params = ast.literal_eval(ep[9]) if ep[9] else {}
             except (ValueError, TypeError):
                 logger.warning("Unparseable format_params: %r", ep[9])
@@ -330,9 +327,6 @@ for _table_key, _params in tables.items():
 
         @task(task_id='pack_zip')
         def pack_zip(cfg, **context):
-            """Скачивает промежуточные CSV из S3, упаковывает каждый в ZIP вместе с .meta и .tkt,
-            удаляет исходные CSV. Создаёт итоговый summary.tkt со списком ZIP-файлов.
-            Результаты (zip_name_list, summary_tkt_name, total_row_count) кладёт в XCom."""
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
             ti = context["ti"]
 
@@ -372,8 +366,6 @@ for _table_key, _params in tables.items():
                     zf.writestr(meta_name, meta_bytes)
                     zf.writestr(tkt_name,  f"{csv_name};{rows}".encode())
                     zf.writestr(csv_name,  csv_bytes)
-                buf.seek(0)
-
                 hook.load_bytes(
                     buf.getvalue(),
                     key=f"{cfg['s3_prefix']}/{zip_name}",
@@ -411,8 +403,6 @@ for _table_key, _params in tables.items():
 
         @task(task_id='save_status', trigger_rule='none_failed')
         def save_status(cfg, **context):
-            """Фиксирует результат выгрузки в export.extract_history через ClickHouseHook,
-            используя значения из XCom задач get_delta_params и package_zip_parts."""
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             ti         = context['ti']
             dp         = ti.xcom_pull(task_ids='init')[0]
@@ -439,8 +429,6 @@ for _table_key, _params in tables.items():
 
         @task(task_id='schedule_next')
         def schedule_next(cfg, **context):
-            """Если дельта-цикл не завершён — вычисляет дату следующего запуска
-            и триггерит этот же DAG через Airflow API."""
             from airflow.api.common.trigger_dag import trigger_dag
             ti = context['ti']
             dp = ti.xcom_pull(task_ids='init')[0]

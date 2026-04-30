@@ -30,22 +30,33 @@ def select_dic(ch_hook, sql):
 def build_dynamic_select(sql_meta: str | dict, indent: str = "    ") -> str:
     """
     Assembles a SELECT SQL string from either a raw string or a structured dictionary.
+    Supports with, fields, from, joins, where, settings.
     """
     if not sql_meta:
         return ""
     if isinstance(sql_meta, str):
         return sql_meta
     
+    sql = ""
+    if sql_meta.get("with"):
+        sql += f"{sql_meta['with']}\n"
+
     fields = sql_meta.get("fields", [])
     if isinstance(fields, list):
         fields_str = f",\n{indent}".join(fields)
     else:
         fields_str = fields
 
-    sql = f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}"
+    sql += f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}"
     
+    if sql_meta.get("joins"):
+        sql += f"\n{sql_meta['joins']}"
+
     if sql_meta.get("where"):
         sql += f"\nWHERE {sql_meta['where']}"
+    
+    if sql_meta.get("settings"):
+        sql += f"\nSETTINGS {sql_meta['settings']}"
     
     return sql
 
@@ -142,13 +153,25 @@ _SQL_REGISTRY_SELECT = """
 """
 
 def build_registry_sql_delta(tbl: str) -> str:
-    with_clause = _SQL_REGISTRY_WITH.format(tbl=tbl, extra_cols='', extra_aggr='')
-    return (
-        with_clause
-        + _SQL_REGISTRY_SELECT
-        + f"    from aggr where extract_name = '{tbl}'\n"
-        + "    settings enable_global_with_statement = 1"
-    )
+    return build_dynamic_select({
+        "with": _SQL_REGISTRY_WITH.format(tbl=tbl, extra_cols='', extra_aggr=''),
+        "fields": [
+            "auto_confirm_delta",
+            "'''' || toString(toDateTimeOrDefault(lower_bound)) || '''' as lower_bound",
+            "toString(selfrun_timeout)                                   as selfrun_timeout",
+            "compression_type",
+            "compression_ext",
+            "max_file_size",
+            "If(xstream_sanitize = 1, 'True', 'False')                  as xstream_sanitize",
+            "If(sanitize_array = 1, 'True', 'False')                    as sanitize_array",
+            "sanitize_list",
+            "If(pg_array_format = 1, 'True', 'False')                   as pg_array_format",
+            "csv_format_params                                           as format_params"
+        ],
+        "from": "aggr",
+        "where": f"extract_name = '{tbl}'",
+        "settings": "enable_global_with_statement = 1"
+    })
 
 def build_registry_sql_recent(tbl: str) -> str:
     extra_cols = ', increment, overlap, time_field, recent_interval'
@@ -158,37 +181,40 @@ def build_registry_sql_recent(tbl: str) -> str:
         ',\n                argMinIf(time_field, prio, prio = 1)      as time_field_v'
         ',\n                argMinIf(recent_interval, prio, prio = 1) as recent_interval_v'
     )
-    with_clause = _SQL_REGISTRY_WITH.format(tbl=tbl, extra_cols=extra_cols, extra_aggr=extra_aggr)
-    time_cols = r"""
-        toString(increment)                                                                                                                                   as increment,
-        toString(overlap)                                                                                                                                     as overlap,
-        '''' || time_field_v || ''''                                                                                                                         as time_field,
-        now()                                                                                                                                                as cur_time,
-        '''' || toString(cur_time) || ''''                                                                                                                   as extract_time,
-        'null'                                                                                                                                               as extract_count,
-        'null'                                                                                                                                               as loaded,
-        'null'                                                                                                                                               as sent,
-        'null'                                                                                                                                               as confirmed,
-        '''' || toString(cur_time - recent_interval_v) || ''''                                                                                              as time_from,
-        '''' || toString(cur_time) || ''''                                                                                                                   as extract_time,
-        'null'                                                                                                                                               as extract_count,
-        'null'                                                                                                                                               as loaded,
-        'null'                                                                                                                                               as sent,
-        'null'                                                                                                                                               as confirmed,
-        '''' || toString(cur_time - recent_interval_v) || ''''                                                                                              as time_from,
-        '''' || toString(cur_time) || ''''                                                                                                                   as time_to,
-        '''' || toString(cur_time - recent_interval_v) || ''' < ' || time_field_v || ' and ' || time_field_v || ' <= ''' || toString(cur_time) || ''''     as condition,
-        'True'                                                                                                                                               as is_current,
-        toString(recent_interval_v)                                                                                                                          as recent_interval,
-        toString(0)                                                                                                                                          as num_state
-"""
-    return (
-        with_clause
-        + _SQL_REGISTRY_SELECT.rstrip()
-        + ',\n' + time_cols
-        + f"    from aggr where extract_name = '{tbl}'\n"
-        + "    settings enable_global_with_statement = 1"
-    )
+    return build_dynamic_select({
+        "with": _SQL_REGISTRY_WITH.format(tbl=tbl, extra_cols=extra_cols, extra_aggr=extra_aggr),
+        "fields": [
+            "auto_confirm_delta",
+            "'''' || toString(toDateTimeOrDefault(lower_bound)) || '''' as lower_bound",
+            "toString(selfrun_timeout)                                   as selfrun_timeout",
+            "compression_type",
+            "compression_ext",
+            "max_file_size",
+            "If(xstream_sanitize = 1, 'True', 'False')                  as xstream_sanitize",
+            "If(sanitize_array = 1, 'True', 'False')                    as sanitize_array",
+            "sanitize_list",
+            "If(pg_array_format = 1, 'True', 'False')                   as pg_array_format",
+            "csv_format_params                                           as format_params",
+            "toString(increment)                                                                                                                                   as increment",
+            "toString(overlap)                                                                                                                                     as overlap",
+            "'''' || time_field_v || ''''                                                                                                                         as time_field",
+            "now()                                                                                                                                                as cur_time",
+            "'''' || toString(cur_time) || ''''                                                                                                                   as extract_time",
+            "'null'                                                                                                                                               as extract_count",
+            "'null'                                                                                                                                               as loaded",
+            "'null'                                                                                                                                               as sent",
+            "'null'                                                                                                                                               as confirmed",
+            "'''' || toString(cur_time - recent_interval_v) || ''''                                                                                              as time_from",
+            "'''' || toString(cur_time) || ''''                                                                                                                   as time_to",
+            "'''' || toString(cur_time - recent_interval_v) || ''' < ' || time_field_v || ' and ' || time_field_v || ' <= ''' || toString(cur_time) || ''''     as condition",
+            "'True'                                                                                                                                               as is_current",
+            "toString(recent_interval_v)                                                                                                                          as recent_interval",
+            "toString(0)                                                                                                                                          as num_state"
+        ],
+        "from": "aggr",
+        "where": f"extract_name = '{tbl}'",
+        "settings": "enable_global_with_statement = 1"
+    })
 
 def make_er_export_task_group(
     group_id: str,

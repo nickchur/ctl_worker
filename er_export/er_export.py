@@ -63,25 +63,26 @@ for table_key, params in tables.items():
 
     if sql_delta:
         sql_get_registry = build_registry_sql_delta(tbl)
-        sql_get_current  = f"""
-            select
-                toString(num_state)                                                                                                      as num_state,
-                '''' || toString(toDateTimeOrDefault(extract_time)) || ''''                                                             as extract_time,
-                ifNull(toString(extract_count), 'null')                                                                                 as extract_count,
-                ifNull('''' || toString(loaded)    || '''', 'null')                                                                     as loaded,
-                ifNull('''' || toString(sent)      || '''', 'null')                                                                     as sent,
-                ifNull('''' || toString(confirmed) || '''', 'null')                                                                     as confirmed,
-                toString(increment)                                                                                                     as increment,
-                toString(overlap)                                                                                                       as overlap,
-                '''' || time_field || ''''                                                                                              as time_field,
-                '''' || toString(time_from) || ''''                                                                                    as time_from,
-                '''' || toString(time_to)   || ''''                                                                                    as time_to,
-                '''' || toString(time_from) || ''' < ' || time_field || ' and ' || time_field || ' <= ''' || toString(time_to) || '''' as condition,
-                if(current_time = extract_time, 'True', 'False')                                                                       as is_current,
-                toString(0)                                                                                                             as recent_interval
-            from export.extract_current_vw
-            where extract_name = '{tbl}'
-        """
+        sql_get_current  = build_dynamic_select({
+            "fields": [
+                "toString(num_state)                                                                                                      as num_state",
+                "'''' || toString(toDateTimeOrDefault(extract_time)) || ''''                                                             as extract_time",
+                "ifNull(toString(extract_count), 'null')                                                                                 as extract_count",
+                "ifNull('''' || toString(loaded)    || '''', 'null')                                                                     as loaded",
+                "ifNull('''' || toString(sent)      || '''', 'null')                                                                     as sent",
+                "ifNull('''' || toString(confirmed) || '''', 'null')                                                                     as confirmed",
+                "toString(increment)                                                                                                     as increment",
+                "toString(overlap)                                                                                                       as overlap",
+                "'''' || time_field || ''''                                                                                              as time_field",
+                "'''' || toString(time_from) || ''''                                                                                    as time_from",
+                "'''' || toString(time_to)   || ''''                                                                                    as time_to",
+                "'''' || toString(time_from) || ''' < ' || time_field || ' and ' || time_field || ' <= ''' || toString(time_to) || '''' as condition",
+                "if(current_time = extract_time, 'True', 'False')                                                                       as is_current",
+                "toString(0)                                                                                                             as recent_interval"
+            ],
+            "from": "export.extract_current_vw",
+            "where": f"extract_name = '{tbl}'"
+        })
     else:
         sql_get_registry = build_registry_sql_recent(tbl)
         sql_get_current  = None

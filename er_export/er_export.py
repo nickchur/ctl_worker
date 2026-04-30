@@ -33,7 +33,7 @@ from er_export.er_config import (
 
 logger = logging.getLogger(__name__)
 
-TFS_KAFKA_CALLBACK = 'er_export.er_export__hrplatform_datalab.tfs_message_delivery_callback'
+TFS_KAFKA_CALLBACK = 'er_export.er_export.tfs_message_delivery_callback'
 
 
 def parse_ch_type(ch_type: str) -> tuple[str, bool]:

@@ -80,12 +80,12 @@ def tfs_message_delivery_callback(err, msg) -> None:
 
 
 def _make_pre_execute_kafka(scenario: str):
-    """Фабрика замыкания pre_execute для notify_tfs_kafka: захватывает scenario по значению.
+    """Фабрика замыкания pre_execute для notify_tfs: захватывает scenario по значению.
     В test-режиме бросает AirflowSkipException."""
     def _pre_execute(context):
         if MODE != 'prod':
             raise AirflowSkipException("Kafka notification skipped in test mode")
-        summary_tkt = context['ti'].xcom_pull(task_ids='package_zip_parts', key='summary_tkt_name')
+        summary_tkt = context['ti'].xcom_pull(task_ids='pack_zip', key='summary_tkt_name')
         context['task'].producer_function_args = [scenario, summary_tkt]
     return _pre_execute
 
@@ -244,8 +244,8 @@ for _table_key, _params in tables.items():
         render_template_as_native_obj=True,
     ) as dag:
 
-        @task(task_id='get_delta_params')
-        def get_delta_params(cfg, **context):
+        @task(task_id='init')
+        def init(cfg, **context):
             """Создаёт S3-бакет, опционально подтверждает предыдущий дельта-интервал (auto_confirm),
             затем получает параметры текущего интервала из export.extract_current_vw."""
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -258,16 +258,16 @@ for _table_key, _params in tables.items():
             rows, _ = hook.execute(cfg['sql_get_delta_params'], with_column_types=True)
             return rows
 
-        t_get_delta = get_delta_params(cfg=_task_cfg)
+        t_init = init(cfg=_task_cfg)
 
-        select_extract_params = ClickHouseOperator(
-            task_id='select_extract_params',
+        get_params = ClickHouseOperator(
+            task_id='get_params',
             sql=_sql_select_extract_params,
             do_xcom_push=True,
         )
 
-        @task(task_id='get_metadata')
-        def get_metadata(cfg, **context):
+        @task(task_id='build_meta')
+        def build_meta(cfg, **context):
             """Получает схему таблицы через DESCRIBE TABLE, строит .meta JSON
             (колонки из CH + extra_columns из конфига) и кладёт его в XCom под ключом meta_json."""
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
@@ -296,14 +296,14 @@ for _table_key, _params in tables.items():
             }
             context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
 
-        t_get_metadata = get_metadata(cfg=_task_cfg)
+        t_build_meta = build_meta(cfg=_task_cfg)
 
         def _pre_execute_copy(context):
             """Инжектирует export_time и condition из get_delta_params в SQL выгрузки,
-            а также параметры файла (max_size, sanitize и др.) из select_extract_params."""
+            а также параметры файла (max_size, sanitize и др.) из get_params."""
             ti = context['ti']
-            dp = ti.xcom_pull(task_ids='get_delta_params')[0]
-            ep = ti.xcom_pull(task_ids='select_extract_params')[0]
+            dp = ti.xcom_pull(task_ids='init')[0]
+            ep = ti.xcom_pull(task_ids='get_params')[0]
             op = context['task']
             op.sql              = op.sql.format(export_time=dp[1], condition=dp[11])
             op.max_size         = ep[4]
@@ -317,8 +317,8 @@ for _table_key, _params in tables.items():
                 logger.warning("Unparseable format_params: %r", ep[9])
                 op.format_params = {}
 
-        copy_clickhouse_query = HrpClickNativeToS3ListOperator(
-            task_id='copy_clickhouse_query',
+        export_to_s3 = HrpClickNativeToS3ListOperator(
+            task_id='export_to_s3',
             s3_bucket=TFS_OUT_BUCKET,
             s3_key=f"{_s3_prefix}/{{{{ ts_nodash }}}}.csv",  # ts_nodash — стандартный Airflow-макрос
             sql=_sql_export,
@@ -328,17 +328,17 @@ for _table_key, _params in tables.items():
             pre_execute=_pre_execute_copy,
         )
 
-        @task(task_id='package_zip_parts')
-        def package_zip_parts(cfg, **context):
+        @task(task_id='pack_zip')
+        def pack_zip(cfg, **context):
             """Скачивает промежуточные CSV из S3, упаковывает каждый в ZIP вместе с .meta и .tkt,
             удаляет исходные CSV. Создаёт итоговый summary.tkt со списком ZIP-файлов.
             Результаты (zip_name_list, summary_tkt_name, total_row_count) кладёт в XCom."""
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
             ti = context["ti"]
 
-            s3_key_list    = ti.xcom_pull(task_ids='copy_clickhouse_query', key='s3_key_list')
-            row_count_list = ti.xcom_pull(task_ids='copy_clickhouse_query', key='row_count_list')
-            meta_json_str  = ti.xcom_pull(task_ids='get_metadata', key='meta_json')
+            s3_key_list    = ti.xcom_pull(task_ids='export_to_s3', key='s3_key_list')
+            row_count_list = ti.xcom_pull(task_ids='export_to_s3', key='row_count_list')
+            meta_json_str  = ti.xcom_pull(task_ids='build_meta', key='meta_json')
 
             if not s3_key_list:
                 logger.warning("No CSV parts exported — skipping ZIP packaging")
@@ -398,10 +398,10 @@ for _table_key, _params in tables.items():
             ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
             ti.xcom_push(key="total_row_count",  value=sum(int(r) for r in row_count_list))
 
-        t_package = package_zip_parts(cfg=_task_cfg)
+        t_pack = pack_zip(cfg=_task_cfg)
 
-        notify_tfs_kafka = ProduceToTopicOperator(
-            task_id='notify_tfs_kafka',
+        notify_tfs = ProduceToTopicOperator(
+            task_id='notify_tfs',
             producer_function=produce_tfs_kafka_notification,
             producer_function_args=[_scenario, ''],  # заполняется в pre_execute
             delivery_callback=TFS_KAFKA_CALLBACK,
@@ -409,15 +409,15 @@ for _table_key, _params in tables.items():
             pre_execute=_make_pre_execute_kafka(_scenario),
         )
 
-        @task(task_id='update_send_status', trigger_rule='none_failed')
-        def update_send_status(cfg, **context):
+        @task(task_id='save_status', trigger_rule='none_failed')
+        def save_status(cfg, **context):
             """Фиксирует результат выгрузки в export.extract_history через ClickHouseHook,
             используя значения из XCom задач get_delta_params и package_zip_parts."""
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             ti         = context['ti']
-            dp         = ti.xcom_pull(task_ids='get_delta_params')[0]
-            total_rows = ti.xcom_pull(task_ids='package_zip_parts', key='total_row_count')
-            zip_names  = ti.xcom_pull(task_ids='package_zip_parts', key='zip_name_list')
+            dp         = ti.xcom_pull(task_ids='init')[0]
+            total_rows = ti.xcom_pull(task_ids='pack_zip', key='total_row_count')
+            zip_names  = ti.xcom_pull(task_ids='pack_zip', key='zip_name_list')
             hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
             hook.execute(f"""
                 insert into export.extract_history (
@@ -435,26 +435,26 @@ for _table_key, _params in tables.items():
                     {zip_names!r}
             """)
 
-        t_update = update_send_status(cfg=_task_cfg)
+        t_save = save_status(cfg=_task_cfg)
 
-        @task(task_id='trigger_next_run')
-        def trigger_next_run(cfg, **context):
+        @task(task_id='schedule_next')
+        def schedule_next(cfg, **context):
             """Если дельта-цикл не завершён — вычисляет дату следующего запуска
             и триггерит этот же DAG через Airflow API."""
             from airflow.api.common.trigger_dag import trigger_dag
             ti = context['ti']
-            dp = ti.xcom_pull(task_ids='get_delta_params')[0]
+            dp = ti.xcom_pull(task_ids='init')[0]
             if str(dp[12]).lower() in ('true', 't', '1'):
                 return
-            ep = ti.xcom_pull(task_ids='select_extract_params')[0]
+            ep = ti.xcom_pull(task_ids='get_params')[0]
             run_date = pendulum.now('UTC').add(minutes=int(ep[1]))
             trigger_dag(dag_id=cfg['dag_id'], execution_date=run_date, replace_microseconds=False)
 
-        t_trigger_next = trigger_next_run(cfg=_task_cfg)
+        t_schedule = schedule_next(cfg=_task_cfg)
 
         # ── task dependencies ────────────────────────────────────────────────
-        t_get_delta >> [select_extract_params, t_get_metadata]
-        [select_extract_params, t_get_metadata] >> copy_clickhouse_query
-        copy_clickhouse_query >> t_package >> notify_tfs_kafka >> t_update >> t_trigger_next
+        t_init >> [get_params, t_build_meta]
+        [get_params, t_build_meta] >> export_to_s3
+        export_to_s3 >> t_pack >> notify_tfs >> t_save >> t_schedule
 
     globals()[_dag_id] = dag

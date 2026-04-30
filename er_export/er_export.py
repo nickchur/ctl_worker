@@ -164,7 +164,7 @@ for table_key, params in wfs.items():
             'extract_time':    Param(None, type=['string', 'null'],  title='Extract time',       description='Техническое время выгрузки (правая граница дельты). Формат: 2024-01-01 00:00:00'),
             'condition':       Param(None, type=['string', 'null'],  title='Condition',           description='Перезаписать значение плейсхолдера {condition}'),
             'is_current':      Param(None, type=['boolean', 'null'], title='Is current',       description='True = данные актуальны, остановить авто-перезапуск (self-run)'),
-            'increment':       Param(params.get('increment'), type=['integer', 'null'], title='Increment (сек)'),
+            'increment':       Param(params.get('increment'), type=['integer', 'null'], title='Increment (сек)', description='Размер временного окна (шаг) одной выгрузки в секундах'),
             'selfrun_timeout': Param(params.get('selfrun_timeout'), type=['integer', 'null'], title='Selfrun timeout (мин)'),
         },
     )

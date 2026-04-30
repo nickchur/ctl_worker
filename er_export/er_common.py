@@ -270,6 +270,9 @@ def make_er_export_task_group(
             ti = context['ti']
             dp = ti.xcom_pull(task_ids=f"{group_id}.init")
             op = context['task']
+            
+            logger.info("PRE_EXECUTE_COPY for %s: dp keys=%s", op.task_id, list(dp.keys()) if dp else "None")
+            
             op.sql              = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
             
             raw_max_size = dp.get('max_file_size')
@@ -285,11 +288,13 @@ def make_er_export_task_group(
             op.xstream_sanitize = dp['xstream_sanitize'] == 'True'
             op.sanitize_array   = dp['sanitize_array'] == 'True'
             
-            raw_sanitize_list = dp.get('sanitize_list')
-            if not raw_sanitize_list or str(raw_sanitize_list).lower() in ('none', 'null', ''):
+            raw_sl = dp.get('sanitize_list')
+            if not raw_sl or str(raw_sl).strip().lower() in ('none', 'null', ''):
                 op.sanitize_list = '[]'
             else:
-                op.sanitize_list = raw_sanitize_list
+                op.sanitize_list = str(raw_sl)
+            
+            logger.info("PRE_EXECUTE_COPY: final sanitize_list=%r", op.sanitize_list)
 
             op.pg_array_format  = dp['pg_array_format'] == 'True'
             try:
@@ -307,6 +312,7 @@ def make_er_export_task_group(
             replace=True,
             post_file_check=False,
             pre_execute=_pre_execute_copy,
+            sanitize_list='[]',
         )
 
         @task(task_id='pack_zip')

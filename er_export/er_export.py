@@ -31,7 +31,6 @@ from er_export.er_core import (
     build_sql
 )
 
-# Пытаемся импортировать ctl_obj_load из общих утилит
 from plugins.ctl_utils import ctl_obj_load
 
 logger = logging.getLogger(__name__)
@@ -125,7 +124,9 @@ for table_key, params in wfs.items():
         'scenario':    scen,
         's3_prefix':   s3_prefix,
         'bucket':      BUCKET,
-        'topic':       DEF_ARGS.get('topic', 'TFS.HRPLT.IN'),
+        'topic':              DEF_ARGS['topic'],
+        'kafka_sensor_conn_id': DEF_ARGS['kafka_sensor_conn_id'],
+        'kafka_sensor_topic':   DEF_ARGS['kafka_sensor_topic'],
         'sql_auto_confirm': f"""
             insert into export.extract_history (
                 extract_name, extract_time, extract_count, loaded, sent, confirmed,
@@ -171,7 +172,7 @@ for table_key, params in wfs.items():
             'max_file_size':   Param(None, type=['integer', 'null'], title='Max file size', description='Максимальный размер одного CSV файла (байт). По умолчанию из реестра.'),
             'pool':            Param(pool, type='string', title='Kafka Pool', description='Пул Airflow для задач Kafka'),
             'topic':           Param(cfg['topic'], type='string', title='Kafka Topic', description='Топик для отправки уведомлений'),
-            'xstream_sanitize': Param(None, type=['boolean', 'null'], title='XStream Sanitize', description='Очистка спецсимволов для xStream'),
+            'sanitize':        Param(None, type=['boolean', 'null'], title='Sanitize', description='Очистка спецсимволов'),
             'sanitize_array':  Param(None, type=['boolean', 'null'], title='Sanitize Array', description='Очистка массивов'),
         },
     )

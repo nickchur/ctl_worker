@@ -144,7 +144,7 @@ def sql_reg_delta(tbl: str) -> str:
             "compression_type_v                         as compression_type",
             "compression_ext_v                          as compression_ext",
             "max_file_size_v                            as max_file_size",
-            "If(xstream_sanitize_v = 1, 'True', 'False') as xstream_sanitize",
+            "If(xstream_sanitize_v = 1, 'True', 'False') as sanitize",
             "If(sanitize_array_v = 1, 'True', 'False')   as sanitize_array",
             "sanitize_list_v                            as sanitize_list",
             "If(pg_array_format_v = 1, 'True', 'False')  as pg_array_format",
@@ -170,7 +170,7 @@ def sql_reg_recent(tbl: str) -> str:
             "compression_type_v                         as compression_type",
             "compression_ext_v                          as compression_ext",
             "max_file_size_v                            as max_file_size",
-            "If(xstream_sanitize_v = 1, 'True', 'False') as xstream_sanitize",
+            "If(xstream_sanitize_v = 1, 'True', 'False') as sanitize",
             "If(sanitize_array_v = 1, 'True', 'False')   as sanitize_array",
             "sanitize_list_v                            as sanitize_list",
             "If(pg_array_format_v = 1, 'True', 'False')  as pg_array_format",
@@ -246,8 +246,8 @@ def export_tg(
                 result['auto_confirm'] = 1 if p['auto_confirm'] else 0
             if p.get('max_file_size') is not None:
                 result['max_file_size'] = str(p['max_file_size'])
-            if p.get('xstream_sanitize') is not None:
-                result['xstream_sanitize'] = 'True' if p['xstream_sanitize'] else 'False'
+            if p.get('sanitize') is not None:
+                result['sanitize'] = 'True' if p['sanitize'] else 'False'
             if p.get('sanitize_array') is not None:
                 result['sanitize_array'] = 'True' if p['sanitize_array'] else 'False'
                 
@@ -464,8 +464,8 @@ def export_tg(
 
         t_wait_confirm = KafkaConsumeSensor(
             task_id='wait_for_confirm',
-            kafka_config_id=cfg.get('kafka_sensor_conn_id', 'tfs-kafka-in'),
-            topics=[cfg.get('kafka_sensor_topic', 'TFS.HRPLT.OUT')],
+            kafka_config_id=cfg['kafka_sensor_conn_id'],
+            topics=[cfg['kafka_sensor_topic']],
             apply_function=_handle_confirm,
             poke_interval=60,
             timeout=3600,

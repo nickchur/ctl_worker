@@ -34,7 +34,6 @@ VALUES (
     'FULL_UK',
     ['person_uuid', 'item_id'],
     [
-        '{export_time} as export_time',
         'insert_time',
         'header_id',
         'header_person_id',
@@ -43,9 +42,7 @@ VALUES (
         'item_id',
         'person_uuid',
         'tenant',
-        'company',
-        '''I'' as ctl_action',
-        'now() as ctl_validfrom'
+        'company'
     ],
     'evolution.lc_items_opened',
     '{condition}'

@@ -12,6 +12,7 @@ from er_export.er_config import (
     DEFAULT_ARGS,
     ENV_STAND,
     ER_EXTRA_COLUMNS,
+    ER_MANDATORY_FIELDS,
     MODE,
     ROW_COUNT_LIMIT_MAP,
     TFS_OUT_BUCKET,
@@ -52,7 +53,7 @@ for table_key, params in wfs.items():
     def _prepare_sql(sql_key):
         sql_meta = params.get(sql_key)
         if isinstance(sql_meta, dict) and "fields" not in sql_meta:
-            sql_meta["fields"] = params.get("fields", [])
+            sql_meta["fields"] = params.get("fields", []) + ER_MANDATORY_FIELDS
         return build_dynamic_select(sql_meta)
 
     sql_delta  = _prepare_sql('sql_stmt_export_delta')

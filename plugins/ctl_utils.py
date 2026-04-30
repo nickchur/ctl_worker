@@ -486,16 +486,17 @@ def ctl_obj_load(key, s3_id=None, bucket=None):
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_obj_etag(key, ext='json'):
+def ctl_obj_etag(key, ext='json', s3_id=None, bucket=None):
     """
     Возвращает только ETag (md5) объекта из S3 без загрузки тела файла.
     """
     from botocore.exceptions import ClientError
 
     s3 = get_config().get('conns', {}).get('s3', {})
-    bucket = s3.get('bucket', 'edpetl-ctl')
+    s3_id = s3_id or s3.get('conn_id', 's3')
+    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
 
-    hook = S3Hook(aws_conn_id=s3.get('conn_id', 's3'))
+    hook = S3Hook(aws_conn_id=s3_id)
     # key_ext = f'{key}.json'
     key_ext = f'{key}.{ext}'
     try:
@@ -518,16 +519,17 @@ def ctl_obj_etag(key, ext='json'):
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_obj_save(key, data, var=False, ext='json'):
+def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
     """
     Сохраняет объект в S3 и обновляет переменную Airflow, если указано.
     """
     
     s3 = get_config().get('conns', {}).get('s3', {})
-    bucket = s3.get('bucket', 'edpetl-ctl')
+    s3_id = s3_id or s3.get('conn_id', 's3')
+    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
 
     if bucket:
-        hook = S3Hook(aws_conn_id=s3.get('conn_id', 's3'))
+        hook = S3Hook(aws_conn_id=s3_id)
         key_ext = f'{key}.{ext}'
             
         # 1. Готовим контент в памяти

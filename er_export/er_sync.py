@@ -8,7 +8,7 @@ import logging
 import pendulum
 from airflow.decorators import dag, task
 
-from er_export.er_config import CH_ID, DEF_ARGS
+from er_export.er_config import CH_ID, DEF_ARGS, MODE
 from er_export.er_core import get_dict
 from plugins.ctl_utils import ctl_obj_save
 
@@ -36,6 +36,35 @@ def er_sync_dag():
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
         hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+
+        if MODE == 'test':
+            hook.execute("""
+                CREATE TABLE IF NOT EXISTS export.er_wf_meta
+                (
+                    extract_name    String,
+                    db_name         String,
+                    replica         String,
+                    schema_name     String,
+                    format          String        DEFAULT 'TSVWithNames',
+                    strategy        String        DEFAULT 'FULL_UK',
+                    pk              Array(String) DEFAULT [],
+                    uk              Array(String) DEFAULT [],
+                    fields          Array(String) DEFAULT [],
+                    sql_from        String        DEFAULT '',
+                    sql_where       String        DEFAULT '',
+                    increment       Int32         DEFAULT 60,
+                    selfrun_timeout Int32         DEFAULT 10,
+                    auto_confirm    UInt8         DEFAULT 1,
+                    description     String        DEFAULT '',
+                    is_recent       UInt8         DEFAULT 0,
+                    is_active       UInt8         DEFAULT 1,
+                    updated_at      DateTime      DEFAULT now()
+                )
+                ENGINE = ReplacingMergeTree(updated_at)
+                ORDER BY (db_name, extract_name)
+            """)
+            logger.info("Test mode: ensured export.er_wf_meta exists")
+
         rows = get_dict(
             hook,
             "SELECT * FROM export.er_wf_meta FINAL WHERE is_active = 1",

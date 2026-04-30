@@ -28,10 +28,6 @@ def select_dic(ch_hook, sql):
         return []
 
 def build_dynamic_select(sql_meta: str | dict, indent: str = "    ") -> str:
-    """
-    Assembles a SELECT SQL string from either a raw string or a structured dictionary.
-    Supports with, fields, from, joins, where, settings.
-    """
     if not sql_meta:
         return ""
     if isinstance(sql_meta, str):
@@ -99,45 +95,37 @@ def tfs_message_delivery_callback(err, msg) -> None:
 
 def _make_pre_execute_kafka(scenario: str, mode: str):
     def pre_execute(context):
-        ti = context['ti']
-        # For production/UAT, we might want to skip if zero rows, but here we just pass filenames
-        zip_names = ti.xcom_pull(task_ids=f"{context['task'].task_group.group_id}.pack_zip", key='zip_name_list')
-        summary_tkt = ti.xcom_pull(task_ids=f"{context['task'].task_group.group_id}.pack_zip", key='summary_tkt_name')
-        
+        if mode != 'prod':
+            raise AirflowSkipException("Kafka notification skipped in test mode")
+        group_id = context['task'].task_group.group_id
+        summary_tkt = context['ti'].xcom_pull(task_ids=f"{group_id}.pack_zip", key='summary_tkt_name')
         if not summary_tkt:
             raise AirflowSkipException("No data exported, skipping notification")
-            
-        op = context['task']
-        op.producer_function_args = [scenario, summary_tkt]
+        context['task'].producer_function_args = [scenario, summary_tkt]
     return pre_execute
 
 _SQL_REGISTRY_WITH = """WITH aggr AS (
     SELECT
-        extract_name,
-        argMinIf(auto_confirm_delta, prio, prio=1) as auto_confirm_delta_v,
-        argMinIf(lower_bound, prio, prio=1)        as lower_bound_v,
-        argMinIf(selfrun_timeout, prio, prio=1)    as selfrun_timeout_v,
-        argMinIf(compression_type, prio, prio=1)   as compression_type_v,
-        argMinIf(compression_ext, prio, prio=1)    as compression_ext_v,
-        argMinIf(max_file_size, prio, prio=1)      as max_file_size_v,
-        argMinIf(xstream_sanitize, prio, prio=1)   as xstream_sanitize_v,
-        argMinIf(sanitize_array, prio, prio=1)     as sanitize_array_v,
-        argMinIf(sanitize_list, prio, prio=1)      as sanitize_list_v,
-        argMinIf(pg_array_format, prio, prio=1)    as pg_array_format_v,
-        argMinIf(csv_format_params, prio, prio=1)  as csv_format_params_v
+        argMinIf(extract_name, prio, prio=1)                                       as extract_name,
+        argMinIf(auto_confirm_delta, prio, prio=1)                                 as auto_confirm_delta_v,
+        argMinIf(lower_bound, prio, prio=1)                                        as lower_bound_v,
+        argMinIf(selfrun_timeout, prio, prio=1)                                    as selfrun_timeout_v,
+        argMinIf(compression_type, prio, lower(compression_type) <> 'default')    as compression_type_v,
+        argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext_v,
+        argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size_v,
+        argMinIf(xstream_sanitize, prio, prio=1)                                   as xstream_sanitize_v,
+        argMinIf(sanitize_array, prio, prio=1)                                     as sanitize_array_v,
+        argMinIf(sanitize_list, prio, lower(sanitize_list) <> 'default')           as sanitize_list_v,
+        argMinIf(pg_array_format, prio, prio=1)                                    as pg_array_format_v,
+        argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params_v
         {extra_aggr}
     FROM (
-        SELECT
-            1 as prio, *
-        FROM export.extract_registry_vw
-        WHERE extract_name = '{tbl}'
+        SELECT 1 as prio, *
+        FROM export.extract_registry_vw WHERE extract_name = '{tbl}'
         UNION ALL
-        SELECT
-            2 as prio, *
-        FROM export.extract_registry_vw
-        WHERE extract_name = 'default'
+        SELECT 2 as prio, *
+        FROM export.extract_registry_vw WHERE extract_name = 'default'
     )
-    GROUP BY extract_name
 )"""
 
 def build_registry_sql_delta(tbl: str) -> str:
@@ -145,7 +133,7 @@ def build_registry_sql_delta(tbl: str) -> str:
         "with": _SQL_REGISTRY_WITH.format(tbl=tbl, extra_aggr=''),
         "fields": [
             "auto_confirm_delta_v                       as auto_confirm_delta",
-            "concat('\\'', toString(lower_bound_v), '\\'') as lower_bound",
+            "concat('\\'', toString(toDateTimeOrDefault(lower_bound_v)), '\\'') as lower_bound",
             "toString(selfrun_timeout_v)                as selfrun_timeout",
             "compression_type_v                         as compression_type",
             "compression_ext_v                          as compression_ext",
@@ -171,7 +159,7 @@ def build_registry_sql_recent(tbl: str) -> str:
         "with": _SQL_REGISTRY_WITH.format(tbl=tbl, extra_aggr=extra_aggr),
         "fields": [
             "auto_confirm_delta_v                       as auto_confirm_delta",
-            "concat('\\'', toString(lower_bound_v), '\\'') as lower_bound",
+            "concat('\\'', toString(toDateTimeOrDefault(lower_bound_v)), '\\'') as lower_bound",
             "toString(selfrun_timeout_v)                as selfrun_timeout",
             "compression_type_v                         as compression_type",
             "compression_ext_v                          as compression_ext",
@@ -230,8 +218,9 @@ def make_er_export_task_group(
                 hook.execute(cfg['sql_auto_confirm'])
             if cfg['sql_get_current']:
                 cur_res = select_dic(hook, cfg['sql_get_current'])
-                if cur_res:
-                    return {**reg, **cur_res[0]}
+                if not cur_res:
+                    raise ValueError(f"No delta state found for {cfg['tbl']}")
+                return {**reg, **cur_res[0]}
             return reg
 
         t_init = init(cfg=task_cfg)
@@ -271,8 +260,6 @@ def make_er_export_task_group(
             dp = ti.xcom_pull(task_ids=f"{group_id}.init")
             op = context['task']
             
-            logger.info("PRE_EXECUTE_COPY for %s: dp keys=%s", op.task_id, list(dp.keys()) if dp else "None")
-            
             op.sql              = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
             
             raw_max_size = dp.get('max_file_size')
@@ -300,8 +287,6 @@ def make_er_export_task_group(
                 logger.warning("Invalid sanitize_list in XCom: %r, falling back to []", raw_sl)
                 op.sanitize_list = '[]'
             
-            logger.info("PRE_EXECUTE_COPY: final sanitize_list=%r", op.sanitize_list)
-
             op.pg_array_format  = dp['pg_array_format'] == 'True'
             try:
                 op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}
@@ -390,7 +375,7 @@ def make_er_export_task_group(
 
         notify_tfs = ProduceToTopicOperator(
             task_id='notify_tfs',
-            topic=task_cfg.get('topic', 'TFS.HRPLT.IN'), # Fallback
+            topic=task_cfg.get('topic', 'TFS.HRPLT.IN'),
             producer_function=produce_tfs_kafka_notification,
             producer_function_args=[task_cfg['scenario'], ''],
             delivery_callback=TFS_KAFKA_CALLBACK,

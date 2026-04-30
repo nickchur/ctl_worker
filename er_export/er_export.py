@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import json
-import os
 import logging
 import pendulum
 from airflow import DAG
-from airflow.models import Variable
 
 from er_export.er_config import (
     CH_ID,
@@ -76,6 +73,7 @@ for table_key, params in wfs.items():
                 SELECT
                     num_state       as num_state_v,
                     extract_time    as extract_time_v,
+                    current_time    as current_time_v,
                     extract_count   as extract_count_v,
                     loaded          as loaded_v,
                     sent            as sent_v,
@@ -101,7 +99,7 @@ for table_key, params in wfs.items():
                 "concat('\\'', toString(time_from_v), '\\'')                                         as time_from",
                 "concat('\\'', toString(time_to_v), '\\'')                                           as time_to",
                 "concat('\\'', toString(time_from_v), '\\' < ', time_field_v, ' and ', time_field_v, ' <= \\'', toString(time_to_v), '\\'') as condition",
-                "'False'                                                                             as is_current",
+                "if(current_time_v = extract_time_v, 'True', 'False')                               as is_current",
                 "toString(0)                                                                         as recent_interval"
             ],
             "from": "data"

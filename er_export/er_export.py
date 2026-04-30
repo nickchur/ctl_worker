@@ -141,7 +141,7 @@ for table_key, params in wfs.items():
         'sql_get_registry': sql_reg,
         'sql_get_current':  sql_cur,
         'extra_columns': EXTRA_COLS,
-        'auto_confirm_delta': params.get('auto_confirm_delta', 1),
+        'auto_confirm': params.get('auto_confirm', 1),
         'strategy':      params.get('strategy', 'FULL_UK'),
         'PK':            params.get('PK', []),
         'UK':            params.get('UK', []),

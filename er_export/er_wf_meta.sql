@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; плейсхолдер {condition} подставляется рантаймом',
     increment     Int32         DEFAULT 60             COMMENT 'Инкремент дельты (сек), используется если не перекрыто в registry',
     selfrun_timeout Int32       DEFAULT 10             COMMENT 'Таймаут перед авто-запуском следующей дельты (мин)',
+    auto_confirm   UInt8         DEFAULT 1              COMMENT '1 = авто-подтверждение дельты, 0 = ждать уведомления в Kafka',
     description   String        DEFAULT ''             COMMENT 'Произвольное описание DAG-а (отображается в Airflow UI)',
     is_recent     UInt8         DEFAULT 0             COMMENT '0 = дельта-выгрузка (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent)',
     is_active     UInt8         DEFAULT 1             COMMENT '0 = запись игнорируется при синхронизации в Variable',
@@ -27,7 +28,7 @@ ORDER BY (db_name, extract_name);
 
 -- Example row for evolution.lc_items_opened
 INSERT INTO export.er_wf_meta
-    (extract_name, db_name, replica, schema_name, strategy, uk, fields, sql_from, sql_where, increment, selfrun_timeout)
+    (extract_name, db_name, replica, schema_name, strategy, uk, fields, sql_from, sql_where, increment, selfrun_timeout, auto_confirm)
 VALUES (
     'lc_items_opened',
     'evolution',
@@ -51,15 +52,4 @@ VALUES (
     60,
     10,
     1
-);
-_dt',
-        'item_id',
-        'person_uuid',
-        'tenant',
-        'company'
-    ],
-    'evolution.lc_items_opened',
-    '{condition}',
-    60,
-    10
 );

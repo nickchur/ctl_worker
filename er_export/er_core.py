@@ -479,7 +479,7 @@ def export_tg(
         t_init >> [t_build_meta, export_to_s3]
         [t_build_meta, export_to_s3] >> t_pack
 
-        if cfg.get('auto_confirm_delta'):
+        if cfg.get('auto_confirm'):
             t_pack >> notify_tfs >> t_save >> t_schedule
         else:
             from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor

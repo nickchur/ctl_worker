@@ -61,7 +61,7 @@ def er_sync_dag():
                 "UK":       row["uk"],
                 "increment": row["increment"],
                 "selfrun_timeout": row["selfrun_timeout"],
-                "auto_confirm_delta": row["auto_confirm_delta"],
+                "auto_confirm": row["auto_confirm"],
                 sql_key:    sql_val,
             }
             if row["fields"]:

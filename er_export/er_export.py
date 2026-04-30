@@ -13,11 +13,11 @@ from airflow.decorators import task
 from airflow.operators.dummy_operator import DummyOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
-from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
+from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
 from airflow.utils.task_group import TaskGroup
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseOperator
 from airflow_clickhouse_plugin.operators.clickhouse_dbapi import ClickHouseBranchSQLOperator
-from hrp_operators import HrpClickNativeToS3ListOperator
+from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
 
 from er_export.er_config import (
     CH_ID,

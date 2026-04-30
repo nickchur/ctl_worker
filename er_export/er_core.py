@@ -418,7 +418,7 @@ def export_tg(
             producer_function=produce_msg,
             producer_function_args=[cfg['scenario'], ''],
             delivery_callback=ON_DELIVERY,
-            pool="{{ params.pool }}",
+            pool=pool,
             pre_execute=_pre_kafka(cfg['scenario'], mode),
         )
 

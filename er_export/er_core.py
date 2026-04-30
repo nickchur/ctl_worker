@@ -239,8 +239,10 @@ def export_tg(
                 result['increment'] = str(p['increment'])
             if p.get('selfrun_timeout') is not None:
                 result['selfrun_timeout'] = str(p['selfrun_timeout'])
+            if p.get('strategy'):
+                result['strategy'] = p['strategy']
             add_note(
-                {k: result.get(k) for k in ('extract_time', 'condition', 'is_current', 'increment', 'selfrun_timeout')},
+                {k: result.get(k) for k in ('extract_time', 'condition', 'is_current', 'increment', 'selfrun_timeout', 'strategy')},
                 level='Task,DAG', title='Delta',
             )
             return result
@@ -250,6 +252,8 @@ def export_tg(
         @task(task_id='build_meta')
         def build_meta(cfg, **context):
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+            ti = context['ti']
+            dp = ti.xcom_pull(task_ids=f"{gid}.init")
             hook = ClickHouseHook(clickhouse_conn_id=cid)
             rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
             columns = []
@@ -267,7 +271,7 @@ def export_tg(
             meta = {
                 "schema_name": cfg['schema_name'],
                 "table_name":  cfg['tbl'],
-                "strategy":    cfg['strategy'],
+                "strategy":    dp.get('strategy', cfg['strategy']),
                 "PK":          cfg['PK'],
                 "UK":          cfg['UK'],
                 "params":      {"separation": "\t", "escapesymbol": "\""},

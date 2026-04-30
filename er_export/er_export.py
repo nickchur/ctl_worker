@@ -166,6 +166,7 @@ for table_key, params in wfs.items():
             'is_current':      Param(None, type=['boolean', 'null'], title='Is current',       description='True = данные актуальны, остановить авто-перезапуск (self-run)'),
             'increment':       Param(params.get('increment'), type=['integer', 'null'], title='Increment (сек)', description='Размер временного окна (шаг) одной выгрузки в секундах'),
             'selfrun_timeout': Param(params.get('selfrun_timeout'), type=['integer', 'null'], title='Selfrun timeout (мин)', description='Пауза перед автоматическим запуском следующей итерации (мин)'),
+            'strategy':        Param(params.get('strategy', 'FULL_UK'), type='string', title='Strategy', description='Стратегия слияния данных (FULL_UK, DELTA_UK и др.)'),
         },
     )
 

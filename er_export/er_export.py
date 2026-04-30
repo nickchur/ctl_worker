@@ -84,7 +84,7 @@ for table_key, params in wfs.items():
                 "'''' || time_field || ''''                                                                                              as time_field",
                 "'''' || toString(time_from) || ''''                                                                                    as time_from",
                 "'''' || toString(time_to)   || ''''                                                                                    as time_to",
-                "'''' || toString(time_from) || ''' < ' || time_field || ' and ' || time_field || ' <= ''' || toString(time_to) || '''' as condition,
+                "'''' || toString(time_from) || ''' < ' || time_field || ' and ' || time_field || ' <= ''' || toString(time_to) || '''' as condition",
                 "if(current_time = extract_time, 'True', 'False')                                                                       as is_current",
                 "toString(0)                                                                                                             as recent_interval"
             ],

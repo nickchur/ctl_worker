@@ -1,7 +1,33 @@
 from __future__ import annotations
 
+import base64
+import json
 import os
 from datetime import timedelta
+
+VAULT_PATH = '/vault/secrets/application'
+CH_BD      = 'evolution'
+
+if os.getenv("AIRFLOW__CTL_PIN"):
+    CH_ID = 'dlab-click-test'
+    with open(VAULT_PATH) as f:
+        secrets = json.load(f)
+
+    def _b64(s: str) -> str:
+        return base64.b64decode(s).decode()
+
+    conn_json = {
+        "conn_type": "clickhouse",
+        "host":      "tvlds-hrplt0429.cloud.delta.sbrf.ru",
+        "port":      9440,
+        "login":     _b64(secrets['SCSP_CLICKHOUSE_USERNAME']),
+        "password":  _b64(secrets['SCSP_CLICKHOUSE_PASSWORD']),
+        "schema":    CH_BD,
+        "extra":     {"verify": False, "secure": True},
+    }
+    os.environ[f'AIRFLOW_CONN_{CH_ID.upper()}'] = json.dumps(conn_json)
+else:
+    CH_ID = 'dlab-click'
 
 TFS_OUT_CONN_ID = 's3-tfs-hrplt'
 TFS_OUT_BUCKET  = 'tfshrplt'
@@ -18,8 +44,8 @@ DEFAULT_ARGS = {
     "retries":             3,
     "retry_delay":         timedelta(minutes=5),
     "aws_conn_id":         TFS_OUT_CONN_ID,
-    "clickhouse_conn_id":  "dlab-click",
-    "conn_id":             "dlab-click",
+    "clickhouse_conn_id":  CH_ID,
+    "conn_id":             CH_ID,
     "kafka_config_id":     "tfs-kafka-out",
     "topic":               TFS_OUT_TOPIC,
 }

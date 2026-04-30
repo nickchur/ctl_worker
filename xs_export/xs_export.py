@@ -139,24 +139,23 @@ def create_dynamic_dags():
         )
 
         with dag:
-            for table_meta in config.get("tables", []):
-                full_name = table_meta["full_table_name"]
-                db_name, table_name = full_name.split(".")
-                base_cols = table_meta["columns"]
+            full_name = config["full_table_name"]
+            db_name, table_name = full_name.split(".")
+            base_cols = config["columns"]
 
-                params = {
-                    "replica": table_meta["name_file"].split("__")[2],
-                    "sql_stmt_update_exp": build_dynamic_select(base_cols, table_meta.get("update_exp")),
-                    "sql_stmt_load_delta": build_dynamic_select(base_cols, table_meta.get("load_delta")),
-                    "sql_stmt_export_delta": build_dynamic_select(base_cols, table_meta.get("export_delta")),
-                }
+            params = {
+                "replica": config["name_file"].split("__")[2],
+                "sql_stmt_update_exp": build_dynamic_select(base_cols, config.get("update_exp")),
+                "sql_stmt_load_delta": build_dynamic_select(base_cols, config.get("load_delta")),
+                "sql_stmt_export_delta": build_dynamic_select(base_cols, config.get("export_delta")),
+            }
 
-                make_xs_export_task_group(
-                    dag=dag,
-                    database_name=db_name,
-                    table_name=table_name,
-                    params=params
-                )
+            make_xs_export_task_group(
+                dag=dag,
+                database_name=db_name,
+                table_name=table_name,
+                params=params
+            )
         globals()[dag_id] = dag
 
 if os.environ.get("AIRFLOW_HOME") or __name__ == "__main__":

@@ -1,30 +1,28 @@
 {
-  "tables": {
-    "evolution.lc_items_opened": {
-      "replica": "hrplatform_datalab",
-      "schema": "learning",
-      "format": "TSVWithNames",
-      "strategy": "FULL_UK",
-      "PK": [],
-      "UK": ["person_uuid", "item_id"],
-      "fields": [
-        "{export_time} as export_time",
-        "insert_time",
-        "header_id",
-        "header_person_id",
-        "header_event_type",
-        "header_created_dt",
-        "item_id",
-        "person_uuid",
-        "tenant",
-        "company",
-        "'I' as ctl_action",
-        "now() as ctl_validfrom"
-      ],
-      "sql_stmt_export_delta": {
-        "from": "evolution.lc_items_opened",
-        "where": "{condition}"
-      }
+  "evolution.lc_items_opened": {
+    "replica": "hrplatform_datalab",
+    "schema": "learning",
+    "format": "TSVWithNames",
+    "strategy": "FULL_UK",
+    "PK": [],
+    "UK": ["person_uuid", "item_id"],
+    "fields": [
+      "{export_time} as export_time",
+      "insert_time",
+      "header_id",
+      "header_person_id",
+      "header_event_type",
+      "header_created_dt",
+      "item_id",
+      "person_uuid",
+      "tenant",
+      "company",
+      "'I' as ctl_action",
+      "now() as ctl_validfrom"
+    ],
+    "sql_stmt_export_delta": {
+      "from": "evolution.lc_items_opened",
+      "where": "{condition}"
     }
   }
 }

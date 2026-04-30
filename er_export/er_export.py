@@ -30,8 +30,7 @@ logger = logging.getLogger(__name__)
 # Load metadata
 META_FILE = os.path.join(os.path.dirname(__file__), "er_meta.json")
 with open(META_FILE, 'r') as f:
-    meta_data = json.load(f)
-tables = meta_data.get("tables", {})
+    tables = json.load(f)
 
 # ── DAG factory ──────────────────────────────────────────────────────────────
 

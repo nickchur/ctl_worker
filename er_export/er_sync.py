@@ -71,6 +71,9 @@ def er_sync_dag():
         )
 
         if not rows:
+            if MODE == 'test':
+                logger.warning("export.er_wf_meta is empty — skipping Variable update in test mode")
+                return
             raise ValueError("No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")
 
         wfs = {}

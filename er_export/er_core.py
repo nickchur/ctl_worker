@@ -17,6 +17,7 @@ from airflow.decorators import task
 from airflow.utils.task_group import TaskGroup
 from airflow.exceptions import AirflowSkipException
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator # type: ignore
+from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor # type: ignore
 from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
 from plugins.utils import add_note
 
@@ -241,8 +242,20 @@ def export_tg(
                 result['selfrun_timeout'] = str(p['selfrun_timeout'])
             if p.get('strategy'):
                 result['strategy'] = p['strategy']
+            if p.get('auto_confirm') is not None:
+                result['auto_confirm'] = 1 if p['auto_confirm'] else 0
+            if p.get('max_file_size') is not None:
+                result['max_file_size'] = str(p['max_file_size'])
+            if p.get('xstream_sanitize') is not None:
+                result['xstream_sanitize'] = 'True' if p['xstream_sanitize'] else 'False'
+            if p.get('sanitize_array') is not None:
+                result['sanitize_array'] = 'True' if p['sanitize_array'] else 'False'
+                
             add_note(
-                {k: result.get(k) for k in ('extract_time', 'condition', 'is_current', 'increment', 'selfrun_timeout', 'strategy')},
+                {k: result.get(k) for k in (
+                    'extract_time', 'condition', 'is_current', 'increment', 
+                    'selfrun_timeout', 'strategy', 'auto_confirm', 'max_file_size'
+                )},
                 level='Task,DAG', title='Delta',
             )
             return result
@@ -431,15 +444,36 @@ def export_tg(
 
         notify_tfs = ProduceToTopicOperator(
             task_id='notify_tfs',
-            topic=cfg.get('topic', 'TFS.HRPLT.IN'),
+            topic="{{ params.topic }}",
             producer_function=produce_msg,
             producer_function_args=[cfg['scenario'], ''],
             delivery_callback=ON_DELIVERY,
-            pool=pool,
+            pool="{{ params.pool }}",
             pre_execute=_pre_kafka(cfg['scenario'], mode),
         )
 
-        @task(task_id='save_status', trigger_rule='none_failed')
+        def _handle_confirm(message):
+            logger.info("Received confirmation from Kafka: %s", message.value())
+            return True
+
+        def _pre_wait(context):
+            ti = context['ti']
+            dp = ti.xcom_pull(task_ids=f"{gid}.init")
+            if dp.get('auto_confirm'):
+                raise AirflowSkipException("Auto-confirm is enabled, skipping sensor")
+
+        t_wait_confirm = KafkaConsumeSensor(
+            task_id='wait_for_confirm',
+            kafka_config_id=cfg.get('kafka_sensor_conn_id', 'tfs-kafka-in'),
+            topics=[cfg.get('kafka_sensor_topic', 'TFS.HRPLT.OUT')],
+            apply_function=_handle_confirm,
+            poke_interval=60,
+            timeout=3600,
+            mode='reschedule',
+            pre_execute=_pre_wait,
+        )
+
+        @task(task_id='save_status', trigger_rule='none_failed_min_one_success')
         def save_status(cfg, **context):
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
             ti         = context['ti']
@@ -482,25 +516,6 @@ def export_tg(
 
         t_init >> [t_build_meta, export_to_s3]
         [t_build_meta, export_to_s3] >> t_pack
-
-        if cfg.get('auto_confirm'):
-            t_pack >> notify_tfs >> t_save >> t_schedule
-        else:
-            from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor
-            
-            def _handle_confirm(message):
-                logger.info("Received confirmation from Kafka: %s", message.value())
-                return True
-
-            t_wait_kafka = KafkaConsumeSensor(
-                task_id='wait_for_confirm',
-                kafka_config_id=cfg.get('kafka_sensor_conn_id', 'tfs-kafka-in'),
-                topics=[cfg.get('kafka_sensor_topic', 'TFS.HRPLT.OUT')],
-                apply_function=_handle_confirm,
-                poke_interval=60,
-                timeout=3600,
-                mode='reschedule',
-            )
-            t_pack >> notify_tfs >> t_wait_kafka >> t_save >> t_schedule
+        t_pack >> notify_tfs >> t_wait_confirm >> t_save >> t_schedule
 
     return tg

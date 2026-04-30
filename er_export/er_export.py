@@ -167,6 +167,12 @@ for table_key, params in wfs.items():
             'increment':       Param(params.get('increment'), type=['integer', 'null'], title='Increment (сек)', description='Размер временного окна (шаг) одной выгрузки в секундах'),
             'selfrun_timeout': Param(params.get('selfrun_timeout'), type=['integer', 'null'], title='Selfrun timeout (мин)', description='Пауза перед автоматическим запуском следующей итерации (мин)'),
             'strategy':        Param(params.get('strategy', 'FULL_UK'), type='string', title='Strategy', description='Стратегия слияния данных (FULL_UK, DELTA_UK и др.)'),
+            'auto_confirm':    Param(bool(params.get('auto_confirm', 1)), type='boolean', title='Auto confirm', description='True = не ждать подтверждения из Kafka'),
+            'max_file_size':   Param(None, type=['integer', 'null'], title='Max file size', description='Максимальный размер одного CSV файла (байт). По умолчанию из реестра.'),
+            'pool':            Param(pool, type='string', title='Kafka Pool', description='Пул Airflow для задач Kafka'),
+            'topic':           Param(cfg['topic'], type='string', title='Kafka Topic', description='Топик для отправки уведомлений'),
+            'xstream_sanitize': Param(None, type=['boolean', 'null'], title='XStream Sanitize', description='Очистка спецсимволов для xStream'),
+            'sanitize_array':  Param(None, type=['boolean', 'null'], title='Sanitize Array', description='Очистка массивов'),
         },
     )
 

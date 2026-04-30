@@ -318,8 +318,10 @@ for _table_key, _params in tables.items():
             op.sanitize_array   = ep[6] == 'True'
             op.sanitize_list    = ep[7]
             op.pg_array_format  = ep[8] == 'True'
-            raw_fmt = ep[9]
-            op.format_params    = json.loads(raw_fmt) if raw_fmt and raw_fmt.strip() not in ('', 'default') else {}
+            try:
+                op.format_params = json.loads(ep[9]) if ep[9] else {}
+            except (json.JSONDecodeError, TypeError):
+                op.format_params = {}
 
         copy_clickhouse_query = HrpClickNativeToS3ListOperator(
             task_id='copy_clickhouse_query',

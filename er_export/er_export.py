@@ -5,6 +5,7 @@ import os
 import logging
 import pendulum
 from airflow import DAG
+from airflow.models import Variable
 
 from er_export.er_config import (
     CH_ID,
@@ -27,10 +28,20 @@ from er_export.er_common import (
 
 logger = logging.getLogger(__name__)
 
-# Load metadata
+# Load metadata from Airflow Variable or fallback to local file
+VARIABLE_NAME = "datalab_er_wfs"
 META_FILE = os.path.join(os.path.dirname(__file__), "er_meta.json")
-with open(META_FILE, 'r') as f:
-    tables = json.load(f)
+
+try:
+    tables = Variable.get(VARIABLE_NAME, deserialize_json=True)
+    logger.info(f"Loaded metadata from Airflow Variable: {VARIABLE_NAME}")
+except Exception as e:
+    logger.warning(f"Could not load Variable {VARIABLE_NAME}: {e}. Falling back to {META_FILE}")
+    if os.path.exists(META_FILE):
+        with open(META_FILE, 'r') as f:
+            tables = json.load(f)
+    else:
+        tables = {}
 
 # ── DAG factory ──────────────────────────────────────────────────────────────
 
@@ -81,7 +92,7 @@ for table_key, params in tables.items():
                 "'''' || time_field || ''''                                                                                              as time_field",
                 "'''' || toString(time_from) || ''''                                                                                    as time_from",
                 "'''' || toString(time_to)   || ''''                                                                                    as time_to",
-                "'''' || toString(time_from) || ''' < ' || time_field || ' and ' || time_field || ' <= ''' || toString(time_to) || '''' as condition",
+                "'''' || toString(time_from) || ''' < ' || time_field || ' and ' || time_field || ' <= ''' || toString(time_to) || '''' as condition,
                 "if(current_time = extract_time, 'True', 'False')                                                                       as is_current",
                 "toString(0)                                                                                                             as recent_interval"
             ],

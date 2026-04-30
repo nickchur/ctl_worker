@@ -321,6 +321,7 @@ for _table_key, _params in tables.items():
             try:
                 op.format_params = json.loads(ep[9]) if ep[9] else {}
             except (json.JSONDecodeError, TypeError):
+                logger.warning("Unparseable format_params: %r", ep[9])
                 op.format_params = {}
 
         copy_clickhouse_query = HrpClickNativeToS3ListOperator(

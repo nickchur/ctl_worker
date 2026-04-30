@@ -33,19 +33,19 @@ logger = logging.getLogger(__name__)
 
 # Load metadata
 VARIABLE_NAME = "datalab_er_wfs"
-tables = ctl_obj_load(VARIABLE_NAME)
+wfs = ctl_obj_load(VARIABLE_NAME, s3_id='s3', bucket='datalab-er')
 
-if not tables:
+if not wfs:
     # Если из Variable/S3 ничего не пришло, пробуем локальный файл (для тестов)
     META_FILE = os.path.join(os.path.dirname(__file__), "er_meta.json")
     if os.path.exists(META_FILE):
         with open(META_FILE, 'r') as f:
-            tables = json.load(f)
+            wfs = json.load(f)
         logger.info(f"Loaded metadata from local fallback: {META_FILE}")
 
 # ── DAG factory ──────────────────────────────────────────────────────────────
 
-for table_key, params in tables.items():
+for table_key, params in wfs.items():
     db, tbl = table_key.split(".", maxsplit=1)
     dag_id      = f"export_er__{params['replica']}__{tbl}"
     replica     = params['replica']

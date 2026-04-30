@@ -104,7 +104,7 @@ def er_sync_dag():
             wfs[table_key] = entry
 
         logger.info("Loaded %d workflow(s) from export.er_wf_meta", len(wfs))
-        ctl_obj_save(VAR_NAME, wfs, var=True, s3_id="s3", bucket=BUCKET)
+        ctl_obj_save(VAR_NAME, wfs, var=True, bucket=BUCKET)
 
     sync()
 

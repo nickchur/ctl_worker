@@ -161,7 +161,7 @@ for table_key, params in wfs.items():
         is_paused_upon_creation=True,
         render_template_as_native_obj=True,
         params={
-            'extract_time':    Param(None, type=['string', 'null'],  title='Extract time',       description='Перезаписать: 2024-01-01 00:00:00'),
+            'extract_time':    Param(None, type=['string', 'null'],  title='Extract time',       description='Техническое время выгрузки (правая граница дельты). Формат: 2024-01-01 00:00:00'),
             'condition':       Param(None, type=['string', 'null'],  title='Condition',           description='Перезаписать значение плейсхолдера {condition}'),
             'is_current':      Param(None, type=['boolean', 'null'], title='Is current',       description='True = данные актуальны, остановить авто-перезапуск (self-run)'),
             'increment':       Param(params.get('increment'), type=['integer', 'null'], title='Increment (сек)'),

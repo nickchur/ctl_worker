@@ -56,10 +56,15 @@ CH_TYPE_MAP: dict[str, str] = {
 
 
 def get_export_time_placeholder(table_name: str) -> str:
+    """Возвращает Jinja-шаблон, который подставляет метку времени среза (extract_time)
+    из XCom задачи get_delta_params в SQL выгрузки."""
     return f"{{{{ ti.xcom_pull(task_ids='{table_name}.get_delta_params')[0][1] }}}}"
 
 
 def get_delta_condition_placeholder(table_name: str) -> str:
+    """Возвращает Jinja-шаблон, который подставляет условие WHERE для инкремента
+    (например: '2024-01-01' < insert_time and insert_time <= '2024-01-02')
+    из XCom задачи get_delta_params в SQL выгрузки."""
     return f"{{{{ ti.xcom_pull(task_ids='{table_name}.get_delta_params')[0][11] }}}}"
 
 

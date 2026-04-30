@@ -21,7 +21,8 @@ from er_export.er_config import (
 from er_export.er_common import (
     make_er_export_task_group,
     build_registry_sql_delta,
-    build_registry_sql_recent
+    build_registry_sql_recent,
+    build_dynamic_select
 )
 
 logger = logging.getLogger(__name__)
@@ -47,8 +48,8 @@ for table_key, params in tables.items():
     scenario, tfs_prefix, tfs_out_pool = TFS_OUT_CONFIG_MAP[replica]
     s3_prefix = f"{tfs_prefix}/{replica}"
 
-    sql_delta  = params.get('sql_stmt_export_delta')
-    sql_recent = params.get('sql_stmt_export_recent')
+    sql_delta  = build_dynamic_select(params.get('sql_stmt_export_delta'))
+    sql_recent = build_dynamic_select(params.get('sql_stmt_export_recent'))
 
     if not (sql_delta or sql_recent):
         raise RuntimeError("One of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' must be specified!")

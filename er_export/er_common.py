@@ -27,6 +27,28 @@ def select_dic(ch_hook, sql):
     else:
         return []
 
+def build_dynamic_select(sql_meta: str | dict, indent: str = "    ") -> str:
+    """
+    Assembles a SELECT SQL string from either a raw string or a structured dictionary.
+    """
+    if not sql_meta:
+        return ""
+    if isinstance(sql_meta, str):
+        return sql_meta
+    
+    fields = sql_meta.get("fields", [])
+    if isinstance(fields, list):
+        fields_str = f",\n{indent}".join(fields)
+    else:
+        fields_str = fields
+
+    sql = f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}"
+    
+    if sql_meta.get("where"):
+        sql += f"\nWHERE {sql_meta['where']}"
+    
+    return sql
+
 def parse_ch_type(ch_type: str, ch_type_map: dict) -> tuple[str, bool]:
     notnull = True
     if ch_type.startswith("LowCardinality(") and ch_type.endswith(")"):

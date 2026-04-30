@@ -132,7 +132,7 @@ def make_er_export_task_group(
     if row_count_limit > 0:
         sql_stmt_export = f"select * from ({sql_stmt_export}) limit {row_count_limit}"
 
-    with TaskGroup(dag=dag, group_id=table_name, tooltip=f"Выгрузка {table_name} → ZIP → TFS") as tg:
+    with TaskGroup(group_id=table_name, tooltip=f"Выгрузка {table_name} → ZIP → TFS") as tg:
 
         # ── check auto-confirm ──────────────────────────────────────────────
         check_need_auto_confirm_delta = ClickHouseBranchSQLOperator(
@@ -296,7 +296,7 @@ def make_er_export_task_group(
 
         # ── TFS task group: export → zip → kafka ────────────────────────────
         tg_tfs_id = "prepare_and_send_files_via_tfs_route"
-        with TaskGroup(dag=dag, group_id=tg_tfs_id) as tg_tfs:
+        with TaskGroup(group_id=tg_tfs_id) as tg_tfs:
 
             def _pre_execute_copy(context):
                 """Инжектирует export_time и condition из get_delta_params в SQL выгрузки,

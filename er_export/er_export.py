@@ -75,25 +75,7 @@ for table_key, params in wfs.items():
 
     if sql_delta:
         sql_reg = sql_reg_delta(tbl)
-        sql_cur = build_sql({
-            "fields": [
-                "toString(a.num_state)                                                                   as num_state",
-                "concat('\\'', toString(a.extract_time), '\\'')                                          as extract_time",
-                "ifNull(toString(a.extract_count), 'null')                                               as extract_count",
-                "if(a.extract_count is null, 'null', concat('\\'', toString(a.loaded), '\\''))           as loaded",
-                "if(a.extract_count is null, 'null', concat('\\'', toString(a.sent), '\\''))             as sent",
-                "if(a.extract_count is null, 'null', concat('\\'', toString(a.confirmed), '\\''))        as confirmed",
-                "toString(a.increment)                                                                    as increment",
-                "toString(a.overlap)                                                                      as overlap",
-                "concat('\\'', a.time_field, '\\'')                                                       as time_field",
-                "concat('\\'', toString(a.time_from), '\\'')                                              as time_from",
-                "concat('\\'', toString(a.time_to), '\\'')                                                as time_to",
-                "concat('\\'', toString(a.time_from), '\\' < ', a.time_field, ' and ', a.time_field, ' <= \\'', toString(a.time_to), '\\'') as condition",
-                "if(a.current_time = a.extract_time, 'True', 'False')                                   as is_current",
-                "toString(0)                                                                              as recent_interval"
-            ],
-            "from": f"(SELECT * FROM export.extract_current_vw WHERE extract_name = '{tbl}') as a"
-        })
+        sql_cur = f"SELECT * FROM export.extract_current_vw WHERE extract_name = '{tbl}'"
     else:
         sql_reg = sql_reg_recent(tbl)
         sql_cur = None

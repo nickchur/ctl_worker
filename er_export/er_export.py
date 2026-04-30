@@ -73,20 +73,20 @@ for table_key, params in wfs.items():
         sql_get_registry = build_registry_sql_delta(tbl)
         sql_get_current  = build_dynamic_select({
             "fields": [
-                "toString(num_state)                                                                                                      as num_state",
-                "'''' || toString(toDateTimeOrDefault(extract_time)) || ''''                                                             as extract_time",
-                "ifNull(toString(extract_count), 'null')                                                                                 as extract_count",
-                "ifNull('''' || toString(loaded)    || '''', 'null')                                                                     as loaded",
-                "ifNull('''' || toString(sent)      || '''', 'null')                                                                     as sent",
-                "ifNull('''' || toString(confirmed) || '''', 'null')                                                                     as confirmed",
-                "toString(increment)                                                                                                     as increment",
-                "toString(overlap)                                                                                                       as overlap",
-                "'''' || time_field || ''''                                                                                              as time_field",
-                "'''' || toString(time_from) || ''''                                                                                    as time_from",
-                "'''' || toString(time_to)   || ''''                                                                                    as time_to",
-                "'''' || toString(time_from) || ''' < ' || time_field || ' and ' || time_field || ' <= ''' || toString(time_to) || '''' as condition",
-                "if(current_time = extract_time, 'True', 'False')                                                                       as is_current",
-                "toString(0)                                                                                                             as recent_interval"
+                "toString(num_state)                                                                 as num_state",
+                "concat('\\'', toString(extract_time), '\\'')                                         as extract_time",
+                "ifNull(toString(extract_count), 'null')                                             as extract_count",
+                "ifNull(concat('\\'', toString(loaded), '\\''), 'null')                               as loaded",
+                "ifNull(concat('\\'', toString(sent), '\\''), 'null')                                 as sent",
+                "ifNull(concat('\\'', toString(confirmed), '\\''), 'null')                            as confirmed",
+                "toString(increment)                                                                 as increment",
+                "toString(overlap)                                                                   as overlap",
+                "concat('\\'', time_field, '\\'')                                                     as time_field",
+                "concat('\\'', toString(time_from), '\\'')                                            as time_from",
+                "concat('\\'', toString(time_to), '\\'')                                              as time_to",
+                "concat('\\'', toString(time_from), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(time_to), '\\'') as condition",
+                "'False'                                                                             as is_current",
+                "toString(0)                                                                         as recent_interval"
             ],
             "from": "export.extract_current_vw",
             "where": f"extract_name = '{tbl}'"
@@ -104,6 +104,7 @@ for table_key, params in wfs.items():
         'scenario':    scenario,
         's3_prefix':   s3_prefix,
         'bucket':      TFS_OUT_BUCKET,
+        'topic':       DEFAULT_ARGS.get('topic', 'TFS.HRPLT.IN'),
         'sql_auto_confirm': f"""
             insert into export.extract_history (
                 extract_name, extract_time, extract_count, loaded, sent, confirmed,

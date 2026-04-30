@@ -98,58 +98,50 @@ def tfs_message_delivery_callback(err, msg) -> None:
     )
 
 def _make_pre_execute_kafka(scenario: str, mode: str):
-    def _pre_execute(context):
-        if mode != 'prod':
-            raise AirflowSkipException("Kafka notification skipped in test mode")
-        summary_tkt = context['ti'].xcom_pull(task_ids=f"{context['task'].task_group.group_id}.pack_zip", key='summary_tkt_name')
-        context['task'].producer_function_args = [scenario, summary_tkt]
-    return _pre_execute
+    def pre_execute(context):
+        ti = context['ti']
+        # For production/UAT, we might want to skip if zero rows, but here we just pass filenames
+        zip_names = ti.xcom_pull(task_ids=f"{context['task'].task_group.group_id}.pack_zip", key='zip_name_list')
+        summary_tkt = ti.xcom_pull(task_ids=f"{context['task'].task_group.group_id}.pack_zip", key='summary_tkt_name')
+        
+        if not summary_tkt:
+            raise AirflowSkipException("No data exported, skipping notification")
+            
+        op = context['task']
+        op.producer_function_args = [scenario, summary_tkt]
+    return pre_execute
 
-_SQL_REGISTRY_WITH = """
-    with
-        '{tbl}' as extr_name,
-        src as (
-            select 1 as prio, auto_confirm_delta, lower_bound, selfrun_timeout,
-                   compression_type, compression_ext, max_file_size, xstream_sanitize,
-                   sanitize_array, sanitize_list, pg_array_format, csv_format_params{extra_cols}
-            from export.extract_registry_vw where extract_name = extr_name
-            union all
-            select 2 as prio, auto_confirm_delta, lower_bound, selfrun_timeout,
-                   compression_type, compression_ext, max_file_size, xstream_sanitize,
-                   sanitize_array, sanitize_list, pg_array_format, csv_format_params{extra_cols}
-            from export.extract_registry_vw where extract_name = 'default'
-        ),
-        aggr as (
-            select
-                argMinIf(extr_name, prio, prio = 1)                                        as extract_name,
-                argMinIf(auto_confirm_delta, prio, prio = 1)                               as auto_confirm_delta,
-                argMinIf(lower_bound, prio, prio = 1)                                      as lower_bound,
-                argMinIf(selfrun_timeout, prio, prio = 1)                                  as selfrun_timeout,
-                argMinIf(compression_type, prio, lower(compression_type) <> 'default')    as compression_type,
-                argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext,
-                argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size,
-                argMinIf(xstream_sanitize, prio, prio = 1)                                as xstream_sanitize,
-                argMinIf(sanitize_array, prio, prio = 1)                                  as sanitize_array,
-                argMinIf(sanitize_list, prio, lower(sanitize_list) <> 'default')          as sanitize_list,
-                argMinIf(pg_array_format, prio, prio = 1)                                 as pg_array_format,
-                argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params{extra_aggr}
-            from src
-        )
-"""
-
-_SQL_REGISTRY_SELECT = """
-    select
-        auto_confirm_delta,
-        '''' || toString(toDateTimeOrDefault(lower_bound)) || '''' as lower_bound,
-        toString(selfrun_timeout)                                   as selfrun_timeout,
-        compression_type,
-        compression_ext,
-        max_file_size,
-        If(xstream_sanitize = 1, 'True', 'False')                  as xstream_sanitize,
-        If(sanitize_array = 1, 'True', 'False')                    as sanitize_array,
-        sanitize_list,
-        If(pg_array_format = 1, 'True', 'False')                   as pg_array_format,
-        csv_format_params                                           as format_params
+_SQL_REGISTRY_WITH = """WITH
+    argMinIf(replica, prio, prio = 1)          as replica,
+    argMinIf(schema, prio, prio = 1)           as schema,
+    argMinIf(format, prio, prio = 1)           as format,
+    argMinIf(strategy, prio, prio = 1)         as strategy,
+    argMinIf(PK, prio, prio = 1)               as PK,
+    argMinIf(UK, prio, prio = 1)               as UK,
+    argMinIf(auto_confirm_delta, prio, prio=1) as auto_confirm_delta,
+    argMinIf(lower_bound, prio, prio=1)        as lower_bound,
+    argMinIf(selfrun_timeout, prio, prio=1)    as selfrun_timeout,
+    argMinIf(compression_type, prio, prio=1)   as compression_type,
+    argMinIf(compression_ext, prio, prio=1)    as compression_ext,
+    argMinIf(max_file_size, prio, prio=1)      as max_file_size,
+    argMinIf(xstream_sanitize, prio, prio=1)   as xstream_sanitize,
+    argMinIf(sanitize_array, prio, prio=1)     as sanitize_array,
+    argMinIf(sanitize_list, prio, prio=1)      as sanitize_list,
+    argMinIf(pg_array_format, prio, prio=1)    as pg_array_format,
+    argMinIf(csv_format_params, prio, prio=1)  as csv_format_params{extra_cols}
+FROM (
+    SELECT
+        1 as prio, *
+    FROM export.extract_registry_vw
+    WHERE extract_name = '{tbl}'
+    UNION ALL
+    SELECT
+        2 as prio, *
+    FROM export.extract_registry_vw
+    WHERE extract_name = 'default'
+)
+GROUP BY extract_name
+AS aggr
 """
 
 def build_registry_sql_delta(tbl: str) -> str:
@@ -175,14 +167,8 @@ def build_registry_sql_delta(tbl: str) -> str:
 
 def build_registry_sql_recent(tbl: str) -> str:
     extra_cols = ', increment, overlap, time_field, recent_interval'
-    extra_aggr = (
-        ',\n                argMinIf(increment, prio, prio = 1)       as increment'
-        ',\n                argMinIf(overlap, prio, prio = 1)         as overlap'
-        ',\n                argMinIf(time_field, prio, prio = 1)      as time_field_v'
-        ',\n                argMinIf(recent_interval, prio, prio = 1) as recent_interval_v'
-    )
     return build_dynamic_select({
-        "with": _SQL_REGISTRY_WITH.format(tbl=tbl, extra_cols=extra_cols, extra_aggr=extra_aggr),
+        "with": _SQL_REGISTRY_WITH.format(tbl=tbl, extra_cols=extra_cols),
         "fields": [
             "auto_confirm_delta",
             "'''' || toString(toDateTimeOrDefault(lower_bound)) || '''' as lower_bound",
@@ -195,21 +181,21 @@ def build_registry_sql_recent(tbl: str) -> str:
             "sanitize_list",
             "If(pg_array_format = 1, 'True', 'False')                   as pg_array_format",
             "csv_format_params                                           as format_params",
-            "now()                                                                                                                                                as cur_time",
-            "'''' || toString(cur_time) || ''''                                                                                                                   as extract_time",
-            "'null'                                                                                                                                               as extract_count",
-            "'null'                                                                                                                                               as loaded",
-            "'null'                                                                                                                                               as sent",
-            "'null'                                                                                                                                               as confirmed",
-            "toString(increment)                                                                                                                                   as increment",
-            "toString(overlap)                                                                                                                                     as overlap",
-            "'''' || time_field_v || ''''                                                                                                                         as time_field",
-            "'''' || toString(cur_time - recent_interval_v) || ''''                                                                                              as time_from",
-            "'''' || toString(cur_time) || ''''                                                                                                                   as time_to",
-            "'''' || toString(cur_time - recent_interval_v) || ''' < ' || time_field_v || ' and ' || time_field_v || ' <= ''' || toString(cur_time) || ''''     as condition",
-            "'True'                                                                                                                                               as is_current",
-            "toString(recent_interval_v)                                                                                                                          as recent_interval",
-            "toString(0)                                                                                                                                          as num_state"
+            "now()                                                       as cur_time",
+            "'''' || toString(cur_time) || ''''                          as extract_time",
+            "'null'                                                      as extract_count",
+            "'null'                                                      as loaded",
+            "'null'                                                      as sent",
+            "'null'                                                      as confirmed",
+            "toString(increment)                                         as increment",
+            "toString(overlap)                                           as overlap",
+            "'''' || time_field || ''''                                  as time_field",
+            "'''' || toString(cur_time - recent_interval) || ''''        as time_from",
+            "'''' || toString(cur_time) || ''''                          as time_to",
+            "'''' || toString(cur_time - recent_interval) || ''' < ' || time_field || ' and ' || time_field || ' <= ''' || toString(cur_time) || '''' as condition",
+            "'True'                                                      as is_current",
+            "toString(recent_interval)                                   as recent_interval",
+            "toString(0)                                                 as num_state"
         ],
         "from": "aggr",
         "where": f"extract_name = '{tbl}'",
@@ -376,6 +362,7 @@ def make_er_export_task_group(
 
         notify_tfs = ProduceToTopicOperator(
             task_id='notify_tfs',
+            topic=task_cfg.get('topic', 'TFS.HRPLT.IN'), # Fallback
             producer_function=produce_tfs_kafka_notification,
             producer_function_args=[task_cfg['scenario'], ''],
             delivery_callback=TFS_KAFKA_CALLBACK,

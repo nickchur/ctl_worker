@@ -81,6 +81,13 @@ CH_TYPE_MAP: dict[str, str] = {
 }
 
 
+ER_EXTRA_COLUMNS = [
+    {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
+    {"column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None},
+    {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
+]
+
+
 def get_export_time_placeholder(table_name: str) -> str:
     """Возвращает Jinja-шаблон, который подставляет метку времени среза (extract_time)
     из XCom задачи get_delta_params в SQL выгрузки."""
@@ -101,33 +108,8 @@ tables = {
         "format":   "TSVWithNames",
         "strategy": "FULL_UK",
         "PK":       [],
-        "UK":       ["person_uuid", "item_id"],
-        "extra_columns": [
-            {
-                "column_name": "export_time",
-                "source_type": "TIMESTAMP",
-                "length":      None,
-                "notnull":     False,
-                "precision":   None,
-                "scale":       None,
-            },
-            {
-                "column_name": "ctl_action",
-                "source_type": "VARCHAR",
-                "length":      10,
-                "notnull":     False,
-                "precision":   None,
-                "scale":       None,
-            },
-            {
-                "column_name": "ctl_validfrom",
-                "source_type": "TIMESTAMP",
-                "length":      None,
-                "notnull":     False,
-                "precision":   None,
-                "scale":       None,
-            },
-        ],
+        "UK":            ["person_uuid", "item_id"],
+        "extra_columns": ER_EXTRA_COLUMNS,
         "sql_stmt_export_delta": f"""
             select
                 {get_export_time_placeholder('lc_items_opened')} as export_time,

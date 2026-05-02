@@ -14,8 +14,8 @@ from io import BytesIO
 
 import pendulum
 from airflow.decorators import task
-from airflow.utils.task_group import TaskGroup
-from airflow.exceptions import AirflowSkipException
+from airflow.utils.task_group import TaskGroup # type: ignore
+from airflow.exceptions import AirflowSkipException, AirflowFailException
 from plugins.utils import add_note
 
 logger = logging.getLogger(__name__)
@@ -23,10 +23,14 @@ logger = logging.getLogger(__name__)
 ON_DELIVERY = 'er_export.er_core.on_delivery'
 
 def _fmt_dt(v):
+    """Безопасное форматирование даты и времени для SQL-запросов. Возвращает 'null', если значение None."""
     return 'null' if v is None else f"'{v}'"
 
 def _format_cur(cur: dict) -> dict:
-    """Format raw extract_current_vw row into SQL-ready strings."""
+    """
+    Преобразует сырую строку из представления extract_current_vw
+    в формат словаря со значениями, готовыми для подстановки в SQL-запрос.
+    """
     tf = str(cur['time_field']).strip("'")
     ec = cur['extract_count']
     return {
@@ -46,7 +50,11 @@ def _format_cur(cur: dict) -> dict:
         'recent_interval': '0',
     }
 
-def get_dict(ch_hook, sql):
+def get_dict(ch_hook, sql: str) -> list[dict]:
+    """
+    Выполняет SQL-запрос в ClickHouse с помощью переданного хука
+    и возвращает результат в виде списка словарей.
+    """
     res, cols = ch_hook.execute(sql, with_column_types=True)
     if res:
         cols = [col[0] for col in cols]
@@ -54,36 +62,11 @@ def get_dict(ch_hook, sql):
     else:
         return []
 
-def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
-    if not sql_meta:
-        return ""
-    if isinstance(sql_meta, str):
-        return sql_meta
-    
-    sql = ""
-    if sql_meta.get("with"):
-        sql += f"{sql_meta['with']}\n"
-
-    fields = sql_meta.get("fields", [])
-    if isinstance(fields, list):
-        fields_str = f",\n{indent}".join(fields)
-    else:
-        fields_str = fields
-
-    sql += f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}"
-    
-    if sql_meta.get("joins"):
-        sql += f"\n{sql_meta['joins']}"
-
-    if sql_meta.get("where"):
-        sql += f"\nWHERE {sql_meta['where']}"
-    
-    if sql_meta.get("settings"):
-        sql += f"\nSETTINGS {sql_meta['settings']}"
-    
-    return sql
-
 def parse_type(ch_type: str, type_map: dict) -> tuple[str, bool]:
+    """
+    Анализирует тип данных ClickHouse, извлекает базовый тип (игнорируя LowCardinality и Nullable)
+    и сопоставляет его с целевым типом. Возвращает кортеж (тип, not_null).
+    """
     notnull = True
     if ch_type.startswith("LowCardinality(") and ch_type.endswith(")"):
         ch_type = ch_type[15:-1]
@@ -94,6 +77,10 @@ def parse_type(ch_type: str, type_map: dict) -> tuple[str, bool]:
     return type_map.get(base, "STRING"), notnull
 
 def produce_msg(scenario_id: str, file_name: str, throttle_delay: int = 1):
+    """
+    Генератор сообщений для Kafka.
+    Формирует тело сообщения в формате XML для уведомления системы о готовности файла.
+    """
     time.sleep(throttle_delay)
     rq_uuid = str(uuid.uuid4()).replace('-', '')
     message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -112,15 +99,23 @@ def produce_msg(scenario_id: str, file_name: str, throttle_delay: int = 1):
     logger.info("Prepare message to send:\n%s", message)
     yield None, message
 
-def on_delivery(err, msg) -> None:
+def on_delivery(err: Exception | None, msg) -> None:
+    """
+    Callback-функция библиотеки Kafka, вызываемая после попытки доставки сообщения.
+    Логирует успех или выбрасывает исключение при ошибке.
+    """
     if err is not None:
-        raise RuntimeError(f"Failed to deliver message: {err}")
+        raise AirflowFailException(f"Failed to deliver message: {err}")
     logger.info(
         "Produced record to topic %s partition [%s] @ offset %s\n%s",
         msg.topic(), msg.partition(), msg.offset(), msg.value(),
     )
 
 def _pre_kafka(scenario: str, mode: str):
+    """
+    Возвращает функцию pre_execute для задачи Airflow.
+    Пропускает отправку уведомления в Kafka, если включен тестовый режим или нет данных.
+    """
     def pre_execute(context):
         if mode != 'prod':
             raise AirflowSkipException("Kafka notification skipped in test mode")
@@ -130,83 +125,6 @@ def _pre_kafka(scenario: str, mode: str):
             raise AirflowSkipException("No data exported, skipping notification")
         context['task'].producer_function_args = [scenario, summary_tkt]
     return pre_execute
-
-_REG_WITH = """WITH aggr AS (
-    SELECT
-        argMinIf(extract_name, prio, prio=1)                                       as extract_name,
-        argMinIf(auto_confirm_delta, prio, prio=1)                                 as auto_confirm_delta,
-        argMinIf(lower_bound, prio, prio=1)                                        as lower_bound,
-        argMinIf(selfrun_timeout, prio, prio=1)                                    as selfrun_timeout,
-        argMinIf(compression_type, prio, lower(compression_type) <> 'default')    as compression_type,
-        argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext,
-        argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size,
-        argMinIf(pg_array_format, prio, prio=1)                                    as pg_array_format,
-        argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params
-        {extra_aggr}
-    FROM (
-        SELECT 1 as prio, *
-        FROM export.extract_registry_vw WHERE extract_name = '{tbl}'
-        UNION ALL
-        SELECT 2 as prio, *
-        FROM export.extract_registry_vw WHERE extract_name = 'default'
-    )
-)"""
-
-def sql_reg_delta(tbl: str) -> str:
-    return build_sql({
-        "with": _REG_WITH.format(tbl=tbl, extra_aggr=''),
-        "fields": [
-            "auto_confirm_delta                       as auto_confirm_delta",
-            "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'') as lower_bound",
-            "toString(selfrun_timeout)                as selfrun_timeout",
-            "compression_type                         as compression_type",
-            "compression_ext                          as compression_ext",
-            "max_file_size                            as max_file_size",
-            "If(pg_array_format = 1, 'True', 'False')  as pg_array_format",
-            "csv_format_params                        as format_params"
-        ],
-        "from": "aggr",
-        "where": f"extract_name = '{tbl}'",
-        "settings": "enable_global_with_statement = 1"
-    })
-
-def sql_reg_recent(tbl: str) -> str:
-    extra_aggr = """,
-        argMinIf(increment, prio, prio = 1)       as increment,
-        argMinIf(overlap, prio, prio = 1)         as overlap,
-        argMinIf(time_field, prio, prio = 1)      as time_field,
-        argMinIf(recent_interval, prio, prio = 1) as recent_interval"""
-    return build_sql({
-        "with": _REG_WITH.format(tbl=tbl, extra_aggr=extra_aggr),
-        "fields": [
-            "auto_confirm_delta                       as auto_confirm_delta",
-            "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'') as lower_bound",
-            "toString(selfrun_timeout)                as selfrun_timeout",
-            "compression_type                         as compression_type",
-            "compression_ext                          as compression_ext",
-            "max_file_size                            as max_file_size",
-            "If(pg_array_format = 1, 'True', 'False')  as pg_array_format",
-            "csv_format_params                        as format_params",
-            "now()                                      as cur_time",
-            "concat('\\'', toString(cur_time), '\\'')   as extract_time",
-            "'null'                                     as extract_count",
-            "'null'                                     as loaded",
-            "'null'                                     as sent",
-            "'null'                                     as confirmed",
-            "toString(increment)                      as increment",
-            "toString(overlap)                        as overlap",
-            "concat('\\'', time_field, '\\'')         as time_field",
-            "concat('\\'', toString(cur_time - recent_interval), '\\'') as time_from",
-            "concat('\\'', toString(cur_time), '\\'')   as time_to",
-            "concat('\\'', toString(cur_time - recent_interval), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(cur_time), '\\'') as condition",
-            "'True'                                     as is_current",
-            "toString(recent_interval)                as recent_interval",
-            "toString(0)                                as num_state"
-        ],
-        "from": "aggr",
-        "where": f"extract_name = '{tbl}'",
-        "settings": "enable_global_with_statement = 1"
-    })
 
 def export_tg(
     gid: str,
@@ -219,6 +137,11 @@ def export_tg(
     mode: str,
     pool: str
 ) -> TaskGroup:
+    """
+    Основная фабрика группы задач (TaskGroup) для Airflow.
+    Инкапсулирует весь процесс: получение состояния, выгрузка CSV в S3, 
+    упаковка в ZIP, отправка сообщения в Kafka и обновление состояния.
+    """
     
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
     from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
@@ -233,14 +156,14 @@ def export_tg(
             hook = ClickHouseHook(clickhouse_conn_id=cid)
             reg_res = get_dict(hook, cfg['sql_get_registry'])
             if not reg_res:
-                raise ValueError(f"No registry entry found for {cfg['tbl']}")
+                raise AirflowFailException(f"No registry entry found for {cfg['tbl']}")
             reg = reg_res[0]
             if reg['auto_confirm_delta']:
                 hook.execute(cfg['sql_auto_confirm'])
             if cfg['sql_get_current']:
                 cur_res = get_dict(hook, cfg['sql_get_current'])
                 if not cur_res:
-                    raise ValueError(f"No delta state found for {cfg['tbl']}")
+                    raise AirflowFailException(f"No delta state found for {cfg['tbl']}")
                 cur = cur_res[0]
                 result = {**reg, **(cur if 'condition' in cur else _format_cur(cur))}
             else:
@@ -350,7 +273,7 @@ def export_tg(
             row_count_list = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='row_count_list')
             meta_json_str  = ti.xcom_pull(task_ids=f"{gid}.build_meta", key='meta_json')
 
-            if not s3_key_list:
+            if not s3_key_list or not row_count_list:
                 logger.warning("No CSV parts exported — skipping ZIP packaging")
                 ti.xcom_push(key="zip_name_list",    value=[])
                 ti.xcom_push(key="summary_tkt_name", value="")
@@ -464,7 +387,7 @@ def export_tg(
                 mode='reschedule',
             )
         else:
-            from airflow.operators.empty import EmptyOperator
+            from airflow.operators.empty import EmptyOperator # type: ignore
             t_wait_confirm = EmptyOperator(task_id='wait_for_confirm')
 
         @task(task_id='save_status', trigger_rule='none_failed_min_one_success')

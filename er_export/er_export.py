@@ -9,6 +9,7 @@ import logging
 import pendulum
 from airflow import DAG
 from airflow.models import Param
+from airflow.exceptions import AirflowSkipException, AirflowFailException
 
 from er_export.er_config import (
     CH_ID,
@@ -26,9 +27,6 @@ from er_export.er_config import (
 )
 from er_export.er_core import (
     export_tg,
-    sql_reg_delta,
-    sql_reg_recent,
-    build_sql
 )
 
 from plugins.ctl_utils import ctl_obj_load
@@ -38,6 +36,115 @@ logger = logging.getLogger(__name__)
 # Load metadata
 VAR_NAME = "datalab_er_wfs"
 wfs = ctl_obj_load(VAR_NAME, s3_id='s3', bucket='datalab-er')
+
+# ── SQL Builders ──────────────────────────────────────────────────────────────
+
+def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
+    """Динамически собирает SQL-запрос из словаря с метаданными."""
+    if not sql_meta:
+        return ""
+    if isinstance(sql_meta, str):
+        return sql_meta
+    
+    sql = ""
+    if sql_meta.get("with"):
+        sql += f"{sql_meta['with']}\n"
+
+    fields = sql_meta.get("fields", [])
+    if isinstance(fields, list):
+        fields_str = f",\n{indent}".join(fields)
+    else:
+        fields_str = fields
+
+    sql += f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}"
+    
+    if sql_meta.get("joins"):
+        sql += f"\n{sql_meta['joins']}"
+
+    if sql_meta.get("where"):
+        sql += f"\nWHERE {sql_meta['where']}"
+    
+    if sql_meta.get("settings"):
+        sql += f"\nSETTINGS {sql_meta['settings']}"
+    
+    return sql
+
+_REG_WITH = """WITH aggr AS (
+    SELECT
+        argMinIf(extract_name, prio, prio=1)                                       as extract_name,
+        argMinIf(auto_confirm_delta, prio, prio=1)                                 as auto_confirm_delta,
+        argMinIf(lower_bound, prio, prio=1)                                        as lower_bound,
+        argMinIf(selfrun_timeout, prio, prio=1)                                    as selfrun_timeout,
+        argMinIf(compression_type, prio, lower(compression_type) <> 'default')    as compression_type,
+        argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext,
+        argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size,
+        argMinIf(pg_array_format, prio, prio=1)                                    as pg_array_format,
+        argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params
+        {extra_aggr}
+    FROM (
+        SELECT 1 as prio, *
+        FROM export.extract_registry_vw WHERE extract_name = '{tbl}'
+        UNION ALL
+        SELECT 2 as prio, *
+        FROM export.extract_registry_vw WHERE extract_name = 'default'
+    )
+)"""
+
+def sql_reg_delta(tbl: str) -> str:
+    return build_sql({
+        "with": _REG_WITH.format(tbl=tbl, extra_aggr=''),
+        "fields": [
+            "auto_confirm_delta                       as auto_confirm_delta",
+            "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'') as lower_bound",
+            "toString(selfrun_timeout)                as selfrun_timeout",
+            "compression_type                         as compression_type",
+            "compression_ext                          as compression_ext",
+            "max_file_size                            as max_file_size",
+            "If(pg_array_format = 1, 'True', 'False')  as pg_array_format",
+            "csv_format_params                        as format_params"
+        ],
+        "from": "aggr",
+        "where": f"extract_name = '{tbl}'",
+        "settings": "enable_global_with_statement = 1"
+    })
+
+def sql_reg_recent(tbl: str) -> str:
+    extra_aggr = """,
+        argMinIf(increment, prio, prio = 1)       as increment,
+        argMinIf(overlap, prio, prio = 1)         as overlap,
+        argMinIf(time_field, prio, prio = 1)      as time_field,
+        argMinIf(recent_interval, prio, prio = 1) as recent_interval"""
+    return build_sql({
+        "with": _REG_WITH.format(tbl=tbl, extra_aggr=extra_aggr),
+        "fields": [
+            "auto_confirm_delta                       as auto_confirm_delta",
+            "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'') as lower_bound",
+            "toString(selfrun_timeout)                as selfrun_timeout",
+            "compression_type                         as compression_type",
+            "compression_ext                          as compression_ext",
+            "max_file_size                            as max_file_size",
+            "If(pg_array_format = 1, 'True', 'False')  as pg_array_format",
+            "csv_format_params                        as format_params",
+            "now()                                      as cur_time",
+            "concat('\\'', toString(cur_time), '\\'')   as extract_time",
+            "'null'                                     as extract_count",
+            "'null'                                     as loaded",
+            "'null'                                     as sent",
+            "'null'                                     as confirmed",
+            "toString(increment)                      as increment",
+            "toString(overlap)                        as overlap",
+            "concat('\\'', time_field, '\\'')         as time_field",
+            "concat('\\'', toString(cur_time - recent_interval), '\\'') as time_from",
+            "concat('\\'', toString(cur_time), '\\'')   as time_to",
+            "concat('\\'', toString(cur_time - recent_interval), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(cur_time), '\\'') as condition",
+            "'True'                                     as is_current",
+            "toString(recent_interval)                as recent_interval",
+            "toString(0)                                as num_state"
+        ],
+        "from": "aggr",
+        "where": f"extract_name = '{tbl}'",
+        "settings": "enable_global_with_statement = 1"
+    })
 
 # ── DAG factory ──────────────────────────────────────────────────────────────
 
@@ -49,7 +156,7 @@ for table_key, params in wfs.items():
     fmt     = params.get('format', 'TSVWithNames')
 
     if fmt != 'TSVWithNames':
-        raise ValueError(f"Unsupported format: {fmt!r}. Only TSVWithNames is supported.")
+        raise AirflowFailException(f"Unsupported format: {fmt!r}. Only TSVWithNames is supported.")
 
     scen, prefix, pool = TFS_MAP[replica]
     s3_prefix = f"{prefix}/{replica}"
@@ -64,9 +171,9 @@ for table_key, params in wfs.items():
     sql_recent = _prepare_sql('sql_stmt_export_recent')
 
     if not (sql_delta or sql_recent):
-        raise RuntimeError("One of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' must be specified!")
+        raise AirflowFailException("One of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' must be specified!")
     if sql_delta and sql_recent:
-        raise RuntimeError("Only one of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' can be specified!")
+        raise AirflowFailException("Only one of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' can be specified!")
 
     sql_export = sql_delta or sql_recent
     row_limit  = LIMITS.get(ENV_STAND, 0)

@@ -11,6 +11,7 @@ from datetime import timedelta
 
 VAULT_PATH = '/vault/secrets/application'
 CH_BD      = 'export'
+VAR_NAME = "datalab_er_wfs"
 
 if os.getenv("AIRFLOW__CTL_PIN"):
     CH_ID = 'dlab-click-test'

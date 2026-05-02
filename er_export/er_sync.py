@@ -4,18 +4,15 @@ Syncs configuration from the ClickHouse `export.er_wf_meta` table to Airflow Var
 """
 from __future__ import annotations
 
-import logging
 import pendulum
 from airflow.decorators import dag, task
 
-from er_export.er_config import CH_ID, DEF_ARGS, MODE
+from er_export.er_config import CH_ID, DEF_ARGS, MODE, VAR_NAME
 from er_export.er_core import get_dict
 from plugins.ctl_utils import ctl_obj_save
 
-logger = logging.getLogger(__name__)
-
-VAR_NAME = "datalab_er_wfs"
-BUCKET   = "datalab-er"
+from  logging import getLogger
+logger = getLogger("airflow.task")
 
 
 @dag(
@@ -104,7 +101,7 @@ def er_sync_dag():
             wfs[table_key] = entry
 
         logger.info("Loaded %d workflow(s) from export.er_wf_meta", len(wfs))
-        ctl_obj_save(VAR_NAME, wfs, var=True, bucket=BUCKET)
+        ctl_obj_save(VAR_NAME, wfs, var=True)
 
     sync()
 

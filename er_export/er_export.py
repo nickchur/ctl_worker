@@ -5,7 +5,6 @@ Dynamically generates Airflow DAGs based on metadata loaded from ClickHouse.
 from __future__ import annotations
 
 import json
-import logging
 import pendulum
 from airflow import DAG
 from airflow.models import Param
@@ -24,6 +23,7 @@ from er_export.er_config import (
     BUCKET,
     TFS_MAP,
     S3_CONN,
+    VAR_NAME,
 )
 from er_export.er_core import (
     export_tg,
@@ -31,11 +31,12 @@ from er_export.er_core import (
 
 from plugins.ctl_utils import ctl_obj_load
 
-logger = logging.getLogger(__name__)
+from  logging import getLogger
+logger = getLogger("airflow.task")
+
 
 # Load metadata
-VAR_NAME = "datalab_er_wfs"
-wfs = ctl_obj_load(VAR_NAME, s3_id='s3', bucket='datalab-er')
+wfs = ctl_obj_load(VAR_NAME)
 
 # ── SQL Builders ──────────────────────────────────────────────────────────────
 
@@ -148,7 +149,7 @@ def sql_reg_recent(tbl: str) -> str:
 
 # ── DAG factory ──────────────────────────────────────────────────────────────
 
-for table_key, params in wfs.items():
+def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     db, tbl = table_key.split(".", maxsplit=1)
     dag_id  = f"export_er__{params['replica']}__{tbl}"
     replica = params['replica']
@@ -279,3 +280,11 @@ for table_key, params in wfs.items():
         )
 
     globals()[dag_id] = dag
+    return dag_id, dag
+
+for table_key, params in wfs.items():
+    try:
+        dag_id, dag = create_export_dag(table_key, params)
+        globals()[dag_id] = dag
+    except Exception as e:
+        logger.error(f"Failed to generate DAG for {table_key}: {e}")

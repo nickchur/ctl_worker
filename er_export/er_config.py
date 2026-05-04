@@ -13,7 +13,10 @@ VAULT_PATH = '/vault/secrets/application'
 CH_BD      = 'export'
 VAR_NAME = "datalab_er_wfs"
 
-if os.getenv("AIRFLOW__CTL_PIN"):
+# ER_MODE=test включает тестовый CH-коннект из vault; по умолчанию — prod
+MODE = os.getenv("ER_MODE", "prod" if not os.getenv("AIRFLOW__CTL_PIN") else "test")
+
+if MODE == 'test':
     CH_ID = 'dlab-click-test'
     with open(VAULT_PATH) as f:
         secrets = json.load(f)
@@ -32,11 +35,9 @@ if os.getenv("AIRFLOW__CTL_PIN"):
     }
     os.environ[f'AIRFLOW_CONN_{CH_ID.upper()}'] = json.dumps(conn_json)
     S3_CONN = 's3-archive'
-    MODE = 'test'
 else:
     CH_ID   = 'dlab-click'
     S3_CONN = 's3-tfs-hrplt'
-    MODE    = 'prod'
 
 BUCKET = 'tfshrplt'
 TOPIC  = 'TFS.HRPLT.IN'

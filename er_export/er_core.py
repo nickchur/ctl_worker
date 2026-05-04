@@ -126,6 +126,7 @@ def _pre_kafka(scenario: str, mode: str):
         context['task'].producer_function_args = [scenario, summary_tkt]
     return pre_execute
 
+
 def export_tg(
     gid: str,
     cfg: dict,
@@ -245,7 +246,10 @@ def export_tg(
                     logger.warning("Invalid max_file_size: %r, using None", raw_max_size)
                     op.max_size = None
 
-            op.pg_array_format  = dp['pg_array_format'] == 'True'
+            op.pg_array_format   = dp['pg_array_format'] == 'True'
+            op.xstream_sanitize  = dp.get('xstream_sanitize', 'False') == 'True'
+            op.sanitize_array    = dp.get('sanitize_array', 'False') == 'True'
+            op.sanitize_list     = dp.get('sanitize_list') or ''
             try:
                 op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}
             except (ValueError, TypeError):
@@ -371,13 +375,13 @@ def export_tg(
         )
 
         if not cfg.get('auto_confirm', 1):
-            from airflow.providers.apache.kafka.sensors.kafka_consume import KafkaConsumeSensor  # type: ignore
+            from airflow.providers.apache.kafka.sensors.await_message import AwaitMessageSensor  # type: ignore
 
             def _handle_confirm(message):
                 logger.info("Received confirmation from Kafka: %s", message.value())
                 return True
 
-            t_wait_confirm = KafkaConsumeSensor(
+            t_wait_confirm = AwaitMessageSensor(
                 task_id='wait_for_confirm',
                 kafka_config_id=cfg['kafka_in_conn'],
                 topics=[cfg['kafka_in_topic']],
@@ -398,6 +402,7 @@ def export_tg(
             total_rows = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='total_row_count')
             zip_names  = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='zip_name_list')
             hook = ClickHouseHook(clickhouse_conn_id=cid)
+            zip_arr = "[" + ", ".join(f"'{z}'" for z in (zip_names or [])) + "]"
             hook.execute(f"""
                 insert into export.extract_history (
                     extract_name, extract_time, extract_count,
@@ -411,7 +416,7 @@ def export_tg(
                     now(), now(), null,
                     {dp['increment']}, {dp['overlap']}, {dp['recent_interval']},
                     {dp['time_field']}, {dp['time_from']}, {dp['time_to']},
-                    {zip_names!r}
+                    {zip_arr}
             """)
             add_note({'rows': total_rows, 'files': zip_names}, level='Task', title='Saved')
 
@@ -419,14 +424,22 @@ def export_tg(
 
         @task(task_id='schedule_next')
         def schedule_next(cfg, **context):
-            from airflow.api.common.trigger_dag import trigger_dag
+            from airflow.models import DagBag
+            from airflow.utils.types import DagRunType
+            from airflow.utils.state import DagRunState
             ti = context['ti']
             dp = ti.xcom_pull(task_ids=f"{gid}.init")
             if str(dp['is_current']).lower() in ('true', 't', '1'):
                 add_note('already current', level='Task,DAG', title='Schedule')
                 return
             run_date = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
-            trigger_dag(dag_id=cfg['dag_id'], execution_date=run_date, replace_microseconds=False)
+            dag_obj = DagBag().get_dag(cfg['dag_id'])
+            dag_obj.create_dagrun(
+                run_type=DagRunType.MANUAL,
+                execution_date=run_date,
+                state=DagRunState.QUEUED,
+                external_trigger=True,
+            )
             add_note(str(run_date), level='Task,DAG', title='Next run')
 
         t_schedule = schedule_next(cfg=cfg)

@@ -7,7 +7,6 @@
     "PK": [],
     "UK": ["person_uuid", "item_id"],
     "fields": [
-      "{export_time} as export_time",
       "insert_time",
       "header_id",
       "header_person_id",
@@ -16,9 +15,7 @@
       "item_id",
       "person_uuid",
       "tenant",
-      "company",
-      "'I' as ctl_action",
-      "now() as ctl_validfrom"
+      "company"
     ],
     "sql_stmt_export_delta": {
       "from": "evolution.lc_items_opened",

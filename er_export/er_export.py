@@ -80,7 +80,10 @@ _REG_WITH = """WITH aggr AS (
         argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext,
         argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size,
         argMinIf(pg_array_format, prio, prio=1)                                    as pg_array_format,
-        argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params
+        argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params,
+        argMinIf(xstream_sanitize, prio, prio=1)                                   as xstream_sanitize,
+        argMinIf(sanitize_array, prio, prio=1)                                     as sanitize_array,
+        argMinIf(sanitize_list, prio, lower(sanitize_list) <> 'default')           as sanitize_list
         {extra_aggr}
     FROM (
         SELECT 1 as prio, *
@@ -101,8 +104,11 @@ def sql_reg_delta(tbl: str) -> str:
             "compression_type                         as compression_type",
             "compression_ext                          as compression_ext",
             "max_file_size                            as max_file_size",
-            "If(pg_array_format = 1, 'True', 'False')  as pg_array_format",
-            "csv_format_params                        as format_params"
+            "If(pg_array_format = 1, 'True', 'False')    as pg_array_format",
+            "csv_format_params                           as format_params",
+            "If(xstream_sanitize = 1, 'True', 'False')   as xstream_sanitize",
+            "If(sanitize_array = 1, 'True', 'False')     as sanitize_array",
+            "sanitize_list                                as sanitize_list"
         ],
         "from": "aggr",
         "where": f"extract_name = '{tbl}'",
@@ -124,8 +130,11 @@ def sql_reg_recent(tbl: str) -> str:
             "compression_type                         as compression_type",
             "compression_ext                          as compression_ext",
             "max_file_size                            as max_file_size",
-            "If(pg_array_format = 1, 'True', 'False')  as pg_array_format",
-            "csv_format_params                        as format_params",
+            "If(pg_array_format = 1, 'True', 'False')    as pg_array_format",
+            "csv_format_params                           as format_params",
+            "If(xstream_sanitize = 1, 'True', 'False')   as xstream_sanitize",
+            "If(sanitize_array = 1, 'True', 'False')     as sanitize_array",
+            "sanitize_list                                as sanitize_list",
             "now()                                      as cur_time",
             "concat('\\'', toString(cur_time), '\\'')   as extract_time",
             "'null'                                     as extract_count",
@@ -165,6 +174,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     def _prepare_sql(sql_key):
         meta = params.get(sql_key)
         if isinstance(meta, dict) and "fields" not in meta:
+            meta = dict(meta)
             meta["fields"] = MANDATORY_PRE + params.get("fields", []) + MANDATORY_SUF
         return build_sql(meta)
 
@@ -249,7 +259,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         max_active_tasks=1,
         max_active_runs=1,
         catchup=False,
-        tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema],
+        tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema.replace(' ', '_').lower()],
         is_paused_upon_creation=True,
         render_template_as_native_obj=True,
         params={

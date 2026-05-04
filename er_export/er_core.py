@@ -270,7 +270,6 @@ def export_tg(
         @task(task_id='pack_zip')
         def pack_zip(cfg, **context):
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-            from hrp_operators import HrpS3ArchiveOperator  # type: ignore
             ti = context["ti"]
 
             s3_key_list    = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='s3_key_list')
@@ -302,46 +301,27 @@ def export_tg(
                 tkt_name  = f"{cfg['replica']}__{tkt_ts}.tkt"
                 zip_name  = f"{cfg['replica']}__{outer_ts}__{cfg['tbl']}__{part}_{total}_{rows}.csv.zip"
 
-                meta_s3_key = f"{cfg['s3_prefix']}/{meta_name}"
-                tkt_s3_key  = f"{cfg['s3_prefix']}/{tkt_name}"
-                csv_s3_key  = f"{cfg['s3_prefix']}/{csv_name}"
-                zip_s3_key  = f"{cfg['s3_prefix']}/{zip_name}"
+                zip_s3_key = f"{cfg['s3_prefix']}/{zip_name}"
+
+                tkt_bytes = f"{csv_name};{rows}".encode()
+                csv_bytes = hook.get_key(key=s3_key, bucket_name=bucket).get()["Body"].read()
+
+                buf = BytesIO()
+                with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr(tkt_name,  tkt_bytes)
+                    zf.writestr(csv_name,  csv_bytes)
+                    zf.writestr(meta_name, meta_bytes)
 
                 hook.load_bytes(
-                    bytes_data=meta_bytes,
-                    key=meta_s3_key,
+                    bytes_data=buf.getvalue(),
+                    key=zip_s3_key,
                     bucket_name=bucket,
-                    replace=True
-                )
-                hook.load_bytes(
-                    bytes_data=f"{csv_name};{rows}".encode(),
-                    key=tkt_s3_key,
-                    bucket_name=bucket,
-                    replace=True
-                )
-                hook.copy_object(
-                    source_bucket_key=s3_key,
-                    dest_bucket_key=csv_s3_key,
-                    source_bucket_name=bucket,
-                    dest_bucket_name=bucket,
-                )
-
-                archive_op = HrpS3ArchiveOperator(
-                    task_id=f'archive_files_{part}',
-                    s3_keys_source=[tkt_s3_key, csv_s3_key, meta_s3_key],
-                    s3_bucket_source=bucket,
-                    aws_conn_id_source=s3_conn,
-                    aws_conn_id=s3_conn,
-                    compression='zip',
-                    s3_bucket=bucket,
-                    s3_key=zip_s3_key,
                     replace=True,
                 )
-                archive_op.execute(context)
 
-                hook.delete_objects(bucket=bucket, keys=[s3_key, tkt_s3_key, csv_s3_key, meta_s3_key])
+                hook.delete_objects(bucket=bucket, keys=[s3_key])
                 uploaded_zips.append(zip_name)
-                logger.info("Packaged %d/%d: %s using HrpS3ArchiveOperator", part, total, zip_name)
+                logger.info("Packaged %d/%d: %s", part, total, zip_name)
 
             summary_ts  = base_ts.add(seconds=(total - 1) * 2 + 3).format("YYYYMMDDHHmmss")
             summary_tkt = f"{cfg['replica']}__{summary_ts}.tkt"

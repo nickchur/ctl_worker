@@ -362,17 +362,18 @@ def export_tg(
                 return True
 
             t_wait_confirm = AwaitMessageSensor(
-                task_id='wait_for_confirm',
+                task_id='confirm_tfs',
                 kafka_config_id=cfg['kafka_in_conn'],
                 topics=[cfg['kafka_in_topic']],
                 apply_function=_handle_confirm,
                 poke_interval=60,
                 timeout=3600,
                 mode='reschedule',
+                trigger_rule='none_failed',
             )
         else:
             from airflow.operators.empty import EmptyOperator # type: ignore
-            t_wait_confirm = EmptyOperator(task_id='wait_for_confirm')
+            t_wait_confirm = EmptyOperator(task_id='confirm_tfs', trigger_rule='none_failed')
 
         @task(task_id='save_status', trigger_rule='none_failed_min_one_success')
         def save_status(cfg, **context):

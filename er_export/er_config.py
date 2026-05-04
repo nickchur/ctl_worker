@@ -99,3 +99,20 @@ EXTRA_COLS = [
     {"column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None},
     {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
 ]
+
+def get_config() -> dict:
+    return {
+        'CH_ID':         CH_ID,
+        'TYPE_MAP':      TYPE_MAP,
+        'DEF_ARGS':      DEF_ARGS,
+        'ENV_STAND':     ENV_STAND,
+        'EXTRA_COLS':    EXTRA_COLS,
+        'MANDATORY_PRE': MANDATORY_PRE,
+        'MANDATORY_SUF': MANDATORY_SUF,
+        'MODE':          MODE,
+        'LIMITS':        LIMITS,
+        'BUCKET':        BUCKET,
+        'TFS_MAP':       TFS_MAP,
+        'S3_CONN':       S3_CONN,
+        'VAR_NAME':      VAR_NAME,
+    }

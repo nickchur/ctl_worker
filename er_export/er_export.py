@@ -10,21 +10,22 @@ from airflow import DAG
 from airflow.models import Param
 from airflow.exceptions import AirflowSkipException, AirflowFailException
 
-from er_export.er_config import (
-    CH_ID,
-    TYPE_MAP,
-    DEF_ARGS,
-    ENV_STAND,
-    EXTRA_COLS,
-    MANDATORY_PRE,
-    MANDATORY_SUF,
-    MODE,
-    LIMITS,
-    BUCKET,
-    TFS_MAP,
-    S3_CONN,
-    VAR_NAME,
-)
+from er_export.er_config import get_config
+
+_cfg = get_config()
+CH_ID         = _cfg['CH_ID']
+TYPE_MAP      = _cfg['TYPE_MAP']
+DEF_ARGS      = _cfg['DEF_ARGS']
+ENV_STAND     = _cfg['ENV_STAND']
+EXTRA_COLS    = _cfg['EXTRA_COLS']
+MANDATORY_PRE = _cfg['MANDATORY_PRE']
+MANDATORY_SUF = _cfg['MANDATORY_SUF']
+MODE          = _cfg['MODE']
+LIMITS        = _cfg['LIMITS']
+BUCKET        = _cfg['BUCKET']
+TFS_MAP       = _cfg['TFS_MAP']
+S3_CONN       = _cfg['S3_CONN']
+VAR_NAME      = _cfg['VAR_NAME']
 from er_export.er_core import (
     export_tg,
 )

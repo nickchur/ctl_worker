@@ -678,3 +678,4 @@ for table_key, params in wfs.items():
         globals()[dag_id] = dag
     except Exception as e:
         logger.error(f"Failed to generate DAG for {table_key}: {e}")
+        raise e

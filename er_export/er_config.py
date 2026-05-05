@@ -114,16 +114,6 @@ def get_dict(ch_hook, sql: str) -> list[dict]:
     return []
 
 
-def _ensure_pool() -> None:
-    from airflow.models import Pool
-    from airflow.utils.session import create_session
-    with create_session() as session:
-        if not session.query(Pool).filter(Pool.pool == POOL_NAME).first():
-            session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS, description='ER export pool', include_deferred=False))
-
-_ensure_pool()
-
-
 def get_config() -> dict:
     return {
         'CH_ID':         CH_ID,

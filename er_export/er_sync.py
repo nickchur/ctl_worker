@@ -15,10 +15,19 @@ DEF_ARGS  = _cfg['DEF_ARGS']
 MODE      = _cfg['MODE']
 VAR_NAME  = _cfg['VAR_NAME']
 POOL_NAME = _cfg['POOL_NAME']
+POOL_SLOTS = _cfg['POOL_SLOTS']
 from plugins.ctl_utils import ctl_obj_save
 
 from  logging import getLogger
 logger = getLogger("airflow.task")
+
+
+def _ensure_pool() -> None:
+    from airflow.models import Pool
+    from airflow.utils.session import create_session
+    with create_session() as session:
+        if not session.query(Pool).filter(Pool.pool == POOL_NAME).first():
+            session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS, description='ER export pool', include_deferred=False))
 
 
 @dag(
@@ -37,6 +46,9 @@ def er_sync_dag():
     @task(task_id="sync", pool=POOL_NAME)
     def sync():
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
+        # Ensure Airflow Pool exists (called here to avoid overhead during DAG parsing)
+        _ensure_pool()
 
         hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
 
@@ -58,6 +70,7 @@ def er_sync_dag():
                     increment       Int32         DEFAULT 60             COMMENT 'Инкремент дельты (сек)',
                     selfrun_timeout Int32         DEFAULT 10             COMMENT 'Таймаут перед авто-запуском следующей дельты (мин)',
                     auto_confirm    UInt8         DEFAULT 1              COMMENT '1 = авто-подтверждение дельты, 0 = ждать уведомления в Kafka',
+                    confirm_timeout Int32         DEFAULT 3600           COMMENT 'Таймаут ожидания подтверждения из Kafka (сек)',
                     description     String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
                     is_recent       UInt8         DEFAULT 0             COMMENT '0 = delta (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent)',
                     is_active       UInt8         DEFAULT 1             COMMENT '0 = запись игнорируется при синхронизации в Variable',
@@ -107,6 +120,7 @@ def er_sync_dag():
                 "increment": row["increment"],
                 "selfrun_timeout": row["selfrun_timeout"],
                 "auto_confirm": row["auto_confirm"],
+                "confirm_timeout": row.get("confirm_timeout", 3600),
                 sql_key:    sql_val,
             }
             if row["fields"]:

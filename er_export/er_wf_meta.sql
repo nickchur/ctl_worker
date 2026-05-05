@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     increment     Int32         DEFAULT 60             COMMENT 'Инкремент дельты (сек), используется если не перекрыто в registry',
     selfrun_timeout Int32       DEFAULT 10             COMMENT 'Таймаут перед авто-запуском следующей дельты (мин)',
     auto_confirm   UInt8         DEFAULT 1              COMMENT '1 = авто-подтверждение дельты, 0 = ждать уведомления в Kafka',
+    confirm_timeout Int32        DEFAULT 3600           COMMENT 'Таймаут ожидания подтверждения из Kafka (сек)',
     description   String        DEFAULT ''             COMMENT 'Произвольное описание DAG-а (отображается в Airflow UI)',
     is_recent     UInt8         DEFAULT 0             COMMENT '0 = дельта-выгрузка (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent)',
     is_active     UInt8         DEFAULT 1             COMMENT '0 = запись игнорируется при синхронизации в Variable',

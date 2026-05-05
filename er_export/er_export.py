@@ -619,10 +619,12 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'UK':               params.get('UK', []),
     }
 
+    description = params.get('description') or f"ER-выгрузка {table_key} → S3 ZIP → TFS Kafka"
+
     dag = DAG(
         dag_id=dag_id,
-        description=params.get('description') or f"ER-выгрузка {table_key} → S3 ZIP → TFS Kafka",
-        doc_md='```\n' + json.dumps(params, ensure_ascii=False, indent=2, default=str) + '\n```',
+        description=description,
+        doc_md='```\n' + json.dumps({**params, 'description': description}, ensure_ascii=False, indent=2, default=str) + '\n```',
         default_args=DEF_ARGS,
         start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone('UTC')),
         schedule_interval='55 0 * * *',

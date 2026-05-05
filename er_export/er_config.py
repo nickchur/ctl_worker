@@ -216,23 +216,51 @@ def get_dict(ch_hook, sql: str) -> list[dict]:
     return []
 
 
+DEFAULT_PARAMS: dict = {
+    'increment':         60,
+    'selfrun_timeout':   10,
+    'strategy':          'FULL_UK',
+    'auto_confirm':      1,
+    'confirm_timeout':   3600,
+    'lower_bound':       '',
+    'time_field':        'extract_time',
+    'overlap':           0,
+    'recent_interval':   3600,
+    'compression_type':  'none',
+    'compression_ext':   '',
+    'max_file_size':     '',
+    'pg_array_format':   0,
+    'csv_format_params': '',
+    'xstream_sanitize':  0,
+    'sanitize_array':    0,
+    'sanitize_list':     '',
+}
+
+
+def get_params(row: dict) -> dict:
+    """Merges er_wf_meta 'params' JSON with DEFAULT_PARAMS. Row-level values win."""
+    overrides = json.loads(row.get('params') or '{}')
+    return {**DEFAULT_PARAMS, **overrides}
+
+
 def get_config() -> dict:
     return {
-        'CH_ID':         CH_ID,
-        'TYPE_MAP':      TYPE_MAP,
-        'DEF_ARGS':      DEF_ARGS,
-        'ENV_STAND':     ENV_STAND,
+        'CH_ID':          CH_ID,
+        'TYPE_MAP':       TYPE_MAP,
+        'DEF_ARGS':       DEF_ARGS,
+        'ENV_STAND':      ENV_STAND,
         'EXTRA_COLS':     EXTRA_COLS,
         'EXTRA_COLS_PRE': EXTRA_COLS_PRE,
         'EXTRA_COLS_SUF': EXTRA_COLS_SUF,
-        'MANDATORY_PRE': MANDATORY_PRE,
-        'MANDATORY_SUF': MANDATORY_SUF,
-        'MODE':          MODE,
-        'LIMITS':        LIMITS,
-        'BUCKET':        BUCKET,
-        'TFS_MAP':       TFS_MAP,
-        'S3_CONN':       S3_CONN,
-        'VAR_NAME':      VAR_NAME,
-        'POOL_NAME':     POOL_NAME,
-        'POOL_SLOTS':    POOL_SLOTS,
+        'MANDATORY_PRE':  MANDATORY_PRE,
+        'MANDATORY_SUF':  MANDATORY_SUF,
+        'MODE':           MODE,
+        'LIMITS':         LIMITS,
+        'BUCKET':         BUCKET,
+        'TFS_MAP':        TFS_MAP,
+        'S3_CONN':        S3_CONN,
+        'VAR_NAME':       VAR_NAME,
+        'POOL_NAME':      POOL_NAME,
+        'POOL_SLOTS':     POOL_SLOTS,
+        'DEFAULT_PARAMS': DEFAULT_PARAMS,
     }

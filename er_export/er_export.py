@@ -18,7 +18,7 @@ from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Param
 
-from er_export.er_config import get_config, get_dict, obj_load, add_note
+from er_export.er_config import get_config, get_dict, obj_load, add_note, get_params
 
 logger = logging.getLogger("airflow.task")
 
@@ -43,52 +43,6 @@ POOL_NAME      = _cfg['POOL_NAME']
 
 ON_DELIVERY    = 'er_export.er_export.on_delivery'
 
-# ── SQL Query Templates ───────────────────────────────────────────────────────
-
-_REG_WITH_TEMPLATE = """WITH aggr AS (
-    SELECT
-        argMinIf(extract_name, prio, prio=1)                                       as extract_name,
-        argMinIf(auto_confirm_delta, prio, prio=1)                                 as auto_confirm_delta,
-        argMinIf(lower_bound, prio, prio=1)                                        as lower_bound,
-        argMinIf(selfrun_timeout, prio, prio=1)                                    as selfrun_timeout,
-        argMinIf(compression_type, prio, lower(compression_type) <> 'default')    as compression_type,
-        argMinIf(compression_ext, prio, lower(compression_ext) <> 'default')      as compression_ext,
-        argMinIf(max_file_size, prio, lower(max_file_size) <> 'default')          as max_file_size,
-        argMinIf(pg_array_format, prio, prio=1)                                    as pg_array_format,
-        argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params,
-        argMinIf(xstream_sanitize, prio, prio=1)                                   as xstream_sanitize,
-        argMinIf(sanitize_array, prio, prio=1)                                     as sanitize_array,
-        argMinIf(sanitize_list, prio, lower(sanitize_list) <> 'default')           as sanitize_list,
-        argMinIf(increment, prio, prio=1)                                          as increment,
-        argMinIf(overlap, prio, prio=1)                                            as overlap,
-        argMinIf(time_field, prio, prio=1)                                         as time_field
-        {extra_aggr}
-    FROM (
-        SELECT 1 as prio, *
-        FROM export.extract_registry_vw WHERE extract_name = '{tbl}'
-        UNION ALL
-        SELECT 2 as prio, *
-        FROM export.extract_registry_vw WHERE extract_name = 'default'
-    )
-)"""
-
-_REG_FIELDS_BASE = [
-    "auto_confirm_delta",
-    "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'') as lower_bound",
-    "toString(selfrun_timeout) as selfrun_timeout",
-    "compression_type",
-    "compression_ext",
-    "max_file_size",
-    "If(pg_array_format = 1, 'True', 'False') as pg_array_format",
-    "csv_format_params as format_params",
-    "If(xstream_sanitize = 1, 'True', 'False') as xstream_sanitize",
-    "If(sanitize_array = 1, 'True', 'False') as sanitize_array",
-    "sanitize_list",
-    "toString(increment) as increment",
-    "toString(overlap) as overlap",
-    "concat('\\'', time_field, '\\'') as time_field",
-]
-
 # ── SQL Builders ──────────────────────────────────────────────────────────────
 
 def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
@@ -108,39 +62,6 @@ def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
     if sql_meta.get("settings"): parts.append(f"SETTINGS {sql_meta['settings']}")
 
     return "\n".join(parts)
-
-
-def sql_reg_delta(tbl: str) -> str:
-    """SQL to fetch baseline registry settings for a delta-enabled table."""
-    return build_sql({
-        "with":     _REG_WITH_TEMPLATE.format(tbl=tbl, extra_aggr=''),
-        "fields":   _REG_FIELDS_BASE,
-        "from":     "aggr",
-        "where":    f"extract_name = '{tbl}'",
-        "settings": "enable_global_with_statement = 1",
-    })
-
-
-def sql_reg_recent(tbl: str) -> str:
-    """SQL to fetch registry settings for a 'recent' interval export."""
-    extra_aggr = ", argMinIf(recent_interval, prio, prio = 1) as recent_interval"
-    return build_sql({
-        "with":   _REG_WITH_TEMPLATE.format(tbl=tbl, extra_aggr=extra_aggr),
-        "fields": _REG_FIELDS_BASE + [
-            "now() as cur_time",
-            "concat('\\'', toString(cur_time), '\\'') as extract_time",
-            "'null' as extract_count", "'null' as loaded", "'null' as sent", "'null' as confirmed",
-            "concat('\\'', toString(cur_time - recent_interval), '\\'') as time_from",
-            "concat('\\'', toString(cur_time), '\\'') as time_to",
-            "concat('\\'', toString(cur_time - recent_interval), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(cur_time), '\\'') as condition",
-            "'True' as is_current",
-            "toString(recent_interval) as recent_interval",
-            "toString(0) as num_state",
-        ],
-        "from":     "aggr",
-        "where":    f"extract_name = '{tbl}'",
-        "settings": "enable_global_with_statement = 1",
-    })
 
 
 def sql_cur_delta(tbl: str) -> str:
@@ -252,24 +173,38 @@ def _er_init(cfg, **context):
     
     S3Hook(aws_conn_id=S3_CONN).create_bucket(bucket_name=BUCKET)
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-    
-    reg = get_dict(hook, cfg['sql_get_registry'])
-    if not reg: raise AirflowFailException(f"Registry entry missing for {cfg['tbl']}")
-    reg = reg[0]
-    
-    if reg.get('auto_confirm_delta'): hook.execute(cfg['sql_auto_confirm'])
-    
+
+    tf  = cfg.get('time_field', 'extract_time')
+    lb  = cfg.get('lower_bound') or '1970-01-01 00:00:00'
+    reg = {
+        'auto_confirm_delta': cfg.get('auto_confirm', 1),
+        'lower_bound':        f"'{lb}'",
+        'selfrun_timeout':    str(cfg.get('selfrun_timeout', 10)),
+        'compression_type':   cfg.get('compression_type', 'none'),
+        'compression_ext':    cfg.get('compression_ext', ''),
+        'max_file_size':      cfg.get('max_file_size', ''),
+        'pg_array_format':    cfg.get('pg_array_format', 'False'),
+        'format_params':      cfg.get('format_params', ''),
+        'xstream_sanitize':   cfg.get('xstream_sanitize', 'False'),
+        'sanitize_array':     cfg.get('sanitize_array', 'False'),
+        'sanitize_list':      cfg.get('sanitize_list', ''),
+        'increment':          str(cfg.get('increment', 60)),
+        'overlap':            str(cfg.get('overlap', 0)),
+        'time_field':         f"'{tf}'",
+    }
+
+    if reg['auto_confirm_delta']: hook.execute(cfg['sql_auto_confirm'])
+
     if cfg['sql_get_current']:
         cur_res = get_dict(hook, cfg['sql_get_current'])
         if not cur_res:
             logger.warning("First execution for %s. Bootstrapping from registry.", cfg['tbl'])
-            lb = reg['lower_bound'].strip("'")
             state = {
                 'num_state': 0, 'extract_time': lb, 'extract_count': None,
                 'loaded': None, 'sent': None, 'confirmed': None,
-                'increment': int(reg.get('increment', 60)),
-                'overlap': int(reg.get('overlap', 0)),
-                'time_field': reg.get('time_field', "'extract_time'"),
+                'increment': int(cfg.get('increment', 60)),
+                'overlap': int(cfg.get('overlap', 0)),
+                'time_field': tf,
                 'time_from': lb, 'time_to': lb, 'current_time': lb,
             }
             result = {**reg, **_format_cur_state(state)}
@@ -277,6 +212,19 @@ def _er_init(cfg, **context):
             cur = cur_res[0]
             result = {**reg, **(cur if 'condition' in cur else _format_cur_state(cur))}
     else:
+        ri  = int(cfg.get('recent_interval', 3600))
+        now = pendulum.now('UTC').replace(microsecond=0)
+        t0  = now.subtract(seconds=ri)
+        reg.update({
+            'extract_time':    f"'{now}'",
+            'extract_count':   'null', 'loaded': 'null', 'sent': 'null', 'confirmed': 'null',
+            'time_from':       f"'{t0}'",
+            'time_to':         f"'{now}'",
+            'condition':       f"'{t0}' < {tf} and {tf} <= '{now}'",
+            'is_current':      'True',
+            'recent_interval': str(ri),
+            'num_state':       '0',
+        })
         result = reg
 
     # Parameter overrides
@@ -434,6 +382,8 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
     from airflow.providers.apache.kafka.sensors.kafka import AwaitMessageSensor
 
+    p = get_params(params)
+
     db, tbl = table_key.split(".", maxsplit=1)
     replica, schema = params['replica'], params['schema']
     if params.get('format', 'TSVWithNames') != 'TSVWithNames':
@@ -460,17 +410,32 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     cfg = {
         'db': db, 'tbl': tbl, 'dag_id': f"export_er__{schema}__{tbl}",
         'schema_name': schema, 'replica': replica, 'scenario': scen, 's3_prefix': f"{prefix}/{replica}",
-        'sql_get_registry': sql_reg_delta(tbl) if sql_delta else sql_reg_recent(tbl),
-        'sql_get_current': sql_cur_delta(tbl) if sql_delta else None,
+        'sql_get_current':  sql_cur_delta(tbl) if sql_delta else None,
         'sql_auto_confirm': f"INSERT INTO export.extract_history SELECT extract_name, extract_time, extract_count, loaded, sent, now(), increment, overlap, recent_interval, time_field, time_from, time_to, exported_files FROM export.extract_history_vw WHERE extract_name = '{tbl}' AND sent IS NOT NULL AND confirmed IS NULL",
-        'auto_confirm': params.get('auto_confirm', 1), 'confirm_timeout': params.get('confirm_timeout', 3600),
-        'strategy': params.get('strategy', 'FULL_UK'), 'fields': fields, 'PK': params.get('PK', []), 'UK': params.get('UK', []),
+        'fields': fields, 'PK': params.get('PK', []), 'UK': params.get('UK', []),
         'topic': DEF_ARGS['topic'], 'kafka_in_conn': DEF_ARGS['kafka_in_conn'], 'kafka_in_topic': DEF_ARGS['kafka_in_topic'],
+        'strategy':         p['strategy'],
+        'auto_confirm':     p['auto_confirm'],
+        'confirm_timeout':  p['confirm_timeout'],
+        'increment':        p['increment'],
+        'selfrun_timeout':  p['selfrun_timeout'],
+        'lower_bound':      p['lower_bound'],
+        'time_field':       p['time_field'],
+        'overlap':          p['overlap'],
+        'recent_interval':  p['recent_interval'],
+        'compression_type': p['compression_type'],
+        'compression_ext':  p['compression_ext'],
+        'max_file_size':    str(p['max_file_size']),
+        'format_params':    p['csv_format_params'],
+        'pg_array_format':  'True' if p['pg_array_format'] else 'False',
+        'xstream_sanitize': 'True' if p['xstream_sanitize'] else 'False',
+        'sanitize_array':   'True' if p['sanitize_array'] else 'False',
+        'sanitize_list':    p['sanitize_list'],
     }
 
     dag = DAG(
         dag_id=cfg['dag_id'], description=params.get('description', f"ER: {table_key}"),
-        doc_md=f"```json\n{json.dumps(params, indent=2, default=str)}\n```",
+        doc_md=f"```json\n{json.dumps(p, indent=2, default=str)}\n```",
         default_args=DEF_ARGS, start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone('UTC')),
         schedule_interval='55 0 * * *', max_active_tasks=1, max_active_runs=1, catchup=False,
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema.replace(' ', '_').lower()],
@@ -479,11 +444,11 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             'extract_time': Param(None, type=['string', 'null'], title='Extract time'),
             'condition': Param(None, type=['string', 'null'], title='Condition'),
             'is_current': Param(None, type=['boolean', 'null'], title='Is current'),
-            'increment': Param(params.get('increment'), type=['integer', 'null'], title='Increment (сек)'),
-            'selfrun_timeout': Param(params.get('selfrun_timeout'), type=['integer', 'null'], title='Selfrun timeout (мин)'),
-            'strategy': Param(params.get('strategy', 'FULL_UK'), type='string', title='Strategy'),
-            'auto_confirm': Param(bool(params.get('auto_confirm', 1)), type='boolean', title='Auto confirm'),
-            'confirm_timeout': Param(params.get('confirm_timeout', 3600), type='integer', title='Confirm timeout (сек)'),
+            'increment':       Param(p['increment'],          type=['integer', 'null'], title='Increment (сек)'),
+            'selfrun_timeout': Param(p['selfrun_timeout'],    type=['integer', 'null'], title='Selfrun timeout (мин)'),
+            'strategy':        Param(p['strategy'],           type='string',            title='Strategy'),
+            'auto_confirm':    Param(bool(p['auto_confirm']), type='boolean',           title='Auto confirm'),
+            'confirm_timeout': Param(p['confirm_timeout'],    type='integer',           title='Confirm timeout (сек)'),
             'max_file_size': Param(None, type=['integer', 'null'], title='Max file size'),
             'pool': Param(POOL_NAME, type='string', title='Pool'),
             'topic': Param(cfg['topic'], type='string', title='Topic'),

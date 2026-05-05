@@ -9,6 +9,7 @@ import json
 import logging
 import time
 import uuid
+from typing import Any
 
 import pendulum
 from airflow import DAG
@@ -22,52 +23,30 @@ from plugins.utils import add_note
 
 logger = logging.getLogger("airflow.task")
 
+# ── Configuration & Constants ────────────────────────────────────────────────
+
 _cfg = get_config()
-CH_ID         = _cfg['CH_ID']
-TYPE_MAP      = _cfg['TYPE_MAP']
-DEF_ARGS      = _cfg['DEF_ARGS']
-ENV_STAND     = _cfg['ENV_STAND']
-EXTRA_COLS     = _cfg['EXTRA_COLS']
+CH_ID          = _cfg['CH_ID']
+TYPE_MAP       = _cfg['TYPE_MAP']
+DEF_ARGS       = _cfg['DEF_ARGS']
+ENV_STAND      = _cfg['ENV_STAND']
 EXTRA_COLS_PRE = _cfg['EXTRA_COLS_PRE']
 EXTRA_COLS_SUF = _cfg['EXTRA_COLS_SUF']
-MANDATORY_PRE = _cfg['MANDATORY_PRE']
-MANDATORY_SUF = _cfg['MANDATORY_SUF']
-MODE          = _cfg['MODE']
-LIMITS        = _cfg['LIMITS']
-BUCKET        = _cfg['BUCKET']
-TFS_MAP       = _cfg['TFS_MAP']
-S3_CONN       = _cfg['S3_CONN']
-VAR_NAME      = _cfg['VAR_NAME']
-POOL_NAME     = _cfg['POOL_NAME']
+MANDATORY_PRE  = _cfg['MANDATORY_PRE']
+MANDATORY_SUF  = _cfg['MANDATORY_SUF']
+MODE           = _cfg['MODE']
+LIMITS         = _cfg['LIMITS']
+BUCKET         = _cfg['BUCKET']
+TFS_MAP        = _cfg['TFS_MAP']
+S3_CONN        = _cfg['S3_CONN']
+VAR_NAME       = _cfg['VAR_NAME']
+POOL_NAME      = _cfg['POOL_NAME']
 
-ON_DELIVERY = 'er_export.er_export.on_delivery'
+ON_DELIVERY    = 'er_export.er_export.on_delivery'
 
-# ── SQL Builders ──────────────────────────────────────────────────────────────
+# ── SQL Query Templates ───────────────────────────────────────────────────────
 
-def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
-    if not sql_meta:
-        return ""
-    if isinstance(sql_meta, str):
-        return sql_meta
-
-    sql = ""
-    if sql_meta.get("with"):
-        sql += f"{sql_meta['with']}\n"
-
-    fields = sql_meta.get("fields", [])
-    fields_str = f",\n{indent}".join(fields) if isinstance(fields, list) else fields
-    sql += f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}"
-
-    if sql_meta.get("joins"):
-        sql += f"\n{sql_meta['joins']}"
-    if sql_meta.get("where"):
-        sql += f"\nWHERE {sql_meta['where']}"
-    if sql_meta.get("settings"):
-        sql += f"\nSETTINGS {sql_meta['settings']}"
-
-    return sql
-
-_REG_WITH = """WITH aggr AS (
+_REG_WITH_TEMPLATE = """WITH aggr AS (
     SELECT
         argMinIf(extract_name, prio, prio=1)                                       as extract_name,
         argMinIf(auto_confirm_delta, prio, prio=1)                                 as auto_confirm_delta,
@@ -95,626 +74,446 @@ _REG_WITH = """WITH aggr AS (
 )"""
 
 _REG_FIELDS_BASE = [
-    "auto_confirm_delta                                                           as auto_confirm_delta",
-    "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'')            as lower_bound",
-    "toString(selfrun_timeout)                                                    as selfrun_timeout",
-    "compression_type                                                             as compression_type",
-    "compression_ext                                                              as compression_ext",
-    "max_file_size                                                                as max_file_size",
-    "If(pg_array_format = 1, 'True', 'False')                                   as pg_array_format",
-    "csv_format_params                                                            as format_params",
-    "If(xstream_sanitize = 1, 'True', 'False')                                  as xstream_sanitize",
-    "If(sanitize_array = 1, 'True', 'False')                                     as sanitize_array",
-    "sanitize_list                                                                as sanitize_list",
-    "toString(increment)                                                         as increment",
-    "toString(overlap)                                                           as overlap",
-    "concat('\\'', time_field, '\\'')                                            as time_field",
+    "auto_confirm_delta",
+    "concat('\\'', toString(toDateTimeOrDefault(lower_bound)), '\\'') as lower_bound",
+    "toString(selfrun_timeout) as selfrun_timeout",
+    "compression_type",
+    "compression_ext",
+    "max_file_size",
+    "If(pg_array_format = 1, 'True', 'False') as pg_array_format",
+    "csv_format_params as format_params",
+    "If(xstream_sanitize = 1, 'True', 'False') as xstream_sanitize",
+    "If(sanitize_array = 1, 'True', 'False') as sanitize_array",
+    "sanitize_list",
+    "toString(increment) as increment",
+    "toString(overlap) as overlap",
+    "concat('\\'', time_field, '\\'') as time_field",
 ]
 
+# ── SQL Builders ──────────────────────────────────────────────────────────────
+
+def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
+    """Assembles a SQL query from a metadata dictionary."""
+    if not sql_meta: return ""
+    if isinstance(sql_meta, str): return sql_meta
+
+    parts = []
+    if sql_meta.get("with"): parts.append(sql_meta['with'])
+
+    fields = sql_meta.get("fields", [])
+    fields_str = f",\n{indent}".join(fields) if isinstance(fields, list) else fields
+    parts.append(f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}")
+
+    if sql_meta.get("joins"):    parts.append(sql_meta['joins'])
+    if sql_meta.get("where"):    parts.append(f"WHERE {sql_meta['where']}")
+    if sql_meta.get("settings"): parts.append(f"SETTINGS {sql_meta['settings']}")
+
+    return "\n".join(parts)
+
+
 def sql_reg_delta(tbl: str) -> str:
+    """SQL to fetch baseline registry settings for a delta-enabled table."""
     return build_sql({
-        "with":     _REG_WITH.format(tbl=tbl, extra_aggr=''),
+        "with":     _REG_WITH_TEMPLATE.format(tbl=tbl, extra_aggr=''),
         "fields":   _REG_FIELDS_BASE,
         "from":     "aggr",
         "where":    f"extract_name = '{tbl}'",
         "settings": "enable_global_with_statement = 1",
     })
 
+
 def sql_reg_recent(tbl: str) -> str:
-    extra_aggr = """,
-        argMinIf(recent_interval, prio, prio = 1) as recent_interval"""
+    """SQL to fetch registry settings for a 'recent' interval export."""
+    extra_aggr = ", argMinIf(recent_interval, prio, prio = 1) as recent_interval"
     return build_sql({
-        "with":   _REG_WITH.format(tbl=tbl, extra_aggr=extra_aggr),
+        "with":   _REG_WITH_TEMPLATE.format(tbl=tbl, extra_aggr=extra_aggr),
         "fields": _REG_FIELDS_BASE + [
-            "now()                                                                       as cur_time",
-            "concat('\\'', toString(cur_time), '\\'')                                   as extract_time",
-            "'null'                                                                      as extract_count",
-            "'null'                                                                      as loaded",
-            "'null'                                                                      as sent",
-            "'null'                                                                      as confirmed",
-            "concat('\\'', toString(cur_time - recent_interval), '\\'')                 as time_from",
-            "concat('\\'', toString(cur_time), '\\'')                                   as time_to",
+            "now() as cur_time",
+            "concat('\\'', toString(cur_time), '\\'') as extract_time",
+            "'null' as extract_count", "'null' as loaded", "'null' as sent", "'null' as confirmed",
+            "concat('\\'', toString(cur_time - recent_interval), '\\'') as time_from",
+            "concat('\\'', toString(cur_time), '\\'') as time_to",
             "concat('\\'', toString(cur_time - recent_interval), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(cur_time), '\\'') as condition",
-            "'True'                                                                      as is_current",
-            "toString(recent_interval)                                                   as recent_interval",
-            "toString(0)                                                                 as num_state",
+            "'True' as is_current",
+            "toString(recent_interval) as recent_interval",
+            "toString(0) as num_state",
         ],
         "from":     "aggr",
         "where":    f"extract_name = '{tbl}'",
         "settings": "enable_global_with_statement = 1",
     })
 
+
 def sql_cur_delta(tbl: str) -> str:
+    """SQL to fetch the current delta state for processing."""
     return build_sql({
         "fields": [
-            "toString(a.num_state)                                                                   as num_state",
-            "concat('\\'', toString(a.extract_time), '\\'')                                          as extract_time",
-            "ifNull(toString(a.extract_count), 'null')                                               as extract_count",
-            "if(a.extract_count is null, 'null', concat('\\'', toString(a.loaded), '\\''))           as loaded",
-            "if(a.extract_count is null, 'null', concat('\\'', toString(a.sent), '\\''))             as sent",
-            "if(a.extract_count is null, 'null', concat('\\'', toString(a.confirmed), '\\''))        as confirmed",
-            "toString(a.increment)                                                                    as increment",
-            "toString(a.overlap)                                                                      as overlap",
-            "concat('\\'', a.time_field, '\\'')                                                       as time_field",
-            "concat('\\'', toString(a.time_from), '\\'')                                              as time_from",
-            "concat('\\'', toString(a.time_to), '\\'')                                                as time_to",
+            "toString(a.num_state) as num_state",
+            "concat('\\'', toString(a.extract_time), '\\'') as extract_time",
+            "ifNull(toString(a.extract_count), 'null') as extract_count",
+            "if(a.extract_count is null, 'null', concat('\\'', toString(a.loaded), '\\'')) as loaded",
+            "if(a.extract_count is null, 'null', concat('\\'', toString(a.sent), '\\'')) as sent",
+            "if(a.extract_count is null, 'null', concat('\\'', toString(a.confirmed), '\\'')) as confirmed",
+            "toString(a.increment) as increment",
+            "toString(a.overlap) as overlap",
+            "concat('\\'', a.time_field, '\\'') as time_field",
+            "concat('\\'', toString(a.time_from), '\\'') as time_from",
+            "concat('\\'', toString(a.time_to), '\\'') as time_to",
             "concat('\\'', toString(a.time_from), '\\' < ', a.time_field, ' and ', a.time_field, ' <= \\'', toString(a.time_to), '\\'') as condition",
-            "if(a.current_time = a.extract_time, 'True', 'False')                                   as is_current",
-            "toString(0)                                                                              as recent_interval",
+            "if(a.current_time = a.extract_time, 'True', 'False') as is_current",
+            "toString(0) as recent_interval",
         ],
         "from": f"(SELECT * FROM export.extract_current_vw WHERE extract_name = '{tbl}') as a",
     })
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _fmt_dt(v):
+def _fmt_val(v: Any) -> str:
+    """Formats a value as a SQL string literal or 'null'."""
     return 'null' if v is None else f"'{v}'"
 
-def _format_cur(cur: dict) -> dict:
+
+def _format_cur_state(cur: dict) -> dict:
+    """Prepares state dictionary for runtime SQL injection."""
     tf = str(cur['time_field']).strip("'")
     ec = cur['extract_count']
+    fmt_dt = lambda x: _fmt_val(x)
     return {
         'num_state':       str(cur['num_state']),
-        'extract_time':    _fmt_dt(cur['extract_time']),
+        'extract_time':    fmt_dt(cur['extract_time']),
         'extract_count':   'null' if ec is None else str(ec),
-        'loaded':          'null' if ec is None else _fmt_dt(cur['loaded']),
-        'sent':            'null' if ec is None else _fmt_dt(cur['sent']),
-        'confirmed':       'null' if ec is None else _fmt_dt(cur['confirmed']),
+        'loaded':          fmt_dt(cur['loaded']) if ec is not None else 'null',
+        'sent':            fmt_dt(cur['sent']) if ec is not None else 'null',
+        'confirmed':       fmt_dt(cur['confirmed']) if ec is not None else 'null',
         'increment':       str(cur['increment']),
         'overlap':         str(cur['overlap']),
         'time_field':      f"'{tf}'",
-        'time_from':       _fmt_dt(cur['time_from']),
-        'time_to':         _fmt_dt(cur['time_to']),
-        'condition':       f"{_fmt_dt(cur['time_from'])} < {tf} and {tf} <= {_fmt_dt(cur['time_to'])}",
-        'is_current':      'True' if cur['current_time'] == cur['extract_time'] else 'False',
-        'recent_interval': '0',
+        'time_from':       fmt_dt(cur['time_from']),
+        'time_to':         fmt_dt(cur['time_to']),
+        'condition':       f"{fmt_dt(cur['time_from'])} < {tf} and {tf} <= {fmt_dt(cur['time_to'])}",
+        'is_current':      'True' if cur.get('current_time') == cur.get('extract_time') else 'False',
+        'recent_interval': str(cur.get('recent_interval', 0)),
     }
 
-def parse_type(ch_type: str, type_map: dict) -> tuple[str, bool]:
+
+def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool]:
+    """Resolves ClickHouse type to target type and nullability."""
     notnull = True
-    if ch_type.startswith("LowCardinality(") and ch_type.endswith(")"):
-        ch_type = ch_type[15:-1]
-    if ch_type.startswith("Nullable(") and ch_type.endswith(")"):
+    if ch_type.startswith("LowCardinality("): ch_type = ch_type[15:-1]
+    if ch_type.startswith("Nullable("): 
         ch_type = ch_type[9:-1]
         notnull = False
     base = ch_type.split("(")[0]
-    return type_map.get(base, "STRING"), notnull
+    return mapping.get(base, "STRING"), notnull
+
 
 def produce_msg(scenario_id: str, file_name: str, throttle_delay: int = 1):
+    """Generates XML notification for TFS system."""
     time.sleep(throttle_delay)
     rq_uuid = str(uuid.uuid4()).replace('-', '')
     message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <TransferFileCephRq>
-        <RqUID>{rq_uuid}</RqUID>
-        <RqTm>{pendulum.now().format('YYYY-MM-DDTHH:mm:ss.SSSZ')}</RqTm>
-        <ScenarioInfo>
-            <ScenarioId>{scenario_id}</ScenarioId>
-        </ScenarioInfo>
-        <File>
-            <FileInfo>
-                <Name>{file_name}</Name>
-            </FileInfo>
-        </File>
-    </TransferFileCephRq>"""
-    logger.info("Prepare message to send:\n%s", message)
+<TransferFileCephRq>
+    <RqUID>{rq_uuid}</RqUID>
+    <RqTm>{pendulum.now().format('YYYY-MM-DDTHH:mm:ss.SSSZ')}</RqTm>
+    <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
+    <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
+</TransferFileCephRq>"""
+    logger.info("Kafka message prepared: %s", rq_uuid)
     yield None, message
 
-def on_delivery(err: Exception | None, msg) -> None:
-    if err is not None:
-        raise AirflowFailException(f"Failed to deliver message: {err}")
-    logger.info(
-        "Produced record to topic %s partition [%s] @ offset %s\n%s",
-        msg.topic(), msg.partition(), msg.offset(), msg.value(),
-    )
 
-def _pre_kafka(scenario: str):
-    def pre_execute(context):
-        if MODE != 'prod':
-            raise AirflowSkipException("Kafka notification skipped in test mode")
-        summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
-        if not summary_tkt:
-            raise AirflowSkipException("No data exported, skipping notification")
-        context['task'].producer_function_args = [scenario, summary_tkt]
-    return pre_execute
+def on_delivery(err: Exception | None, msg) -> None:
+    """Kafka delivery callback."""
+    if err: raise AirflowFailException(f"Kafka delivery failed: {err}")
+    logger.info("Message delivered to %s [%s]", msg.topic(), msg.partition())
 
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
 @task(task_id='init', pool=POOL_NAME)
 def _er_init(cfg, **context):
+    """Initializes export state, handles bootstrap for new tables."""
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+    
     S3Hook(aws_conn_id=S3_CONN).create_bucket(bucket_name=BUCKET)
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-    reg_res = get_dict(hook, cfg['sql_get_registry'])
-    if not reg_res:
-        raise AirflowFailException(f"No registry entry found for {cfg['tbl']}")
-    reg = reg_res[0]
-    if reg['auto_confirm_delta']:
-        hook.execute(cfg['sql_auto_confirm'])
+    
+    reg = get_dict(hook, cfg['sql_get_registry'])
+    if not reg: raise AirflowFailException(f"Registry entry missing for {cfg['tbl']}")
+    reg = reg[0]
+    
+    if reg.get('auto_confirm_delta'): hook.execute(cfg['sql_auto_confirm'])
     
     if cfg['sql_get_current']:
         cur_res = get_dict(hook, cfg['sql_get_current'])
         if not cur_res:
-            logger.warning(f"No delta state found for {cfg['tbl']}. Initializing from registry (First Execution).")
-            # Bootstrap initial state from registry
+            logger.warning("First execution for %s. Bootstrapping from registry.", cfg['tbl'])
             lb = reg['lower_bound'].strip("'")
-            cur = {
-                'num_state': 0,
-                'extract_time': lb,
-                'extract_count': None,
+            state = {
+                'num_state': 0, 'extract_time': lb, 'extract_count': None,
                 'loaded': None, 'sent': None, 'confirmed': None,
                 'increment': int(reg.get('increment', 60)),
                 'overlap': int(reg.get('overlap', 0)),
                 'time_field': reg.get('time_field', "'extract_time'"),
-                'time_from': lb,
-                'time_to': lb,
-                'current_time': lb,
+                'time_from': lb, 'time_to': lb, 'current_time': lb,
             }
-            result = {**reg, **_format_cur(cur)}
+            result = {**reg, **_format_cur_state(state)}
         else:
             cur = cur_res[0]
-            result = {**reg, **(cur if 'condition' in cur else _format_cur(cur))}
+            result = {**reg, **(cur if 'condition' in cur else _format_cur_state(cur))}
     else:
         result = reg
 
+    # Parameter overrides
     p = context['params']
-    if p.get('extract_time'):
-        result['extract_time'] = f"'{p['extract_time']}'"
-    if p.get('condition'):
-        result['condition'] = p['condition']
-    if p.get('is_current') is not None:
-        result['is_current'] = 'True' if p['is_current'] else 'False'
-    if p.get('increment') is not None:
-        result['increment'] = str(p['increment'])
-    if p.get('selfrun_timeout') is not None:
-        result['selfrun_timeout'] = str(p['selfrun_timeout'])
-    if p.get('strategy'):
-        result['strategy'] = p['strategy']
-    if p.get('auto_confirm') is not None:
-        result['auto_confirm'] = 1 if p['auto_confirm'] else 0
-    if p.get('max_file_size') is not None:
-        result['max_file_size'] = str(p['max_file_size'])
-    add_note(
-        {k: result.get(k) for k in (
-            'extract_time', 'condition', 'is_current', 'increment',
-            'selfrun_timeout', 'strategy', 'auto_confirm', 'max_file_size'
-        )},
-        level='Task,DAG', title='Delta',
-    )
+    key_map = {
+        'extract_time': lambda v: f"'{v}'",
+        'condition': str, 'is_current': lambda v: 'True' if v else 'False',
+        'increment': str, 'selfrun_timeout': str, 'strategy': str,
+        'auto_confirm': lambda v: 1 if v else 0, 'max_file_size': str
+    }
+    for key, transform in key_map.items():
+        if p.get(key) is not None: result[key] = transform(p[key])
+    
+    add_note({k: result.get(k) for k in key_map}, level='Task,DAG', title='Delta State')
     return result
 
 
 @task(task_id='build_meta', pool=POOL_NAME)
 def _er_build_meta(cfg, **context):
+    """Builds .meta JSON describing the exported data structure."""
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-    ti  = context['ti']
-    dp  = ti.xcom_pull(task_ids="init")
+    dp = context['ti'].xcom_pull(task_ids="init")
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
     rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
     
-    # columns info from CH
     ch_cols = {}
     for row in rows:
-        source_type, notnull = parse_type(row[1], TYPE_MAP)
+        stype, notnull = parse_ch_type(row[1], TYPE_MAP)
         ch_cols[row[0]] = {
-            "column_name": row[0],
-            "source_type": source_type,
-            "length":      None,
-            "notnull":     notnull,
-            "precision":   None,
-            "scale":       None,
-            "description": row[4] if len(row) > 4 and row[4] else None,
+            "column_name": row[0], "source_type": stype, "notnull": notnull,
+            "description": row[4] if len(row) > 4 else None,
         }
     
-    # define final list of columns
     fields = cfg.get('fields', ['*'])
-    if not fields or fields == ['*'] or fields == '*':
-        # use all columns from DESCRIBE in order
-        data_cols = [ch_cols[row[0]] for row in rows]
+    if not fields or fields in (['*'], '*'):
+        data_cols = [ch_cols[r[0]] for r in rows]
     else:
-        # use specific columns in provided order
-        # handle potential 'as' in fields (simple heuristic)
         data_cols = []
         for f in fields:
             name = f.split()[-1] if ' as ' in f.lower() else f
-            if name in ch_cols:
-                data_cols.append(ch_cols[name])
-            else:
-                # if not in CH (expression or technical field not handled by mandatory list), add a default entry
-                data_cols.append({
-                    "column_name": name,
-                    "source_type": "STRING",
-                    "length":      None,
-                    "notnull":     False,
-                    "precision":   None,
-                    "scale":       None,
-                    "description": f"Calculated field: {f}",
-                })
+            data_cols.append(ch_cols.get(name, {
+                "column_name": name, "source_type": "STRING", "notnull": False,
+                "description": f"Calculated: {f}"
+            }))
 
-    columns = EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF
     meta = {
-        "schema_name": cfg['schema_name'],
-        "table_name":  cfg['tbl'],
-        "strategy":    dp.get('strategy', cfg['strategy']),
-        "PK":          cfg['PK'],
-        "UK":          cfg['UK'],
-        "params":      {"separation": "\t", "escapesymbol": "\""},
-        "columns":     columns,
+        "schema_name": cfg['schema_name'], "table_name": cfg['tbl'],
+        "strategy": dp.get('strategy', cfg['strategy']),
+        "PK": cfg['PK'], "UK": cfg['UK'],
+        "params": {"separation": "\t", "escapesymbol": "\""},
+        "columns": EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF,
     }
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
 
 
 @task(task_id='pack_zip', pool=POOL_NAME)
 def _er_pack_zip(cfg, **context):
-    from datetime import datetime
+    """Streams data from S3, wraps into ZIP with metadata, and uploads back to S3."""
     from stat import S_IFREG
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from stream_zip import ZIP_32, stream_zip # type: ignore
 
-    ti  = context["ti"]
+    ti = context["ti"]
+    s3_keys = ti.xcom_pull(task_ids="export_to_s3", key='s3_key_list')
+    counts  = ti.xcom_pull(task_ids="export_to_s3", key='row_count_list')
+    meta_s  = ti.xcom_pull(task_ids="build_meta",   key='meta_json')
 
-    s3_key_list    = ti.xcom_pull(task_ids="export_to_s3", key='s3_key_list')
-    row_count_list = ti.xcom_pull(task_ids="export_to_s3", key='row_count_list')
-    meta_json_str  = ti.xcom_pull(task_ids="build_meta",   key='meta_json')
-
-    if not s3_key_list or not row_count_list:
-        logger.warning("No CSV parts exported — skipping ZIP packaging")
-        ti.xcom_push(key="zip_name_list",    value=[])
+    if not s3_keys:
         ti.xcom_push(key="summary_tkt_name", value="")
-        ti.xcom_push(key="total_row_count",  value=0)
         return
 
-    meta_bytes = meta_json_str.encode()
-    hook       = S3Hook(aws_conn_id=S3_CONN)
-    total      = len(s3_key_list)
-    base_ts    = pendulum.now("UTC")
-    uploaded_zips = []
+    hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
+    base_ts, uploaded = pendulum.now("UTC"), []
 
     class _Reader:
-        def __init__(self, gen):
-            self._it  = gen
-            self._buf = bytearray()
-
+        def __init__(self, g): self._g, self._b = g, bytearray()
         def read(self, n=-1):
             if n < 0:
-                self._buf.extend(b''.join(self._it))
-                data, self._buf = bytes(self._buf), bytearray()
-                return data
-            while len(self._buf) < n:
-                try:
-                    self._buf.extend(next(self._it))
-                except StopIteration:
-                    break
-            chunk, self._buf = bytes(self._buf[:n]), self._buf[n:]
+                self._b.extend(b''.join(self._g))
+                d, self._b = bytes(self._b), bytearray()
+                return d
+            while len(self._b) < n:
+                try: self._b.extend(next(self._g))
+                except StopIteration: break
+            chunk, self._b = bytes(self._b[:n]), self._b[n:]
             return chunk
 
-    for i, (s3_key, row_count) in enumerate(zip(s3_key_list, row_count_list)):
-        rows     = int(row_count)
-        part     = i + 1
-        inner_ts = base_ts.add(seconds=i * 2    ).format("YYYYMMDDHHmmss")
-        tkt_ts   = base_ts.add(seconds=i * 2 + 1).format("YYYYMMDDHHmmss")
-        outer_ts = base_ts.add(seconds=i * 2 + 2).format("YYYYMMDDHHmmss")
-
-        csv_name  = f"{cfg['schema_name']}__{cfg['tbl']}__{inner_ts}__{part}_{total}_{rows}.csv"
-        meta_name = f"{cfg['schema_name']}__{cfg['tbl']}__{inner_ts}__{part}_{total}_{rows}.meta"
-        tkt_name  = f"{cfg['replica']}__{tkt_ts}.tkt"
-        zip_name  = f"{cfg['replica']}__{outer_ts}__{cfg['tbl']}__{part}_{total}_{rows}.csv.zip"
-        zip_s3_key = f"{cfg['s3_prefix']}/{zip_name}"
-
-        tkt_bytes = f"{csv_name};{rows}".encode()
-        s3_body   = hook.get_key(key=s3_key, bucket_name=BUCKET).get()["Body"]
-
-        now = datetime.now()
+    for i, (key, rows) in enumerate(zip(s3_keys, counts)):
+        ts_s = lambda s: base_ts.add(seconds=i*2 + s).format("YYYYMMDDHHmmss")
+        csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.csv"
+        meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.meta"
+        tkt_n  = f"{cfg['replica']}__{ts_s(1)}.tkt"
+        zip_n  = f"{cfg['replica']}__{ts_s(2)}__{cfg['tbl']}__{i+1}_{total}_{rows}.csv.zip"
+        
+        s3_body = hook.get_key(key=key, bucket_name=BUCKET).get()["Body"]
         members = [
-            (tkt_name,  now, S_IFREG | 0o600, ZIP_32, [tkt_bytes]),
-            (meta_name, now, S_IFREG | 0o600, ZIP_32, [meta_bytes]),
-            (csv_name,  now, S_IFREG | 0o600, ZIP_32,
-             s3_body.iter_chunks(chunk_size=8 * 1024 * 1024)),
+            (tkt_n,  None, S_IFREG | 0o600, ZIP_32, [f"{csv_n};{rows}".encode()]),
+            (meta_n, None, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
+            (csv_n,  None, S_IFREG | 0o600, ZIP_32, s3_body.iter_chunks(chunk_size=8*1024*1024)),
         ]
-        hook.load_file_obj(
-            _Reader(stream_zip(members)),
-            key=zip_s3_key,
-            bucket_name=BUCKET,
-            replace=True,
-        )
-        hook.delete_objects(bucket=BUCKET, keys=[s3_key])
-        uploaded_zips.append(zip_name)
-        logger.info("Packaged %d/%d: %s", part, total, zip_name)
+        hook.load_file_obj(_Reader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
+        hook.delete_objects(bucket=BUCKET, keys=[key])
+        uploaded.append(zip_n)
 
-    summary_ts  = base_ts.add(seconds=(total - 1) * 2 + 3).format("YYYYMMDDHHmmss")
-    summary_tkt = f"{cfg['replica']}__{summary_ts}.tkt"
-    hook.load_bytes(
-        "\n".join(uploaded_zips).encode(),
-        key=f"{cfg['s3_prefix']}/{summary_tkt}",
-        bucket_name=BUCKET,
-        replace=True,
-    )
-    logger.info("Created summary tkt: %s", summary_tkt)
-
-    total_rows = sum(int(r) for r in row_count_list)
-    add_note({'rows': total_rows, 'parts': total, 'files': uploaded_zips}, level='Task,DAG', title='Exported')
-    ti.xcom_push(key="zip_name_list",    value=uploaded_zips)
+    summary_tkt = f"{cfg['replica']}__{ts_s(3)}.tkt"
+    hook.load_bytes("\n".join(uploaded).encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
+    
+    ti.xcom_push(key="zip_name_list", value=uploaded)
     ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
-    ti.xcom_push(key="total_row_count",  value=total_rows)
+    ti.xcom_push(key="total_row_count",  value=sum(int(r) for r in counts))
 
 
 @task(task_id='save_status', trigger_rule='all_done', pool=POOL_NAME)
 def _er_save_status(cfg, **context):
+    """Records export results in history table."""
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-    ti         = context['ti']
-    dp         = ti.xcom_pull(task_ids="init")
-    if dp is None:
-        return
-    total_rows = ti.xcom_pull(task_ids="pack_zip", key='total_row_count') or 0
-    zip_names  = ti.xcom_pull(task_ids="pack_zip", key='zip_name_list') or []
-    hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-    zip_arr = "[" + ", ".join(f"'{z}'" for z in zip_names) + "]"
-    hook.execute(f"""
-        insert into export.extract_history (
-            extract_name, extract_time, extract_count,
-            loaded, sent, confirmed,
-            increment, overlap, recent_interval,
-            time_field, time_from, time_to, exported_files
-        ) select
-            '{cfg['tbl']}',
-            {dp['extract_time']},
-            {total_rows},
-            now(), now(), null,
+    ti, dp = context['ti'], context['ti'].xcom_pull(task_ids="init")
+    if not dp: return
+    
+    rows = ti.xcom_pull(task_ids="pack_zip", key='total_row_count') or 0
+    zips = ti.xcom_pull(task_ids="pack_zip", key='zip_name_list') or []
+    zip_arr = "[" + ", ".join(f"'{z}'" for z in zips) + "]"
+    
+    ClickHouseHook(clickhouse_conn_id=CH_ID).execute(f"""
+        INSERT INTO export.extract_history (
+            extract_name, extract_time, extract_count, loaded, sent, confirmed,
+            increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
+        ) SELECT
+            '{cfg['tbl']}', {dp['extract_time']}, {rows}, now(), now(), null,
             {dp['increment']}, {dp['overlap']}, {dp['recent_interval']},
-            {dp['time_field']}, {dp['time_from']}, {dp['time_to']},
-            {zip_arr}
+            {dp['time_field']}, {dp['time_from']}, {dp['time_to']}, {zip_arr}
     """)
-    add_note({'rows': total_rows, 'files': zip_names}, level='Task', title='Saved')
 
 
 @task(task_id='schedule_next', pool=POOL_NAME)
 def _er_schedule_next(cfg, **context):
+    """Triggers subsequent run if delta is not yet current."""
     from airflow.models import DagBag
     from airflow.utils.types import DagRunType
     from airflow.utils.state import DagRunState
-    ti  = context['ti']
-    dp  = ti.xcom_pull(task_ids="init")
-    if str(dp['is_current']).lower() in ('true', 't', '1'):
-        add_note('already current', level='Task,DAG', title='Schedule')
-        return
-    run_date = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
-    dag_obj = DagBag().get_dag(cfg['dag_id'])
-    dag_obj.create_dagrun(
-        run_type=DagRunType.MANUAL,
-        execution_date=run_date,
-        state=DagRunState.QUEUED,
-        external_trigger=True,
-    )
-    add_note(str(run_date), level='Task,DAG', title='Next run')
+    dp = context['ti'].xcom_pull(task_ids="init")
+    if str(dp.get('is_current')).lower() in ('true', 't', '1'): return
 
-# ── DAG factory ───────────────────────────────────────────────────────────────
+    DagBag().get_dag(cfg['dag_id']).create_dagrun(
+        run_type=DagRunType.MANUAL, execution_date=pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout'])),
+        state=DagRunState.QUEUED, external_trigger=True,
+    )
+
+# ── DAG Factory ───────────────────────────────────────────────────────────────
 
 def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
-    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
-    from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
+    """Generates a dynamic Airflow DAG from metadata."""
+    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator # type: ignore
+    from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
 
     db, tbl = table_key.split(".", maxsplit=1)
-    replica = params['replica']
-    schema  = params['schema']
-    fmt     = params.get('format', 'TSVWithNames')
-
-    if fmt != 'TSVWithNames':
-        raise AirflowFailException(f"Unsupported format: {fmt!r}. Only TSVWithNames is supported.")
+    replica, schema = params['replica'], params['schema']
+    if params.get('format', 'TSVWithNames') != 'TSVWithNames':
+        raise AirflowFailException("Only TSVWithNames format is supported.")
 
     scen, prefix = TFS_MAP[replica]
-    s3_prefix = f"{prefix}/{replica}"
-
     fields = params.get("fields", [])
-    if not fields or fields == ['*'] or fields == '*':
-        fields = ['*']
+    if not fields or fields in (['*'], '*'): fields = ['*']
 
-    def _prepare_sql(sql_key):
-        meta = params.get(sql_key)
-        if isinstance(meta, dict) and "fields" not in meta:
-            meta = dict(meta)
-            meta["fields"] = MANDATORY_PRE + fields + MANDATORY_SUF
-        return build_sql(meta)
+    def _prep_sql(key):
+        m = params.get(key)
+        if isinstance(m, dict) and "fields" not in m:
+            m = {**m, "fields": MANDATORY_PRE + fields + MANDATORY_SUF}
+        return build_sql(m)
 
-    sql_delta  = _prepare_sql('sql_stmt_export_delta')
-    sql_recent = _prepare_sql('sql_stmt_export_recent')
+    sql_delta, sql_recent = _prep_sql('sql_stmt_export_delta'), _prep_sql('sql_stmt_export_recent')
+    if not (sql_delta or sql_recent) or (sql_delta and sql_recent):
+        raise AirflowFailException("Must specify exactly one of delta or recent SQL statements.")
 
-    if not (sql_delta or sql_recent):
-        raise AirflowFailException("One of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' must be specified!")
-    if sql_delta and sql_recent:
-        raise AirflowFailException("Only one of 'sql_stmt_export_delta' or 'sql_stmt_export_recent' can be specified!")
+    sql_exp = sql_delta or sql_recent
+    if LIMITS.get(ENV_STAND, 0) > 0:
+        sql_exp = f"SELECT * FROM ({sql_exp}) LIMIT {LIMITS[ENV_STAND]}"
 
-    sql_export = sql_delta or sql_recent
-    row_limit  = LIMITS.get(ENV_STAND, 0)
-    if row_limit > 0:
-        sql_export = f"select * from ({sql_export}) limit {row_limit}"
-
-    if sql_delta:
-        sql_reg, sql_cur = sql_reg_delta(tbl), sql_cur_delta(tbl)
-    else:
-        sql_reg, sql_cur = sql_reg_recent(tbl), None
-
-    dag_id = f"export_er__{schema}__{tbl}"
     cfg = {
-        'db':               db,
-        'tbl':              tbl,
-        'dag_id':           dag_id,
-        'schema_name':      schema,
-        'replica':          replica,
-        'scenario':         scen,
-        's3_prefix':        s3_prefix,
-        'bucket':           BUCKET,
-        'topic':            DEF_ARGS['topic'],
-        'kafka_in_conn':    DEF_ARGS['kafka_in_conn'],
-        'kafka_in_topic':   DEF_ARGS['kafka_in_topic'],
-        'sql_auto_confirm': f"""
-            insert into export.extract_history (
-                extract_name, extract_time, extract_count, loaded, sent, confirmed,
-                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
-            )
-            select
-                extract_name, extract_time, extract_count, loaded, sent, now(),
-                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
-            from export.extract_history_vw
-            where extract_name = '{tbl}'
-                  and sent is not null and confirmed is null
-        """,
-        'sql_get_registry': sql_reg,
-        'sql_get_current':  sql_cur,
-        'auto_confirm':     params.get('auto_confirm', 1),
-        'confirm_timeout':  params.get('confirm_timeout', 3600),
-        'strategy':         params.get('strategy', 'FULL_UK'),
-        'fields':           fields,
-        'PK':               params.get('PK', []),
-        'UK':               params.get('UK', []),
+        'db': db, 'tbl': tbl, 'dag_id': f"export_er__{schema}__{tbl}",
+        'schema_name': schema, 'replica': replica, 'scenario': scen, 's3_prefix': f"{prefix}/{replica}",
+        'sql_get_registry': sql_reg_delta(tbl) if sql_delta else sql_reg_recent(tbl),
+        'sql_get_current': sql_cur_delta(tbl) if sql_delta else None,
+        'sql_auto_confirm': f"INSERT INTO export.extract_history SELECT extract_name, extract_time, extract_count, loaded, sent, now(), increment, overlap, recent_interval, time_field, time_from, time_to, exported_files FROM export.extract_history_vw WHERE extract_name = '{tbl}' AND sent IS NOT NULL AND confirmed IS NULL",
+        'auto_confirm': params.get('auto_confirm', 1), 'confirm_timeout': params.get('confirm_timeout', 3600),
+        'strategy': params.get('strategy', 'FULL_UK'), 'fields': fields, 'PK': params.get('PK', []), 'UK': params.get('UK', []),
+        'topic': DEF_ARGS['topic'], 'kafka_in_conn': DEF_ARGS['kafka_in_conn'], 'kafka_in_topic': DEF_ARGS['kafka_in_topic'],
     }
 
-    description = params.get('description') or f"ER-выгрузка {table_key} → S3 ZIP → TFS Kafka"
-
     dag = DAG(
-        dag_id=dag_id,
-        description=description,
-        doc_md='```\n' + json.dumps({**params, 'description': description}, ensure_ascii=False, indent=2, default=str) + '\n```',
-        default_args=DEF_ARGS,
-        start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone('UTC')),
-        schedule_interval='55 0 * * *',
-        max_active_tasks=1,
-        max_active_runs=1,
-        catchup=False,
+        dag_id=cfg['dag_id'], description=params.get('description', f"ER: {table_key}"),
+        doc_md=f"```json\n{json.dumps(params, indent=2, default=str)}\n```",
+        default_args=DEF_ARGS, start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone('UTC')),
+        schedule_interval='55 0 * * *', max_active_tasks=1, max_active_runs=1, catchup=False,
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema.replace(' ', '_').lower()],
-        is_paused_upon_creation=True,
-        render_template_as_native_obj=True,
+        render_template_as_native_obj=True, is_paused_upon_creation=True,
         params={
-            'extract_time':    Param(None,                           type=['string', 'null'],  title='Extract time',      description='Техническое время выгрузки (правая граница дельты). Формат: 2024-01-01 00:00:00'),
-            'condition':       Param(None,                           type=['string', 'null'],  title='Condition',          description='Перезаписать значение плейсхолдера {condition}'),
-            'is_current':      Param(None,                           type=['boolean', 'null'], title='Is current',         description='True = данные актуальны, остановить авто-перезапуск (self-run)'),
-            'increment':       Param(params.get('increment'),        type=['integer', 'null'], title='Increment (сек)',    description='Размер временного окна (шаг) одной выгрузки в секундах'),
-            'selfrun_timeout': Param(params.get('selfrun_timeout'),  type=['integer', 'null'], title='Selfrun timeout (мин)', description='Пауза перед автоматическим запуском следующей итерации (мин)'),
-            'strategy':        Param(params.get('strategy', 'FULL_UK'), type='string',         title='Strategy',           description='Стратегия слияния данных (FULL_UK, DELTA_UK и др.)'),
-            'auto_confirm':    Param(bool(params.get('auto_confirm', 1)), type='boolean',      title='Auto confirm',       description='True = не ждать подтверждения из Kafka'),
-            'confirm_timeout': Param(params.get('confirm_timeout', 3600), type='integer',      title='Confirm timeout (сек)', description='Таймаут ожидания подтверждения из Kafka (сек)'),
-            'max_file_size':   Param(None,                           type=['integer', 'null'], title='Max file size',      description='Максимальный размер одного CSV файла (байт). По умолчанию из реестра.'),
-            'pool':            Param(POOL_NAME,                      type='string',            title='Kafka Pool',         description='Пул Airflow для задач Kafka'),
-            'topic':           Param(cfg['topic'],                   type='string',            title='Kafka Topic',        description='Топик для отправки уведомлений'),
+            'extract_time': Param(None, type=['string', 'null'], title='Extract time'),
+            'condition': Param(None, type=['string', 'null'], title='Condition'),
+            'is_current': Param(None, type=['boolean', 'null'], title='Is current'),
+            'increment': Param(params.get('increment'), type=['integer', 'null'], title='Increment (сек)'),
+            'selfrun_timeout': Param(params.get('selfrun_timeout'), type=['integer', 'null'], title='Selfrun timeout (мин)'),
+            'strategy': Param(params.get('strategy', 'FULL_UK'), type='string', title='Strategy'),
+            'auto_confirm': Param(bool(params.get('auto_confirm', 1)), type='boolean', title='Auto confirm'),
+            'confirm_timeout': Param(params.get('confirm_timeout', 3600), type='integer', title='Confirm timeout (сек)'),
+            'max_file_size': Param(None, type=['integer', 'null'], title='Max file size'),
+            'pool': Param(POOL_NAME, type='string', title='Pool'),
+            'topic': Param(cfg['topic'], type='string', title='Topic'),
         },
     )
 
     with dag:
-        t_init       = _er_init(cfg=cfg)
-        t_build_meta = _er_build_meta(cfg=cfg)
-
-        def _pre_execute_copy(context):
-            ti = context['ti']
-            dp = ti.xcom_pull(task_ids="init")
-            op = context['task']
+        def _pre_exp(ctx):
+            dp = ctx['ti'].xcom_pull(task_ids="init")
+            op = ctx['task']
             op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
-            raw_max_size = dp.get('max_file_size')
-            if str(raw_max_size).lower() in ('default', 'none', 'null', ''):
-                op.max_size = None
-            else:
-                try:
-                    op.max_size = int(raw_max_size)
-                except (ValueError, TypeError):
-                    logger.warning("Invalid max_file_size: %r, using None", raw_max_size)
-                    op.max_size = None
-            op.pg_array_format  = dp['pg_array_format'] == 'True'
-            op.xstream_sanitize = dp.get('xstream_sanitize', 'False') == 'True'
-            op.sanitize_array   = dp.get('sanitize_array', 'False') == 'True'
-            op.sanitize_list    = dp.get('sanitize_list') or ''
-            try:
-                op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}
-            except (ValueError, TypeError):
-                logger.warning("Unparseable format_params: %r", dp['format_params'])
-                op.format_params = {}
+            try: op.max_size = int(dp.get('max_file_size'))
+            except: op.max_size = None
+            op.pg_array_format, op.xstream_sanitize, op.sanitize_array = dp['pg_array_format'] == 'True', dp.get('xstream_sanitize', 'False') == 'True', dp.get('sanitize_array', 'False') == 'True'
+            op.sanitize_list = dp.get('sanitize_list') or ''
+            try: op.format_params = ast.literal_eval(dp['format_params'])
+            except: op.format_params = {}
 
-        export_to_s3 = HrpClickNativeToS3ListOperator(
-            task_id='export_to_s3',
-            s3_bucket=BUCKET,
-            s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
-            sql=sql_export,
-            compression=None,
-            replace=True,
-            post_file_check=False,
-            pre_execute=_pre_execute_copy,
-            pool=POOL_NAME,
+        t_init, t_meta = _er_init(cfg=cfg), _er_build_meta(cfg=cfg)
+        t_exp = HrpClickNativeToS3ListOperator(
+            task_id='export_to_s3', s3_bucket=BUCKET, s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
+            sql=sql_exp, compression=None, replace=True, post_file_check=False, pre_execute=_pre_exp, pool=POOL_NAME,
         )
-
-        t_pack = _er_pack_zip(cfg=cfg)
-
-        notify_tfs = ProduceToTopicOperator(
-            task_id='notify_tfs',
-            topic="{{ params.topic }}",
-            producer_function=produce_msg,
-            producer_function_args=[cfg['scenario'], ''],
-            delivery_callback=ON_DELIVERY,
-            pool=POOL_NAME,
-            pre_execute=_pre_kafka(cfg['scenario']),
+        t_zip = _er_pack_zip(cfg=cfg)
+        t_msg = ProduceToTopicOperator(
+            task_id='notify_tfs', topic="{{ params.topic }}", producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
+            delivery_callback=on_delivery, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
         )
+        t_wait = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME) if cfg.get('auto_confirm') else \
+                 AwaitMessageSensor(task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']], apply_function=lambda m: True, poke_interval=60, timeout=cfg.get('confirm_timeout', 3600), mode='reschedule', trigger_rule='none_failed', pool=POOL_NAME)
+        
+        t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)
 
-        if not cfg.get('auto_confirm', 1):
-            from airflow.providers.apache.kafka.sensors.await_message import AwaitMessageSensor  # type: ignore
+    return cfg['dag_id'], dag
 
-            def _handle_confirm(message):
-                logger.info("Received confirmation from Kafka: %s", message.value())
-                return True
-
-            t_wait_confirm = AwaitMessageSensor(
-                task_id='wait_confirm',
-                kafka_config_id=cfg['kafka_in_conn'],
-                topics=[cfg['kafka_in_topic']],
-                apply_function=_handle_confirm,
-                poke_interval=60,
-                timeout=cfg.get('confirm_timeout', 3600),
-                mode='reschedule',
-                trigger_rule='none_failed',
-                pool=POOL_NAME,
-            )
-        else:
-            from airflow.operators.empty import EmptyOperator  # type: ignore
-            t_wait_confirm = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME)
-
-        t_save     = _er_save_status(cfg=cfg)
-        t_schedule = _er_schedule_next(cfg=cfg)
-
-        t_init >> [t_build_meta, export_to_s3]
-        [t_build_meta, export_to_s3] >> t_pack
-        t_pack >> notify_tfs >> t_wait_confirm >> t_save >> t_schedule
-
-    return dag_id, dag
-
+# ── Dynamic DAG Registration ──────────────────────────────────────────────────
 
 try:
-    wfs = ctl_obj_load(VAR_NAME)
+    workflows = ctl_obj_load(VAR_NAME)
 except Exception as e:
-    logger.error(f"Failed to load workflows from Variable {VAR_NAME}: {e}")
-    wfs = {}
+    logger.error("Failed to load workflows: %s", e)
+    workflows = {}
 
-if not wfs:
-    logger.warning(f"No workflows found in Variable {VAR_NAME} or it failed to load. No dynamic DAGs generated.")
-
-for table_key, params in wfs.items():
+for table_key, workflow_params in workflows.items():
     try:
-        dag_id, dag = create_export_dag(table_key, params)
-        globals()[dag_id] = dag
+        dag_id, dag_obj = create_export_dag(table_key, workflow_params)
+        globals()[dag_id] = dag_obj
     except Exception as e:
-        logger.error(f"Failed to generate DAG for {table_key}: {e}")
+        logger.error("DAG generation failed for %s: %s", table_key, e)
         raise e

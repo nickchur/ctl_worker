@@ -417,16 +417,19 @@ def _er_pack_zip(cfg, **context):
     ti.xcom_push(key="total_row_count",  value=total_rows)
 
 
-@task(task_id='save_status', trigger_rule='none_failed_min_one_success')
+@task(task_id='save_status', trigger_rule='all_done')
 def _er_save_status(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     gid        = context['task'].task_group.group_id
     ti         = context['ti']
     dp         = ti.xcom_pull(task_ids=f"{gid}.init")
-    total_rows = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='total_row_count')
-    zip_names  = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='zip_name_list')
+    if dp is None:
+        # init didn't produce results (failed or skipped) — nothing to record
+        return
+    total_rows = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='total_row_count') or 0
+    zip_names  = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='zip_name_list') or []
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-    zip_arr = "[" + ", ".join(f"'{z}'" for z in (zip_names or [])) + "]"
+    zip_arr = "[" + ", ".join(f"'{z}'" for z in zip_names) + "]"
     hook.execute(f"""
         insert into export.extract_history (
             extract_name, extract_time, extract_count,

@@ -80,7 +80,10 @@ _REG_WITH = """WITH aggr AS (
         argMinIf(csv_format_params, prio, lower(csv_format_params) <> 'default')  as csv_format_params,
         argMinIf(xstream_sanitize, prio, prio=1)                                   as xstream_sanitize,
         argMinIf(sanitize_array, prio, prio=1)                                     as sanitize_array,
-        argMinIf(sanitize_list, prio, lower(sanitize_list) <> 'default')           as sanitize_list
+        argMinIf(sanitize_list, prio, lower(sanitize_list) <> 'default')           as sanitize_list,
+        argMinIf(increment, prio, prio=1)                                          as increment,
+        argMinIf(overlap, prio, prio=1)                                            as overlap,
+        argMinIf(time_field, prio, prio=1)                                         as time_field
         {extra_aggr}
     FROM (
         SELECT 1 as prio, *
@@ -103,6 +106,9 @@ _REG_FIELDS_BASE = [
     "If(xstream_sanitize = 1, 'True', 'False')                                  as xstream_sanitize",
     "If(sanitize_array = 1, 'True', 'False')                                     as sanitize_array",
     "sanitize_list                                                                as sanitize_list",
+    "toString(increment)                                                         as increment",
+    "toString(overlap)                                                           as overlap",
+    "concat('\\'', time_field, '\\'')                                            as time_field",
 ]
 
 def sql_reg_delta(tbl: str) -> str:
@@ -116,9 +122,6 @@ def sql_reg_delta(tbl: str) -> str:
 
 def sql_reg_recent(tbl: str) -> str:
     extra_aggr = """,
-        argMinIf(increment, prio, prio = 1)       as increment,
-        argMinIf(overlap, prio, prio = 1)         as overlap,
-        argMinIf(time_field, prio, prio = 1)      as time_field,
         argMinIf(recent_interval, prio, prio = 1) as recent_interval"""
     return build_sql({
         "with":   _REG_WITH.format(tbl=tbl, extra_aggr=extra_aggr),
@@ -129,9 +132,6 @@ def sql_reg_recent(tbl: str) -> str:
             "'null'                                                                      as loaded",
             "'null'                                                                      as sent",
             "'null'                                                                      as confirmed",
-            "toString(increment)                                                         as increment",
-            "toString(overlap)                                                           as overlap",
-            "concat('\\'', time_field, '\\'')                                            as time_field",
             "concat('\\'', toString(cur_time - recent_interval), '\\'')                 as time_from",
             "concat('\\'', toString(cur_time), '\\'')                                   as time_to",
             "concat('\\'', toString(cur_time - recent_interval), '\\' < ', time_field, ' and ', time_field, ' <= \\'', toString(cur_time), '\\'') as condition",
@@ -251,14 +251,32 @@ def _er_init(cfg, **context):
     reg = reg_res[0]
     if reg['auto_confirm_delta']:
         hook.execute(cfg['sql_auto_confirm'])
+    
     if cfg['sql_get_current']:
         cur_res = get_dict(hook, cfg['sql_get_current'])
         if not cur_res:
-            raise AirflowFailException(f"No delta state found for {cfg['tbl']}")
-        cur = cur_res[0]
-        result = {**reg, **(cur if 'condition' in cur else _format_cur(cur))}
+            logger.warning(f"No delta state found for {cfg['tbl']}. Initializing from registry (First Execution).")
+            # Bootstrap initial state from registry
+            lb = reg['lower_bound'].strip("'")
+            cur = {
+                'num_state': 0,
+                'extract_time': lb,
+                'extract_count': None,
+                'loaded': None, 'sent': None, 'confirmed': None,
+                'increment': int(reg.get('increment', 60)),
+                'overlap': int(reg.get('overlap', 0)),
+                'time_field': reg.get('time_field', "'extract_time'"),
+                'time_from': lb,
+                'time_to': lb,
+                'current_time': lb,
+            }
+            result = {**reg, **_format_cur(cur)}
+        else:
+            cur = cur_res[0]
+            result = {**reg, **(cur if 'condition' in cur else _format_cur(cur))}
     else:
         result = reg
+
     p = context['params']
     if p.get('extract_time'):
         result['extract_time'] = f"'{p['extract_time']}'"

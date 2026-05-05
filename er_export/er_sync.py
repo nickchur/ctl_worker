@@ -43,7 +43,7 @@ def _ensure_pool() -> None:
 )
 def er_sync_dag():
 
-    @task(task_id="sync", pool=POOL_NAME)
+    @task(task_id="sync", pool="default_pool")
     def sync():
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 

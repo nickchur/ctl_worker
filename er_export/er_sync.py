@@ -31,7 +31,7 @@ def _ensure_pool() -> None:
 
 
 @dag(
-    dag_id="er_sync__datalab_er_wfs",
+    dag_id="export_er_sync",
     description="Sync export.er_wf_meta → Airflow Variable datalab_er_wfs",
     default_args=DEF_ARGS,
     start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone("UTC")),

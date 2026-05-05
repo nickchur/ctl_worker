@@ -669,6 +669,9 @@ except Exception as e:
     logger.error(f"Failed to load workflows from Variable {VAR_NAME}: {e}")
     wfs = {}
 
+if not wfs:
+    logger.warning(f"No workflows found in Variable {VAR_NAME} or it failed to load. No dynamic DAGs generated.")
+
 for table_key, params in wfs.items():
     try:
         dag_id, dag = create_export_dag(table_key, params)

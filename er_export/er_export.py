@@ -12,7 +12,7 @@ import uuid
 
 import pendulum
 from airflow import DAG
-from airflow.decorators import task, task_group
+from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Param
 
@@ -231,8 +231,7 @@ def _pre_kafka(scenario: str):
     def pre_execute(context):
         if MODE != 'prod':
             raise AirflowSkipException("Kafka notification skipped in test mode")
-        gid = context['task'].task_group.group_id
-        summary_tkt = context['ti'].xcom_pull(task_ids=f"{gid}.pack_zip", key='summary_tkt_name')
+        summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
         if not summary_tkt:
             raise AirflowSkipException("No data exported, skipping notification")
         context['task'].producer_function_args = [scenario, summary_tkt]
@@ -290,9 +289,8 @@ def _er_init(cfg, **context):
 @task(task_id='build_meta', pool=POOL_NAME)
 def _er_build_meta(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-    gid = context['task'].task_group.group_id
     ti  = context['ti']
-    dp  = ti.xcom_pull(task_ids=f"{gid}.init")
+    dp  = ti.xcom_pull(task_ids="init")
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
     rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
     data_cols = []
@@ -327,12 +325,11 @@ def _er_pack_zip(cfg, **context):
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from stream_zip import ZIP_32, stream_zip
 
-    gid = context['task'].task_group.group_id
     ti  = context["ti"]
 
-    s3_key_list    = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='s3_key_list')
-    row_count_list = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='row_count_list')
-    meta_json_str  = ti.xcom_pull(task_ids=f"{gid}.build_meta",   key='meta_json')
+    s3_key_list    = ti.xcom_pull(task_ids="export_to_s3", key='s3_key_list')
+    row_count_list = ti.xcom_pull(task_ids="export_to_s3", key='row_count_list')
+    meta_json_str  = ti.xcom_pull(task_ids="build_meta",   key='meta_json')
 
     if not s3_key_list or not row_count_list:
         logger.warning("No CSV parts exported — skipping ZIP packaging")
@@ -418,14 +415,12 @@ def _er_pack_zip(cfg, **context):
 @task(task_id='save_status', trigger_rule='all_done', pool=POOL_NAME)
 def _er_save_status(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-    gid        = context['task'].task_group.group_id
     ti         = context['ti']
-    dp         = ti.xcom_pull(task_ids=f"{gid}.init")
+    dp         = ti.xcom_pull(task_ids="init")
     if dp is None:
-        # init didn't produce results (failed or skipped) — nothing to record
         return
-    total_rows = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='total_row_count') or 0
-    zip_names  = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='zip_name_list') or []
+    total_rows = ti.xcom_pull(task_ids="pack_zip", key='total_row_count') or 0
+    zip_names  = ti.xcom_pull(task_ids="pack_zip", key='zip_name_list') or []
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
     zip_arr = "[" + ", ".join(f"'{z}'" for z in zip_names) + "]"
     hook.execute(f"""
@@ -451,9 +446,8 @@ def _er_schedule_next(cfg, **context):
     from airflow.models import DagBag
     from airflow.utils.types import DagRunType
     from airflow.utils.state import DagRunState
-    gid = context['task'].task_group.group_id
     ti  = context['ti']
-    dp  = ti.xcom_pull(task_ids=f"{gid}.init")
+    dp  = ti.xcom_pull(task_ids="init")
     if str(dp['is_current']).lower() in ('true', 't', '1'):
         add_note('already current', level='Task,DAG', title='Schedule')
         return
@@ -467,96 +461,12 @@ def _er_schedule_next(cfg, **context):
     )
     add_note(str(run_date), level='Task,DAG', title='Next run')
 
-# ── TaskGroup factory ─────────────────────────────────────────────────────────
-
-@task_group(group_id='er_export')
-def export_tg(cfg: dict, sql: str):
-    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
-    from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
-
-    t_init       = _er_init(cfg=cfg)
-    t_build_meta = _er_build_meta(cfg=cfg)
-
-    def _pre_execute_copy(context):
-        ti = context['ti']
-        dp = ti.xcom_pull(task_ids=f"{context['task'].task_group.group_id}.init")
-        op = context['task']
-        op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
-        raw_max_size = dp.get('max_file_size')
-        if str(raw_max_size).lower() in ('default', 'none', 'null', ''):
-            op.max_size = None
-        else:
-            try:
-                op.max_size = int(raw_max_size)
-            except (ValueError, TypeError):
-                logger.warning("Invalid max_file_size: %r, using None", raw_max_size)
-                op.max_size = None
-        op.pg_array_format  = dp['pg_array_format'] == 'True'
-        op.xstream_sanitize = dp.get('xstream_sanitize', 'False') == 'True'
-        op.sanitize_array   = dp.get('sanitize_array', 'False') == 'True'
-        op.sanitize_list    = dp.get('sanitize_list') or ''
-        try:
-            op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}
-        except (ValueError, TypeError):
-            logger.warning("Unparseable format_params: %r", dp['format_params'])
-            op.format_params = {}
-
-    export_to_s3 = HrpClickNativeToS3ListOperator(
-        task_id='export_to_s3',
-        s3_bucket=BUCKET,
-        s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
-        sql=sql,
-        compression=None,
-        replace=True,
-        post_file_check=False,
-        pre_execute=_pre_execute_copy,
-        pool=POOL_NAME,
-    )
-
-    t_pack = _er_pack_zip(cfg=cfg)
-
-    notify_tfs = ProduceToTopicOperator(
-        task_id='notify_tfs',
-        topic="{{ params.topic }}",
-        producer_function=produce_msg,
-        producer_function_args=[cfg['scenario'], ''],
-        delivery_callback=ON_DELIVERY,
-        pool=POOL_NAME,
-        pre_execute=_pre_kafka(cfg['scenario']),
-    )
-
-    if not cfg.get('auto_confirm', 1):
-        from airflow.providers.apache.kafka.sensors.await_message import AwaitMessageSensor  # type: ignore
-
-        def _handle_confirm(message):
-            logger.info("Received confirmation from Kafka: %s", message.value())
-            return True
-
-        t_wait_confirm = AwaitMessageSensor(
-            task_id='wait_confirm',
-            kafka_config_id=cfg['kafka_in_conn'],
-            topics=[cfg['kafka_in_topic']],
-            apply_function=_handle_confirm,
-            poke_interval=60,
-            timeout=cfg.get('confirm_timeout', 3600),
-            mode='reschedule',
-            trigger_rule='none_failed',
-            pool=POOL_NAME,
-        )
-    else:
-        from airflow.operators.empty import EmptyOperator  # type: ignore
-        t_wait_confirm = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME)
-
-    t_save     = _er_save_status(cfg=cfg)
-    t_schedule = _er_schedule_next(cfg=cfg)
-
-    t_init >> [t_build_meta, export_to_s3]
-    [t_build_meta, export_to_s3] >> t_pack
-    t_pack >> notify_tfs >> t_wait_confirm >> t_save >> t_schedule
-
 # ── DAG factory ───────────────────────────────────────────────────────────────
 
 def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
+    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
+    from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
+
     db, tbl = table_key.split(".", maxsplit=1)
     replica = params['replica']
     schema  = params['schema']
@@ -658,7 +568,85 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     )
 
     with dag:
-        export_tg(cfg=cfg, sql=sql_export)
+        t_init       = _er_init(cfg=cfg)
+        t_build_meta = _er_build_meta(cfg=cfg)
+
+        def _pre_execute_copy(context):
+            ti = context['ti']
+            dp = ti.xcom_pull(task_ids="init")
+            op = context['task']
+            op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
+            raw_max_size = dp.get('max_file_size')
+            if str(raw_max_size).lower() in ('default', 'none', 'null', ''):
+                op.max_size = None
+            else:
+                try:
+                    op.max_size = int(raw_max_size)
+                except (ValueError, TypeError):
+                    logger.warning("Invalid max_file_size: %r, using None", raw_max_size)
+                    op.max_size = None
+            op.pg_array_format  = dp['pg_array_format'] == 'True'
+            op.xstream_sanitize = dp.get('xstream_sanitize', 'False') == 'True'
+            op.sanitize_array   = dp.get('sanitize_array', 'False') == 'True'
+            op.sanitize_list    = dp.get('sanitize_list') or ''
+            try:
+                op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}
+            except (ValueError, TypeError):
+                logger.warning("Unparseable format_params: %r", dp['format_params'])
+                op.format_params = {}
+
+        export_to_s3 = HrpClickNativeToS3ListOperator(
+            task_id='export_to_s3',
+            s3_bucket=BUCKET,
+            s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
+            sql=sql_export,
+            compression=None,
+            replace=True,
+            post_file_check=False,
+            pre_execute=_pre_execute_copy,
+            pool=POOL_NAME,
+        )
+
+        t_pack = _er_pack_zip(cfg=cfg)
+
+        notify_tfs = ProduceToTopicOperator(
+            task_id='notify_tfs',
+            topic="{{ params.topic }}",
+            producer_function=produce_msg,
+            producer_function_args=[cfg['scenario'], ''],
+            delivery_callback=ON_DELIVERY,
+            pool=POOL_NAME,
+            pre_execute=_pre_kafka(cfg['scenario']),
+        )
+
+        if not cfg.get('auto_confirm', 1):
+            from airflow.providers.apache.kafka.sensors.await_message import AwaitMessageSensor  # type: ignore
+
+            def _handle_confirm(message):
+                logger.info("Received confirmation from Kafka: %s", message.value())
+                return True
+
+            t_wait_confirm = AwaitMessageSensor(
+                task_id='wait_confirm',
+                kafka_config_id=cfg['kafka_in_conn'],
+                topics=[cfg['kafka_in_topic']],
+                apply_function=_handle_confirm,
+                poke_interval=60,
+                timeout=cfg.get('confirm_timeout', 3600),
+                mode='reschedule',
+                trigger_rule='none_failed',
+                pool=POOL_NAME,
+            )
+        else:
+            from airflow.operators.empty import EmptyOperator  # type: ignore
+            t_wait_confirm = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME)
+
+        t_save     = _er_save_status(cfg=cfg)
+        t_schedule = _er_schedule_next(cfg=cfg)
+
+        t_init >> [t_build_meta, export_to_s3]
+        [t_build_meta, export_to_s3] >> t_pack
+        t_pack >> notify_tfs >> t_wait_confirm >> t_save >> t_schedule
 
     return dag_id, dag
 

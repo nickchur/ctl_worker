@@ -242,7 +242,7 @@ def _pre_kafka(scenario: str):
 
 # ── TaskGroup factory ─────────────────────────────────────────────────────────
 
-@task(task_id='init')
+@task(task_id='init', pool=POOL_NAME)
 def _er_init(cfg, **context):
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
@@ -289,7 +289,7 @@ def _er_init(cfg, **context):
     return result
 
 
-@task(task_id='build_meta')
+@task(task_id='build_meta', pool=POOL_NAME)
 def _er_build_meta(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     gid = context['task'].task_group.group_id
@@ -322,7 +322,7 @@ def _er_build_meta(cfg, **context):
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
 
 
-@task(task_id='pack_zip')
+@task(task_id='pack_zip', pool=POOL_NAME)
 def _er_pack_zip(cfg, **context):
     from datetime import datetime
     from stat import S_IFREG
@@ -417,7 +417,7 @@ def _er_pack_zip(cfg, **context):
     ti.xcom_push(key="total_row_count",  value=total_rows)
 
 
-@task(task_id='save_status', trigger_rule='all_done')
+@task(task_id='save_status', trigger_rule='all_done', pool=POOL_NAME)
 def _er_save_status(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     gid        = context['task'].task_group.group_id
@@ -448,7 +448,7 @@ def _er_save_status(cfg, **context):
     add_note({'rows': total_rows, 'files': zip_names}, level='Task', title='Saved')
 
 
-@task(task_id='schedule_next')
+@task(task_id='schedule_next', pool=POOL_NAME)
 def _er_schedule_next(cfg, **context):
     from airflow.models import DagBag
     from airflow.utils.types import DagRunType
@@ -512,6 +512,7 @@ def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
             replace=True,
             post_file_check=False,
             pre_execute=_pre_execute_copy,
+            pool=POOL_NAME,
         )
 
         t_pack = _er_pack_zip(cfg=cfg)
@@ -542,10 +543,11 @@ def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
                 timeout=3600,
                 mode='reschedule',
                 trigger_rule='none_failed',
+                pool=POOL_NAME,
             )
         else:
             from airflow.operators.empty import EmptyOperator  # type: ignore
-            t_wait_confirm = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed')
+            t_wait_confirm = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME)
 
         t_save     = _er_save_status(cfg=cfg)
         t_schedule = _er_schedule_next(cfg=cfg)

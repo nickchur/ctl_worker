@@ -9,6 +9,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import timedelta
 from typing import Any
 
 import pendulum
@@ -226,6 +227,10 @@ def on_delivery(err: Exception | None, msg) -> None:
     logger.info("Message delivered to %s [%s]", msg.topic(), msg.partition())
 
 
+def _kafka_accept_any(msg) -> bool:
+    return True
+
+
 def _pre_kafka(scenario: str):
     """Factory for Kafka pre-execution logic: checks if data was actually exported."""
     def pre_execute(context):
@@ -424,10 +429,10 @@ def _er_schedule_next(cfg, **context):
 
 def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     """Generates a dynamic Airflow DAG from metadata."""
-    from airflow.operators.empty import EmptyOperator # type: ignore
-    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator # type: ignore
-    from airflow.providers.apache.kafka.sensors.await_message import AwaitMessageSensor # type: ignore
     from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
+    from airflow.operators.empty import EmptyOperator
+    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
+    from airflow.providers.apache.kafka.sensors.kafka import AwaitMessageSensor
 
     db, tbl = table_key.split(".", maxsplit=1)
     replica, schema = params['replica'], params['schema']
@@ -505,10 +510,10 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
             task_id='notify_tfs', topic="{{ params.topic }}", producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
-            delivery_callback=on_delivery, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
+            delivery_callback="er_export.er_export.on_delivery", pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
         )
         t_wait = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME) if cfg.get('auto_confirm') else \
-                 AwaitMessageSensor(task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']], apply_function=lambda m: True, poke_interval=60, timeout=cfg.get('confirm_timeout', 3600), mode='reschedule', trigger_rule='none_failed', pool=POOL_NAME)
+                 AwaitMessageSensor(task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']], apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME, execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)))
         
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)
 

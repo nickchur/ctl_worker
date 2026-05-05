@@ -9,14 +9,12 @@ import json
 import logging
 import time
 import uuid
-import zipfile
 
 import pendulum
 from airflow import DAG
-from airflow.decorators import task
+from airflow.decorators import task, task_group
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Param
-from airflow.utils.task_group import TaskGroup
 
 from er_export.er_config import get_config, get_dict
 from plugins.ctl_utils import ctl_obj_load
@@ -240,7 +238,7 @@ def _pre_kafka(scenario: str):
         context['task'].producer_function_args = [scenario, summary_tkt]
     return pre_execute
 
-# ── TaskGroup factory ─────────────────────────────────────────────────────────
+# ── Tasks ───────────────────────────────────────────────────────────────────
 
 @task(task_id='init', pool=POOL_NAME)
 def _er_init(cfg, **context):
@@ -469,94 +467,92 @@ def _er_schedule_next(cfg, **context):
     )
     add_note(str(run_date), level='Task,DAG', title='Next run')
 
+# ── TaskGroup factory ─────────────────────────────────────────────────────────
 
-def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
+@task_group(group_id='er_export')
+def export_tg(cfg: dict, sql: str):
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
     from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
 
-    with TaskGroup(group_id=gid) as tg:
+    t_init       = _er_init(cfg=cfg)
+    t_build_meta = _er_build_meta(cfg=cfg)
 
-        t_init       = _er_init(cfg=cfg)
-        t_build_meta = _er_build_meta(cfg=cfg)
-
-        def _pre_execute_copy(context):
-            ti = context['ti']
-            dp = ti.xcom_pull(task_ids=f"{context['task'].task_group.group_id}.init")
-            op = context['task']
-            op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
-            raw_max_size = dp.get('max_file_size')
-            if str(raw_max_size).lower() in ('default', 'none', 'null', ''):
-                op.max_size = None
-            else:
-                try:
-                    op.max_size = int(raw_max_size)
-                except (ValueError, TypeError):
-                    logger.warning("Invalid max_file_size: %r, using None", raw_max_size)
-                    op.max_size = None
-            op.pg_array_format  = dp['pg_array_format'] == 'True'
-            op.xstream_sanitize = dp.get('xstream_sanitize', 'False') == 'True'
-            op.sanitize_array   = dp.get('sanitize_array', 'False') == 'True'
-            op.sanitize_list    = dp.get('sanitize_list') or ''
-            try:
-                op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}
-            except (ValueError, TypeError):
-                logger.warning("Unparseable format_params: %r", dp['format_params'])
-                op.format_params = {}
-
-        export_to_s3 = HrpClickNativeToS3ListOperator(
-            task_id='export_to_s3',
-            s3_bucket=BUCKET,
-            s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
-            sql=sql,
-            compression=None,
-            replace=True,
-            post_file_check=False,
-            pre_execute=_pre_execute_copy,
-            pool=POOL_NAME,
-        )
-
-        t_pack = _er_pack_zip(cfg=cfg)
-
-        notify_tfs = ProduceToTopicOperator(
-            task_id='notify_tfs',
-            topic="{{ params.topic }}",
-            producer_function=produce_msg,
-            producer_function_args=[cfg['scenario'], ''],
-            delivery_callback=ON_DELIVERY,
-            pool=POOL_NAME,
-            pre_execute=_pre_kafka(cfg['scenario']),
-        )
-
-        if not cfg.get('auto_confirm', 1):
-            from airflow.providers.apache.kafka.sensors.await_message import AwaitMessageSensor  # type: ignore
-
-            def _handle_confirm(message):
-                logger.info("Received confirmation from Kafka: %s", message.value())
-                return True
-
-            t_wait_confirm = AwaitMessageSensor(
-                task_id='wait_confirm',
-                kafka_config_id=cfg['kafka_in_conn'],
-                topics=[cfg['kafka_in_topic']],
-                apply_function=_handle_confirm,
-                poke_interval=60,
-                timeout=cfg.get('confirm_timeout', 3600),
-                mode='reschedule',
-                trigger_rule='none_failed',
-                pool=POOL_NAME,
-            )
+    def _pre_execute_copy(context):
+        ti = context['ti']
+        dp = ti.xcom_pull(task_ids=f"{context['task'].task_group.group_id}.init")
+        op = context['task']
+        op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
+        raw_max_size = dp.get('max_file_size')
+        if str(raw_max_size).lower() in ('default', 'none', 'null', ''):
+            op.max_size = None
         else:
-            from airflow.operators.empty import EmptyOperator  # type: ignore
-            t_wait_confirm = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME)
+            try:
+                op.max_size = int(raw_max_size)
+            except (ValueError, TypeError):
+                logger.warning("Invalid max_file_size: %r, using None", raw_max_size)
+                op.max_size = None
+        op.pg_array_format  = dp['pg_array_format'] == 'True'
+        op.xstream_sanitize = dp.get('xstream_sanitize', 'False') == 'True'
+        op.sanitize_array   = dp.get('sanitize_array', 'False') == 'True'
+        op.sanitize_list    = dp.get('sanitize_list') or ''
+        try:
+            op.format_params = ast.literal_eval(dp['format_params']) if dp['format_params'] else {}
+        except (ValueError, TypeError):
+            logger.warning("Unparseable format_params: %r", dp['format_params'])
+            op.format_params = {}
 
-        t_save     = _er_save_status(cfg=cfg)
-        t_schedule = _er_schedule_next(cfg=cfg)
+    export_to_s3 = HrpClickNativeToS3ListOperator(
+        task_id='export_to_s3',
+        s3_bucket=BUCKET,
+        s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
+        sql=sql,
+        compression=None,
+        replace=True,
+        post_file_check=False,
+        pre_execute=_pre_execute_copy,
+        pool=POOL_NAME,
+    )
 
-        t_init >> [t_build_meta, export_to_s3]
-        [t_build_meta, export_to_s3] >> t_pack
-        t_pack >> notify_tfs >> t_wait_confirm >> t_save >> t_schedule
+    t_pack = _er_pack_zip(cfg=cfg)
 
-    return tg
+    notify_tfs = ProduceToTopicOperator(
+        task_id='notify_tfs',
+        topic="{{ params.topic }}",
+        producer_function=produce_msg,
+        producer_function_args=[cfg['scenario'], ''],
+        delivery_callback=ON_DELIVERY,
+        pool=POOL_NAME,
+        pre_execute=_pre_kafka(cfg['scenario']),
+    )
+
+    if not cfg.get('auto_confirm', 1):
+        from airflow.providers.apache.kafka.sensors.await_message import AwaitMessageSensor  # type: ignore
+
+        def _handle_confirm(message):
+            logger.info("Received confirmation from Kafka: %s", message.value())
+            return True
+
+        t_wait_confirm = AwaitMessageSensor(
+            task_id='wait_confirm',
+            kafka_config_id=cfg['kafka_in_conn'],
+            topics=[cfg['kafka_in_topic']],
+            apply_function=_handle_confirm,
+            poke_interval=60,
+            timeout=cfg.get('confirm_timeout', 3600),
+            mode='reschedule',
+            trigger_rule='none_failed',
+            pool=POOL_NAME,
+        )
+    else:
+        from airflow.operators.empty import EmptyOperator  # type: ignore
+        t_wait_confirm = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME)
+
+    t_save     = _er_save_status(cfg=cfg)
+    t_schedule = _er_schedule_next(cfg=cfg)
+
+    t_init >> [t_build_meta, export_to_s3]
+    [t_build_meta, export_to_s3] >> t_pack
+    t_pack >> notify_tfs >> t_wait_confirm >> t_save >> t_schedule
 
 # ── DAG factory ───────────────────────────────────────────────────────────────
 
@@ -662,12 +658,16 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     )
 
     with dag:
-        export_tg(gid='er_export', cfg=cfg, sql=sql_export)
+        export_tg(cfg=cfg, sql=sql_export)
 
     return dag_id, dag
 
 
-wfs = ctl_obj_load(VAR_NAME)
+try:
+    wfs = ctl_obj_load(VAR_NAME)
+except Exception as e:
+    logger.error(f"Failed to load workflows from Variable {VAR_NAME}: {e}")
+    wfs = {}
 
 for table_key, params in wfs.items():
     try:

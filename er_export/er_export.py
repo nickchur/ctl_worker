@@ -597,7 +597,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     else:
         sql_reg, sql_cur = sql_reg_recent(tbl), None
 
-    dag_id = f"export_er__{replica}__{tbl}"
+    dag_id = f"export_er__{schema}__{tbl}"
     cfg = {
         'db':               db,
         'tbl':              tbl,

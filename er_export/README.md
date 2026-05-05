@@ -63,7 +63,7 @@ VALUES (
 1. **init** — читает состояние дельты из реестра (`export.extract_current_vw`), применяет параметры DAG-запуска (extract_time, condition, strategy и др.).
 2. **build_meta** — анализирует структуру таблицы через `DESCRIBE TABLE`, формирует `.meta` файл (JSON). Порядок колонок совпадает с порядком в CSV: `export_time` → поля таблицы → `ctl_action`, `ctl_validfrom`. Комментарии колонок ClickHouse переносятся в поле `description`.
 3. **export_to_s3** — стримит данные из ClickHouse напрямую в S3 (`HrpClickNativeToS3ListOperator`).
-4. **pack_zip** — скачивает CSV из S3, упаковывает вместе с `.meta` и `.tkt` в ZIP средствами stdlib (`zipfile`), загружает обратно в S3, удаляет исходный CSV.
+4. **pack_zip** — потоково упаковывает CSV (из S3), `.meta` и `.tkt` в ZIP через `stream_zip`; загружает результат в S3 через `load_file_obj` (boto3 TransferManager, multipart). CSV не загружается в память целиком. Исходный CSV-файл удаляется.
 5. **notify_tfs** — формирует XML и отправляет в Kafka (топик `TFS.HRPLT.IN`). В тестовом режиме (`ER_MODE=test`) пропускается.
 6. **wait_confirm** *(опционально)* — если `auto_confirm = 0`, ждёт подтверждения из Kafka (топик `TFS.HRPLT.OUT`). Иначе — `EmptyOperator`.
 7. **save_status** — записывает результат в историю (`export.extract_history`).
@@ -104,4 +104,4 @@ VALUES (
 
 - **Формат**: поддерживается только `TSVWithNames`.
 - **Тестовые среды**: на IFT/UAT/QA/DEV автоматически применяется `LIMIT 100`.
-- **Упаковка**: `pack_zip` читает CSV из S3 целиком в память и там же собирает ZIP — в пике воркер держит оба буфера одновременно. Для больших таблиц использовать `max_file_size` для разбивки на части.
+- **Упаковка**: `pack_zip` работает потоково — `stream_zip` генерирует ZIP чанками без буферизации всего файла, `load_file_obj` передаёт их в S3 через multipart upload. Для разбивки очень больших таблиц на части использовать `max_file_size`.

@@ -19,7 +19,7 @@ from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Param
 from airflow.utils.task_group import TaskGroup
 
-from er_export.er_config import get_config
+from er_export.er_config import get_config, get_dict
 from plugins.ctl_utils import ctl_obj_load
 from plugins.utils import add_note
 
@@ -190,13 +190,6 @@ def _format_cur(cur: dict) -> dict:
         'is_current':      'True' if cur['current_time'] == cur['extract_time'] else 'False',
         'recent_interval': '0',
     }
-
-def get_dict(ch_hook, sql: str) -> list[dict]:
-    res, cols = ch_hook.execute(sql, with_column_types=True)
-    if res:
-        cols = [col[0] for col in cols]
-        return [dict(zip(cols, row)) for row in res]
-    return []
 
 def parse_type(ch_type: str, type_map: dict) -> tuple[str, bool]:
     notnull = True

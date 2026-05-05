@@ -103,6 +103,14 @@ EXTRA_COLS = [
 POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
 
+def get_dict(ch_hook, sql: str) -> list[dict]:
+    res, cols = ch_hook.execute(sql, with_column_types=True)
+    if res:
+        cols = [col[0] for col in cols]
+        return [dict(zip(cols, row)) for row in res]
+    return []
+
+
 def _ensure_pool() -> None:
     from airflow.models import Pool
     from airflow.utils.session import create_session

@@ -7,8 +7,7 @@ from __future__ import annotations
 import pendulum
 from airflow.decorators import dag, task
 
-from er_export.er_config import get_config
-from er_export.er_export import get_dict
+from er_export.er_config import get_config, get_dict
 
 _cfg      = get_config()
 CH_ID     = _cfg['CH_ID']

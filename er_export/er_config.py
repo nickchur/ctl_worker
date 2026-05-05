@@ -106,6 +106,54 @@ EXTRA_COLS = EXTRA_COLS_PRE + EXTRA_COLS_SUF
 POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
 
+def obj_load(key: str, default: any = None) -> any:
+    """Loads an object from Airflow Variable (JSON)."""
+    from airflow.models import Variable
+    return Variable.get(key, default_var=default if default is not None else {}, deserialize_json=True)
+
+
+def obj_save(key: str, data: any) -> None:
+    """
+    Saves an object to Airflow Variable (JSON).
+    Compares with existing data to skip redundant writes.
+    Updates Variable description with metadata: {'ts': ..., 'len': ..., 'size': ...}.
+    """
+    from airflow.models import Variable
+    import json
+    import pendulum
+
+    # 1. Read and Compare
+    try:
+        old_val = Variable.get(key, default_var=None, deserialize_json=True)
+    except Exception:
+        old_val = None
+
+    new_json = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    old_json = json.dumps(old_val, sort_keys=True, ensure_ascii=False) if old_val is not None else None
+
+    if new_json == old_json:
+        return
+
+    # 2. Calculate Metadata
+    size_bytes = len(new_json.encode('utf-8'))
+    size_val = float(size_bytes)
+    unit = 'B'
+    for u in ['B', 'KB', 'MB', 'GB']:
+        if size_val < 1024.0:
+            unit = u
+            break
+        size_val /= 1024.0
+    
+    size_str = f"{size_val:.1f} {unit}"
+    length   = len(data) if isinstance(data, (dict, list)) else 1
+    ts       = pendulum.now().format('YYYY-MM-DD HH:mm:ss')
+    
+    desc = f"{{'ts': '{ts}', 'len': {length}, 'size': '{size_str}'}}"
+
+    # 3. Save
+    Variable.set(key, data, description=desc, serialize_json=True)
+
+
 def get_dict(ch_hook, sql: str) -> list[dict]:
     res, cols = ch_hook.execute(sql, with_column_types=True)
     if res:

@@ -17,8 +17,7 @@ from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Param
 
-from er_export.er_config import get_config, get_dict
-from plugins.ctl_utils import ctl_obj_load
+from er_export.er_config import get_config, get_dict, obj_load
 from plugins.utils import add_note
 
 logger = logging.getLogger("airflow.task")
@@ -505,7 +504,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
 # ── Dynamic DAG Registration ──────────────────────────────────────────────────
 
 try:
-    workflows = ctl_obj_load(VAR_NAME)
+    workflows = obj_load(VAR_NAME)
 except Exception as e:
     logger.error("Failed to load workflows: %s", e)
     workflows = {}

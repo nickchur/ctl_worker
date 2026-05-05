@@ -45,7 +45,7 @@ TOPIC  = 'TFS.HRPLT.IN'
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()
 
 TFS_MAP = {
-    "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er", "tfs_HRPLATFORM-2100"),
+    "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
 }
 
 DEF_ARGS = {
@@ -100,6 +100,19 @@ EXTRA_COLS = [
     {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
 ]
 
+POOL_NAME   = 'datalab_export_er'
+POOL_SLOTS  = 20
+
+def _ensure_pool() -> None:
+    from airflow.models import Pool
+    from airflow.utils.session import create_session
+    with create_session() as session:
+        if not session.query(Pool).filter(Pool.pool == POOL_NAME).first():
+            session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS, description='ER export pool'))
+
+_ensure_pool()
+
+
 def get_config() -> dict:
     return {
         'CH_ID':         CH_ID,
@@ -115,4 +128,6 @@ def get_config() -> dict:
         'TFS_MAP':       TFS_MAP,
         'S3_CONN':       S3_CONN,
         'VAR_NAME':      VAR_NAME,
+        'POOL_NAME':     POOL_NAME,
+        'POOL_SLOTS':    POOL_SLOTS,
     }

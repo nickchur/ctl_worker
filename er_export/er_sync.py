@@ -7,8 +7,15 @@ from __future__ import annotations
 import pendulum
 from airflow.decorators import dag, task
 
-from er_export.er_config import CH_ID, DEF_ARGS, MODE, VAR_NAME
-from er_export.er_core import get_dict
+from er_export.er_config import get_config
+from er_export.er_export import get_dict
+
+_cfg      = get_config()
+CH_ID     = _cfg['CH_ID']
+DEF_ARGS  = _cfg['DEF_ARGS']
+MODE      = _cfg['MODE']
+VAR_NAME  = _cfg['VAR_NAME']
+POOL_NAME = _cfg['POOL_NAME']
 from plugins.ctl_utils import ctl_obj_save
 
 from  logging import getLogger
@@ -28,7 +35,7 @@ logger = getLogger("airflow.task")
 )
 def er_sync_dag():
 
-    @task(task_id="sync")
+    @task(task_id="sync", pool=POOL_NAME)
     def sync():
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 

@@ -39,6 +39,7 @@ BUCKET        = _cfg['BUCKET']
 TFS_MAP       = _cfg['TFS_MAP']
 S3_CONN       = _cfg['S3_CONN']
 VAR_NAME      = _cfg['VAR_NAME']
+POOL_NAME     = _cfg['POOL_NAME']
 
 ON_DELIVERY = 'er_export.er_export.on_delivery'
 
@@ -247,7 +248,7 @@ def _pre_kafka(scenario: str):
 
 # ── TaskGroup factory ─────────────────────────────────────────────────────────
 
-def export_tg(gid: str, cfg: dict, sql: str, pool: str) -> TaskGroup:
+def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
     from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
 
@@ -445,7 +446,7 @@ def export_tg(gid: str, cfg: dict, sql: str, pool: str) -> TaskGroup:
             producer_function=produce_msg,
             producer_function_args=[cfg['scenario'], ''],
             delivery_callback=ON_DELIVERY,
-            pool=pool,
+            pool=POOL_NAME,
             pre_execute=_pre_kafka(cfg['scenario']),
         )
 
@@ -573,7 +574,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     if fmt != 'TSVWithNames':
         raise AirflowFailException(f"Unsupported format: {fmt!r}. Only TSVWithNames is supported.")
 
-    scen, prefix, pool = TFS_MAP[replica]
+    scen, prefix = TFS_MAP[replica]
     s3_prefix = f"{prefix}/{replica}"
 
     def _prepare_sql(sql_key):
@@ -626,13 +627,13 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             'strategy':        Param(params.get('strategy', 'FULL_UK'), type='string',         title='Strategy',           description='Стратегия слияния данных (FULL_UK, DELTA_UK и др.)'),
             'auto_confirm':    Param(bool(params.get('auto_confirm', 1)), type='boolean',      title='Auto confirm',       description='True = не ждать подтверждения из Kafka'),
             'max_file_size':   Param(None,                           type=['integer', 'null'], title='Max file size',      description='Максимальный размер одного CSV файла (байт). По умолчанию из реестра.'),
-            'pool':            Param(pool,                           type='string',            title='Kafka Pool',         description='Пул Airflow для задач Kafka'),
+            'pool':            Param(POOL_NAME,                      type='string',            title='Kafka Pool',         description='Пул Airflow для задач Kafka'),
             'topic':           Param(cfg['topic'],                   type='string',            title='Kafka Topic',        description='Топик для отправки уведомлений'),
         },
     )
 
     with dag:
-        export_tg(gid='er_export', cfg=cfg, sql=sql_export, pool=pool)
+        export_tg(gid='er_export', cfg=cfg, sql=sql_export)
 
     return dag_id, dag
 

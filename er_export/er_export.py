@@ -293,10 +293,12 @@ def _er_build_meta(cfg, **context):
     dp  = ti.xcom_pull(task_ids="init")
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
     rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
-    data_cols = []
+    
+    # columns info from CH
+    ch_cols = {}
     for row in rows:
         source_type, notnull = parse_type(row[1], TYPE_MAP)
-        data_cols.append({
+        ch_cols[row[0]] = {
             "column_name": row[0],
             "source_type": source_type,
             "length":      None,
@@ -304,7 +306,33 @@ def _er_build_meta(cfg, **context):
             "precision":   None,
             "scale":       None,
             "description": row[4] if len(row) > 4 and row[4] else None,
-        })
+        }
+    
+    # define final list of columns
+    fields = cfg.get('fields', ['*'])
+    if not fields or fields == ['*'] or fields == '*':
+        # use all columns from DESCRIBE in order
+        data_cols = [ch_cols[row[0]] for row in rows]
+    else:
+        # use specific columns in provided order
+        # handle potential 'as' in fields (simple heuristic)
+        data_cols = []
+        for f in fields:
+            name = f.split()[-1] if ' as ' in f.lower() else f
+            if name in ch_cols:
+                data_cols.append(ch_cols[name])
+            else:
+                # if not in CH (expression or technical field not handled by mandatory list), add a default entry
+                data_cols.append({
+                    "column_name": name,
+                    "source_type": "STRING",
+                    "length":      None,
+                    "notnull":     False,
+                    "precision":   None,
+                    "scale":       None,
+                    "description": f"Calculated field: {f}",
+                })
+
     columns = EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF
     meta = {
         "schema_name": cfg['schema_name'],
@@ -323,7 +351,7 @@ def _er_pack_zip(cfg, **context):
     from datetime import datetime
     from stat import S_IFREG
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-    from stream_zip import ZIP_32, stream_zip
+    from stream_zip import ZIP_32, stream_zip # type: ignore
 
     ti  = context["ti"]
 
@@ -478,11 +506,15 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     scen, prefix = TFS_MAP[replica]
     s3_prefix = f"{prefix}/{replica}"
 
+    fields = params.get("fields", [])
+    if not fields or fields == ['*'] or fields == '*':
+        fields = ['*']
+
     def _prepare_sql(sql_key):
         meta = params.get(sql_key)
         if isinstance(meta, dict) and "fields" not in meta:
             meta = dict(meta)
-            meta["fields"] = MANDATORY_PRE + params.get("fields", []) + MANDATORY_SUF
+            meta["fields"] = MANDATORY_PRE + fields + MANDATORY_SUF
         return build_sql(meta)
 
     sql_delta  = _prepare_sql('sql_stmt_export_delta')
@@ -533,6 +565,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'auto_confirm':     params.get('auto_confirm', 1),
         'confirm_timeout':  params.get('confirm_timeout', 3600),
         'strategy':         params.get('strategy', 'FULL_UK'),
+        'fields':           fields,
         'PK':               params.get('PK', []),
         'UK':               params.get('UK', []),
     }

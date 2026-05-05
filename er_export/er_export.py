@@ -177,7 +177,7 @@ def _er_init(cfg, **context):
     tf  = cfg.get('time_field', 'extract_time')
     lb  = cfg.get('lower_bound') or '1970-01-01 00:00:00'
     reg = {
-        'auto_confirm_delta': cfg.get('auto_confirm', 1),
+        'auto_confirm_delta': cfg.get('auto_confirm_delta', 0),
         'lower_bound':        f"'{lb}'",
         'selfrun_timeout':    str(cfg.get('selfrun_timeout', 10)),
         'compression_type':   cfg.get('compression_type', 'none'),
@@ -411,12 +411,13 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'db': db, 'tbl': tbl, 'dag_id': f"export_er__{schema}__{tbl}",
         'schema_name': schema, 'replica': replica, 'scenario': scen, 's3_prefix': f"{prefix}/{replica}",
         'sql_get_current':  sql_cur_delta(tbl) if sql_delta else None,
-        'sql_auto_confirm': f"INSERT INTO export.extract_history SELECT extract_name, extract_time, extract_count, loaded, sent, now(), increment, overlap, recent_interval, time_field, time_from, time_to, exported_files FROM export.extract_history_vw WHERE extract_name = '{tbl}' AND sent IS NOT NULL AND confirmed IS NULL",
+        'sql_auto_confirm': f"INSERT INTO export.extract_history (extract_name, extract_time, extract_count, loaded, sent, confirmed, increment, overlap, recent_interval, time_field, time_from, time_to, exported_files) SELECT extract_name, extract_time, extract_count, loaded, sent, now(), increment, overlap, recent_interval, time_field, time_from, time_to, exported_files FROM export.extract_history_vw WHERE extract_name = '{tbl}' AND sent IS NOT NULL AND confirmed IS NULL",
         'fields': fields, 'PK': params.get('PK', []), 'UK': params.get('UK', []),
         'topic': DEF_ARGS['topic'], 'kafka_in_conn': DEF_ARGS['kafka_in_conn'], 'kafka_in_topic': DEF_ARGS['kafka_in_topic'],
         'strategy':         p['strategy'],
-        'auto_confirm':     p['auto_confirm'],
-        'confirm_timeout':  p['confirm_timeout'],
+        'auto_confirm':       p['auto_confirm'],
+        'auto_confirm_delta': p['auto_confirm_delta'],
+        'confirm_timeout':    p['confirm_timeout'],
         'increment':        p['increment'],
         'selfrun_timeout':  p['selfrun_timeout'],
         'lower_bound':      p['lower_bound'],

@@ -52,7 +52,7 @@ def er_sync_dag():
 
         hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
 
-        if MODE == 'test':
+        if MODE == 'ALPHA':
             hook.execute("""
                 CREATE TABLE IF NOT EXISTS export.er_wf_meta
                 (
@@ -87,7 +87,7 @@ def er_sync_dag():
         )
 
         if not rows:
-            if MODE == 'test':
+            if MODE == 'ALPHA':
                 logger.warning("export.er_wf_meta is empty — skipping Variable update in test mode")
                 return
             raise ValueError("No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")

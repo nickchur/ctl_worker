@@ -79,6 +79,16 @@ def er_sync_dag():
                 return
             raise ValueError("No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")
 
+        # batch-fetch CH table comments for rows without description
+        no_desc = [(r["db_name"], r["extract_name"]) for r in rows if not r["description"]]
+        ch_comments: dict[tuple, str] = {}
+        if no_desc:
+            cond = " OR ".join(f"(database='{db}' AND name='{tbl}')" for db, tbl in no_desc)
+            ch_comments = {
+                (r["database"], r["name"]): r["comment"]
+                for r in get_dict(hook, f"SELECT database, name, comment FROM system.tables WHERE {cond}")
+            }
+
         wfs = {}
         for row in rows:
             table_key = f"{row['db_name']}.{row['extract_name']}"
@@ -101,8 +111,9 @@ def er_sync_dag():
             }
             if row["fields"]:
                 entry["fields"] = row["fields"]
-            if row["description"]:
-                entry["description"] = row["description"]
+            desc = row["description"] or ch_comments.get((row["db_name"], row["extract_name"]), "")
+            if desc:
+                entry["description"] = desc
 
             wfs[table_key] = entry
 

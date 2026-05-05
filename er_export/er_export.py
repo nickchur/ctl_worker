@@ -242,96 +242,243 @@ def _pre_kafka(scenario: str):
 
 # ── TaskGroup factory ─────────────────────────────────────────────────────────
 
+@task(task_id='init')
+def _er_init(cfg, **context):
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+    from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+    S3Hook(aws_conn_id=S3_CONN).create_bucket(bucket_name=BUCKET)
+    hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+    reg_res = get_dict(hook, cfg['sql_get_registry'])
+    if not reg_res:
+        raise AirflowFailException(f"No registry entry found for {cfg['tbl']}")
+    reg = reg_res[0]
+    if reg['auto_confirm_delta']:
+        hook.execute(cfg['sql_auto_confirm'])
+    if cfg['sql_get_current']:
+        cur_res = get_dict(hook, cfg['sql_get_current'])
+        if not cur_res:
+            raise AirflowFailException(f"No delta state found for {cfg['tbl']}")
+        cur = cur_res[0]
+        result = {**reg, **(cur if 'condition' in cur else _format_cur(cur))}
+    else:
+        result = reg
+    p = context['params']
+    if p.get('extract_time'):
+        result['extract_time'] = f"'{p['extract_time']}'"
+    if p.get('condition'):
+        result['condition'] = p['condition']
+    if p.get('is_current') is not None:
+        result['is_current'] = 'True' if p['is_current'] else 'False'
+    if p.get('increment') is not None:
+        result['increment'] = str(p['increment'])
+    if p.get('selfrun_timeout') is not None:
+        result['selfrun_timeout'] = str(p['selfrun_timeout'])
+    if p.get('strategy'):
+        result['strategy'] = p['strategy']
+    if p.get('auto_confirm') is not None:
+        result['auto_confirm'] = 1 if p['auto_confirm'] else 0
+    if p.get('max_file_size') is not None:
+        result['max_file_size'] = str(p['max_file_size'])
+    add_note(
+        {k: result.get(k) for k in (
+            'extract_time', 'condition', 'is_current', 'increment',
+            'selfrun_timeout', 'strategy', 'auto_confirm', 'max_file_size'
+        )},
+        level='Task,DAG', title='Delta',
+    )
+    return result
+
+
+@task(task_id='build_meta')
+def _er_build_meta(cfg, **context):
+    from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+    gid = context['task'].task_group.group_id
+    ti  = context['ti']
+    dp  = ti.xcom_pull(task_ids=f"{gid}.init")
+    hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+    rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
+    data_cols = []
+    for row in rows:
+        source_type, notnull = parse_type(row[1], TYPE_MAP)
+        data_cols.append({
+            "column_name": row[0],
+            "source_type": source_type,
+            "length":      None,
+            "notnull":     notnull,
+            "precision":   None,
+            "scale":       None,
+            "description": row[4] if len(row) > 4 and row[4] else None,
+        })
+    columns = EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF
+    meta = {
+        "schema_name": cfg['schema_name'],
+        "table_name":  cfg['tbl'],
+        "strategy":    dp.get('strategy', cfg['strategy']),
+        "PK":          cfg['PK'],
+        "UK":          cfg['UK'],
+        "params":      {"separation": "\t", "escapesymbol": "\""},
+        "columns":     columns,
+    }
+    context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
+
+
+@task(task_id='pack_zip')
+def _er_pack_zip(cfg, **context):
+    from datetime import datetime
+    from stat import S_IFREG
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+    from stream_zip import ZIP_32, stream_zip
+
+    gid = context['task'].task_group.group_id
+    ti  = context["ti"]
+
+    s3_key_list    = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='s3_key_list')
+    row_count_list = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='row_count_list')
+    meta_json_str  = ti.xcom_pull(task_ids=f"{gid}.build_meta",   key='meta_json')
+
+    if not s3_key_list or not row_count_list:
+        logger.warning("No CSV parts exported — skipping ZIP packaging")
+        ti.xcom_push(key="zip_name_list",    value=[])
+        ti.xcom_push(key="summary_tkt_name", value="")
+        ti.xcom_push(key="total_row_count",  value=0)
+        return
+
+    meta_bytes = meta_json_str.encode()
+    hook       = S3Hook(aws_conn_id=S3_CONN)
+    total      = len(s3_key_list)
+    base_ts    = pendulum.now("UTC")
+    uploaded_zips = []
+
+    class _Reader:
+        def __init__(self, gen):
+            self._it  = gen
+            self._buf = bytearray()
+
+        def read(self, n=-1):
+            if n < 0:
+                self._buf.extend(b''.join(self._it))
+                data, self._buf = bytes(self._buf), bytearray()
+                return data
+            while len(self._buf) < n:
+                try:
+                    self._buf.extend(next(self._it))
+                except StopIteration:
+                    break
+            chunk, self._buf = bytes(self._buf[:n]), self._buf[n:]
+            return chunk
+
+    for i, (s3_key, row_count) in enumerate(zip(s3_key_list, row_count_list)):
+        rows     = int(row_count)
+        part     = i + 1
+        inner_ts = base_ts.add(seconds=i * 2    ).format("YYYYMMDDHHmmss")
+        tkt_ts   = base_ts.add(seconds=i * 2 + 1).format("YYYYMMDDHHmmss")
+        outer_ts = base_ts.add(seconds=i * 2 + 2).format("YYYYMMDDHHmmss")
+
+        csv_name  = f"{cfg['schema_name']}__{cfg['tbl']}__{inner_ts}__{part}_{total}_{rows}.csv"
+        meta_name = f"{cfg['schema_name']}__{cfg['tbl']}__{inner_ts}__{part}_{total}_{rows}.meta"
+        tkt_name  = f"{cfg['replica']}__{tkt_ts}.tkt"
+        zip_name  = f"{cfg['replica']}__{outer_ts}__{cfg['tbl']}__{part}_{total}_{rows}.csv.zip"
+        zip_s3_key = f"{cfg['s3_prefix']}/{zip_name}"
+
+        tkt_bytes = f"{csv_name};{rows}".encode()
+        s3_body   = hook.get_key(key=s3_key, bucket_name=BUCKET).get()["Body"]
+
+        now = datetime.now()
+        members = [
+            (tkt_name,  now, S_IFREG | 0o600, ZIP_32, [tkt_bytes]),
+            (meta_name, now, S_IFREG | 0o600, ZIP_32, [meta_bytes]),
+            (csv_name,  now, S_IFREG | 0o600, ZIP_32,
+             s3_body.iter_chunks(chunk_size=8 * 1024 * 1024)),
+        ]
+        hook.load_file_obj(
+            _Reader(stream_zip(members)),
+            key=zip_s3_key,
+            bucket_name=BUCKET,
+            replace=True,
+        )
+        hook.delete_objects(bucket=BUCKET, keys=[s3_key])
+        uploaded_zips.append(zip_name)
+        logger.info("Packaged %d/%d: %s", part, total, zip_name)
+
+    summary_ts  = base_ts.add(seconds=(total - 1) * 2 + 3).format("YYYYMMDDHHmmss")
+    summary_tkt = f"{cfg['replica']}__{summary_ts}.tkt"
+    hook.load_bytes(
+        "\n".join(uploaded_zips).encode(),
+        key=f"{cfg['s3_prefix']}/{summary_tkt}",
+        bucket_name=BUCKET,
+        replace=True,
+    )
+    logger.info("Created summary tkt: %s", summary_tkt)
+
+    total_rows = sum(int(r) for r in row_count_list)
+    add_note({'rows': total_rows, 'parts': total, 'files': uploaded_zips}, level='Task,DAG', title='Exported')
+    ti.xcom_push(key="zip_name_list",    value=uploaded_zips)
+    ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
+    ti.xcom_push(key="total_row_count",  value=total_rows)
+
+
+@task(task_id='save_status', trigger_rule='none_failed_min_one_success')
+def _er_save_status(cfg, **context):
+    from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+    gid        = context['task'].task_group.group_id
+    ti         = context['ti']
+    dp         = ti.xcom_pull(task_ids=f"{gid}.init")
+    total_rows = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='total_row_count')
+    zip_names  = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='zip_name_list')
+    hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+    zip_arr = "[" + ", ".join(f"'{z}'" for z in (zip_names or [])) + "]"
+    hook.execute(f"""
+        insert into export.extract_history (
+            extract_name, extract_time, extract_count,
+            loaded, sent, confirmed,
+            increment, overlap, recent_interval,
+            time_field, time_from, time_to, exported_files
+        ) select
+            '{cfg['tbl']}',
+            {dp['extract_time']},
+            {total_rows},
+            now(), now(), null,
+            {dp['increment']}, {dp['overlap']}, {dp['recent_interval']},
+            {dp['time_field']}, {dp['time_from']}, {dp['time_to']},
+            {zip_arr}
+    """)
+    add_note({'rows': total_rows, 'files': zip_names}, level='Task', title='Saved')
+
+
+@task(task_id='schedule_next')
+def _er_schedule_next(cfg, **context):
+    from airflow.models import DagBag
+    from airflow.utils.types import DagRunType
+    from airflow.utils.state import DagRunState
+    gid = context['task'].task_group.group_id
+    ti  = context['ti']
+    dp  = ti.xcom_pull(task_ids=f"{gid}.init")
+    if str(dp['is_current']).lower() in ('true', 't', '1'):
+        add_note('already current', level='Task,DAG', title='Schedule')
+        return
+    run_date = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
+    dag_obj = DagBag().get_dag(cfg['dag_id'])
+    dag_obj.create_dagrun(
+        run_type=DagRunType.MANUAL,
+        execution_date=run_date,
+        state=DagRunState.QUEUED,
+        external_trigger=True,
+    )
+    add_note(str(run_date), level='Task,DAG', title='Next run')
+
+
 def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator  # type: ignore
     from hrp_operators import HrpClickNativeToS3ListOperator  # type: ignore
 
     with TaskGroup(group_id=gid) as tg:
 
-        @task(task_id='init')
-        def init(cfg, **context):
-            from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-            from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-            S3Hook(aws_conn_id=S3_CONN).create_bucket(bucket_name=BUCKET)
-            hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-            reg_res = get_dict(hook, cfg['sql_get_registry'])
-            if not reg_res:
-                raise AirflowFailException(f"No registry entry found for {cfg['tbl']}")
-            reg = reg_res[0]
-            if reg['auto_confirm_delta']:
-                hook.execute(cfg['sql_auto_confirm'])
-            if cfg['sql_get_current']:
-                cur_res = get_dict(hook, cfg['sql_get_current'])
-                if not cur_res:
-                    raise AirflowFailException(f"No delta state found for {cfg['tbl']}")
-                cur = cur_res[0]
-                result = {**reg, **(cur if 'condition' in cur else _format_cur(cur))}
-            else:
-                result = reg
-            p = context['params']
-            if p.get('extract_time'):
-                result['extract_time'] = f"'{p['extract_time']}'"
-            if p.get('condition'):
-                result['condition'] = p['condition']
-            if p.get('is_current') is not None:
-                result['is_current'] = 'True' if p['is_current'] else 'False'
-            if p.get('increment') is not None:
-                result['increment'] = str(p['increment'])
-            if p.get('selfrun_timeout') is not None:
-                result['selfrun_timeout'] = str(p['selfrun_timeout'])
-            if p.get('strategy'):
-                result['strategy'] = p['strategy']
-            if p.get('auto_confirm') is not None:
-                result['auto_confirm'] = 1 if p['auto_confirm'] else 0
-            if p.get('max_file_size') is not None:
-                result['max_file_size'] = str(p['max_file_size'])
-            add_note(
-                {k: result.get(k) for k in (
-                    'extract_time', 'condition', 'is_current', 'increment',
-                    'selfrun_timeout', 'strategy', 'auto_confirm', 'max_file_size'
-                )},
-                level='Task,DAG', title='Delta',
-            )
-            return result
-
-        t_init = init(cfg=cfg)
-
-        @task(task_id='build_meta')
-        def build_meta(cfg, **context):
-            from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-            ti = context['ti']
-            dp = ti.xcom_pull(task_ids=f"{gid}.init")
-            hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-            rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
-            data_cols = []
-            for row in rows:
-                source_type, notnull = parse_type(row[1], TYPE_MAP)
-                data_cols.append({
-                    "column_name": row[0],
-                    "source_type": source_type,
-                    "length":      None,
-                    "notnull":     notnull,
-                    "precision":   None,
-                    "scale":       None,
-                    "description": row[4] if len(row) > 4 and row[4] else None,
-                })
-            columns = EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF
-            meta = {
-                "schema_name": cfg['schema_name'],
-                "table_name":  cfg['tbl'],
-                "strategy":    dp.get('strategy', cfg['strategy']),
-                "PK":          cfg['PK'],
-                "UK":          cfg['UK'],
-                "params":      {"separation": "\t", "escapesymbol": "\""},
-                "columns":     columns,
-            }
-            context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
-
-        t_build_meta = build_meta(cfg=cfg)
+        t_init       = _er_init(cfg=cfg)
+        t_build_meta = _er_build_meta(cfg=cfg)
 
         def _pre_execute_copy(context):
             ti = context['ti']
-            dp = ti.xcom_pull(task_ids=f"{gid}.init")
+            dp = ti.xcom_pull(task_ids=f"{context['task'].task_group.group_id}.init")
             op = context['task']
             op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
             raw_max_size = dp.get('max_file_size')
@@ -364,101 +511,7 @@ def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
             pre_execute=_pre_execute_copy,
         )
 
-        @task(task_id='pack_zip')
-        def pack_zip(cfg, **context):
-            from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-            ti = context["ti"]
-
-            s3_key_list    = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='s3_key_list')
-            row_count_list = ti.xcom_pull(task_ids=f"{gid}.export_to_s3", key='row_count_list')
-            meta_json_str  = ti.xcom_pull(task_ids=f"{gid}.build_meta",   key='meta_json')
-
-            if not s3_key_list or not row_count_list:
-                logger.warning("No CSV parts exported — skipping ZIP packaging")
-                ti.xcom_push(key="zip_name_list",    value=[])
-                ti.xcom_push(key="summary_tkt_name", value="")
-                ti.xcom_push(key="total_row_count",  value=0)
-                return
-
-            from datetime import datetime
-            from stat import S_IFREG
-            from stream_zip import ZIP_32, stream_zip
-
-            meta_bytes = meta_json_str.encode()
-            hook       = S3Hook(aws_conn_id=S3_CONN)
-            total      = len(s3_key_list)
-            base_ts    = pendulum.now("UTC")
-            uploaded_zips = []
-
-            class _Reader:
-                """Wrap stream_zip generator as file-like object for load_file_obj."""
-                def __init__(self, gen):
-                    self._it  = gen
-                    self._buf = bytearray()
-
-                def read(self, n=-1):
-                    if n < 0:
-                        self._buf.extend(b''.join(self._it))
-                        data, self._buf = bytes(self._buf), bytearray()
-                        return data
-                    while len(self._buf) < n:
-                        try:
-                            self._buf.extend(next(self._it))
-                        except StopIteration:
-                            break
-                    chunk, self._buf = bytes(self._buf[:n]), self._buf[n:]
-                    return chunk
-
-            for i, (s3_key, row_count) in enumerate(zip(s3_key_list, row_count_list)):
-                rows     = int(row_count)
-                part     = i + 1
-                inner_ts = base_ts.add(seconds=i * 2    ).format("YYYYMMDDHHmmss")
-                tkt_ts   = base_ts.add(seconds=i * 2 + 1).format("YYYYMMDDHHmmss")
-                outer_ts = base_ts.add(seconds=i * 2 + 2).format("YYYYMMDDHHmmss")
-
-                csv_name  = f"{cfg['schema_name']}__{cfg['tbl']}__{inner_ts}__{part}_{total}_{rows}.csv"
-                meta_name = f"{cfg['schema_name']}__{cfg['tbl']}__{inner_ts}__{part}_{total}_{rows}.meta"
-                tkt_name  = f"{cfg['replica']}__{tkt_ts}.tkt"
-                zip_name  = f"{cfg['replica']}__{outer_ts}__{cfg['tbl']}__{part}_{total}_{rows}.csv.zip"
-                zip_s3_key = f"{cfg['s3_prefix']}/{zip_name}"
-
-                tkt_bytes = f"{csv_name};{rows}".encode()
-                s3_body   = hook.get_key(key=s3_key, bucket_name=BUCKET).get()["Body"]
-
-                now = datetime.now()
-                members = [
-                    (tkt_name,  now, S_IFREG | 0o600, ZIP_32, [tkt_bytes]),
-                    (meta_name, now, S_IFREG | 0o600, ZIP_32, [meta_bytes]),
-                    (csv_name,  now, S_IFREG | 0o600, ZIP_32,
-                     s3_body.iter_chunks(chunk_size=8 * 1024 * 1024)),
-                ]
-                hook.load_file_obj(
-                    _Reader(stream_zip(members)),
-                    key=zip_s3_key,
-                    bucket_name=BUCKET,
-                    replace=True,
-                )
-                hook.delete_objects(bucket=BUCKET, keys=[s3_key])
-                uploaded_zips.append(zip_name)
-                logger.info("Packaged %d/%d: %s", part, total, zip_name)
-
-            summary_ts  = base_ts.add(seconds=(total - 1) * 2 + 3).format("YYYYMMDDHHmmss")
-            summary_tkt = f"{cfg['replica']}__{summary_ts}.tkt"
-            hook.load_bytes(
-                "\n".join(uploaded_zips).encode(),
-                key=f"{cfg['s3_prefix']}/{summary_tkt}",
-                bucket_name=BUCKET,
-                replace=True,
-            )
-            logger.info("Created summary tkt: %s", summary_tkt)
-
-            total_rows = sum(int(r) for r in row_count_list)
-            add_note({'rows': total_rows, 'parts': total, 'files': uploaded_zips}, level='Task,DAG', title='Exported')
-            ti.xcom_push(key="zip_name_list",    value=uploaded_zips)
-            ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
-            ti.xcom_push(key="total_row_count",  value=total_rows)
-
-        t_pack = pack_zip(cfg=cfg)
+        t_pack = _er_pack_zip(cfg=cfg)
 
         notify_tfs = ProduceToTopicOperator(
             task_id='notify_tfs',
@@ -491,55 +544,8 @@ def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
             from airflow.operators.empty import EmptyOperator  # type: ignore
             t_wait_confirm = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed')
 
-        @task(task_id='save_status', trigger_rule='none_failed_min_one_success')
-        def save_status(cfg, **context):
-            from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-            ti         = context['ti']
-            dp         = ti.xcom_pull(task_ids=f"{gid}.init")
-            total_rows = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='total_row_count')
-            zip_names  = ti.xcom_pull(task_ids=f"{gid}.pack_zip", key='zip_name_list')
-            hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-            zip_arr = "[" + ", ".join(f"'{z}'" for z in (zip_names or [])) + "]"
-            hook.execute(f"""
-                insert into export.extract_history (
-                    extract_name, extract_time, extract_count,
-                    loaded, sent, confirmed,
-                    increment, overlap, recent_interval,
-                    time_field, time_from, time_to, exported_files
-                ) select
-                    '{cfg['tbl']}',
-                    {dp['extract_time']},
-                    {total_rows},
-                    now(), now(), null,
-                    {dp['increment']}, {dp['overlap']}, {dp['recent_interval']},
-                    {dp['time_field']}, {dp['time_from']}, {dp['time_to']},
-                    {zip_arr}
-            """)
-            add_note({'rows': total_rows, 'files': zip_names}, level='Task', title='Saved')
-
-        t_save = save_status(cfg=cfg)
-
-        @task(task_id='schedule_next')
-        def schedule_next(cfg, **context):
-            from airflow.models import DagBag
-            from airflow.utils.types import DagRunType
-            from airflow.utils.state import DagRunState
-            ti = context['ti']
-            dp = ti.xcom_pull(task_ids=f"{gid}.init")
-            if str(dp['is_current']).lower() in ('true', 't', '1'):
-                add_note('already current', level='Task,DAG', title='Schedule')
-                return
-            run_date = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
-            dag_obj = DagBag().get_dag(cfg['dag_id'])
-            dag_obj.create_dagrun(
-                run_type=DagRunType.MANUAL,
-                execution_date=run_date,
-                state=DagRunState.QUEUED,
-                external_trigger=True,
-            )
-            add_note(str(run_date), level='Task,DAG', title='Next run')
-
-        t_schedule = schedule_next(cfg=cfg)
+        t_save     = _er_save_status(cfg=cfg)
+        t_schedule = _er_schedule_next(cfg=cfg)
 
         t_init >> [t_build_meta, export_to_s3]
         [t_build_meta, export_to_s3] >> t_pack

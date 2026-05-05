@@ -94,11 +94,14 @@ TYPE_MAP: dict[str, str] = {
 MANDATORY_PRE = ["{export_time} as export_time"]
 MANDATORY_SUF = ["'I' as ctl_action", "now() as ctl_validfrom"]
 
-EXTRA_COLS = [
-    {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
-    {"column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None},
-    {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None},
+EXTRA_COLS_PRE = [
+    {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
+EXTRA_COLS_SUF = [
+    {"column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None, "description": None},
+    {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
+]
+EXTRA_COLS = EXTRA_COLS_PRE + EXTRA_COLS_SUF
 
 POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
@@ -127,7 +130,9 @@ def get_config() -> dict:
         'TYPE_MAP':      TYPE_MAP,
         'DEF_ARGS':      DEF_ARGS,
         'ENV_STAND':     ENV_STAND,
-        'EXTRA_COLS':    EXTRA_COLS,
+        'EXTRA_COLS':     EXTRA_COLS,
+        'EXTRA_COLS_PRE': EXTRA_COLS_PRE,
+        'EXTRA_COLS_SUF': EXTRA_COLS_SUF,
         'MANDATORY_PRE': MANDATORY_PRE,
         'MANDATORY_SUF': MANDATORY_SUF,
         'MODE':          MODE,

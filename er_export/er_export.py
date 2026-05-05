@@ -30,7 +30,9 @@ CH_ID         = _cfg['CH_ID']
 TYPE_MAP      = _cfg['TYPE_MAP']
 DEF_ARGS      = _cfg['DEF_ARGS']
 ENV_STAND     = _cfg['ENV_STAND']
-EXTRA_COLS    = _cfg['EXTRA_COLS']
+EXTRA_COLS     = _cfg['EXTRA_COLS']
+EXTRA_COLS_PRE = _cfg['EXTRA_COLS_PRE']
+EXTRA_COLS_SUF = _cfg['EXTRA_COLS_SUF']
 MANDATORY_PRE = _cfg['MANDATORY_PRE']
 MANDATORY_SUF = _cfg['MANDATORY_SUF']
 MODE          = _cfg['MODE']
@@ -302,18 +304,19 @@ def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
             dp = ti.xcom_pull(task_ids=f"{gid}.init")
             hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
             rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
-            columns = []
+            data_cols = []
             for row in rows:
                 source_type, notnull = parse_type(row[1], TYPE_MAP)
-                columns.append({
+                data_cols.append({
                     "column_name": row[0],
                     "source_type": source_type,
                     "length":      None,
                     "notnull":     notnull,
                     "precision":   None,
                     "scale":       None,
+                    "description": row[4] if len(row) > 4 and row[4] else None,
                 })
-            columns.extend(cfg['extra_columns'])
+            columns = EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF
             meta = {
                 "schema_name": cfg['schema_name'],
                 "table_name":  cfg['tbl'],
@@ -586,7 +589,6 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         """,
         'sql_get_registry': sql_reg,
         'sql_get_current':  sql_cur,
-        'extra_columns':    EXTRA_COLS,
         'auto_confirm':     params.get('auto_confirm', 1),
         'strategy':         params.get('strategy', 'FULL_UK'),
         'PK':               params.get('PK', []),

@@ -13,10 +13,10 @@ VAULT_PATH = '/vault/secrets/application'
 CH_BD      = 'export'
 VAR_NAME = "datalab_er_wfs"
 
-# ER_MODE=test включает тестовый CH-коннект из vault; по умолчанию — prod
-MODE = os.getenv("ER_MODE", "prod" if not os.getenv("AIRFLOW__CTL_PIN") else "test")
+# ER_MODE включает тестовый CH-коннект из vault; по умолчанию — SIGMA/ALPHA
+MODE = os.getenv("ER_MODE", "SIGMA" if not os.getenv("AIRFLOW__CTL_PIN") else "ALPHA")
 
-if MODE == 'test':
+if MODE == 'ALPHA':
     CH_ID = 'dlab-click-test'
     with open(VAULT_PATH) as f:
         secrets = json.load(f)
@@ -152,6 +152,60 @@ def obj_save(key: str, data: any) -> None:
 
     # 3. Save
     Variable.set(key, data, description=desc, serialize_json=True)
+
+
+def add_note(msg, context=None, level='task', add=True, title='', compact=False):
+    """
+    Structured notes in Airflow UI (DAG/Task).
+    Copied from plugins.utils to remove external dependency.
+    """
+    from airflow.utils.session import create_session
+    from airflow.operators.python import get_current_context
+    from pprint import PrettyPrinter
+    import logging
+
+    logger = logging.getLogger("airflow.task")
+    MAX_NOTE_LEN = 1000
+
+    if not context:
+        try:
+            context = get_current_context()
+        except Exception:
+            logger.warning("Could not get Airflow context for add_note")
+            return
+        
+    if isinstance(msg, dict) and len(msg) == 1:
+        t, msg = next(iter(msg.items()))
+        title += str(t) + (f' ({len(msg)})' if isinstance(msg, (dict, list, tuple, set)) else '')
+                    
+    if not isinstance(msg, str):
+        msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
+        msg = '```\n' + msg + '\n```'
+
+    logger.info(f"📝 Note added to {level} {title}:\n{msg}")
+    
+    with create_session() as session:
+        for l in list(set(level.upper().split(',')))[:2]:
+            new_note = msg.strip()
+            if l == 'DAG':
+                obj = session.merge(context['dag_run'])
+            else:
+                obj = session.merge(context['task_instance'])
+            session.expire(obj)
+            
+            if title:
+                import unicodedata
+                if not (title and unicodedata.category(title[0]) == 'So'):
+                    title = "📝 " + title
+                new_note = f"{title}\n---\n{new_note}"
+
+            if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
+                continue
+                
+            if add:
+                new_note = f"{new_note}\n\n---\n{obj.note if obj.note else ''}"
+                
+            obj.note = new_note[:MAX_NOTE_LEN]
 
 
 def get_dict(ch_hook, sql: str) -> list[dict]:

@@ -17,8 +17,7 @@ from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Param
 
-from er_export.er_config import get_config, get_dict, obj_load
-from plugins.utils import add_note
+from er_export.er_config import get_config, get_dict, obj_load, add_note
 
 logger = logging.getLogger("airflow.task")
 
@@ -226,6 +225,18 @@ def on_delivery(err: Exception | None, msg) -> None:
     if err: raise AirflowFailException(f"Kafka delivery failed: {err}")
     logger.info("Message delivered to %s [%s]", msg.topic(), msg.partition())
 
+
+def _pre_kafka(scenario: str):
+    """Factory for Kafka pre-execution logic: checks if data was actually exported."""
+    def pre_execute(context):
+        if MODE != 'SIGMA':
+            raise AirflowSkipException("Kafka notification skipped in test mode")
+        summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
+        if not summary_tkt:
+            raise AirflowSkipException("No data exported, skipping notification")
+        context['task'].producer_function_args = [scenario, summary_tkt]
+    return pre_execute
+
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
 @task(task_id='init', pool=POOL_NAME)
@@ -413,7 +424,9 @@ def _er_schedule_next(cfg, **context):
 
 def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     """Generates a dynamic Airflow DAG from metadata."""
+    from airflow.operators.empty import EmptyOperator # type: ignore
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator # type: ignore
+    from airflow.providers.apache.kafka.sensors.await_message import AwaitMessageSensor # type: ignore
     from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
 
     db, tbl = table_key.split(".", maxsplit=1)

@@ -522,44 +522,8 @@ def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
 
 # ── DAG factory ───────────────────────────────────────────────────────────────
 
-def _build_dag_cfg(table_key: str, params: dict, tbl: str, replica: str, schema: str,
-                   scen: str, s3_prefix: str, sql_reg: str, sql_cur) -> dict:
-    return {
-        'db':               table_key.split(".", maxsplit=1)[0],
-        'tbl':              tbl,
-        'dag_id':           f"export_er__{replica}__{tbl}",
-        'schema_name':      schema,
-        'replica':          replica,
-        'scenario':         scen,
-        's3_prefix':        s3_prefix,
-        'bucket':           BUCKET,
-        'topic':            DEF_ARGS['topic'],
-        'kafka_in_conn':    DEF_ARGS['kafka_in_conn'],
-        'kafka_in_topic':   DEF_ARGS['kafka_in_topic'],
-        'sql_auto_confirm': f"""
-            insert into export.extract_history (
-                extract_name, extract_time, extract_count, loaded, sent, confirmed,
-                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
-            )
-            select
-                extract_name, extract_time, extract_count, loaded, sent, now(),
-                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
-            from export.extract_history_vw
-            where extract_name = '{tbl}'
-                  and sent is not null and confirmed is null
-        """,
-        'sql_get_registry': sql_reg,
-        'sql_get_current':  sql_cur,
-        'extra_columns':    EXTRA_COLS,
-        'auto_confirm':     params.get('auto_confirm', 1),
-        'strategy':         params.get('strategy', 'FULL_UK'),
-        'PK':               params.get('PK', []),
-        'UK':               params.get('UK', []),
-    }
-
-
 def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
-    _, tbl  = table_key.split(".", maxsplit=1)
+    db, tbl = table_key.split(".", maxsplit=1)
     replica = params['replica']
     schema  = params['schema']
     fmt     = params.get('format', 'TSVWithNames')
@@ -595,8 +559,39 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     else:
         sql_reg, sql_cur = sql_reg_recent(tbl), None
 
-    cfg    = _build_dag_cfg(table_key, params, tbl, replica, schema, scen, s3_prefix, sql_reg, sql_cur)
-    dag_id = cfg['dag_id']
+    dag_id = f"export_er__{replica}__{tbl}"
+    cfg = {
+        'db':               db,
+        'tbl':              tbl,
+        'dag_id':           dag_id,
+        'schema_name':      schema,
+        'replica':          replica,
+        'scenario':         scen,
+        's3_prefix':        s3_prefix,
+        'bucket':           BUCKET,
+        'topic':            DEF_ARGS['topic'],
+        'kafka_in_conn':    DEF_ARGS['kafka_in_conn'],
+        'kafka_in_topic':   DEF_ARGS['kafka_in_topic'],
+        'sql_auto_confirm': f"""
+            insert into export.extract_history (
+                extract_name, extract_time, extract_count, loaded, sent, confirmed,
+                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
+            )
+            select
+                extract_name, extract_time, extract_count, loaded, sent, now(),
+                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
+            from export.extract_history_vw
+            where extract_name = '{tbl}'
+                  and sent is not null and confirmed is null
+        """,
+        'sql_get_registry': sql_reg,
+        'sql_get_current':  sql_cur,
+        'extra_columns':    EXTRA_COLS,
+        'auto_confirm':     params.get('auto_confirm', 1),
+        'strategy':         params.get('strategy', 'FULL_UK'),
+        'PK':               params.get('PK', []),
+        'UK':               params.get('UK', []),
+    }
 
     dag = DAG(
         dag_id=dag_id,

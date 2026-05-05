@@ -9,8 +9,9 @@ import json
 import logging
 import time
 import uuid
+import os
+import threading
 import zipfile
-from io import BytesIO
 
 import pendulum
 from airflow import DAG
@@ -381,11 +382,27 @@ def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
                 ti.xcom_push(key="total_row_count",  value=0)
                 return
 
-            meta_bytes    = meta_json_str.encode()
-            hook          = S3Hook(aws_conn_id=S3_CONN)
-            total         = len(s3_key_list)
-            base_ts       = pendulum.now("UTC")
+            meta_bytes = meta_json_str.encode()
+            hook       = S3Hook(aws_conn_id=S3_CONN)
+            s3_client  = hook.get_conn()
+            total      = len(s3_key_list)
+            base_ts    = pendulum.now("UTC")
             uploaded_zips = []
+            MIN_PART = 5 * 1024 * 1024  # S3 minimum multipart part size
+
+            def _produce(write_fd, s3_body, tkt_name, tkt_bytes, csv_name, meta_name, exc_box):
+                try:
+                    with os.fdopen(write_fd, 'wb') as wp:
+                        with zipfile.ZipFile(wp, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                            with zf.open(tkt_name, 'w') as f:
+                                f.write(tkt_bytes)
+                            with zf.open(meta_name, 'w') as f:
+                                f.write(meta_bytes)
+                            with zf.open(csv_name, 'w') as f:
+                                for chunk in s3_body.iter_chunks(chunk_size=8 * 1024 * 1024):
+                                    f.write(chunk)
+                except Exception as e:
+                    exc_box.append(e)
 
             for i, (s3_key, row_count) in enumerate(zip(s3_key_list, row_count_list)):
                 rows     = int(row_count)
@@ -398,22 +415,61 @@ def export_tg(gid: str, cfg: dict, sql: str) -> TaskGroup:
                 meta_name = f"{cfg['schema_name']}__{cfg['tbl']}__{inner_ts}__{part}_{total}_{rows}.meta"
                 tkt_name  = f"{cfg['replica']}__{tkt_ts}.tkt"
                 zip_name  = f"{cfg['replica']}__{outer_ts}__{cfg['tbl']}__{part}_{total}_{rows}.csv.zip"
+                zip_s3_key = f"{cfg['s3_prefix']}/{zip_name}"
 
                 tkt_bytes = f"{csv_name};{rows}".encode()
-                csv_bytes = hook.get_key(key=s3_key, bucket_name=BUCKET).get()["Body"].read()
+                s3_body   = hook.get_key(key=s3_key, bucket_name=BUCKET).get()["Body"]
 
-                buf = BytesIO()
-                with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr(tkt_name,  tkt_bytes)
-                    zf.writestr(csv_name,  csv_bytes)
-                    zf.writestr(meta_name, meta_bytes)
-
-                hook.load_bytes(
-                    bytes_data=buf.getvalue(),
-                    key=f"{cfg['s3_prefix']}/{zip_name}",
-                    bucket_name=BUCKET,
-                    replace=True,
+                read_fd, write_fd = os.pipe()
+                exc_box  = []
+                producer = threading.Thread(
+                    target=_produce,
+                    args=(write_fd, s3_body, tkt_name, tkt_bytes, csv_name, meta_name, exc_box),
+                    daemon=True,
                 )
+                producer.start()
+
+                mpu = s3_client.create_multipart_upload(Bucket=BUCKET, Key=zip_s3_key)
+                upload_id = mpu['UploadId']
+                parts, part_num, buf = [], 0, bytearray()
+
+                try:
+                    with os.fdopen(read_fd, 'rb') as rp:
+                        while chunk := rp.read(MIN_PART):
+                            buf.extend(chunk)
+                            while len(buf) >= MIN_PART:
+                                part_num += 1
+                                resp = s3_client.upload_part(
+                                    Bucket=BUCKET, Key=zip_s3_key,
+                                    UploadId=upload_id, PartNumber=part_num,
+                                    Body=bytes(buf[:MIN_PART]),
+                                )
+                                parts.append({'PartNumber': part_num, 'ETag': resp['ETag']})
+                                del buf[:MIN_PART]
+
+                    producer.join()
+                    if exc_box:
+                        raise exc_box[0]
+
+                    if buf:
+                        part_num += 1
+                        resp = s3_client.upload_part(
+                            Bucket=BUCKET, Key=zip_s3_key,
+                            UploadId=upload_id, PartNumber=part_num,
+                            Body=bytes(buf),
+                        )
+                        parts.append({'PartNumber': part_num, 'ETag': resp['ETag']})
+
+                    s3_client.complete_multipart_upload(
+                        Bucket=BUCKET, Key=zip_s3_key,
+                        UploadId=upload_id,
+                        MultipartUpload={'Parts': parts},
+                    )
+                except Exception:
+                    s3_client.abort_multipart_upload(Bucket=BUCKET, Key=zip_s3_key, UploadId=upload_id)
+                    producer.join()
+                    raise
+
                 hook.delete_objects(bucket=BUCKET, keys=[s3_key])
                 uploaded_zips.append(zip_name)
                 logger.info("Packaged %d/%d: %s", part, total, zip_name)

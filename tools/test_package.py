@@ -80,12 +80,37 @@ def tools_test_package():
         s3_prefix = (p["s3_prefix"] or "").rstrip("/")
         bucket = p["bucket"]
         lines = p["parts"]
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+
         header = lines[0]
+
+        # Определяем разделитель из метаданных (по умолчанию табуляция)
+        sep = "\t"
+        try:
+            meta_dict = json.loads(p["meta"])
+            sep_raw = meta_dict.get("params", {}).get("separation", "\t")
+            # Обрабатываем экранированную табуляцию из JSON
+            sep = "\t" if sep_raw == "\\t" else sep_raw
+        except Exception:
+            pass
+
+        expected_cols = len(header.split(sep))
+
         parts, cur = [], []
-        for line in lines:
+        for i, line in enumerate(lines):
             if line == header and cur:
                 parts.append(cur)
                 cur = []
+
+            # Валидация количества колонок
+            cols = len(line.split(sep))
+            if cols != expected_cols:
+                raise ValueError(
+                    f"Ошибка валидации данных: строка {i+1} содержит {cols} колонок, "
+                    f"ожидалось {expected_cols}. Разделитель: {sep!r}. Текст строки: {line!r}"
+                )
+
             cur.append(line)
         if cur:
             parts.append(cur)
@@ -99,7 +124,9 @@ def tools_test_package():
         for i, part_lines in enumerate(parts):
             rows = len(part_lines) - 1
             part = i + 1
-            csv_bytes = "\n".join(part_lines).encode()
+            # Добавляем финальный перенос строки, чтобы сохранить табуляцию в последней колонке
+            csv_content = "\n".join(part_lines) + "\n"
+            csv_bytes = csv_content.encode()
 
             inner_ts = base_ts.add(seconds=i * 2).format("YYYYMMDDHHmmss")
             tkt_ts   = base_ts.add(seconds=i * 2 + 1).format("YYYYMMDDHHmmss")

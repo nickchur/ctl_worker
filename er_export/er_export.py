@@ -143,19 +143,32 @@ def _format_cur_state(cur: dict) -> dict:
     }
 
 
-def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool]:
+def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool, int | None, int | None, int | None]:
     """Раскрывает обёртки LowCardinality/Nullable и маппирует базовый CH-тип в целевой.
 
-    Возвращает (target_type, notnull): notnull=False если тип обёрнут в Nullable().
+    Возвращает (target_type, notnull, length, precision, scale).
+    FixedString(N) → length=N; Decimal(P,S) → precision=P, scale=S, length=P.
     Неизвестные базовые типы по умолчанию маппируются в STRING.
     """
     notnull = True
+    length = precision = scale = None
     if ch_type.startswith("LowCardinality("): ch_type = ch_type[15:-1]
-    if ch_type.startswith("Nullable("): 
+    if ch_type.startswith("Nullable("):
         ch_type = ch_type[9:-1]
         notnull = False
     base = ch_type.split("(")[0]
-    return mapping.get(base, "STRING"), notnull
+    if "(" in ch_type:
+        args = [a.strip() for a in ch_type[len(base) + 1:-1].split(",")]
+        try:
+            if base == "FixedString":
+                length = int(args[0])
+            elif base == "Decimal" and len(args) == 2:
+                precision = int(args[0])
+                scale     = int(args[1])
+                length    = precision
+        except (ValueError, IndexError):
+            pass
+    return mapping.get(base, "STRING"), notnull, length, precision, scale
 
 
 def produce_msg(scenario_id: str, file_name: str, throttle_delay: int = 1):
@@ -328,15 +341,17 @@ def _er_build_meta(cfg, **context):
     dp = context['ti'].xcom_pull(task_ids="init")
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
     rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
-    
+
     ch_cols = {}
     for row in rows:
-        stype, notnull = parse_ch_type(row[1], TYPE_MAP)
+        stype, notnull, length, precision, scale = parse_ch_type(row[1], TYPE_MAP)
+        comment = row[4] if len(row) > 4 else ""
         ch_cols[row[0]] = {
-            "column_name": row[0], "source_type": stype, "notnull": notnull,
-            "description": row[4] if len(row) > 4 else None,
+            "column_name": row[0], "source_type": stype, "length": length,
+            "notnull": notnull, "precision": precision, "scale": scale,
+            "description": comment or None,
         }
-    
+
     fields = cfg.get('fields', ['*'])
     if not fields or fields in (['*'], '*'):
         data_cols = [ch_cols[r[0]] for r in rows]
@@ -345,16 +360,21 @@ def _er_build_meta(cfg, **context):
         for f in fields:
             name = f.split()[-1] if ' as ' in f.lower() else f
             data_cols.append(ch_cols.get(name, {
-                "column_name": name, "source_type": "STRING", "notnull": False,
-                "description": f"Calculated: {f}"
+                "column_name": name, "source_type": "STRING", "length": None,
+                "notnull": False, "precision": None, "scale": None,
+                "description": f"Calculated: {f}",
             }))
 
     meta = {
-        "schema_name": cfg['schema_name'], "table_name": cfg['tbl'],
-        "strategy": dp.get('strategy', cfg['strategy']),
-        "PK": cfg['PK'], "UK": cfg['UK'],
-        "params": {"separation": "\t", "escapesymbol": "\""},
-        "columns": EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF,
+        "mask_file":   None,
+        "schema_name": cfg['schema_name'],
+        "table_name":  cfg['tbl'],
+        "description": cfg.get('description') or None,
+        "strategy":    dp.get('strategy', cfg['strategy']),
+        "PK":          cfg['PK'],
+        "UK":          [cfg['UK']] if cfg['UK'] else [],
+        "params":      {"separation": "\t"},
+        "columns":     EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF,
     }
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
     add_note({"🗂️ build_meta": [c["column_name"] for c in meta["columns"]]}, level='task,dag', context=context)
@@ -404,10 +424,10 @@ def _er_pack_zip(cfg, **context):
 
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
         ts_s = lambda s: base_ts.add(seconds=i*2 + s).format("YYYYMMDDHHmmss")
-        csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.csv"
-        meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.meta"
-        tkt_n  = f"{cfg['replica']}__{ts_s(1)}.tkt"
-        zip_n  = f"{cfg['replica']}__{ts_s(2)}__{cfg['tbl']}__{i+1}_{total}_{rows}.csv.zip"
+        csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.csv".lower()
+        meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.meta".lower()
+        tkt_n  = f"{cfg['replica']}__{ts_s(1)}.tkt".lower()
+        zip_n  = f"{cfg['replica']}__{ts_s(2)}__{cfg['tbl']}__{i+1}_{total}_{rows}.zip".lower()
         
         s3_body = hook.get_key(key=key, bucket_name=BUCKET).get()["Body"]
         mtime = base_ts.add(seconds=i*2).naive()
@@ -420,7 +440,7 @@ def _er_pack_zip(cfg, **context):
         hook.delete_objects(bucket=BUCKET, keys=[key])
         uploaded.append(zip_n)
 
-    summary_tkt = f"{cfg['replica']}__{ts_s(3)}.tkt"
+    summary_tkt = f"{cfg['replica']}__{ts_s(3)}.tkt".lower()
     hook.load_bytes("\n".join(uploaded).encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
     
     total_rows = sum(int(r) for r in counts)
@@ -547,6 +567,8 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'topic':           DEF_ARGS['topic'],
         'kafka_in_conn':   DEF_ARGS['kafka_in_conn'],
         'kafka_in_topic':  DEF_ARGS['kafka_in_topic'],
+        # ── Метаданные ───────────────────────────────────────────────────────
+        'description':     params.get('description', ''),
         # ── Параметры из er_wf_meta.params (DEFAULT_PARAMS + overrides) ─────
         'strategy':        p['strategy'],
         'auto_confirm':    p['auto_confirm'],

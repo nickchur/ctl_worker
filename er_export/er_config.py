@@ -97,7 +97,7 @@ TYPE_MAP: dict[str, str] = {
 
 # 📎 SQL-выражения, автоматически добавляемые в SELECT каждой выгрузки
 MANDATORY_PRE = ["{export_time} as export_time"]          # подставляется рантаймом из состояния дельты
-MANDATORY_SUF = ["'I' as ctl_action", "now() as ctl_validfrom"]
+MANDATORY_SUF = ["'I' as ctl_action", "now64(6) as ctl_validfrom"]
 
 # 🗂️ Описания служебных колонок для .meta-файла TFS (порядок: PRE + data + SUF)
 EXTRA_COLS_PRE = [
@@ -226,8 +226,8 @@ def get_dict(ch_hook, sql: str) -> list[dict]:
 
 DEFAULT_PARAMS: dict = {
     # ── Дельта / расписание ──────────────────────────────────────────────────
-    'increment':         60,           # шаг дельты, сек: time_to = time_from + increment
-    'selfrun_timeout':   10,           # задержка до следующего автозапуска, мин
+    'increment':         3600,         # шаг дельты, сек: time_to = time_from + increment (не чаще 1 пакета/час по стандарту ТФС)
+    'selfrun_timeout':   60,           # задержка до следующего автозапуска, мин (не чаще 1 пакета/час)
     'overlap':           0,            # перекрытие окна дельты назад, сек (для компенсации задержек CDC)
     'lower_bound':       '',           # нижняя граница первой дельты (bootstrap); '' → 1970-01-01
     'time_field':        'extract_time',  # поле времени в таблице-источнике

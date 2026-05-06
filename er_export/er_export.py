@@ -600,10 +600,11 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 enum=['FULL_UK', 'FULL_NO_UK', 'INC', 'APPEND'],
                 description=(
                     'Стратегия загрузки TFS. '
-                    'FULL_UK — полное обновление snp с дедубликацией по UK (рекомендуется). '
-                    'FULL_NO_UK — полное обновление без дедубликации. '
-                    'INC — инкрементальное обновление по UK с поддержкой удалений (ctl_action=D). '
-                    'APPEND — только добавление записей, без изменений и удалений.'
+                    'FULL_UK — полное обновление snp с дедубликацией по UK; строки с ctl_action=D отбрасываются TFS. '
+                    'FULL_NO_UK — полное обновление без дедубликации; строки с ctl_action=D отбрасываются TFS. '
+                    'INC — инкрементальное обновление: ctl_action=D+UK→удаление, ctl_action=D без UK→отброс, '
+                    'остальные+UK→обновление, остальные без UK→вставка. '
+                    'APPEND — только добавление; ctl_action игнорируется TFS, всегда I.'
                 ),
             ),
             'auto_confirm': Param(

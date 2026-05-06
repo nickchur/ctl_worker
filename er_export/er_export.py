@@ -331,11 +331,12 @@ def _er_init(cfg, **context):
 
 @task(task_id='build_meta', pool=POOL_NAME)
 def _er_build_meta(cfg, **context):
-    """🗂️ Строит .meta JSON с описанием структуры данных для TFS.
+    """🗂️ Строит .meta JSON с описанием структуры таблицы для ЕР/TFS.
 
-    Колонки собираются в порядке: EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF.
-    Типы маппируются из ClickHouse в целевые через TYPE_MAP (er_config).
-    Если fields = ['*'], берёт все колонки из DESCRIBE TABLE.
+    Порядок колонок: export_time (PRE) + data_cols + ctl_action, ctl_validfrom (SUF).
+    Типы: DESCRIBE TABLE → parse_ch_type → TYPE_MAP; для FixedString/Decimal
+    извлекаются length/precision/scale. Если fields=['*'] — все колонки таблицы.
+    UK оборачивается в массив массивов: ['id'] → [['id']] (стандарт ЕР).
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = context['ti'].xcom_pull(task_ids="init")
@@ -382,15 +383,16 @@ def _er_build_meta(cfg, **context):
 
 @task(task_id='pack_zip', pool=POOL_NAME)
 def _er_pack_zip(cfg, **context):
-    """📦 Упаковывает CSV-файлы из S3 в ZIP-архивы формата TFS и загружает обратно в S3.
+    """📦 Упаковывает CSV-файлы из S3 в ZIP-архивы формата ЕР и загружает обратно в S3.
 
-    Каждый CSV оборачивается в отдельный ZIP с тремя файлами:
-      *.tkt  — манифест (имя CSV + кол-во строк)
-      *.meta — JSON-схема колонок
-      *.csv  — данные (стриминг из S3 без буферизации в памяти)
+    Каждый CSV оборачивается в отдельный ZIP (стриминг, без буферизации в памяти):
+      [replica]__[ts].tkt      — `filename;rowcount` (TKT внутри архива, стандарт ЕР)
+      [schema]__[table]__[ts].meta — JSON-схема колонок
+      [schema]__[table]__[ts].csv  — данные из S3
 
+    Имена файлов — строго нижний регистр, расширение архива .zip (стандарт ЕР).
     После упаковки исходные CSV удаляются из S3.
-    Отдельный summary.tkt перечисляет все ZIP-файлы пакета — он передаётся в Kafka.
+    Summary TKT (снаружи архива) перечисляет все ZIP-файлы пакета — передаётся в Kafka.
     """
     from stat import S_IFREG
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook

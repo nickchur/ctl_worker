@@ -1,6 +1,27 @@
 """
-Synchronization DAG for ER export metadata.
-Syncs configuration from the ClickHouse `export.er_wf_meta` table to Airflow Variables/S3.
+DAG синхронизации метаданных ER-выгрузок.
+
+Читает таблицу export.er_wf_meta из ClickHouse и сохраняет активные записи
+в Airflow Variable `datalab_er_wfs` (JSON-словарь), который используется
+фабрикой er_export.py для динамической генерации DAG-ов.
+
+Структура записи в Variable:
+  {
+    "db_name.extract_name": {
+      "replica":   str,           # ключ в TFS_MAP
+      "schema":    str,           # целевая схема TFS
+      "format":    str,           # TSVWithNames
+      "PK":        list[str],
+      "UK":        list[str],
+      "params":    str,           # JSON с переопределёнными DEFAULT_PARAMS
+      "sql_stmt_export_delta" | "sql_stmt_export_recent": {"from": ..., "where": ...},
+      "fields":    list[str],     # опционально
+      "description": str,         # опционально
+    }
+  }
+
+Расписание: каждые 5 минут. При пустой таблице в SIGMA-режиме падает,
+чтобы не затереть Variable пустым значением.
 """
 from __future__ import annotations
 
@@ -23,6 +44,11 @@ logger = getLogger("airflow.task")
 
 
 def _ensure_pool() -> None:
+    """Создаёт Airflow Pool для ER-выгрузок, если он ещё не существует.
+
+    Вызывается внутри таска (не при парсинге DAG), чтобы не создавать
+    сессию БД при каждом обходе scheduler-ом.
+    """
     from airflow.models import Pool
     from airflow.utils.session import create_session
     with create_session() as session:
@@ -45,14 +71,20 @@ def er_sync_dag():
 
     @task(task_id="sync", pool="default_pool")
     def sync():
+        """Читает er_wf_meta, собирает словарь выгрузок и сохраняет в Airflow Variable.
+
+        В ALPHA-режиме дополнительно создаёт таблицу er_wf_meta если её нет,
+        и пропускает обновление Variable при пустой таблице.
+        В SIGMA-режиме пустая таблица — ошибка (защита от затирания Variable).
+        """
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
-        # Ensure Airflow Pool exists (called here to avoid overhead during DAG parsing)
         _ensure_pool()
 
         hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
 
         if MODE == 'ALPHA':
+            # В тестовом окружении таблица может отсутствовать — создаём на лету
             hook.execute("""
                 CREATE TABLE IF NOT EXISTS export.er_wf_meta
                 (
@@ -88,7 +120,8 @@ def er_sync_dag():
                 return
             raise ValueError("No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")
 
-        # batch-fetch CH table comments for rows without description
+        # Для строк без явного description подтягиваем комментарий таблицы из system.tables
+        # одним батч-запросом, чтобы не делать N отдельных DESCRIBE.
         no_desc = [(r["db_name"], r["extract_name"]) for r in rows if not r["description"]]
         ch_comments: dict[tuple, str] = {}
         if no_desc:
@@ -101,8 +134,10 @@ def er_sync_dag():
         wfs = {}
         for row in rows:
             table_key = f"{row['db_name']}.{row['extract_name']}"
-            sql_key   = "sql_stmt_export_recent" if row["is_recent"] else "sql_stmt_export_delta"
-            sql_val   = {"from": row["sql_from"]}
+
+            # is_recent определяет ключ SQL-запроса: фабрика er_export.py проверяет наличие одного из двух
+            sql_key = "sql_stmt_export_recent" if row["is_recent"] else "sql_stmt_export_delta"
+            sql_val = {"from": row["sql_from"]}
             if row["sql_where"]:
                 sql_val["where"] = row["sql_where"]
 
@@ -117,13 +152,15 @@ def er_sync_dag():
             }
             if row["fields"]:
                 entry["fields"] = row["fields"]
+
             desc = row["description"] or ch_comments.get((row["db_name"], row["extract_name"]), "")
             if desc:
                 entry["description"] = desc
 
             wfs[table_key] = entry
 
-        logger.info("Loaded %d workflow(s) from export.er_wf_meta", len(wfs))
+        logger.info("Загружено %d выгрузок из export.er_wf_meta", len(wfs))
+        # ctl_obj_save пропускает запись если данные не изменились (сравнение JSON)
         ctl_obj_save(VAR_NAME, wfs, var=True)
 
     sync()

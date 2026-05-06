@@ -427,7 +427,7 @@ def _er_pack_zip(cfg, **context):
     ti.xcom_push(key="total_row_count",  value=sum(int(r) for r in counts))
 
 
-@task(task_id='save_status', trigger_rule='all_success', pool=POOL_NAME)
+@task(task_id='save_status', trigger_rule='none_failed', pool=POOL_NAME)
 def _er_save_status(cfg, **context):
     """Записывает результат выгрузки в export.extract_history.
 

@@ -491,7 +491,11 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             task_id='notify_tfs', topic="{{ params.topic }}", producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
             delivery_callback="er_export.er_export.on_delivery", pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
         )
-        t_wait = AwaitMessageSensor(task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']], apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME, execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm')))
+        t_wait = AwaitMessageSensor(
+            task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']],
+            apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME,
+            execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm'))
+        )
         
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)
 

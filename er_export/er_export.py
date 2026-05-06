@@ -27,7 +27,10 @@ from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Param
 
-from er_export.er_config import get_config, get_dict, obj_load, add_note, get_params
+try:
+    from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_load, add_note, get_params
+except ImportError:
+    from er_export.er_config import get_config, get_dict, obj_load, add_note, get_params
 
 logger = logging.getLogger("airflow.task")
 

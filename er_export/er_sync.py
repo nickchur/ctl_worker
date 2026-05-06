@@ -34,7 +34,10 @@ import pendulum
 from airflow.decorators import dag, task
 from logging import getLogger
 
-from er_export.er_config import get_config, get_dict
+try:
+    from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict
+except ImportError:
+    from er_export.er_config import get_config, get_dict
 from plugins.ctl_utils import ctl_obj_save
 
 _cfg       = get_config()

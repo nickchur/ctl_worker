@@ -5,7 +5,7 @@ CH-коннект и S3 определяются наличием перемен
   есть  → dlab-click-test + s3-archive, секреты из Vault.
   нет   → dlab-click + s3-tfs-hrplt.
 
-Поведение на стенде управляется ENV_STAND (prom / uat / qa / ift / dev).
+Поведение на стенде управляется ENV_STAND (PROM / UAT / QA / IFT / DEV).
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ else:
 BUCKET = 'tfshrplt'
 TOPIC  = 'TFS.HRPLT.IN'
 
-ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()
+ENV_STAND = os.getenv("ENV_STAND", "").strip().upper()
 
 # replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
@@ -66,11 +66,11 @@ DEF_ARGS = {
 
 # Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
 LIMITS = {
-    "prom": 0,
-    "uat":  100,
-    "qa":   100,
-    "ift":  100,
-    "dev":  100,
+    "PROM": 0,
+    "UAT":  100,
+    "QA":   100,
+    "IFT":  100,
+    "DEV":  100,
 }
 
 TYPE_MAP: dict[str, str] = {

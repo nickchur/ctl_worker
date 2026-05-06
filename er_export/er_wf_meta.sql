@@ -1,6 +1,6 @@
--- DDL for export.er_wf_meta
--- Flat config table for ER export workflows (no JSON columns)
--- Synced to Airflow Variable "datalab_er_wfs" every 5 min by er_sync__datalab_er_wfs DAG
+-- DDL для export.er_wf_meta
+-- Управляющая таблица ER-выгрузок. Синхронизируется в Airflow Variable "datalab_er_wfs"
+-- каждые 5 минут DAG-ом export_er_sync.
 --
 -- ВАЖНО: выполнять через clickhouse-client или HTTP-интерфейс, НЕ через JDBC.
 -- JDBC-драйвер интерпретирует {shard} и {replica} как именованные параметры → ошибка.
@@ -10,53 +10,38 @@
 
 CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
 (
-    extract_name  String                    COMMENT 'Имя выгрузки (table name без схемы), соответствует extract_name в extract_registry_vw',
+    extract_name  String                    COMMENT 'Имя выгрузки (table name без схемы)',
     db_name       String                    COMMENT 'База данных источника в ClickHouse (левая часть "db.table")',
-    replica       String                    COMMENT 'Реплика-маршрутизатор TFS (ключ в TFS_OUT_CONFIG_MAP)',
+    replica       String                    COMMENT 'Реплика-маршрутизатор TFS (ключ в TFS_MAP er_config.py)',
     schema_name   String                    COMMENT 'Целевая схема в .meta-файле для TFS',
     format        String        DEFAULT 'TSVWithNames' COMMENT 'Формат выгрузки ClickHouse',
-    strategy      String        DEFAULT 'FULL_UK'      COMMENT 'Стратегия merge в .meta: FULL_UK, FULL_PK, DELTA_UK и др.',
     pk            Array(String) DEFAULT []             COMMENT 'Список колонок первичного ключа',
     uk            Array(String) DEFAULT []             COMMENT 'Список колонок уникального ключа',
-    fields        Array(String) DEFAULT []             COMMENT 'SELECT-выражения таблицы-источника (export_time, ctl_action, ctl_validfrom добавляются автоматически)',
+    fields        Array(String) DEFAULT []             COMMENT 'SELECT-выражения таблицы-источника; [] = все колонки (DESCRIBE TABLE)',
     sql_from      String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос',
-    sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; плейсхолдер {condition} подставляется рантаймом',
-    increment     Int32         DEFAULT 60             COMMENT 'Инкремент дельты (сек), используется если не перекрыто в registry',
-    selfrun_timeout Int32       DEFAULT 10             COMMENT 'Таймаут перед авто-запуском следующей дельты (мин)',
-    auto_confirm   UInt8         DEFAULT 1              COMMENT '1 = авто-подтверждение дельты, 0 = ждать уведомления в Kafka',
-    confirm_timeout Int32        DEFAULT 3600           COMMENT 'Таймаут ожидания подтверждения из Kafka (сек)',
-    description   String        DEFAULT ''             COMMENT 'Произвольное описание DAG-а (отображается в Airflow UI)',
-    is_recent     UInt8         DEFAULT 0             COMMENT '0 = дельта-выгрузка (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent)',
-    is_active     UInt8         DEFAULT 1             COMMENT '0 = запись игнорируется при синхронизации в Variable',
-    updated_at    DateTime      DEFAULT now()         COMMENT 'Версия строки для ReplacingMergeTree'
+    sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; {condition} подставляется рантаймом',
+    params        String        DEFAULT '{}'           COMMENT 'JSON с переопределёнными параметрами выгрузки (см. DEFAULT_PARAMS в er_config.py)',
+    description   String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
+    is_recent     UInt8         DEFAULT 0              COMMENT '0 = delta-выгрузка, 1 = recent (скользящее окно)',
+    is_active     UInt8         DEFAULT 1              COMMENT '0 = запись игнорируется при синхронизации в Variable',
+    updated_at    DateTime      DEFAULT now()          COMMENT 'Версия строки для ReplacingMergeTree'
 )
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/export/er_wf_meta', '{replica}', updated_at)
 ORDER BY (db_name, extract_name);
 
--- Example row for evolution.lc_items_opened
+
+-- Пример: delta-выгрузка с нестандартными параметрами
+-- Поля strategy, increment, auto_confirm и др. передаются через params JSON,
+-- а не как отдельные колонки. Неуказанные параметры берутся из DEFAULT_PARAMS (er_config.py).
 INSERT INTO export.er_wf_meta
-    (extract_name, db_name, replica, schema_name, strategy, uk, fields, sql_from, sql_where, increment, selfrun_timeout, auto_confirm)
+    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_where, params)
 VALUES (
     'lc_items_opened',
     'evolution',
     'hrplatform_datalab',
     'learning',
-    'FULL_UK',
     ['person_uuid', 'item_id'],
-    [
-        'insert_time',
-        'header_id',
-        'header_person_id',
-        'header_event_type',
-        'header_created_dt',
-        'item_id',
-        'person_uuid',
-        'tenant',
-        'company'
-    ],
     'evolution.lc_items_opened',
     '{condition}',
-    60,
-    10,
-    1
+    '{"strategy": "FULL_UK", "increment": 60, "selfrun_timeout": 10, "auto_confirm": 1}'
 );

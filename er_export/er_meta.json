@@ -3,9 +3,9 @@
     "replica": "hrplatform_datalab",
     "schema": "learning",
     "format": "TSVWithNames",
-    "strategy": "FULL_UK",
     "PK": [],
     "UK": ["person_uuid", "item_id"],
+    "params": "{\"strategy\": \"FULL_UK\", \"increment\": 60, \"auto_confirm\": 1}",
     "fields": [
       "insert_time",
       "header_id",

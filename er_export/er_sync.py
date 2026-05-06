@@ -43,6 +43,7 @@ _cfg       = get_config()
 CH_ID      = _cfg['CH_ID']
 DEF_ARGS   = _cfg['DEF_ARGS']
 MODE       = _cfg['MODE']
+ENV_STAND  = _cfg['ENV_STAND']
 VAR_NAME   = _cfg['VAR_NAME']
 POOL_NAME  = _cfg['POOL_NAME']
 POOL_SLOTS = _cfg['POOL_SLOTS']
@@ -80,9 +81,9 @@ def er_sync_dag():
     def sync():
         """Читает er_wf_meta, собирает словарь выгрузок и сохраняет в Airflow Variable.
 
-        В ALPHA-режиме дополнительно создаёт таблицу er_wf_meta если её нет,
+        На стенде DEV дополнительно создаёт таблицу er_wf_meta если её нет,
         и пропускает обновление Variable при пустой таблице.
-        В SIGMA-режиме пустая таблица — ошибка (защита от затирания Variable).
+        На остальных стендах пустая таблица — ошибка (защита от затирания Variable).
         """
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
@@ -90,7 +91,7 @@ def er_sync_dag():
 
         hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
 
-        if MODE == 'ALPHA':
+        if ENV_STAND == 'DEV':
             # В тестовом окружении таблица может отсутствовать — создаём на лету
             hook.execute("""
                 CREATE TABLE IF NOT EXISTS export.er_wf_meta
@@ -124,8 +125,8 @@ def er_sync_dag():
         )
 
         if not rows:
-            if MODE == 'ALPHA':
-                logger.warning("export.er_wf_meta is empty — skipping Variable update in test mode")
+            if ENV_STAND == 'DEV':
+                logger.warning("export.er_wf_meta is empty — skipping Variable update on DEV stand")
                 return
             raise ValueError("No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")
 

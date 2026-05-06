@@ -37,7 +37,10 @@ from logging import getLogger
 try:
     from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_save
 except ImportError:
-    from er_export.er_config import get_config, get_dict, obj_save
+    try:
+        from er_export.er_config import get_config, get_dict, obj_save
+    except ImportError:
+        from er_config import get_config, get_dict, obj_save
 
 _cfg       = get_config()
 CH_ID      = _cfg['CH_ID']

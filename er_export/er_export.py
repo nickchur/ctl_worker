@@ -30,7 +30,10 @@ from airflow.models import Param
 try:
     from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_load, add_note, get_params
 except ImportError:
-    from er_export.er_config import get_config, get_dict, obj_load, add_note, get_params
+    try:
+        from er_export.er_config import get_config, get_dict, obj_load, add_note, get_params
+    except ImportError:
+        from er_config import get_config, get_dict, obj_load, add_note, get_params
 
 logger = logging.getLogger("airflow.task")
 

@@ -10,7 +10,6 @@ DAG синхронизации метаданных ER-выгрузок.
     "db_name.extract_name": {
       "replica":   str,           # ключ в TFS_MAP
       "schema":    str,           # целевая схема TFS
-      "format":    str,           # TSVWithNames
       "PK":        list[str],
       "UK":        list[str],
       "params":    str,           # JSON с переопределёнными DEFAULT_PARAMS
@@ -92,7 +91,6 @@ def er_sync_dag():
                     db_name         String                    COMMENT 'База данных источника в ClickHouse (левая часть "db.table")',
                     replica         String                    COMMENT 'Реплика-маршрутизатор TFS (ключ в TFS_OUT_CONFIG_MAP)',
                     schema_name     String                    COMMENT 'Целевая схема в .meta-файле для TFS',
-                    format          String        DEFAULT 'TSVWithNames' COMMENT 'Формат выгрузки ClickHouse',
                     pk              Array(String) DEFAULT []             COMMENT 'Список колонок первичного ключа',
                     uk              Array(String) DEFAULT []             COMMENT 'Список колонок уникального ключа',
                     fields          Array(String) DEFAULT []             COMMENT 'SELECT-выражения (export_time, ctl_action, ctl_validfrom добавляются автоматически)',
@@ -149,7 +147,6 @@ def er_sync_dag():
             entry = {
                 "replica": row["replica"],
                 "schema":  row["schema_name"],
-                "format":  row["format"],
                 "PK":      row["pk"],
                 "UK":      row["uk"],
                 "params":  row.get("params", "{}"),

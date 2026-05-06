@@ -14,7 +14,6 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     db_name       String                    COMMENT 'База данных источника в ClickHouse (левая часть "db.table")',
     replica       String                    COMMENT 'Реплика-маршрутизатор TFS (ключ в TFS_MAP er_config.py)',
     schema_name   String                    COMMENT 'Целевая схема в .meta-файле для TFS',
-    format        String        DEFAULT 'TSVWithNames' COMMENT 'Формат выгрузки ClickHouse',
     pk            Array(String) DEFAULT []             COMMENT 'Список колонок первичного ключа',
     uk            Array(String) DEFAULT []             COMMENT 'Список колонок уникального ключа',
     fields        Array(String) DEFAULT []             COMMENT 'SELECT-выражения таблицы-источника; [] = все колонки (DESCRIBE TABLE)',

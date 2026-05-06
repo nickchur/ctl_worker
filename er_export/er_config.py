@@ -248,6 +248,7 @@ DEFAULT_PARAMS: dict = {
     'max_file_size':     '',           # ограничение размера CSV-файла, байт; '' = без ограничений
 
     # ── Формат и санитизация ─────────────────────────────────────────────────
+    'format':            'TSVWithNames',  # формат выгрузки ClickHouse
     'pg_array_format':   0,            # 1 = PostgreSQL-формат массивов в TSV
     'csv_format_params': '',           # доп. параметры форматирования (dict-литерал)
     'xstream_sanitize':  0,            # 1 = экранировать спецсимволы XStream

@@ -89,6 +89,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | `compression_type` | `'none'` | Тип сжатия: `none` / `gzip` / `zstd` |
 | `compression_ext` | `''` | Расширение сжатого файла |
 | `max_file_size` | `''` | Ограничение размера CSV, байт; `''` = без ограничений |
+| `format` | `'TSVWithNames'` | Формат выгрузки ClickHouse |
 | `pg_array_format` | `0` | `1` = PostgreSQL-формат массивов в TSV |
 | `csv_format_params` | `''` | Доп. параметры форматирования (dict-литерал) |
 | `xstream_sanitize` | `0` | `1` = экранировать спецсимволы XStream |

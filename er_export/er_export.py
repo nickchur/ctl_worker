@@ -491,7 +491,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
 
     db, tbl = table_key.split(".", maxsplit=1)
     replica, schema = params['replica'], params['schema']
-    if params.get('format', 'TSVWithNames') != 'TSVWithNames':
+    if p.get('format', 'TSVWithNames') != 'TSVWithNames':
         raise AirflowFailException("Only TSVWithNames format is supported.")
 
     scen, prefix = TFS_MAP[replica]

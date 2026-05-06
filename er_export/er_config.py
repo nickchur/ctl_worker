@@ -221,7 +221,6 @@ DEFAULT_PARAMS: dict = {
     'selfrun_timeout':   10,
     'strategy':          'FULL_UK',
     'auto_confirm':       1,
-    'auto_confirm_delta': 0,
     'confirm_timeout':    3600,
     'lower_bound':       '',
     'time_field':        'extract_time',

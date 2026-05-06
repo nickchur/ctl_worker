@@ -1,5 +1,5 @@
 """
-DAG синхронизации метаданных ER-выгрузок.
+🔄 DAG синхронизации метаданных ER-выгрузок.
 
 Читает таблицу export.er_wf_meta из ClickHouse и сохраняет активные записи
 в Airflow Variable `datalab_er_wfs` (JSON-словарь), который используется
@@ -26,7 +26,7 @@ DAG синхронизации метаданных ER-выгрузок.
     }
   }
 
-Расписание: каждые 5 минут. При пустой таблице в SIGMA-режиме падает,
+⏱️ Расписание: каждые 5 минут. При пустой таблице на не-DEV стенде падает,
 чтобы не затереть Variable пустым значением.
 """
 from __future__ import annotations
@@ -52,7 +52,7 @@ logger = getLogger("airflow.task")
 
 
 def _ensure_pool() -> None:
-    """Создаёт Airflow Pool для ER-выгрузок, если он ещё не существует.
+    """🏊 Создаёт Airflow Pool для ER-выгрузок, если он ещё не существует.
 
     Вызывается внутри таска (не при парсинге DAG), чтобы не создавать
     сессию БД при каждом обходе scheduler-ом.
@@ -66,7 +66,7 @@ def _ensure_pool() -> None:
 
 @dag(
     dag_id="export_er_sync",
-    description="🔄 Синхронизация export.er_wf_meta → Airflow Variable datalab_er_wfs",
+    description="🔄 Синхронизация export.er_wf_meta → Airflow Variable datalab_er_wfs (каждые 5 мин)",
     default_args=DEF_ARGS,
     start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone("UTC")),
     schedule_interval="*/5 * * * *",
@@ -81,9 +81,8 @@ def er_sync_dag():
     def sync():
         """🔄 Читает er_wf_meta, собирает словарь выгрузок и сохраняет в Airflow Variable.
 
-        На стенде DEV дополнительно создаёт таблицу er_wf_meta если её нет,
-        и пропускает обновление Variable при пустой таблице.
-        На остальных стендах пустая таблица — ошибка (защита от затирания Variable).
+        🧪 DEV: создаёт таблицу er_wf_meta если её нет; пропускает обновление при пустой таблице.
+        🏭 Остальные стенды: пустая таблица — ошибка (защита от затирания Variable).
         """
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
@@ -118,7 +117,7 @@ def er_sync_dag():
                 ENGINE = ReplacingMergeTree(updated_at)
                 ORDER BY (db_name, extract_name)
             """)
-            logger.info("Test mode: ensured export.er_wf_meta exists")
+            logger.info("🧪 DEV: ensured export.er_wf_meta exists")
 
         rows = get_dict(
             hook,
@@ -127,11 +126,11 @@ def er_sync_dag():
 
         if not rows:
             if ENV_STAND == 'DEV':
-                logger.warning("export.er_wf_meta is empty — skipping Variable update on DEV stand")
+                logger.warning("⚠️ export.er_wf_meta is empty — skipping Variable update on DEV stand")
                 return
-            raise ValueError("No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")
+            raise ValueError("🚫 No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")
 
-        # Для строк без явного description подтягиваем комментарий таблицы из system.tables
+        # 💬 Для строк без явного description подтягиваем комментарий таблицы из system.tables
         # одним батч-запросом, чтобы не делать N отдельных DESCRIBE.
         no_desc = [(r["db_name"], r["extract_name"]) for r in rows if not r["description"]]
         ch_comments: dict[tuple[str, str], str] = {}
@@ -146,7 +145,7 @@ def er_sync_dag():
         for row in rows:
             table_key = f"{row['db_name']}.{row['extract_name']}"
 
-            # is_recent определяет ключ SQL-запроса: фабрика er_export.py проверяет наличие одного из двух
+            # 🔀 is_recent определяет ключ SQL-запроса: фабрика er_export.py проверяет наличие одного из двух
             sql_key = "sql_stmt_export_recent" if row["is_recent"] else "sql_stmt_export_delta"
             sql_val = {"from": row["sql_from"]}
             if row["sql_with"]:     sql_val["with"]     = row["sql_with"]
@@ -172,8 +171,8 @@ def er_sync_dag():
 
             wfs[table_key] = entry
 
-        logger.info("Загружено %d выгрузок из export.er_wf_meta", len(wfs))
-        # obj_save пропускает запись если данные не изменились (сравнение JSON)
+        logger.info("✅ Загружено %d выгрузок из export.er_wf_meta", len(wfs))
+        # 💾 obj_save пропускает запись если данные не изменились (сравнение JSON)
         obj_save(VAR_NAME, wfs)
 
     sync()

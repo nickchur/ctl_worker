@@ -1,11 +1,11 @@
 """
 Конфигурация и константы фреймворка ER-выгрузок.
 
-Два режима работы (MODE):
-  SIGMA — продовый CH (dlab-click) и S3 (s3-tfs-hrplt).
-  ALPHA — тестовый CH из vault (dlab-click-test) и S3 (s3-archive);
-          включается автоматически при наличии переменной AIRFLOW__CTL_PIN
-          или принудительно через ER_MODE=ALPHA.
+CH-коннект и S3 определяются наличием переменной AIRFLOW__CTL_PIN:
+  есть  → dlab-click-test + s3-archive, секреты из Vault.
+  нет   → dlab-click + s3-tfs-hrplt.
+
+Поведение на стенде управляется ENV_STAND (prom / uat / qa / ift / dev).
 """
 from __future__ import annotations
 
@@ -14,16 +14,12 @@ import json
 import os
 from datetime import timedelta
 
-VAULT_PATH = '/vault/secrets/application'
-CH_BD      = 'export'
-VAR_NAME   = "datalab_er_wfs"
+CH_BD    = 'export'
+VAR_NAME = "datalab_er_wfs"
 
-# ER_MODE включает тестовый CH-коннект из vault; по умолчанию — SIGMA/ALPHA
-MODE = os.getenv("ER_MODE", "SIGMA" if not os.getenv("AIRFLOW__CTL_PIN") else "ALPHA")
-
-if MODE == 'ALPHA':
+if os.getenv("AIRFLOW__CTL_PIN"):
     CH_ID = 'dlab-click-test'
-    with open(VAULT_PATH) as f:
+    with open('/vault/secrets/application') as f:
         secrets = json.load(f)
 
     def _b64(s: str) -> str:
@@ -275,7 +271,6 @@ def get_config() -> dict:
         'EXTRA_COLS_SUF': EXTRA_COLS_SUF,
         'MANDATORY_PRE':  MANDATORY_PRE,
         'MANDATORY_SUF':  MANDATORY_SUF,
-        'MODE':           MODE,
         'LIMITS':         LIMITS,
         'BUCKET':         BUCKET,
         'TFS_MAP':        TFS_MAP,

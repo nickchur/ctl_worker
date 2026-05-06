@@ -42,7 +42,6 @@ except ImportError:
 _cfg       = get_config()
 CH_ID      = _cfg['CH_ID']
 DEF_ARGS   = _cfg['DEF_ARGS']
-MODE       = _cfg['MODE']
 ENV_STAND  = _cfg['ENV_STAND']
 VAR_NAME   = _cfg['VAR_NAME']
 POOL_NAME  = _cfg['POOL_NAME']

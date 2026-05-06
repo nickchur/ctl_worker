@@ -312,7 +312,7 @@ def _er_init(cfg, **context):
         if p.get(key) is not None:
             result[key] = transform(p[key])
     
-    add_note({k: result.get(k) for k in key_map}, level='Task,DAG', title='Delta State')
+    add_note({k: result.get(k) for k in key_map}, level='Task,DAG', title='⚙️ Delta State')
     return result
 
 
@@ -357,7 +357,7 @@ def _er_build_meta(cfg, **context):
         "columns": EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF,
     }
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
-    add_note({"build_meta": [c["column_name"] for c in meta["columns"]]}, level='task,dag', context=context)
+    add_note({"🗂️ build_meta": [c["column_name"] for c in meta["columns"]]}, level='task,dag', context=context)
 
 
 @task(task_id='pack_zip', pool=POOL_NAME)
@@ -427,7 +427,7 @@ def _er_pack_zip(cfg, **context):
     ti.xcom_push(key="zip_name_list",    value=uploaded)
     ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
     ti.xcom_push(key="total_row_count",  value=total_rows)
-    add_note({"pack_zip": uploaded}, title=f"rows={total_rows} files={total}", level='task,dag', context=context)
+    add_note({"📦 pack_zip": uploaded}, title=f"rows={total_rows} files={total}", level='task,dag', context=context)
 
 
 @task(task_id='save_status', trigger_rule='none_failed', pool=POOL_NAME)
@@ -456,7 +456,7 @@ def _er_save_status(cfg, **context):
             {dp['time_field']}, {dp['time_from']}, {dp['time_to']}, {zip_arr}
     """)
     add_note(
-        {"save_status": {"time_from": dp['time_from'], "time_to": dp['time_to'], "rows": rows, "zips": zips}},
+        {"💾 save_status": {"time_from": dp['time_from'], "time_to": dp['time_to'], "rows": rows, "zips": zips}},
         level='task,dag', context=context,
     )
 
@@ -473,7 +473,7 @@ def _er_schedule_next(cfg, **context):
     from airflow.utils.state import DagRunState
     dp = context['ti'].xcom_pull(task_ids="init")
     if str(dp.get('is_current')).lower() in ('true', 't', '1'):
-        add_note("delta is current — next run not scheduled", level='task,dag', context=context)
+        add_note("✅ delta is current — next run not scheduled", level='task,dag', context=context)
         return
 
     next_run = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
@@ -484,7 +484,7 @@ def _er_schedule_next(cfg, **context):
         state=DagRunState.QUEUED,
         external_trigger=True,
     )
-    add_note(f"next run scheduled at {next_run.format('YYYY-MM-DD HH:mm:ss')} UTC", level='task,dag', context=context)
+    add_note(f"⏭️ next run scheduled at {next_run.format('YYYY-MM-DD HH:mm:ss')} UTC", level='task,dag', context=context)
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────
 

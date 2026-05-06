@@ -584,7 +584,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 description='SQL WHERE-условие. Переопределяет условие из состояния дельты.',
             ),
             'is_current': Param(
-                '', type='string', enum=['', 'true', 'false'], title='Is current',
+                '', type=['string', 'null'], enum=['', 'true', 'false'], title='Is current',
                 description='Принудительно пометить состояние как актуальное (не запускать следующий цикл).',
             ),
             'increment': Param(

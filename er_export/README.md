@@ -48,12 +48,12 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | Таск | Описание |
 | :--- | :--- |
 | **init** | Инициализирует состояние дельты из `export.extract_current_vw`. При первом запуске — bootstrap от `lower_bound`. |
-| **build_meta** | Генерирует `.meta` JSON со схемой колонок (DESCRIBE TABLE или из `fields`). |
+| **build_meta** | Генерирует `.meta` JSON со схемой колонок (`DESCRIBE TABLE` или из `fields`). |
 | **export_to_s3** | Нативная выгрузка ClickHouse → S3 (`HrpClickNativeToS3ListOperator`). |
 | **pack_zip** | Потоковая упаковка CSV + `.meta` + `.tkt` в ZIP без буферизации в памяти (`stream_zip`). |
 | **notify_tfs** | Отправка XML-уведомления в Kafka → TFS. Пропускается если нет данных или режим ALPHA. |
-| **wait_confirm** | Ожидание подтверждения из Kafka (`AwaitMessageSensor`). Пропускается при `auto_confirm=True`, в режиме ALPHA или при отсутствии данных. |
-| **save_status** | Фиксирует результат в `export.extract_history` (только при полном успехе). |
+| **wait_confirm** | Ожидание подтверждения из Kafka (`AwaitMessageSensor`). Пропускается при `auto_confirm=1`, в режиме ALPHA или при отсутствии данных. |
+| **save_status** | Фиксирует результат в `export.extract_history` (только при полном успехе всех upstream-тасков). |
 | **schedule_next** | Автоматически ставит следующий запуск если дельта не догнала текущее время. |
 
 ---
@@ -63,11 +63,34 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 **Delta** — инкрементальный, состояние хранится в `export.extract_history`:
 - Окно `[time_from, time_to]` берётся из `export.extract_current_vw`.
 - При первом запуске `time_from = lower_bound` (по умолчанию `1970-01-01`).
-- После подтверждения автоматически запускается следующий цикл.
+- После успешного завершения автоматически запускается следующий цикл.
 
 **Recent** — скользящее окно без хранения состояния:
 - Окно вычисляется как `[now() - recent_interval, now()]`.
 - Подходит для таблиц без нужды в сквозной полноте дельты.
+
+---
+
+## Управляющая таблица `export.er_wf_meta`
+
+| Колонка | Тип | Умолчание | Описание |
+| :--- | :--- | :--- | :--- |
+| `extract_name` | String | — | Имя выгрузки (table name без схемы) |
+| `db_name` | String | — | База данных источника в ClickHouse |
+| `replica` | String | — | Реплика-маршрутизатор TFS (ключ в `TFS_MAP` er_config.py) |
+| `schema_name` | String | — | Целевая схема в `.meta`-файле для TFS |
+| `pk` | Array(String) | `[]` | Список колонок первичного ключа |
+| `uk` | Array(String) | `[]` | Список колонок уникального ключа |
+| `fields` | Array(String) | `[]` | SELECT-выражения; `[]` = все колонки (`DESCRIBE TABLE`) |
+| `sql_from` | String | `''` | FROM-часть запроса: `"db.table"` или псевдоним CTE |
+| `sql_where` | String | `''` | WHERE-условие; `{condition}` подставляется рантаймом |
+| `sql_join` | String | `''` | JOIN-clause (полное выражение, включая ключевое слово) |
+| `sql_with` | String | `''` | WITH-блок (CTE); вставляется перед SELECT |
+| `sql_settings` | String | `''` | SETTINGS-блок ClickHouse; вставляется в конец запроса |
+| `params` | String | `'{}'` | JSON с переопределёнными DEFAULT_PARAMS |
+| `description` | String | `''` | Описание DAG-а (отображается в Airflow UI) |
+| `is_recent` | UInt8 | `0` | `0` = delta-выгрузка, `1` = recent (скользящее окно) |
+| `is_active` | UInt8 | `1` | `0` = запись игнорируется при синхронизации |
 
 ---
 
@@ -77,18 +100,22 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 
 | Параметр | По умолчанию | Описание |
 | :--- | :--- | :--- |
+| **Дельта / расписание** | | |
 | `increment` | `60` | Шаг дельты, сек |
 | `selfrun_timeout` | `10` | Задержка до следующего автозапуска, мин |
 | `overlap` | `0` | Перекрытие окна назад, сек |
 | `lower_bound` | `''` | Нижняя граница первой дельты; `''` → `1970-01-01` |
 | `time_field` | `'extract_time'` | Поле времени в таблице-источнике |
 | `recent_interval` | `3600` | Окно режима recent, сек |
+| **Стратегия и подтверждение** | | |
 | `strategy` | `'FULL_UK'` | Стратегия слияния в TFS |
 | `auto_confirm` | `1` | `1` = не ждать Kafka-подтверждения |
 | `confirm_timeout` | `3600` | Таймаут ожидания подтверждения, сек |
+| **Файлы и сжатие** | | |
 | `compression_type` | `'none'` | Тип сжатия: `none` / `gzip` / `zstd` |
 | `compression_ext` | `''` | Расширение сжатого файла |
 | `max_file_size` | `''` | Ограничение размера CSV, байт; `''` = без ограничений |
+| **Формат и санитизация** | | |
 | `format` | `'TSVWithNames'` | Формат выгрузки ClickHouse |
 | `pg_array_format` | `0` | `1` = PostgreSQL-формат массивов в TSV |
 | `csv_format_params` | `''` | Доп. параметры форматирования (dict-литерал) |
@@ -110,7 +137,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 
 Для новых таблиц запись в `extract_history` создаётся автоматически с `time_from = lower_bound`.
 
-### Пример вставки (без JOIN)
+### Пример: простая delta-выгрузка
 
 ```sql
 INSERT INTO export.er_wf_meta
@@ -127,7 +154,7 @@ VALUES (
 );
 ```
 
-### Пример вставки (с JOIN)
+### Пример: delta-выгрузка с JOIN
 
 ```sql
 INSERT INTO export.er_wf_meta
@@ -146,30 +173,32 @@ VALUES (
 ```
 
 > `sql_join` содержит **полное** JOIN-выражение (включая ключевое слово: `JOIN`, `LEFT JOIN`, `INNER JOIN` и т.п.).
-> Для автоматического включения всех полей оставьте `fields = []`.
-> Для recent-режима установите `is_recent = 1` и добавьте `"recent_interval"` в `params`.
 
-### Пример с CTE и SETTINGS
+### Пример: тяжёлый запрос с CTE и настройками CH
 
 ```sql
 INSERT INTO export.er_wf_meta
-    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_with, sql_where, sql_settings, params)
+    (extract_name, db_name, replica, schema_name, uk,
+     sql_with, sql_from, sql_where, sql_settings, params)
 VALUES (
     'my_heavy_table',
     'my_database',
     'hrplatform_datalab',
     'target_schema',
     ['id'],
-    'cte',
     'WITH cte AS (SELECT id, max(updated_at) AS updated_at FROM my_database.my_heavy_table GROUP BY id)',
+    'cte',                                           -- FROM-часть = псевдоним CTE
     '{condition}',
-    'max_threads=2, max_memory_usage=''10000000000''',
+    'max_threads=2, max_memory_usage=10000000000',
     '{"strategy": "FULL_UK"}'
 );
 ```
 
 > `sql_with` — полный WITH-блок (включая ключевое слово `WITH`); вставляется перед `SELECT`.
 > `sql_settings` — строка в формате ClickHouse SETTINGS: `key=value, key2=value2`.
+
+> Для автоматического включения всех полей оставьте `fields = []`.
+> Для recent-режима установите `is_recent = 1` и добавьте `"recent_interval"` в `params`.
 
 ---
 

@@ -13,7 +13,13 @@ DAG синхронизации метаданных ER-выгрузок.
       "PK":        list[str],
       "UK":        list[str],
       "params":    str,           # JSON с переопределёнными DEFAULT_PARAMS
-      "sql_stmt_export_delta" | "sql_stmt_export_recent": {"from": ..., "where": ...},
+      "sql_stmt_export_delta" | "sql_stmt_export_recent": {
+          "from":     str,        # обязательно
+          "with":     str,        # опционально — WITH-блок (CTE)
+          "joins":    str,        # опционально — JOIN-clause
+          "where":    str,        # опционально — WHERE-условие
+          "settings": str,        # опционально — SETTINGS-блок ClickHouse
+      },
       "fields":    list[str],     # опционально
       "description": str,         # опционально
     }

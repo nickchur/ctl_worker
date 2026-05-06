@@ -338,7 +338,7 @@ def _er_pack_zip(cfg, **context):
     ti.xcom_push(key="total_row_count",  value=sum(int(r) for r in counts))
 
 
-@task(task_id='save_status', trigger_rule='all_done', pool=POOL_NAME)
+@task(task_id='save_status', trigger_rule='all_success', pool=POOL_NAME)
 def _er_save_status(cfg, **context):
     """Records export results in history table."""
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook

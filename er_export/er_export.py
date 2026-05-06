@@ -357,6 +357,7 @@ def _er_build_meta(cfg, **context):
         "columns": EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF,
     }
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
+    add_note({"build_meta": [c["column_name"] for c in meta["columns"]]}, level='task,dag', context=context)
 
 
 @task(task_id='pack_zip', pool=POOL_NAME)

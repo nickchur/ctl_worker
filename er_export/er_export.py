@@ -196,7 +196,7 @@ def _pre_kafka(scenario: str):
     Динамически подставляет имя summary-файла в аргументы продюсера.
     """
     def pre_execute(context):
-        if MODE != 'SIGMA':
+        if ENV_STAND == 'DEV':
             raise AirflowSkipException("Kafka notification skipped in test mode")
         summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
         if not summary_tkt:
@@ -214,7 +214,7 @@ def _pre_await(auto_confirm=False):
     def pre_execute(context):
         if auto_confirm:
             raise AirflowSkipException("Auto confirm enabled, skipping wait")
-        if MODE != 'SIGMA':
+        if ENV_STAND == 'DEV':
             raise AirflowSkipException("Kafka wait skipped in test mode")
         summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
         if not summary_tkt:

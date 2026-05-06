@@ -1,9 +1,9 @@
 """
-Конфигурация и константы фреймворка ER-выгрузок.
+⚙️ Конфигурация и константы фреймворка ER-выгрузок.
 
 CH-коннект и S3 определяются наличием переменной AIRFLOW__CTL_PIN:
-  есть  → dlab-click-test + s3-archive, секреты из Vault.
-  нет   → dlab-click + s3-tfs-hrplt.
+  🔑 есть  → dlab-click-test + s3-archive, секреты из Vault.
+  🏭 нет   → dlab-click + s3-tfs-hrplt.
 
 Поведение на стенде управляется ENV_STAND (PROM / UAT / QA / IFT / DEV).
 """
@@ -46,7 +46,7 @@ TOPIC  = 'TFS.HRPLT.IN'
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().upper()
 
-# replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
+# 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
     "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
 }
@@ -64,7 +64,7 @@ DEF_ARGS = {
     "topic":              TOPIC,
 }
 
-# Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
+# 🔢 Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
 LIMITS = {
     "PROM": 0,
     "UAT":  100,
@@ -95,11 +95,11 @@ TYPE_MAP: dict[str, str] = {
     "Array":       "STRING",
 }
 
-# SQL-выражения, автоматически добавляемые в SELECT каждой выгрузки
+# 📎 SQL-выражения, автоматически добавляемые в SELECT каждой выгрузки
 MANDATORY_PRE = ["{export_time} as export_time"]          # подставляется рантаймом из состояния дельты
 MANDATORY_SUF = ["'I' as ctl_action", "now() as ctl_validfrom"]
 
-# Описания служебных колонок для .meta-файла TFS (порядок: PRE + data + SUF)
+# 🗂️ Описания служебных колонок для .meta-файла TFS (порядок: PRE + data + SUF)
 EXTRA_COLS_PRE = [
     {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
@@ -113,13 +113,13 @@ POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
 
 def obj_load(key: str, default: any = None) -> any:
-    """Читает объект из Airflow Variable (JSON). При отсутствии возвращает default или {}."""
+    """📥 Читает объект из Airflow Variable (JSON). При отсутствии возвращает default или {}."""
     from airflow.models import Variable
     return Variable.get(key, default_var=default if default is not None else {}, deserialize_json=True)
 
 
 def obj_save(key: str, data: any) -> None:
-    """Сохраняет объект в Airflow Variable (JSON).
+    """📤 Сохраняет объект в Airflow Variable (JSON).
 
     Пропускает запись если данные не изменились (сравнение JSON).
     Обновляет description переменной метаданными: {'ts': ..., 'len': ..., 'size': ...}.
@@ -158,7 +158,7 @@ def obj_save(key: str, data: any) -> None:
 
 
 def add_note(msg, context=None, level='task', add=True, title='', compact=False):
-    """Добавляет структурированную заметку в Airflow UI (Task и/или DAG Run).
+    """📝 Добавляет структурированную заметку в Airflow UI (Task и/или DAG Run).
 
     level  — 'task', 'dag' или 'task,dag' (регистр не важен; макс. 2 объекта)
     add    — True = prepend к существующей заметке; False = заменить полностью
@@ -216,7 +216,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
 
 
 def get_dict(ch_hook, sql: str) -> list[dict]:
-    """Выполняет SQL и возвращает результат как список словарей {column: value}."""
+    """🔍 Выполняет SQL и возвращает результат как список словарей {column: value}."""
     res, cols = ch_hook.execute(sql, with_column_types=True)
     if res:
         cols = [col[0] for col in cols]
@@ -254,13 +254,13 @@ DEFAULT_PARAMS: dict = {
 
 
 def get_params(row: dict) -> dict:
-    """Мёржит JSON-поле params из er_wf_meta с DEFAULT_PARAMS. Значения из row побеждают."""
+    """🔧 Мёржит JSON-поле params из er_wf_meta с DEFAULT_PARAMS. Значения из row побеждают."""
     overrides = json.loads(row.get('params') or '{}')
     return {**DEFAULT_PARAMS, **overrides}
 
 
 def get_config() -> dict:
-    """Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта."""
+    """📦 Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта."""
     return {
         'CH_ID':          CH_ID,
         'TYPE_MAP':       TYPE_MAP,

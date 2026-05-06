@@ -99,7 +99,6 @@ def er_sync_dag():
                     sql_from        String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос',
                     sql_where       String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; {condition} подставляется рантаймом',
                     sql_join        String        DEFAULT ''             COMMENT 'JOIN-clause (полное выражение: JOIN t ON ...); вставляется между FROM и WHERE',
-                    sql_left_join   String        DEFAULT ''             COMMENT 'LEFT JOIN-clause (полное выражение: LEFT JOIN t ON ...); добавляется после sql_join',
                     params          String        DEFAULT '{}'           COMMENT 'JSON с параметрами выгрузки (см. DEFAULT_PARAMS в er_config)',
                     description     String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
                     is_recent       UInt8         DEFAULT 0              COMMENT '0 = delta (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent)',
@@ -140,9 +139,8 @@ def er_sync_dag():
             # is_recent определяет ключ SQL-запроса: фабрика er_export.py проверяет наличие одного из двух
             sql_key = "sql_stmt_export_recent" if row["is_recent"] else "sql_stmt_export_delta"
             sql_val = {"from": row["sql_from"]}
-            joins = " ".join(filter(None, [row["sql_join"], row["sql_left_join"]]))
-            if joins:
-                sql_val["joins"] = joins
+            if row["sql_join"]:
+                sql_val["joins"] = row["sql_join"]
             if row["sql_where"]:
                 sql_val["where"] = row["sql_where"]
 

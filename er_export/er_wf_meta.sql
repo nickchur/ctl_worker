@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     sql_from      String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос',
     sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; {condition} подставляется рантаймом',
     sql_join      String        DEFAULT ''             COMMENT 'JOIN-clause (полное выражение: JOIN t ON ...); вставляется между FROM и WHERE',
-    sql_left_join String        DEFAULT ''             COMMENT 'LEFT JOIN-clause (полное выражение: LEFT JOIN t ON ...); добавляется после sql_join',
     params        String        DEFAULT '{}'           COMMENT 'JSON с переопределёнными параметрами выгрузки (см. DEFAULT_PARAMS в er_config.py)',
     description   String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
     is_recent     UInt8         DEFAULT 0              COMMENT '0 = delta-выгрузка, 1 = recent (скользящее окно)',
@@ -33,10 +32,10 @@ ORDER BY (db_name, extract_name);
 
 
 -- Пример: delta-выгрузка с JOIN и нестандартными параметрами.
--- sql_join и sql_left_join содержат полные JOIN-выражения (включая ключевое слово JOIN/LEFT JOIN).
+-- sql_join содержит полное JOIN-выражение (включая ключевое слово JOIN/LEFT JOIN/INNER JOIN и т.п.).
 -- Поля strategy, increment, auto_confirm и др. передаются через params JSON.
 INSERT INTO export.er_wf_meta
-    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_left_join, sql_where, params)
+    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_join, sql_where, params)
 VALUES (
     'lc_items_opened',
     'evolution',

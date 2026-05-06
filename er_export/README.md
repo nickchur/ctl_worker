@@ -126,11 +126,11 @@ VALUES (
 );
 ```
 
-### Пример вставки (с LEFT JOIN)
+### Пример вставки (с JOIN)
 
 ```sql
 INSERT INTO export.er_wf_meta
-    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_left_join, sql_where, params)
+    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_join, sql_where, params)
 VALUES (
     'my_table',
     'my_database',
@@ -144,8 +144,7 @@ VALUES (
 );
 ```
 
-> `sql_join` и `sql_left_join` содержат **полные** JOIN-выражения (включая ключевое слово).
-> Оба поля объединяются через пробел если заполнены одновременно.
+> `sql_join` содержит **полное** JOIN-выражение (включая ключевое слово: `JOIN`, `LEFT JOIN`, `INNER JOIN` и т.п.).
 > Для автоматического включения всех полей оставьте `fields = []`.
 > Для recent-режима установите `is_recent = 1` и добавьте `"recent_interval"` в `params`.
 

@@ -14,17 +14,24 @@
 
 ---
 
-## Режимы работы
+## Стенды и поведение
 
-| Режим | Описание | Признак |
+Поведение фреймворка управляется двумя переменными окружения.
+
+**`ER_MODE`** — определяет CH-коннект и источник секретов:
+
+| Значение | CH-коннект | Секреты |
 | :--- | :--- | :--- |
-| **SIGMA** | Продовый режим | `ER_MODE=SIGMA` (по умолчанию) |
-| **ALPHA** | Тестовый режим | `ER_MODE=ALPHA` или наличие `AIRFLOW__CTL_PIN` |
+| `SIGMA` (по умолчанию) | `dlab-click` | стандартные Airflow connections |
+| `ALPHA` (при наличии `AIRFLOW__CTL_PIN`) | `dlab-click-test` | Vault `/vault/secrets/application` |
 
-В режиме **ALPHA** автоматически:
-- Используются секреты из Vault (`/vault/secrets/application`), CH-коннект `dlab-click-test`.
-- Применяется `LIMIT 100` для стендов `uat`, `qa`, `ift`, `dev`.
-- Пропускается отправка уведомлений в Kafka и ожидание подтверждения.
+**`ENV_STAND`** — определяет ограничения и поведение на стенде:
+
+| Значение | Лимит строк | Kafka / подтверждение |
+| :--- | :--- | :--- |
+| `prom` | без ограничений | отправляется в штатном режиме |
+| `uat`, `qa`, `ift` | 100 строк | отправляется в штатном режиме |
+| `dev` | 100 строк | **пропускается** (notify_tfs и wait_confirm — skip) |
 
 ---
 
@@ -51,8 +58,8 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | **build_meta** | Генерирует `.meta` JSON со схемой колонок (`DESCRIBE TABLE` или из `fields`). |
 | **export_to_s3** | Нативная выгрузка ClickHouse → S3 (`HrpClickNativeToS3ListOperator`). |
 | **pack_zip** | Потоковая упаковка CSV + `.meta` + `.tkt` в ZIP без буферизации в памяти (`stream_zip`). |
-| **notify_tfs** | Отправка XML-уведомления в Kafka → TFS. Пропускается если нет данных или режим ALPHA. |
-| **wait_confirm** | Ожидание подтверждения из Kafka (`AwaitMessageSensor`). Пропускается при `auto_confirm=1`, в режиме ALPHA или при отсутствии данных. |
+| **notify_tfs** | Отправка XML-уведомления в Kafka → TFS. Пропускается если нет данных или `ENV_STAND=dev`. |
+| **wait_confirm** | Ожидание подтверждения из Kafka (`AwaitMessageSensor`). Пропускается при `auto_confirm=1`, `ENV_STAND=dev` или отсутствии данных. |
 | **save_status** | Фиксирует результат в `export.extract_history` (только при полном успехе всех upstream-тасков). |
 | **schedule_next** | Автоматически ставит следующий запуск если дельта не догнала текущее время. |
 
@@ -135,7 +142,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 
 ### Bootstrap (первый запуск)
 
-Для новых таблиц запись в `extract_history` создаётся автоматически с `time_from = lower_bound`.
+Для новых таблиц запись в `extract_history` создаётся автоматически с `time_from = lower_bound`. На стенде `dev` таблица `er_wf_meta` создаётся автоматически если её нет.
 
 ### Пример: простая delta-выгрузка
 

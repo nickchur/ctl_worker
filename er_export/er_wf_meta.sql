@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     fields        Array(String) DEFAULT []             COMMENT 'SELECT-выражения таблицы-источника; [] = все колонки (DESCRIBE TABLE)',
     sql_from      String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос',
     sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; {condition} подставляется рантаймом',
+    sql_join      String        DEFAULT ''             COMMENT 'JOIN-clause (полное выражение: JOIN t ON ...); вставляется между FROM и WHERE',
+    sql_left_join String        DEFAULT ''             COMMENT 'LEFT JOIN-clause (полное выражение: LEFT JOIN t ON ...); добавляется после sql_join',
     params        String        DEFAULT '{}'           COMMENT 'JSON с переопределёнными параметрами выгрузки (см. DEFAULT_PARAMS в er_config.py)',
     description   String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
     is_recent     UInt8         DEFAULT 0              COMMENT '0 = delta-выгрузка, 1 = recent (скользящее окно)',
@@ -30,18 +32,19 @@ ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/export/er_wf_m
 ORDER BY (db_name, extract_name);
 
 
--- Пример: delta-выгрузка с нестандартными параметрами
--- Поля strategy, increment, auto_confirm и др. передаются через params JSON,
--- а не как отдельные колонки. Неуказанные параметры берутся из DEFAULT_PARAMS (er_config.py).
+-- Пример: delta-выгрузка с JOIN и нестандартными параметрами.
+-- sql_join и sql_left_join содержат полные JOIN-выражения (включая ключевое слово JOIN/LEFT JOIN).
+-- Поля strategy, increment, auto_confirm и др. передаются через params JSON.
 INSERT INTO export.er_wf_meta
-    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_where, params)
+    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_left_join, sql_where, params)
 VALUES (
     'lc_items_opened',
     'evolution',
     'hrplatform_datalab',
     'learning',
     ['person_uuid', 'item_id'],
-    'evolution.lc_items_opened',
+    'evolution.lc_items_opened t1',
+    'LEFT JOIN evolution_export.lc_items_opened_exp t2 ON t1.person_uuid = t2.person_uuid AND t1.item_id = t2.item_id',
     '{condition}',
     '{"strategy": "FULL_UK", "increment": 60, "selfrun_timeout": 10, "auto_confirm": 1}'
 );

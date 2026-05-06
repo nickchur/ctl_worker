@@ -109,7 +109,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 
 Для новых таблиц запись в `extract_history` создаётся автоматически с `time_from = lower_bound`.
 
-### Пример вставки
+### Пример вставки (без JOIN)
 
 ```sql
 INSERT INTO export.er_wf_meta
@@ -126,6 +126,26 @@ VALUES (
 );
 ```
 
+### Пример вставки (с LEFT JOIN)
+
+```sql
+INSERT INTO export.er_wf_meta
+    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_left_join, sql_where, params)
+VALUES (
+    'my_table',
+    'my_database',
+    'hrplatform_datalab',
+    'target_schema',
+    ['id'],
+    'my_database.my_table t1',
+    'LEFT JOIN my_database_export.my_table_exp t2 ON t1.id = t2.id',
+    '{condition}',
+    '{"strategy": "FULL_UK"}'
+);
+```
+
+> `sql_join` и `sql_left_join` содержат **полные** JOIN-выражения (включая ключевое слово).
+> Оба поля объединяются через пробел если заполнены одновременно.
 > Для автоматического включения всех полей оставьте `fields = []`.
 > Для recent-режима установите `is_recent = 1` и добавьте `"recent_interval"` в `params`.
 

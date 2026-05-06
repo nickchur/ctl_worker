@@ -52,7 +52,7 @@ S3_CONN        = _cfg['S3_CONN']
 VAR_NAME       = _cfg['VAR_NAME']
 POOL_NAME      = _cfg['POOL_NAME']
 
-ON_DELIVERY = 'er_export.er_export.on_delivery'   # dot-notation для delivery_callback
+ON_DELIVERY = f'{__name__}.on_delivery'   # dot-notation для delivery_callback
 
 # ── SQL Builders ──────────────────────────────────────────────────────────────
 

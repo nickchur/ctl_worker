@@ -50,7 +50,7 @@ else:
     default_args={"owner": "DataLab (CI02420667)", "retries": 0},
     owner_links={"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"},
     start_date=pendulum.datetime(2025, 8, 7, tz=pendulum.UTC),
-    tags=["DataLab", "tools", "test"],
+    tags=["DataLab", "tools", "ER", "test"],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

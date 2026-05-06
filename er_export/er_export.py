@@ -164,9 +164,11 @@ def _pre_kafka(scenario: str):
     return pre_execute
 
 
-def _pre_await():
-    """Factory for AwaitMessageSensor pre-execution: skip if nothing was sent."""
+def _pre_await(auto_confirm=False):
+    """Factory for AwaitMessageSensor pre-execution: skip if auto_confirm, test mode, or no data."""
     def pre_execute(context):
+        if auto_confirm:
+            raise AirflowSkipException("Auto confirm enabled, skipping wait")
         if MODE != 'SIGMA':
             raise AirflowSkipException("Kafka wait skipped in test mode")
         summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
@@ -390,7 +392,6 @@ def _er_schedule_next(cfg, **context):
 def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     """Generates a dynamic Airflow DAG from metadata."""
     from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
-    from airflow.operators.empty import EmptyOperator
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
     from airflow.providers.apache.kafka.sensors.kafka import AwaitMessageSensor
 
@@ -490,8 +491,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             task_id='notify_tfs', topic="{{ params.topic }}", producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
             delivery_callback="er_export.er_export.on_delivery", pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
         )
-        t_wait = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME) if cfg.get('auto_confirm') else \
-                 AwaitMessageSensor(task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']], apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME, execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await())
+        t_wait = AwaitMessageSensor(task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']], apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME, execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm')))
         
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)
 

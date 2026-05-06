@@ -1,6 +1,11 @@
 """
-Configuration and constants for the ER export framework.
-Includes environment-specific settings, connection IDs, and data type mappings.
+Конфигурация и константы фреймворка ER-выгрузок.
+
+Два режима работы (MODE):
+  SIGMA — продовый CH (dlab-click) и S3 (s3-tfs-hrplt).
+  ALPHA — тестовый CH из vault (dlab-click-test) и S3 (s3-archive);
+          включается автоматически при наличии переменной AIRFLOW__CTL_PIN
+          или принудительно через ER_MODE=ALPHA.
 """
 from __future__ import annotations
 
@@ -49,16 +54,16 @@ TFS_MAP = {
 }
 
 DEF_ARGS = {
-    "owner":               "DataLab (CI02420667)",
-    "retries":             3,
-    "retry_delay":         timedelta(minutes=5),
-    "aws_conn_id":         S3_CONN,
-    "clickhouse_conn_id":  CH_ID,
-    "conn_id":             CH_ID,
-    "kafka_config_id":     "tfs-kafka-out",
-    "kafka_in_conn":"tfs-kafka-in",
-    "kafka_in_topic":  "TFS.HRPLT.OUT",
-    "topic":               TOPIC,
+    "owner":              "DataLab (CI02420667)",
+    "retries":            3,
+    "retry_delay":        timedelta(minutes=5),
+    "aws_conn_id":        S3_CONN,
+    "clickhouse_conn_id": CH_ID,
+    "conn_id":            CH_ID,
+    "kafka_config_id":    "tfs-kafka-out",   # продюсер → TFS
+    "kafka_in_conn":      "tfs-kafka-in",    # консьюмер ← TFS (подтверждения)
+    "kafka_in_topic":     "TFS.HRPLT.OUT",
+    "topic":              TOPIC,
 }
 
 LIMITS = {
@@ -209,6 +214,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
 
 
 def get_dict(ch_hook, sql: str) -> list[dict]:
+    """Выполняет SQL и возвращает результат как список словарей {column: value}."""
     res, cols = ch_hook.execute(sql, with_column_types=True)
     if res:
         cols = [col[0] for col in cols]
@@ -217,23 +223,30 @@ def get_dict(ch_hook, sql: str) -> list[dict]:
 
 
 DEFAULT_PARAMS: dict = {
-    'increment':         60,
-    'selfrun_timeout':   10,
-    'strategy':          'FULL_UK',
-    'auto_confirm':       1,
-    'confirm_timeout':    3600,
-    'lower_bound':       '',
-    'time_field':        'extract_time',
-    'overlap':           0,
-    'recent_interval':   3600,
-    'compression_type':  'none',
-    'compression_ext':   '',
-    'max_file_size':     '',
-    'pg_array_format':   0,
-    'csv_format_params': '',
-    'xstream_sanitize':  0,
-    'sanitize_array':    0,
-    'sanitize_list':     '',
+    # ── Дельта / расписание ──────────────────────────────────────────────────
+    'increment':         60,           # шаг дельты, сек: time_to = time_from + increment
+    'selfrun_timeout':   10,           # задержка до следующего автозапуска, мин
+    'overlap':           0,            # перекрытие окна дельты назад, сек (для компенсации задержек CDC)
+    'lower_bound':       '',           # нижняя граница первой дельты (bootstrap); '' → 1970-01-01
+    'time_field':        'extract_time',  # поле времени в таблице-источнике
+    'recent_interval':   3600,         # окно для режима recent, сек (используется вместо дельты)
+
+    # ── Стратегия и подтверждение ────────────────────────────────────────────
+    'strategy':          'FULL_UK',    # стратегия слияния на стороне TFS
+    'auto_confirm':      1,            # 1 = не ждать Kafka-подтверждения от TFS
+    'confirm_timeout':   3600,         # таймаут ожидания подтверждения, сек
+
+    # ── Файлы и сжатие ───────────────────────────────────────────────────────
+    'compression_type':  'none',       # тип сжатия: none | gzip | zstd
+    'compression_ext':   '',           # расширение сжатого файла, если нужно
+    'max_file_size':     '',           # ограничение размера CSV-файла, байт; '' = без ограничений
+
+    # ── Формат и санитизация ─────────────────────────────────────────────────
+    'pg_array_format':   0,            # 1 = PostgreSQL-формат массивов в TSV
+    'csv_format_params': '',           # доп. параметры форматирования (dict-литерал)
+    'xstream_sanitize':  0,            # 1 = экранировать спецсимволы XStream
+    'sanitize_array':    0,            # 1 = санитизировать CH-массивы в строки
+    'sanitize_list':     '',           # список колонок для санитизации (через запятую)
 }
 
 
@@ -244,6 +257,7 @@ def get_params(row: dict) -> dict:
 
 
 def get_config() -> dict:
+    """Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта."""
     return {
         'CH_ID':          CH_ID,
         'TYPE_MAP':       TYPE_MAP,

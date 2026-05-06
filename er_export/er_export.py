@@ -1,6 +1,15 @@
 """
-DAG Factory for ER exports.
-Dynamically generates Airflow DAGs based on metadata loaded from ClickHouse.
+DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
+
+Жизненный цикл одного запуска:
+  init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm → save_status → schedule_next
+
+Метаданные выгрузок хранятся в Airflow Variable `datalab_er_wfs` (JSON-словарь),
+который синхронизируется DAG-ом export_er_sync из таблицы export.er_wf_meta.
+
+Поддерживаемые режимы выгрузки:
+  delta  — инкрементальный, окно [time_from, time_to] из export.extract_current_vw
+  recent — скользящее окно [now() - recent_interval, now()], без сохранения состояния
 """
 from __future__ import annotations
 
@@ -65,7 +74,11 @@ def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
 
 
 def sql_cur_delta(tbl: str) -> str:
-    """SQL to fetch the current delta state for processing."""
+    """SQL для получения текущего состояния дельты из export.extract_current_vw.
+
+    Все значения возвращаются как строки-SQL-литералы ('2024-01-01' или null),
+    чтобы их можно было подставлять напрямую в шаблонные SQL-запросы через str.format().
+    """
     return build_sql({
         "fields": [
             "toString(a.num_state) as num_state",
@@ -94,7 +107,11 @@ def _fmt_val(v: Any) -> str:
 
 
 def _format_cur_state(cur: dict) -> dict:
-    """Prepares state dictionary for runtime SQL injection."""
+    """Преобразует сырую строку extract_current_vw в словарь SQL-литералов.
+
+    Нужно при bootstrap (первый запуск) или когда вью вернула сырые Python-значения
+    вместо уже отформатированных строк (например, None вместо 'null').
+    """
     tf = str(cur['time_field']).strip("'")
     ec = cur['extract_count']
     fmt_dt = lambda x: _fmt_val(x)
@@ -149,11 +166,16 @@ def on_delivery(err: Exception | None, msg) -> None:
 
 
 def _kafka_accept_any(msg) -> bool:
+    """apply_function для AwaitMessageSensor: принимает любое сообщение из топика."""
     return True
 
 
 def _pre_kafka(scenario: str):
-    """Factory for Kafka pre-execution logic: checks if data was actually exported."""
+    """Фабрика pre_execute для ProduceToTopicOperator.
+
+    Пропускает отправку если данных нет или режим тестовый.
+    Динамически подставляет имя summary-файла в аргументы продюсера.
+    """
     def pre_execute(context):
         if MODE != 'SIGMA':
             raise AirflowSkipException("Kafka notification skipped in test mode")
@@ -165,7 +187,11 @@ def _pre_kafka(scenario: str):
 
 
 def _pre_await(auto_confirm=False):
-    """Factory for AwaitMessageSensor pre-execution: skip if auto_confirm, test mode, or no data."""
+    """Фабрика pre_execute для AwaitMessageSensor.
+
+    Пропускает ожидание если: auto_confirm=True, тестовый режим, или данных не было.
+    Позволяет использовать один оператор вместо EmptyOperator/AwaitMessageSensor switch.
+    """
     def pre_execute(context):
         if auto_confirm:
             raise AirflowSkipException("Auto confirm enabled, skipping wait")
@@ -180,15 +206,25 @@ def _pre_await(auto_confirm=False):
 
 @task(task_id='init', pool=POOL_NAME)
 def _er_init(cfg, **context):
-    """Initializes export state, handles bootstrap for new tables."""
+    """Инициализирует состояние выгрузки и возвращает словарь SQL-литералов для шаблонов.
+
+    Delta-режим: читает export.extract_current_vw; при первом запуске создаёт bootstrap-состояние
+    с time_from/time_to = lower_bound.
+    Recent-режим: вычисляет окно [now() - recent_interval, now()] без обращения к CH.
+
+    Возвращаемый словарь (XCom "return_value") используется всеми downstream-тасками
+    через xcom_pull(task_ids="init").
+    """
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-    
+
     S3Hook(aws_conn_id=S3_CONN).create_bucket(bucket_name=BUCKET)
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
 
     tf  = cfg.get('time_field', 'extract_time')
     lb  = cfg.get('lower_bound') or '1970-01-01 00:00:00'
+
+    # Параметры, общие для delta и recent: передаются оператору экспорта и сохраняются в историю
     reg = {
         'lower_bound':        f"'{lb}'",
         'selfrun_timeout':    str(cfg.get('selfrun_timeout', 10)),
@@ -208,7 +244,7 @@ def _er_init(cfg, **context):
     if cfg['sql_get_current']:
         cur_res = get_dict(hook, cfg['sql_get_current'])
         if not cur_res:
-            logger.warning("First execution for %s. Bootstrapping from registry.", cfg['tbl'])
+            logger.warning("First execution for %s. Bootstrapping from lower_bound=%s.", cfg['tbl'], lb)
             state = {
                 'num_state': 0, 'extract_time': lb, 'extract_count': None,
                 'loaded': None, 'sent': None, 'confirmed': None,
@@ -254,7 +290,12 @@ def _er_init(cfg, **context):
 
 @task(task_id='build_meta', pool=POOL_NAME)
 def _er_build_meta(cfg, **context):
-    """Builds .meta JSON describing the exported data structure."""
+    """Строит .meta JSON с описанием структуры данных для TFS.
+
+    Колонки собираются в порядке: EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF.
+    Типы маппируются из ClickHouse в целевые через TYPE_MAP (er_config).
+    Если fields = ['*'], берёт все колонки из DESCRIBE TABLE.
+    """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = context['ti'].xcom_pull(task_ids="init")
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
@@ -292,7 +333,16 @@ def _er_build_meta(cfg, **context):
 
 @task(task_id='pack_zip', pool=POOL_NAME)
 def _er_pack_zip(cfg, **context):
-    """Streams data from S3, wraps into ZIP with metadata, and uploads back to S3."""
+    """Упаковывает CSV-файлы из S3 в ZIP-архивы формата TFS и загружает обратно в S3.
+
+    Каждый CSV оборачивается в отдельный ZIP с тремя файлами:
+      *.tkt  — манифест (имя CSV + кол-во строк)
+      *.meta — JSON-схема колонок
+      *.csv  — данные (стриминг из S3 без буферизации в памяти)
+
+    После упаковки исходные CSV удаляются из S3.
+    Отдельный summary.tkt перечисляет все ZIP-файлы пакета — он передаётся в Kafka.
+    """
     from stat import S_IFREG
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from stream_zip import ZIP_32, stream_zip # type: ignore
@@ -309,6 +359,7 @@ def _er_pack_zip(cfg, **context):
     hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
     base_ts, uploaded = pendulum.now("UTC"), []
 
+    # stream_zip возвращает генератор байт, а load_file_obj ожидает file-like object
     class _Reader:
         def __init__(self, g): self._g, self._b = g, bytearray()
         def read(self, n=-1):
@@ -350,7 +401,12 @@ def _er_pack_zip(cfg, **context):
 
 @task(task_id='save_status', trigger_rule='all_success', pool=POOL_NAME)
 def _er_save_status(cfg, **context):
-    """Records export results in history table."""
+    """Записывает результат выгрузки в export.extract_history.
+
+    Запускается только при полном успехе (all_success), поэтому confirmed=null —
+    ожидает Kafka-подтверждения от TFS (или остаётся null при auto_confirm).
+    extract_time берётся из XCom init как SQL-литерал (уже в кавычках).
+    """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     ti, dp = context['ti'], context['ti'].xcom_pull(task_ids="init")
     if not dp: return
@@ -372,7 +428,11 @@ def _er_save_status(cfg, **context):
 
 @task(task_id='schedule_next', pool=POOL_NAME)
 def _er_schedule_next(cfg, **context):
-    """Triggers subsequent run if delta is not yet current."""
+    """Запускает следующий цикл дельты, если time_to ещё не догнал текущее время.
+
+    Запуск откладывается на selfrun_timeout минут, чтобы избежать гонки с источником.
+    Для recent-режима is_current всегда True — автозапуск не нужен.
+    """
     from airflow.models import DagBag
     from airflow.utils.types import DagRunType
     from airflow.utils.state import DagRunState
@@ -450,31 +510,71 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema.replace(' ', '_').lower()],
         render_template_as_native_obj=True, is_paused_upon_creation=True,
         params={
-            'extract_time': Param(None, type=['string', 'null'], title='Extract time'),
-            'condition': Param(None, type=['string', 'null'], title='Condition'),
-            'is_current': Param(None, type=['boolean', 'null'], title='Is current'),
-            'increment':       Param(p['increment'],          type=['integer', 'null'], title='Increment (сек)'),
-            'selfrun_timeout': Param(p['selfrun_timeout'],    type=['integer', 'null'], title='Selfrun timeout (мин)'),
-            'strategy':        Param(p['strategy'],           type='string',            title='Strategy'),
-            'auto_confirm':    Param(bool(p['auto_confirm']), type='boolean',           title='Auto confirm'),
-            'confirm_timeout': Param(p['confirm_timeout'],    type='integer',           title='Confirm timeout (сек)'),
-            'max_file_size': Param(None, type=['integer', 'null'], title='Max file size'),
-            'pool': Param(POOL_NAME, type='string', title='Pool'),
-            'topic': Param(cfg['topic'], type='string', title='Topic'),
+            'extract_time': Param(
+                None, type=['string', 'null'], title='Extract time',
+                description='Переопределить время выгрузки (ISO 8601). Игнорирует состояние дельты.',
+            ),
+            'condition': Param(
+                None, type=['string', 'null'], title='Condition',
+                description='SQL WHERE-условие. Переопределяет условие из состояния дельты.',
+            ),
+            'is_current': Param(
+                None, type=['boolean', 'null'], title='Is current',
+                description='Принудительно пометить состояние как актуальное (не запускать следующий цикл).',
+            ),
+            'increment': Param(
+                p['increment'], type=['integer', 'null'], title='Increment (сек)',
+                description='Шаг дельты: time_to = time_from + increment.',
+            ),
+            'selfrun_timeout': Param(
+                p['selfrun_timeout'], type=['integer', 'null'], title='Selfrun timeout (мин)',
+                description='Задержка до следующего автозапуска, если дельта не догнала текущее время.',
+            ),
+            'strategy': Param(
+                p['strategy'], type='string', title='Strategy',
+                description='Стратегия слияния на стороне TFS (FULL_UK, APPEND и др.).',
+            ),
+            'auto_confirm': Param(
+                bool(p['auto_confirm']), type='boolean', title='Auto confirm',
+                description='True = не ждать Kafka-подтверждения от TFS.',
+            ),
+            'confirm_timeout': Param(
+                p['confirm_timeout'], type='integer', title='Confirm timeout (сек)',
+                description='Максимальное время ожидания подтверждения из Kafka.',
+            ),
+            'max_file_size': Param(
+                None, type=['integer', 'null'], title='Max file size',
+                description='Ограничение размера CSV-файла, байт. None — без ограничений.',
+            ),
+            'pool': Param(
+                POOL_NAME, type='string', title='Pool',
+                description='Airflow Pool для регулирования параллелизма выгрузок.',
+            ),
+            'topic': Param(
+                cfg['topic'], type='string', title='Topic',
+                description='Kafka-топик для отправки уведомлений в TFS.',
+            ),
         },
     )
 
     with dag:
         def _pre_exp(ctx):
+            """pre_execute для export_to_s3: подставляет состояние дельты в SQL и параметры оператора."""
             dp = ctx['ti'].xcom_pull(task_ids="init")
             op = ctx['task']
             op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
-            try: op.max_size = int(dp.get('max_file_size'))
-            except: op.max_size = None
-            op.pg_array_format, op.xstream_sanitize, op.sanitize_array = dp['pg_array_format'] == 'True', dp.get('xstream_sanitize', 'False') == 'True', dp.get('sanitize_array', 'False') == 'True'
-            op.sanitize_list = dp.get('sanitize_list') or ''
-            try: op.format_params = ast.literal_eval(dp['format_params'])
-            except: op.format_params = {}
+            try:
+                op.max_size = int(dp.get('max_file_size'))
+            except (TypeError, ValueError):
+                op.max_size = None
+            op.pg_array_format  = dp['pg_array_format'] == 'True'
+            op.xstream_sanitize = dp.get('xstream_sanitize', 'False') == 'True'
+            op.sanitize_array   = dp.get('sanitize_array', 'False') == 'True'
+            op.sanitize_list    = dp.get('sanitize_list') or ''
+            try:
+                op.format_params = ast.literal_eval(dp['format_params'])
+            except (ValueError, SyntaxError):
+                op.format_params = {}
 
         t_init, t_meta = _er_init(cfg=cfg), _er_build_meta(cfg=cfg)
         t_exp = HrpClickNativeToS3ListOperator(

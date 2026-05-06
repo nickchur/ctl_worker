@@ -16,7 +16,7 @@ from datetime import timedelta
 
 VAULT_PATH = '/vault/secrets/application'
 CH_BD      = 'export'
-VAR_NAME = "datalab_er_wfs"
+VAR_NAME   = "datalab_er_wfs"
 
 # ER_MODE включает тестовый CH-коннект из vault; по умолчанию — SIGMA/ALPHA
 MODE = os.getenv("ER_MODE", "SIGMA" if not os.getenv("AIRFLOW__CTL_PIN") else "ALPHA")
@@ -27,6 +27,7 @@ if MODE == 'ALPHA':
         secrets = json.load(f)
 
     def _b64(s: str) -> str:
+        """Декодирует base64-строку из vault в UTF-8."""
         return base64.b64decode(s).decode()
 
     conn_json = {
@@ -49,6 +50,7 @@ TOPIC  = 'TFS.HRPLT.IN'
 
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()
 
+# replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
     "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
 }
@@ -66,6 +68,7 @@ DEF_ARGS = {
     "topic":              TOPIC,
 }
 
+# Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
 LIMITS = {
     "prom": 0,
     "uat":  100,
@@ -96,9 +99,11 @@ TYPE_MAP: dict[str, str] = {
     "Array":       "STRING",
 }
 
-MANDATORY_PRE = ["{export_time} as export_time"]
+# SQL-выражения, автоматически добавляемые в SELECT каждой выгрузки
+MANDATORY_PRE = ["{export_time} as export_time"]          # подставляется рантаймом из состояния дельты
 MANDATORY_SUF = ["'I' as ctl_action", "now() as ctl_validfrom"]
 
+# Описания служебных колонок для .meta-файла TFS (порядок: PRE + data + SUF)
 EXTRA_COLS_PRE = [
     {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
@@ -106,28 +111,28 @@ EXTRA_COLS_SUF = [
     {"column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None, "description": None},
     {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
-EXTRA_COLS = EXTRA_COLS_PRE + EXTRA_COLS_SUF
+EXTRA_COLS = EXTRA_COLS_PRE + EXTRA_COLS_SUF  # полный список служебных колонок
 
 POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
 
 def obj_load(key: str, default: any = None) -> any:
-    """Loads an object from Airflow Variable (JSON)."""
+    """Читает объект из Airflow Variable (JSON). При отсутствии возвращает default или {}."""
     from airflow.models import Variable
     return Variable.get(key, default_var=default if default is not None else {}, deserialize_json=True)
 
 
 def obj_save(key: str, data: any) -> None:
-    """
-    Saves an object to Airflow Variable (JSON).
-    Compares with existing data to skip redundant writes.
-    Updates Variable description with metadata: {'ts': ..., 'len': ..., 'size': ...}.
+    """Сохраняет объект в Airflow Variable (JSON).
+
+    Пропускает запись если данные не изменились (сравнение JSON).
+    Обновляет description переменной метаданными: {'ts': ..., 'len': ..., 'size': ...}.
     """
     from airflow.models import Variable
     import json
     import pendulum
 
-    # 1. Read and Compare
+    # Сравниваем с текущим значением — пропускаем лишнюю запись в БД
     try:
         old_val = Variable.get(key, default_var=None, deserialize_json=True)
     except Exception:
@@ -139,30 +144,31 @@ def obj_save(key: str, data: any) -> None:
     if new_json == old_json:
         return
 
-    # 2. Calculate Metadata
-    size_bytes = len(new_json.encode('utf-8'))
-    size_val = float(size_bytes)
+    # Вычисляем человекочитаемый размер для description
+    size_val = float(len(new_json.encode('utf-8')))
     unit = 'B'
     for u in ['B', 'KB', 'MB', 'GB']:
         if size_val < 1024.0:
             unit = u
             break
         size_val /= 1024.0
-    
+
     size_str = f"{size_val:.1f} {unit}"
     length   = len(data) if isinstance(data, (dict, list)) else 1
     ts       = pendulum.now().format('YYYY-MM-DD HH:mm:ss')
-    
-    desc = f"{{'ts': '{ts}', 'len': {length}, 'size': '{size_str}'}}"
+    desc     = f"{{'ts': '{ts}', 'len': {length}, 'size': '{size_str}'}}"
 
-    # 3. Save
     Variable.set(key, data, description=desc, serialize_json=True)
 
 
 def add_note(msg, context=None, level='task', add=True, title='', compact=False):
-    """
-    Structured notes in Airflow UI (DAG/Task).
-    Copied from plugins.utils to remove external dependency.
+    """Добавляет структурированную заметку в Airflow UI (Task и/или DAG Run).
+
+    level  — 'task', 'dag' или 'task,dag' (регистр не важен; макс. 2 объекта)
+    add    — True = prepend к существующей заметке; False = заменить полностью
+    compact — передаётся в PrettyPrinter для компактного форматирования dict/list
+
+    Скопировано из plugins.utils для устранения внешней зависимости.
     """
     from airflow.utils.session import create_session
     from airflow.operators.python import get_current_context
@@ -178,38 +184,38 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
         except Exception:
             logger.warning("Could not get Airflow context for add_note")
             return
-        
+
+    # Если передан dict с одним ключом — распаковываем его как заголовок
     if isinstance(msg, dict) and len(msg) == 1:
         t, msg = next(iter(msg.items()))
         title += str(t) + (f' ({len(msg)})' if isinstance(msg, (dict, list, tuple, set)) else '')
-                    
+
     if not isinstance(msg, str):
         msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
         msg = '```\n' + msg + '\n```'
 
     logger.info(f"📝 Note added to {level} {title}:\n{msg}")
-    
+
     with create_session() as session:
-        for l in list(set(level.upper().split(',')))[:2]:
+        for lvl in list(set(level.upper().split(',')))[:2]:
             new_note = msg.strip()
-            if l == 'DAG':
-                obj = session.merge(context['dag_run'])
-            else:
-                obj = session.merge(context['task_instance'])
+            obj = session.merge(context['dag_run'] if lvl == 'DAG' else context['task_instance'])
             session.expire(obj)
-            
+
             if title:
                 import unicodedata
-                if not (title and unicodedata.category(title[0]) == 'So'):
+                # Если title не начинается с emoji — добавляем стандартный префикс
+                if not unicodedata.category(title[0]) == 'So':
                     title = "📝 " + title
                 new_note = f"{title}\n---\n{new_note}"
 
+            # Пропускаем если заметка уже начинается с того же текста (идемпотентность)
             if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
                 continue
-                
+
             if add:
                 new_note = f"{new_note}\n\n---\n{obj.note if obj.note else ''}"
-                
+
             obj.note = new_note[:MAX_NOTE_LEN]
 
 
@@ -251,7 +257,7 @@ DEFAULT_PARAMS: dict = {
 
 
 def get_params(row: dict) -> dict:
-    """Merges er_wf_meta 'params' JSON with DEFAULT_PARAMS. Row-level values win."""
+    """Мёржит JSON-поле params из er_wf_meta с DEFAULT_PARAMS. Значения из row побеждают."""
     overrides = json.loads(row.get('params') or '{}')
     return {**DEFAULT_PARAMS, **overrides}
 

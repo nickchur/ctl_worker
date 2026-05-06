@@ -611,10 +611,6 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 None, type=['integer', 'null'], title='Max file size',
                 description='Ограничение размера CSV-файла, байт. None — без ограничений.',
             ),
-            'pool': Param(
-                POOL_NAME, type='string', title='Pool',
-                description='Airflow Pool для регулирования параллелизма выгрузок.',
-            ),
             'topic': Param(
                 cfg['topic'], type='string', title='Topic',
                 description='Kafka-топик для отправки уведомлений в TFS.',

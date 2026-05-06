@@ -35,10 +35,9 @@ from airflow.decorators import dag, task
 from logging import getLogger
 
 try:
-    from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict
+    from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_save
 except ImportError:
-    from er_export.er_config import get_config, get_dict
-from plugins.ctl_utils import ctl_obj_save
+    from er_export.er_config import get_config, get_dict, obj_save
 
 _cfg       = get_config()
 CH_ID      = _cfg['CH_ID']
@@ -171,8 +170,8 @@ def er_sync_dag():
             wfs[table_key] = entry
 
         logger.info("Загружено %d выгрузок из export.er_wf_meta", len(wfs))
-        # ctl_obj_save пропускает запись если данные не изменились (сравнение JSON)
-        ctl_obj_save(VAR_NAME, wfs, var=True)
+        # obj_save пропускает запись если данные не изменились (сравнение JSON)
+        obj_save(VAR_NAME, wfs)
 
     sync()
 

@@ -163,6 +163,17 @@ def _pre_kafka(scenario: str):
         context['task'].producer_function_args = [scenario, summary_tkt]
     return pre_execute
 
+
+def _pre_await():
+    """Factory for AwaitMessageSensor pre-execution: skip if nothing was sent."""
+    def pre_execute(context):
+        if MODE != 'SIGMA':
+            raise AirflowSkipException("Kafka wait skipped in test mode")
+        summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
+        if not summary_tkt:
+            raise AirflowSkipException("No data exported, skipping wait")
+    return pre_execute
+
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
 @task(task_id='init', pool=POOL_NAME)
@@ -480,7 +491,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             delivery_callback="er_export.er_export.on_delivery", pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
         )
         t_wait = EmptyOperator(task_id='wait_confirm', trigger_rule='none_failed', pool=POOL_NAME) if cfg.get('auto_confirm') else \
-                 AwaitMessageSensor(task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']], apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME, execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)))
+                 AwaitMessageSensor(task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']], apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME, execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await())
         
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)
 

@@ -597,7 +597,14 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             ),
             'strategy': Param(
                 p['strategy'], type='string', title='Strategy',
-                description='Стратегия слияния на стороне TFS (FULL_UK, APPEND и др.).',
+                enum=['FULL_UK', 'FULL_NO_UK', 'INC', 'APPEND'],
+                description=(
+                    'Стратегия загрузки TFS. '
+                    'FULL_UK — полное обновление snp с дедубликацией по UK (рекомендуется). '
+                    'FULL_NO_UK — полное обновление без дедубликации. '
+                    'INC — инкрементальное обновление по UK с поддержкой удалений (ctl_action=D). '
+                    'APPEND — только добавление записей, без изменений и удалений.'
+                ),
             ),
             'auto_confirm': Param(
                 bool(p['auto_confirm']), type='boolean', title='Auto confirm',

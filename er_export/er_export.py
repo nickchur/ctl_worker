@@ -320,10 +320,11 @@ def _er_pack_zip(cfg, **context):
         zip_n  = f"{cfg['replica']}__{ts_s(2)}__{cfg['tbl']}__{i+1}_{total}_{rows}.csv.zip"
         
         s3_body = hook.get_key(key=key, bucket_name=BUCKET).get()["Body"]
+        mtime = base_ts.add(seconds=i*2).naive()
         members = [
-            (tkt_n,  None, S_IFREG | 0o600, ZIP_32, [f"{csv_n};{rows}".encode()]),
-            (meta_n, None, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
-            (csv_n,  None, S_IFREG | 0o600, ZIP_32, s3_body.iter_chunks(chunk_size=8*1024*1024)),
+            (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{csv_n};{rows}".encode()]),
+            (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
+            (csv_n,  mtime, S_IFREG | 0o600, ZIP_32, s3_body.iter_chunks(chunk_size=8*1024*1024)),
         ]
         hook.load_file_obj(_Reader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
         hook.delete_objects(bucket=BUCKET, keys=[key])

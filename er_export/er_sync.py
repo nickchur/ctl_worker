@@ -66,7 +66,7 @@ def _ensure_pool() -> None:
 
 @dag(
     dag_id="export_er_sync",
-    description="Синхронизация export.er_wf_meta → Airflow Variable datalab_er_wfs",
+    description="🔄 Синхронизация export.er_wf_meta → Airflow Variable datalab_er_wfs",
     default_args=DEF_ARGS,
     start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone("UTC")),
     schedule_interval="*/5 * * * *",
@@ -79,7 +79,7 @@ def er_sync_dag():
 
     @task(task_id="sync", pool="default_pool")
     def sync():
-        """Читает er_wf_meta, собирает словарь выгрузок и сохраняет в Airflow Variable.
+        """🔄 Читает er_wf_meta, собирает словарь выгрузок и сохраняет в Airflow Variable.
 
         На стенде DEV дополнительно создаёт таблицу er_wf_meta если её нет,
         и пропускает обновление Variable при пустой таблице.

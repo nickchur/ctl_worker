@@ -1,5 +1,5 @@
 """
-DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
+🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
 
 Жизненный цикл одного запуска:
   init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm → save_status → schedule_next
@@ -8,8 +8,8 @@ DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
 который синхронизируется DAG-ом export_er_sync из таблицы export.er_wf_meta.
 
 Поддерживаемые режимы выгрузки:
-  delta  — инкрементальный, окно [time_from, time_to] из export.extract_current_vw
-  recent — скользящее окно [now() - recent_interval, now()], без сохранения состояния
+  📈 delta  — инкрементальный, окно [time_from, time_to] из export.extract_current_vw
+  🔄 recent — скользящее окно [now() - recent_interval, now()], без сохранения состояния
 """
 from __future__ import annotations
 
@@ -224,7 +224,7 @@ def _pre_await(auto_confirm=False):
 
 @task(task_id='init', pool=POOL_NAME)
 def _er_init(cfg, **context):
-    """Инициализирует состояние выгрузки и возвращает словарь SQL-литералов для шаблонов.
+    """⚙️ Инициализирует состояние выгрузки и возвращает словарь SQL-литералов для шаблонов.
 
     Delta-режим: читает export.extract_current_vw; при первом запуске создаёт bootstrap-состояние
     с time_from/time_to = lower_bound.
@@ -318,7 +318,7 @@ def _er_init(cfg, **context):
 
 @task(task_id='build_meta', pool=POOL_NAME)
 def _er_build_meta(cfg, **context):
-    """Строит .meta JSON с описанием структуры данных для TFS.
+    """🗂️ Строит .meta JSON с описанием структуры данных для TFS.
 
     Колонки собираются в порядке: EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF.
     Типы маппируются из ClickHouse в целевые через TYPE_MAP (er_config).
@@ -362,7 +362,7 @@ def _er_build_meta(cfg, **context):
 
 @task(task_id='pack_zip', pool=POOL_NAME)
 def _er_pack_zip(cfg, **context):
-    """Упаковывает CSV-файлы из S3 в ZIP-архивы формата TFS и загружает обратно в S3.
+    """📦 Упаковывает CSV-файлы из S3 в ZIP-архивы формата TFS и загружает обратно в S3.
 
     Каждый CSV оборачивается в отдельный ZIP с тремя файлами:
       *.tkt  — манифест (имя CSV + кол-во строк)
@@ -432,7 +432,7 @@ def _er_pack_zip(cfg, **context):
 
 @task(task_id='save_status', trigger_rule='none_failed', pool=POOL_NAME)
 def _er_save_status(cfg, **context):
-    """Записывает результат выгрузки в export.extract_history.
+    """💾 Записывает результат выгрузки в export.extract_history.
 
     Запускается только при полном успехе (all_success), поэтому confirmed=null —
     ожидает Kafka-подтверждения от TFS (или остаётся null при auto_confirm).
@@ -463,7 +463,7 @@ def _er_save_status(cfg, **context):
 
 @task(task_id='schedule_next', pool=POOL_NAME)
 def _er_schedule_next(cfg, **context):
-    """Запускает следующий цикл дельты, если time_to ещё не догнал текущее время.
+    """⏭️ Запускает следующий цикл дельты, если time_to ещё не догнал текущее время.
 
     Запуск откладывается на selfrun_timeout минут, чтобы избежать гонки с источником.
     Для recent-режима is_current всегда True — автозапуск не нужен.
@@ -489,7 +489,7 @@ def _er_schedule_next(cfg, **context):
 # ── DAG Factory ───────────────────────────────────────────────────────────────
 
 def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
-    """Создаёт Airflow DAG для одной ER-выгрузки на основе записи из Variable.
+    """🏭 Создаёт Airflow DAG для одной ER-выгрузки на основе записи из Variable.
 
     table_key — ключ вида "db_name.extract_name"
     params    — словарь из Variable datalab_er_wfs (одна запись er_wf_meta):

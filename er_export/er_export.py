@@ -248,7 +248,7 @@ def _er_init(cfg, **context):
         'compression_ext':    cfg.get('compression_ext', ''),
         'max_file_size':      cfg.get('max_file_size', ''),
         'pg_array_format':    cfg.get('pg_array_format', 'False'),
-        'format_params':      cfg.get('format_params', ''),
+        'format_params':      cfg.get('csv_format_params', ''),
         'xstream_sanitize':   cfg.get('xstream_sanitize', 'False'),
         'sanitize_array':     cfg.get('sanitize_array', 'False'),
         'sanitize_list':      cfg.get('sanitize_list', ''),

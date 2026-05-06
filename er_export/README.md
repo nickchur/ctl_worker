@@ -148,6 +148,28 @@ VALUES (
 > Для автоматического включения всех полей оставьте `fields = []`.
 > Для recent-режима установите `is_recent = 1` и добавьте `"recent_interval"` в `params`.
 
+### Пример с CTE и SETTINGS
+
+```sql
+INSERT INTO export.er_wf_meta
+    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_with, sql_where, sql_settings, params)
+VALUES (
+    'my_heavy_table',
+    'my_database',
+    'hrplatform_datalab',
+    'target_schema',
+    ['id'],
+    'cte',
+    'WITH cte AS (SELECT id, max(updated_at) AS updated_at FROM my_database.my_heavy_table GROUP BY id)',
+    '{condition}',
+    'max_threads=2, max_memory_usage=''10000000000''',
+    '{"strategy": "FULL_UK"}'
+);
+```
+
+> `sql_with` — полный WITH-блок (включая ключевое слово `WITH`); вставляется перед `SELECT`.
+> `sql_settings` — строка в формате ClickHouse SETTINGS: `key=value, key2=value2`.
+
 ---
 
 ## Системные поля (добавляются автоматически)

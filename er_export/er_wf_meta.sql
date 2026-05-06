@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     sql_from      String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос',
     sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; {condition} подставляется рантаймом',
     sql_join      String        DEFAULT ''             COMMENT 'JOIN-clause (полное выражение: JOIN t ON ...); вставляется между FROM и WHERE',
+    sql_with      String        DEFAULT ''             COMMENT 'WITH-блок (CTE); вставляется перед SELECT',
+    sql_settings  String        DEFAULT ''             COMMENT 'SETTINGS-блок ClickHouse; вставляется в конец запроса',
     params        String        DEFAULT '{}'           COMMENT 'JSON с переопределёнными параметрами выгрузки (см. DEFAULT_PARAMS в er_config.py)',
     description   String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
     is_recent     UInt8         DEFAULT 0              COMMENT '0 = delta-выгрузка, 1 = recent (скользящее окно)',

@@ -50,12 +50,21 @@ S3_CONN        = _cfg['S3_CONN']
 VAR_NAME       = _cfg['VAR_NAME']
 POOL_NAME      = _cfg['POOL_NAME']
 
-ON_DELIVERY    = 'er_export.er_export.on_delivery'
+ON_DELIVERY = 'er_export.er_export.on_delivery'   # dot-notation для delivery_callback
 
 # ── SQL Builders ──────────────────────────────────────────────────────────────
 
 def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
-    """Assembles a SQL query from a metadata dictionary."""
+    """Собирает SQL-запрос из словаря метаданных или возвращает строку как есть.
+
+    Поддерживаемые ключи словаря:
+      with     — CTE-блок (WITH ...)
+      fields   — list[str] или str; если не задан, используется '*'
+      from     — обязательный FROM-clause
+      joins    — JOIN-clause (опционально)
+      where    — WHERE-условие (опционально)
+      settings — SETTINGS-блок ClickHouse (опционально)
+    """
     if not sql_meta: return ""
     if isinstance(sql_meta, str): return sql_meta
 
@@ -102,7 +111,7 @@ def sql_cur_delta(tbl: str) -> str:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _fmt_val(v: Any) -> str:
-    """Formats a value as a SQL string literal or 'null'."""
+    """None → 'null', иначе → SQL-строковый литерал в одинарных кавычках."""
     return 'null' if v is None else f"'{v}'"
 
 
@@ -114,27 +123,30 @@ def _format_cur_state(cur: dict) -> dict:
     """
     tf = str(cur['time_field']).strip("'")
     ec = cur['extract_count']
-    fmt_dt = lambda x: _fmt_val(x)
     return {
         'num_state':       str(cur['num_state']),
-        'extract_time':    fmt_dt(cur['extract_time']),
+        'extract_time':    _fmt_val(cur['extract_time']),
         'extract_count':   'null' if ec is None else str(ec),
-        'loaded':          fmt_dt(cur['loaded']) if ec is not None else 'null',
-        'sent':            fmt_dt(cur['sent']) if ec is not None else 'null',
-        'confirmed':       fmt_dt(cur['confirmed']) if ec is not None else 'null',
+        'loaded':          _fmt_val(cur['loaded']) if ec is not None else 'null',
+        'sent':            _fmt_val(cur['sent']) if ec is not None else 'null',
+        'confirmed':       _fmt_val(cur['confirmed']) if ec is not None else 'null',
         'increment':       str(cur['increment']),
         'overlap':         str(cur['overlap']),
         'time_field':      f"'{tf}'",
-        'time_from':       fmt_dt(cur['time_from']),
-        'time_to':         fmt_dt(cur['time_to']),
-        'condition':       f"{fmt_dt(cur['time_from'])} < {tf} and {tf} <= {fmt_dt(cur['time_to'])}",
+        'time_from':       _fmt_val(cur['time_from']),
+        'time_to':         _fmt_val(cur['time_to']),
+        'condition':       f"{_fmt_val(cur['time_from'])} < {tf} and {tf} <= {_fmt_val(cur['time_to'])}",
         'is_current':      'True' if cur.get('current_time') == cur.get('extract_time') else 'False',
         'recent_interval': str(cur.get('recent_interval', 0)),
     }
 
 
 def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool]:
-    """Resolves ClickHouse type to target type and nullability."""
+    """Раскрывает обёртки LowCardinality/Nullable и маппирует базовый CH-тип в целевой.
+
+    Возвращает (target_type, notnull): notnull=False если тип обёрнут в Nullable().
+    Неизвестные базовые типы по умолчанию маппируются в STRING.
+    """
     notnull = True
     if ch_type.startswith("LowCardinality("): ch_type = ch_type[15:-1]
     if ch_type.startswith("Nullable("): 
@@ -145,7 +157,11 @@ def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool]:
 
 
 def produce_msg(scenario_id: str, file_name: str, throttle_delay: int = 1):
-    """Generates XML notification for TFS system."""
+    """Генератор Kafka-сообщений для TFS: отдаёт одно XML-уведомление о передаче файла.
+
+    throttle_delay — пауза перед отправкой (сек), защита от перегрузки брокера.
+    Функция — генератор (yield key, value), как того требует ProduceToTopicOperator.
+    """
     time.sleep(throttle_delay)
     rq_uuid = str(uuid.uuid4()).replace('-', '')
     message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -160,7 +176,7 @@ def produce_msg(scenario_id: str, file_name: str, throttle_delay: int = 1):
 
 
 def on_delivery(err: Exception | None, msg) -> None:
-    """Kafka delivery callback."""
+    """Колбэк подтверждения доставки Kafka: падает с AirflowFailException при ошибке."""
     if err: raise AirflowFailException(f"Kafka delivery failed: {err}")
     logger.info("Message delivered to %s [%s]", msg.topic(), msg.partition())
 
@@ -263,7 +279,10 @@ def _er_init(cfg, **context):
         t0  = now.subtract(seconds=ri)
         reg.update({
             'extract_time':    f"'{now}'",
-            'extract_count':   'null', 'loaded': 'null', 'sent': 'null', 'confirmed': 'null',
+            'extract_count':   'null',
+            'loaded':          'null',
+            'sent':            'null',
+            'confirmed':       'null',
             'time_from':       f"'{t0}'",
             'time_to':         f"'{now}'",
             'condition':       f"'{t0}' < {tf} and {tf} <= '{now}'",
@@ -273,16 +292,21 @@ def _er_init(cfg, **context):
         })
         result = reg
 
-    # Parameter overrides
+    # Переопределения из DAG Params (ручной запуск): применяются поверх состояния дельты
     p = context['params']
     key_map = {
-        'extract_time': lambda v: f"'{v}'",
-        'condition': str, 'is_current': lambda v: 'True' if v else 'False',
-        'increment': str, 'selfrun_timeout': str, 'strategy': str,
-        'auto_confirm': lambda v: 1 if v else 0, 'max_file_size': str
+        'extract_time':    lambda v: f"'{v}'",
+        'condition':       str,
+        'is_current':      lambda v: 'True' if v else 'False',
+        'increment':       str,
+        'selfrun_timeout': str,
+        'strategy':        str,
+        'auto_confirm':    lambda v: 1 if v else 0,
+        'max_file_size':   str,
     }
     for key, transform in key_map.items():
-        if p.get(key) is not None: result[key] = transform(p[key])
+        if p.get(key) is not None:
+            result[key] = transform(p[key])
     
     add_note({k: result.get(k) for k in key_map}, level='Task,DAG', title='Delta State')
     return result
@@ -439,15 +463,26 @@ def _er_schedule_next(cfg, **context):
     dp = context['ti'].xcom_pull(task_ids="init")
     if str(dp.get('is_current')).lower() in ('true', 't', '1'): return
 
-    DagBag().get_dag(cfg['dag_id']).create_dagrun(
-        run_type=DagRunType.MANUAL, execution_date=pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout'])),
-        state=DagRunState.QUEUED, external_trigger=True,
+    dag = DagBag().get_dag(cfg['dag_id'])
+    dag.create_dagrun(
+        run_type=DagRunType.MANUAL,
+        execution_date=pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout'])),
+        state=DagRunState.QUEUED,
+        external_trigger=True,
     )
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────
 
 def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
-    """Generates a dynamic Airflow DAG from metadata."""
+    """Создаёт Airflow DAG для одной ER-выгрузки на основе записи из Variable.
+
+    table_key — ключ вида "db_name.extract_name"
+    params    — словарь из Variable datalab_er_wfs (одна запись er_wf_meta):
+                replica, schema, format, PK, UK, params (JSON),
+                sql_stmt_export_delta | sql_stmt_export_recent, fields, description
+
+    Возвращает (dag_id, dag) для регистрации в globals().
+    """
     from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
     from airflow.providers.apache.kafka.sensors.kafka import AwaitMessageSensor
@@ -464,6 +499,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     if not fields or fields in (['*'], '*'): fields = ['*']
 
     def _prep_sql(key):
+        """Читает SQL-метадату по ключу и добавляет обязательные поля (export_time, ctl_*)."""
         m = params.get(key)
         if isinstance(m, dict) and "fields" not in m:
             m = {**m, "fields": MANDATORY_PRE + fields + MANDATORY_SUF}
@@ -478,20 +514,34 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         sql_exp = f"SELECT * FROM ({sql_exp}) LIMIT {LIMITS[ENV_STAND]}"
 
     cfg = {
-        'db': db, 'tbl': tbl, 'dag_id': f"export_er__{schema}__{tbl}",
-        'schema_name': schema, 'replica': replica, 'scenario': scen, 's3_prefix': f"{prefix}/{replica}",
-        'sql_get_current':  sql_cur_delta(tbl) if sql_delta else None,
-        'fields': fields, 'PK': params.get('PK', []), 'UK': params.get('UK', []),
-        'topic': DEF_ARGS['topic'], 'kafka_in_conn': DEF_ARGS['kafka_in_conn'], 'kafka_in_topic': DEF_ARGS['kafka_in_topic'],
-        'strategy':         p['strategy'],
+        # ── Идентификация ────────────────────────────────────────────────────
+        'db':              db,
+        'tbl':             tbl,
+        'dag_id':          f"export_er__{schema}__{tbl}",
+        'schema_name':     schema,
+        'replica':         replica,
+        'scenario':        scen,
+        's3_prefix':       f"{prefix}/{replica}",
+        # ── SQL ──────────────────────────────────────────────────────────────
+        'sql_get_current': sql_cur_delta(tbl) if sql_delta else None,  # None → recent-режим
+        # ── Схема ────────────────────────────────────────────────────────────
+        'fields':          fields,
+        'PK':              params.get('PK', []),
+        'UK':              params.get('UK', []),
+        # ── Kafka ────────────────────────────────────────────────────────────
+        'topic':           DEF_ARGS['topic'],
+        'kafka_in_conn':   DEF_ARGS['kafka_in_conn'],
+        'kafka_in_topic':  DEF_ARGS['kafka_in_topic'],
+        # ── Параметры из er_wf_meta.params (DEFAULT_PARAMS + overrides) ─────
+        'strategy':        p['strategy'],
         'auto_confirm':    p['auto_confirm'],
         'confirm_timeout': p['confirm_timeout'],
-        'increment':        p['increment'],
-        'selfrun_timeout':  p['selfrun_timeout'],
-        'lower_bound':      p['lower_bound'],
-        'time_field':       p['time_field'],
-        'overlap':          p['overlap'],
-        'recent_interval':  p['recent_interval'],
+        'increment':       p['increment'],
+        'selfrun_timeout': p['selfrun_timeout'],
+        'lower_bound':     p['lower_bound'],
+        'time_field':      p['time_field'],
+        'overlap':         p['overlap'],
+        'recent_interval': p['recent_interval'],
         'compression_type': p['compression_type'],
         'compression_ext':  p['compression_ext'],
         'max_file_size':    str(p['max_file_size']),
@@ -584,7 +634,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
             task_id='notify_tfs', topic="{{ params.topic }}", producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
-            delivery_callback="er_export.er_export.on_delivery", pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
+            delivery_callback=ON_DELIVERY, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
         )
         t_wait = AwaitMessageSensor(
             task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']],
@@ -610,4 +660,4 @@ for table_key, workflow_params in workflows.items():
         globals()[dag_id] = dag_obj
     except Exception as e:
         logger.error("DAG generation failed for %s: %s", table_key, e)
-        raise e
+        raise  # прерываем парсинг файла: broken DAG лучше, чем молчаливо пропущенная выгрузка

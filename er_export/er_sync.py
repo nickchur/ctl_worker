@@ -27,19 +27,19 @@ from __future__ import annotations
 
 import pendulum
 from airflow.decorators import dag, task
+from logging import getLogger
 
 from er_export.er_config import get_config, get_dict
-
-_cfg      = get_config()
-CH_ID     = _cfg['CH_ID']
-DEF_ARGS  = _cfg['DEF_ARGS']
-MODE      = _cfg['MODE']
-VAR_NAME  = _cfg['VAR_NAME']
-POOL_NAME = _cfg['POOL_NAME']
-POOL_SLOTS = _cfg['POOL_SLOTS']
 from plugins.ctl_utils import ctl_obj_save
 
-from  logging import getLogger
+_cfg       = get_config()
+CH_ID      = _cfg['CH_ID']
+DEF_ARGS   = _cfg['DEF_ARGS']
+MODE       = _cfg['MODE']
+VAR_NAME   = _cfg['VAR_NAME']
+POOL_NAME  = _cfg['POOL_NAME']
+POOL_SLOTS = _cfg['POOL_SLOTS']
+
 logger = getLogger("airflow.task")
 
 
@@ -53,12 +53,12 @@ def _ensure_pool() -> None:
     from airflow.utils.session import create_session
     with create_session() as session:
         if not session.query(Pool).filter(Pool.pool == POOL_NAME).first():
-            session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS, description='ER export pool', include_deferred=False))
+            session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS, description='Пул для ER-выгрузок', include_deferred=False))
 
 
 @dag(
     dag_id="export_er_sync",
-    description="Sync export.er_wf_meta → Airflow Variable datalab_er_wfs",
+    description="Синхронизация export.er_wf_meta → Airflow Variable datalab_er_wfs",
     default_args=DEF_ARGS,
     start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone("UTC")),
     schedule_interval="*/5 * * * *",
@@ -123,7 +123,7 @@ def er_sync_dag():
         # Для строк без явного description подтягиваем комментарий таблицы из system.tables
         # одним батч-запросом, чтобы не делать N отдельных DESCRIBE.
         no_desc = [(r["db_name"], r["extract_name"]) for r in rows if not r["description"]]
-        ch_comments: dict[tuple, str] = {}
+        ch_comments: dict[tuple[str, str], str] = {}
         if no_desc:
             cond = " OR ".join(f"(database='{db}' AND name='{tbl}')" for db, tbl in no_desc)
             ch_comments = {
@@ -166,4 +166,4 @@ def er_sync_dag():
     sync()
 
 
-er_sync_dag()
+er_sync_dag()  # вызов регистрирует DAG в globals() через декоратор @dag

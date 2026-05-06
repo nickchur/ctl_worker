@@ -301,7 +301,7 @@ def _er_init(cfg, **context):
     key_map = {
         'extract_time':    lambda v: f"'{v}'",
         'condition':       str,
-        'is_current':      lambda v: 'True' if v else 'False',
+        'is_current':      lambda v: 'True' if v == 'true' else 'False',
         'increment':       str,
         'selfrun_timeout': str,
         'strategy':        str,
@@ -309,7 +309,7 @@ def _er_init(cfg, **context):
         'max_file_size':   str,
     }
     for key, transform in key_map.items():
-        if p.get(key) is not None:
+        if p.get(key) not in (None, ''):
             result[key] = transform(p[key])
     
     add_note({k: result.get(k) for k in key_map}, level='Task,DAG', title='⚙️ Delta State')
@@ -584,7 +584,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 description='SQL WHERE-условие. Переопределяет условие из состояния дельты.',
             ),
             'is_current': Param(
-                None, type=['boolean', 'null'], title='Is current',
+                '', type='string', enum=['', 'true', 'false'], title='Is current',
                 description='Принудительно пометить состояние как актуальное (не запускать следующий цикл).',
             ),
             'increment': Param(

@@ -10,6 +10,7 @@ DAG синхронизации метаданных ER-выгрузок.
     "db_name.extract_name": {
       "replica":   str,           # ключ в TFS_MAP
       "schema":    str,           # целевая схема TFS
+      "schedule":  str,           # cron-расписание DAG
       "PK":        list[str],
       "UK":        list[str],
       "params":    str,           # JSON с переопределёнными DEFAULT_PARAMS
@@ -109,6 +110,7 @@ def er_sync_dag():
                     sql_settings    String        DEFAULT ''             COMMENT 'SETTINGS-блок ClickHouse; вставляется в конец запроса',
                     params          String        DEFAULT '{}'           COMMENT 'JSON с параметрами выгрузки (см. DEFAULT_PARAMS в er_config)',
                     description     String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
+                    schedule        String        DEFAULT '55 0 * * *'  COMMENT 'Cron-расписание первичного запуска DAG',
                     is_recent       UInt8         DEFAULT 0              COMMENT '0 = delta (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent)',
                     is_active       UInt8         DEFAULT 1              COMMENT '0 = запись игнорируется при синхронизации в Variable',
                     updated_at      DateTime      DEFAULT now()          COMMENT 'Версия строки для ReplacingMergeTree'
@@ -153,12 +155,13 @@ def er_sync_dag():
             if row["sql_settings"]: sql_val["settings"] = row["sql_settings"]
 
             entry = {
-                "replica": row["replica"],
-                "schema":  row["schema_name"],
-                "PK":      row["pk"],
-                "UK":      row["uk"],
-                "params":  row.get("params", "{}"),
-                sql_key:   sql_val,
+                "replica":  row["replica"],
+                "schema":   row["schema_name"],
+                "schedule": row.get("schedule") or "55 0 * * *",
+                "PK":       row["pk"],
+                "UK":       row["uk"],
+                "params":   row.get("params", "{}"),
+                sql_key:    sql_val,
             }
             if row["fields"]:
                 entry["fields"] = row["fields"]

@@ -558,7 +558,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         dag_id=cfg['dag_id'], description=params.get('description', f"ER: {table_key}"),
         doc_md=f"```json\n{json.dumps(p, indent=2, default=str)}\n```",
         default_args=DEF_ARGS, start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone('UTC')),
-        schedule_interval='55 0 * * *', max_active_tasks=1, max_active_runs=1, catchup=False,
+        schedule_interval=params.get('schedule', '55 0 * * *'), max_active_tasks=1, max_active_runs=1, catchup=False,
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema.replace(' ', '_').lower()],
         render_template_as_native_obj=True, is_paused_upon_creation=True,
         params={

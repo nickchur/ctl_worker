@@ -96,6 +96,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | `sql_settings` | String | `''` | SETTINGS-блок ClickHouse; вставляется в конец запроса |
 | `params` | String | `'{}'` | JSON с переопределёнными DEFAULT_PARAMS |
 | `description` | String | `''` | Описание DAG-а (отображается в Airflow UI) |
+| `schedule` | String | `'55 0 * * *'` | Cron-расписание первичного запуска DAG |
 | `is_recent` | UInt8 | `0` | `0` = delta-выгрузка, `1` = recent (скользящее окно) |
 | `is_active` | UInt8 | `1` | `0` = запись игнорируется при синхронизации |
 

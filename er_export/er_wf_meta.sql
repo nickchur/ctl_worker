@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     sql_settings  String        DEFAULT ''             COMMENT 'SETTINGS-блок ClickHouse; вставляется в конец запроса',
     params        String        DEFAULT '{}'           COMMENT 'JSON с переопределёнными параметрами выгрузки (см. DEFAULT_PARAMS в er_config.py)',
     description   String        DEFAULT ''             COMMENT 'Описание DAG-а (отображается в Airflow UI)',
+    schedule      String        DEFAULT '55 0 * * *'   COMMENT 'Cron-расписание первичного запуска DAG (самозапуск через schedule_next)',
     is_recent     UInt8         DEFAULT 0              COMMENT '0 = delta-выгрузка, 1 = recent (скользящее окно)',
     is_active     UInt8         DEFAULT 1              COMMENT '0 = запись игнорируется при синхронизации в Variable',
     updated_at    DateTime      DEFAULT now()          COMMENT 'Версия строки для ReplacingMergeTree'

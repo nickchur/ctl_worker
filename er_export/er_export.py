@@ -236,7 +236,9 @@ def _er_init(cfg, **context):
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
-    S3Hook(aws_conn_id=S3_CONN).create_bucket(bucket_name=BUCKET)
+    s3 = S3Hook(aws_conn_id=S3_CONN)
+    if not s3.check_for_bucket(bucket_name=BUCKET):
+        s3.create_bucket(bucket_name=BUCKET)
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
 
     tf  = cfg.get('time_field', 'extract_time')

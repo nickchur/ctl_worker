@@ -426,7 +426,7 @@ def _er_pack_zip(cfg, **context):
     ti.xcom_push(key="zip_name_list",    value=uploaded)
     ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
     ti.xcom_push(key="total_row_count",  value=total_rows)
-    add_note({"pack_zip": uploaded}, title=f"rows={total_rows} files={total}", context=context)
+    add_note({"pack_zip": uploaded}, title=f"rows={total_rows} files={total}", level='task,dag', context=context)
 
 
 @task(task_id='save_status', trigger_rule='none_failed', pool=POOL_NAME)
@@ -456,7 +456,7 @@ def _er_save_status(cfg, **context):
     """)
     add_note(
         {"save_status": {"time_from": dp['time_from'], "time_to": dp['time_to'], "rows": rows, "zips": zips}},
-        context=context,
+        level='task,dag', context=context,
     )
 
 
@@ -472,7 +472,7 @@ def _er_schedule_next(cfg, **context):
     from airflow.utils.state import DagRunState
     dp = context['ti'].xcom_pull(task_ids="init")
     if str(dp.get('is_current')).lower() in ('true', 't', '1'):
-        add_note("delta is current — next run not scheduled", context=context)
+        add_note("delta is current — next run not scheduled", level='task,dag', context=context)
         return
 
     next_run = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
@@ -483,7 +483,7 @@ def _er_schedule_next(cfg, **context):
         state=DagRunState.QUEUED,
         external_trigger=True,
     )
-    add_note(f"next run scheduled at {next_run.format('YYYY-MM-DD HH:mm:ss')} UTC", context=context)
+    add_note(f"next run scheduled at {next_run.format('YYYY-MM-DD HH:mm:ss')} UTC", level='task,dag', context=context)
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────
 

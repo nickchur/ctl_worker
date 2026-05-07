@@ -44,10 +44,10 @@ else:
     S3_CONN = 's3-tfs-hrplt'
 
 BUCKET         = 'tfshrplt'
-TOPIC          = 'TFS.HRPLT.IN'
+KAFKA_OUT_TOPIC          = 'TFS.HRPLT.IN'
 KAFKA_OUT_CONN = 'tfs-kafka-out'
 KAFKA_IN_CONN  = 'tfs-kafka-in'
-KAFKA_IN_TOPIC = 'TFS.HRPLT.OUT'
+KAFKA_IN_KAFKA_OUT_TOPIC = 'TFS.HRPLT.OUT'
 
 # 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
@@ -261,10 +261,10 @@ def get_config() -> dict:
         'EXTRA_SUF':  EXTRA_SUF,
         'LIMITS':         LIMITS,
         'BUCKET':         BUCKET,
-        'TOPIC':          TOPIC,
+        'KAFKA_OUT_TOPIC':          KAFKA_OUT_TOPIC,
         'KAFKA_OUT_CONN': KAFKA_OUT_CONN,
         'KAFKA_IN_CONN':  KAFKA_IN_CONN,
-        'KAFKA_IN_TOPIC': KAFKA_IN_TOPIC,
+        'KAFKA_IN_KAFKA_OUT_TOPIC': KAFKA_IN_KAFKA_OUT_TOPIC,
         'TFS_MAP':        TFS_MAP,
         'S3_CONN':        S3_CONN,
         'VAR_NAME':       VAR_NAME,

@@ -44,10 +44,10 @@ EXTRA_PRE      = _cfg['EXTRA_PRE']
 EXTRA_SUF      = _cfg['EXTRA_SUF']
 LIMITS         = _cfg['LIMITS']
 BUCKET         = _cfg['BUCKET']
-TOPIC          = _cfg['TOPIC']
+KAFKA_OUT_TOPIC          = _cfg['KAFKA_OUT_TOPIC']
 KAFKA_OUT_CONN = _cfg['KAFKA_OUT_CONN']
 KAFKA_IN_CONN  = _cfg['KAFKA_IN_CONN']
-KAFKA_IN_TOPIC = _cfg['KAFKA_IN_TOPIC']
+KAFKA_IN_KAFKA_OUT_TOPIC = _cfg['KAFKA_IN_KAFKA_OUT_TOPIC']
 TFS_MAP        = _cfg['TFS_MAP']
 S3_CONN        = _cfg['S3_CONN']
 VAR_NAME       = _cfg['VAR_NAME']
@@ -672,12 +672,12 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         )
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
-            task_id='notify_tfs', kafka_config_id=KAFKA_OUT_CONN, topic=TOPIC,
+            task_id='notify_tfs', kafka_config_id=KAFKA_OUT_CONN, topic=KAFKA_OUT_TOPIC,
             producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
             delivery_callback=ON_DELIVERY, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario'], cfg['notify_kafka']),
         )
         t_wait = AwaitMessageSensor(
-            task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_TOPIC],
+            task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_KAFKA_OUT_TOPIC],
             apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME,
             execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm'), cfg['notify_kafka'])
         )

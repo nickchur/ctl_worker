@@ -16,7 +16,6 @@ from datetime import timedelta
 ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
 ENV_SPACE = os.getenv("ENV_SPACE", "").strip().upper()
 
-CH_BD    = 'export'
 VAR_NAME = "datalab_er_wfs"
 
 if ENV_SPACE == "ALPHA":
@@ -34,7 +33,7 @@ if ENV_SPACE == "ALPHA":
         "port":      9440,
         "login":     _b64(secrets['SCSP_CLICKHOUSE_USERNAME']),
         "password":  _b64(secrets['SCSP_CLICKHOUSE_PASSWORD']),
-        "schema":    CH_BD,
+        "schema":    'export',
         "extra":     {"verify": False, "secure": True},
     }
     os.environ[f'AIRFLOW_CONN_{CH_ID.upper()}'] = json.dumps(conn_json)
@@ -43,11 +42,11 @@ else:
     CH_ID   = 'dlab-click'
     S3_CONN = 's3-tfs-hrplt'
 
-BUCKET         = 'tfshrplt'
-KAFKA_OUT_TOPIC          = 'TFS.HRPLT.IN'
-KAFKA_OUT_CONN = 'tfs-kafka-out'
-KAFKA_IN_CONN  = 'tfs-kafka-in'
-KAFKA_IN_KAFKA_OUT_TOPIC = 'TFS.HRPLT.OUT'
+BUCKET          = 'tfshrplt'
+KAFKA_OUT_TOPIC = 'TFS.HRPLT.IN'
+KAFKA_OUT_CONN  = 'tfs-kafka-out'
+KAFKA_IN_CONN   = 'tfs-kafka-in'
+KAFKA_IN_TOPIC  = 'TFS.HRPLT.OUT'
 
 # 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
@@ -260,14 +259,14 @@ def get_config() -> dict:
         'DEF_ARGS':       DEF_ARGS,
         'ENV_STAND':      ENV_STAND,
         'ENV_SPACE':      ENV_SPACE,
-        'EXTRA_PRE':  EXTRA_PRE,
-        'EXTRA_SUF':  EXTRA_SUF,
+        'EXTRA_PRE': EXTRA_PRE,
+        'EXTRA_SUF': EXTRA_SUF,
         'LIMITS':         LIMITS,
         'BUCKET':         BUCKET,
         'KAFKA_OUT_TOPIC':          KAFKA_OUT_TOPIC,
         'KAFKA_OUT_CONN': KAFKA_OUT_CONN,
         'KAFKA_IN_CONN':  KAFKA_IN_CONN,
-        'KAFKA_IN_KAFKA_OUT_TOPIC': KAFKA_IN_KAFKA_OUT_TOPIC,
+        'KAFKA_IN_TOPIC':  KAFKA_IN_TOPIC,
         'TFS_MAP':        TFS_MAP,
         'S3_CONN':        S3_CONN,
         'VAR_NAME':       VAR_NAME,

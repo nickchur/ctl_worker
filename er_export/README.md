@@ -1,22 +1,31 @@
-# 🚀 ER Export Framework
+# ER Export Framework
 
 Фреймворк на базе Airflow для автоматизированной выгрузки данных из **ClickHouse** в **S3** с последующей нотификацией системы **TFS** через **Kafka**.
 
-## 🏗️ Обзор архитектуры
-
-Система построена на принципах **Metadata-driven development**. Для добавления новой таблицы в поток выгрузки не требуется написание кода — достаточно добавить запись в управляющую таблицу в ClickHouse.
-
-### Основной поток данных:
-1. **ClickHouse** — источник данных.
-2. **S3 (Ceph)** — промежуточное хранилище для CSV и ZIP-архивов.
-3. **Kafka** — канал уведомлений для TFS (отправка XML-сообщений).
-4. **TFS** — целевая система потребления данных.
+Построен на принципах **Metadata-driven development**: для добавления новой таблицы не требуется написание кода — достаточно добавить запись в управляющую таблицу ClickHouse.
 
 ---
 
-## 🌍 Стенды и поведение
+## Архитектура
 
-Поведение фреймворка управляется двумя переменными окружения.
+### Основной поток данных
+
+```
+ClickHouse → S3 (CSV → ZIP) → Kafka (XML-уведомление) → TFS
+```
+
+### Файлы
+
+| Файл | Описание |
+| :--- | :--- |
+| `er_export.py` | Фабрика DAG-ов. Динамически создаёт DAG для каждой активной выгрузки. Содержит бизнес-логику: SQL-билдеры, таски, Kafka-хелперы. |
+| `er_sync.py` | DAG синхронизации `export_er_sync`. Синхронизирует `export.er_wf_meta` → Airflow Variable `datalab_er_wfs`. Создаёт пулы. |
+| `er_config.py` | Конфигурация и утилиты. Константы, маппинг типов, `DEFAULT_PARAMS`, хелперы `obj_load`, `obj_save`, `add_note`, `get_params`. |
+| `er_wf_meta.sql` | DDL управляющей таблицы `export.er_wf_meta`. |
+
+---
+
+## Стенды и поведение
 
 **`ENV_SPACE`** — переключает CH-коннект и источник секретов:
 
@@ -25,32 +34,49 @@
 | (не задана) | `dlab-click` | `s3-tfs-hrplt` | стандартные Airflow connections |
 | `ALPHA` | `dlab-click-test` | `s3-archive` | Vault `/vault/secrets/application` |
 
-**`ENVIRONMENT`** — определяет ограничения и поведение на стенде (значение приводится к uppercase):
+**`ENVIRONMENT`** — ограничения и поведение на стенде:
 
 | Значение | Лимит строк | Kafka / подтверждение |
 | :--- | :--- | :--- |
-| `PROM` | без ограничений | отправляется в штатном режиме |
-| `UAT`, `QA`, `IFT` | 100 строк | отправляется в штатном режиме |
-| `DEV` | 100 строк | **пропускается** (notify_tfs и wait_confirm — skip) |
+| `PROM` | без ограничений | штатный режим |
+| `UAT`, `QA`, `IFT` | 100 строк | штатный режим |
+| `DEV` | 100 строк | **пропускается** (`notify_tfs`, `wait_confirm` — skip) |
 
 ---
 
-## 📁 Структура файлов
+## Pipeline
 
-| Файл | Описание |
+```
+init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm → save_status → schedule_next
+```
+
+| Таск | Описание |
 | :--- | :--- |
-| `er_export.py` | **Фабрика DAG-ов**. Динамически создаёт DAG для каждой активной выгрузки. Содержит всю бизнес-логику: SQL-билдеры, хелперы и таски. |
-| `er_sync.py` | **DAG синхронизации** (`export_er_sync`). Синхронизирует `export.er_wf_meta` → Airflow Variable `datalab_er_wfs`. Создаёт пул `datalab_export_er`. |
-| `er_config.py` | **Конфигурация и утилиты**. Константы, маппинг типов, `DEFAULT_PARAMS`, хелперы (`obj_load`, `obj_save`, `add_note`, `get_params`). |
-| `er_wf_meta.sql` | **DDL**. Структура управляющей таблицы `export.er_wf_meta` и пример вставки. |
+| `init` | Инициализирует состояние дельты из `export.extract_current_vw`. При первом запуске — bootstrap от `lower_bound`. Применяет переопределения из DAG Params. |
+| `build_meta` | Генерирует `.meta` JSON (`DESCRIBE TABLE`). Имена колонок, совпадающие с зарезервированными словами Hive, получают суффикс `_`. |
+| `export_to_s3` | Нативная выгрузка ClickHouse → S3 (`HrpClickNativeToS3ListOperator`). |
+| `pack_zip` | Потоковая упаковка CSV + `.meta` + `.tkt` в ZIP (`stream_zip`). При `send_empty=True` и нулевой дельте — пустой CSV с заголовком. |
+| `notify_tfs` | Отправка XML-уведомления в Kafka → TFS. Пропускается при `notify_kafka=False` или если нет данных (и `send_empty=False`). |
+| `wait_confirm` | Ожидание подтверждения из Kafka (`AwaitMessageSensor`). Пропускается при `auto_confirm=True`. |
+| `save_status` | Фиксирует результат в `export.extract_history` (trigger_rule=none_failed). |
+| `schedule_next` | Автозапуск следующего цикла, если дельта не догнала текущее время. |
 
 ---
 
-## 📦 Формат пакета ЕР
+## Режимы выгрузки
 
-Каждый пакет — ZIP-архив с набором файлов. Требования ТФС (Полозов А.А., нояб. 2025; Коновалов М.В., апр. 2026).
+**Delta** — инкрементальный, состояние хранится в `export.extract_history`:
+- Окно `[time_from, time_to]` читается из `export.extract_current_vw`.
+- При первом запуске `time_from = lower_bound` (по умолчанию `1970-01-01`).
+- После успешного завершения автоматически запускается следующий цикл.
 
-### Именование
+**Recent** — скользящее окно без хранения состояния:
+- Окно вычисляется как `[now() - recent_interval, now()]`.
+- Подходит для таблиц без нужды в сквозной полноте дельты.
+
+---
+
+## Формат пакета
 
 Все имена файлов — **строго нижний регистр**, только `[a-z0-9_-]`, длина ≤ 240 байт.
 
@@ -58,17 +84,15 @@
 | :--- | :--- |
 | ZIP-архив | `[replica]__[YYYYMMDDHHMISS]__[any].zip` |
 | CSV с данными | `[schema]__[table]__[YYYYMMDDHHMISS]__[any].csv` |
-| META-описание | имя совпадает с CSV, расширение `.meta` |
-| TKT внутри архива | `[replica]__[YYYYMMDDHHMISS].tkt` |
-| TKT снаружи архива | `[replica]__[YYYYMMDDHHMISS].tkt` |
+| META-описание | то же имя, что у CSV, расширение `.meta` |
+| TKT внутри архива | `[replica]__[YYYYMMDDHHMISS].tkt` (одна строка: `filename;rowcount`) |
+| TKT снаружи архива | `[replica]__[YYYYMMDDHHMISS].tkt` (одна строка на ZIP-файл пакета) |
 
-### CSV (формат TSVWithNames)
+### CSV (TSVWithNames)
 
-Фреймворк выгружает данные в формате **TSVWithNames** (ClickHouse native). Разделитель `\t` (TAB) явно задаётся в поле `params.separation` META-файла. TFS принимает любой разделитель если он указан в META.
-
-- Кодировка: UTF-8
-- Первая строка — заголовок с именами колонок
-- Обязательные технические поля: `ctl_action` (`I`/`U`/`D`), `ctl_validfrom` (микросекунды)
+- Разделитель: `\t`; кодировка: UTF-8.
+- Первая строка — заголовок с именами колонок.
+- Обязательные технические поля: `export_time`, `ctl_action` (`I`), `ctl_validfrom`.
 
 ### META (JSON)
 
@@ -77,10 +101,10 @@
   "mask_file":   null,
   "schema_name": "my_schema",
   "table_name":  "my_table",
-  "description": "Описание таблицы или null",
+  "description": "Описание или null",
   "strategy":    "FULL_UK",
   "PK":          ["id"],
-  "UK":          [["id", "id2"]],
+  "UK":          [["id"]],
   "params":      {"separation": "\t"},
   "columns": [
     {
@@ -96,52 +120,13 @@
 }
 ```
 
-> `mask_file` — `null` когда имя META совпадает с именем CSV (всегда в нашем случае).  
-> `UK` — массив массивов: каждый элемент — один уникальный индекс; `er_wf_meta.uk` (плоский список) автоматически оборачивается в `[uk]`.  
+> `UK` — массив массивов: `er_wf_meta.uk` (плоский список) оборачивается в `[uk]`.  
 > `params.separation` указывается всегда (отклонение от дефолта `;`).  
-> `columns` генерируется из `DESCRIBE TABLE`; для `FixedString(N)` → `length=N`, для `Decimal(P,S)` → `precision=P, scale=S, length=P`.
-
-### TKT
-
-- TKT **внутри** архива: одна строка на CSV-файл в формате `filename;rowcount` (строки без заголовка).
-- TKT **снаружи** архива: одна строка на ZIP-файл пакета (передаётся в TFS через Kafka).
-- В тикете НЕ должно быть мета-файлов.
+> Для `FixedString(N)` → `length=N`; для `Decimal(P,S)` → `precision=P, scale=S, length=P`.
 
 ---
 
-## ⚡ Процесс выгрузки (Pipeline)
-
-```
-init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm → save_status → schedule_next
-```
-
-| Таск | Описание |
-| :--- | :--- |
-| **init** | Инициализирует состояние дельты из `export.extract_current_vw`. При первом запуске — bootstrap от `lower_bound`. |
-| **build_meta** | Генерирует `.meta` JSON со схемой колонок (`DESCRIBE TABLE` или из `fields`). |
-| **export_to_s3** | Нативная выгрузка ClickHouse → S3 (`HrpClickNativeToS3ListOperator`). |
-| **pack_zip** | Потоковая упаковка CSV + `.meta` + `.tkt` в ZIP без буферизации в памяти (`stream_zip`). |
-| **notify_tfs** | Отправка XML-уведомления в Kafka → TFS. Пропускается если нет данных или `ENV_STAND=dev`. |
-| **wait_confirm** | Ожидание подтверждения из Kafka (`AwaitMessageSensor`). Пропускается при `auto_confirm=1`, `ENV_STAND=dev` или отсутствии данных. |
-| **save_status** | Фиксирует результат в `export.extract_history` (только при полном успехе всех upstream-тасков). |
-| **schedule_next** | Автоматически ставит следующий запуск если дельта не догнала текущее время. |
-
----
-
-## 📊 Режимы выгрузки
-
-**Delta** — инкрементальный, состояние хранится в `export.extract_history`:
-- Окно `[time_from, time_to]` берётся из `export.extract_current_vw`.
-- При первом запуске `time_from = lower_bound` (по умолчанию `1970-01-01`).
-- После успешного завершения автоматически запускается следующий цикл.
-
-**Recent** — скользящее окно без хранения состояния:
-- Окно вычисляется как `[now() - recent_interval, now()]`.
-- Подходит для таблиц без нужды в сквозной полноте дельты.
-
----
-
-## 🗄️ Управляющая таблица `export.er_wf_meta`
+## Управляющая таблица `export.er_wf_meta`
 
 | Колонка | Тип | Умолчание | Описание |
 | :--- | :--- | :--- | :--- |
@@ -149,41 +134,45 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | `db_name` | String | — | База данных источника в ClickHouse |
 | `replica` | String | — | Реплика-маршрутизатор TFS (ключ в `TFS_MAP` er_config.py) |
 | `schema_name` | String | — | Целевая схема в `.meta`-файле для TFS |
-| `pk` | Array(String) | `[]` | Список колонок первичного ключа |
-| `uk` | Array(String) | `[]` | Список колонок уникального ключа |
+| `pk` | Array(String) | `[]` | Первичный ключ |
+| `uk` | Array(String) | `[]` | Уникальный ключ |
 | `fields` | Array(String) | `[]` | SELECT-выражения; `[]` = все колонки (`DESCRIBE TABLE`) |
-| `sql_from` | String | `''` | FROM-часть запроса: `"db.table"` или псевдоним CTE |
+| `sql_from` | String | `''` | FROM-часть: `"db.table"` или псевдоним CTE |
 | `sql_where` | String | `''` | WHERE-условие; `{condition}` подставляется рантаймом |
 | `sql_join` | String | `''` | JOIN-clause (полное выражение, включая ключевое слово) |
 | `sql_with` | String | `''` | WITH-блок (CTE); вставляется перед SELECT |
-| `sql_settings` | String | `''` | SETTINGS-блок ClickHouse; вставляется в конец запроса |
+| `sql_settings` | String | `''` | SETTINGS-блок ClickHouse |
 | `params` | String | `'{}'` | JSON с переопределёнными DEFAULT_PARAMS |
-| `description` | String | `''` | Описание DAG-а (отображается в Airflow UI) |
+| `description` | String | `''` | Описание DAG-а |
 | `schedule` | String | `'55 0 * * *'` | Cron-расписание первичного запуска DAG |
-| `is_recent` | UInt8 | `0` | `0` = delta-выгрузка, `1` = recent (скользящее окно) |
-| `is_active` | UInt8 | `1` | `0` = запись игнорируется при синхронизации |
+| `is_recent` | UInt8 | `0` | `0` = delta, `1` = recent |
+| `is_active` | UInt8 | `1` | `0` = запись игнорируется синхронизацией |
 
 ---
 
-## ⚙️ Управление параметрами (DEFAULT_PARAMS)
+## Параметры (DEFAULT_PARAMS)
 
-Все параметры выгрузки хранятся в `er_config.DEFAULT_PARAMS` и могут переопределяться на уровне записи через поле `params` (JSON).
+Хранятся в `er_config.DEFAULT_PARAMS`. Переопределяются в поле `params` (JSON) и через DAG Params UI при ручном запуске.
 
 | Параметр | По умолчанию | Описание |
 | :--- | :--- | :--- |
 | **Дельта / расписание** | | |
-| `increment` | `3600` | Шаг дельты, сек (не чаще 1 пакета/час — требование ТФС) |
-| `selfrun_timeout` | `60` | Задержка до следующего автозапуска, мин (не чаще 1 пакета/час) |
-| `overlap` | `0` | Перекрытие окна назад, сек |
+| `increment` | `60` мин | Шаг дельты; не чаще 1 пакета/час (требование TFS) |
+| `selfrun_timeout` | `60` мин | Задержка до следующего автозапуска |
+| `overlap` | `0` сек | Перекрытие окна назад (компенсация задержек CDC) |
 | `lower_bound` | `''` | Нижняя граница первой дельты; `''` → `1970-01-01` |
 | `time_field` | `'extract_time'` | Поле времени в таблице-источнике |
-| `recent_interval` | `3600` | Окно режима recent, сек |
+| `recent_interval` | `60` мин | Окно для режима recent |
 | **Стратегия и подтверждение** | | |
-| `strategy` | `'FULL_UK'` | Стратегия загрузки TFS: `FULL_UK`, `FULL_NO_UK`, `INC`, `APPEND` (см. ниже) |
-| `auto_confirm` | `1` | `1` = не ждать Kafka-подтверждения |
-| `confirm_timeout` | `3600` | Таймаут ожидания подтверждения, сек |
-| **Файлы и сжатие** | | |
+| `strategy` | `'FULL_UK'` | Стратегия загрузки TFS: `FULL_UK`, `FULL_NO_UK`, `INC`, `APPEND` |
+| `notify_kafka` | `1` | `1` = отправлять Kafka-уведомление; `0` = пропустить |
+| `auto_confirm` | `1` | `1` = не ждать подтверждения от TFS |
+| `confirm_timeout` | `60` мин | Таймаут ожидания подтверждения |
+| `export_timeout` | `120` мин | Таймаут задачи `export_to_s3` |
+| `notify_timeout` | `30` мин | Таймаут задачи `notify_tfs` |
+| **Файлы** | | |
 | `max_file_size` | `''` | Ограничение размера CSV, байт; `''` = без ограничений |
+| `send_empty` | `0` | `1` = слать пустой ZIP+Kafka при нулевой дельте (требование TFS) |
 | **Формат и санитизация** | | |
 | `format` | `'TSVWithNames'` | Формат выгрузки ClickHouse |
 | `pg_array_format` | `0` | `1` = PostgreSQL-формат массивов в TSV |
@@ -192,62 +181,61 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | `sanitize_array` | `0` | `1` = санитизировать CH-массивы в строки |
 | `sanitize_list` | `''` | Список колонок для санитизации (через запятую) |
 
+Все параметры также доступны в DAG Params UI для переопределения при ручном запуске.
+
 ---
 
-## 📋 Стратегии загрузки TFS и обработка CTL_ACTION
+## Стратегии загрузки TFS
 
-| Стратегия | Тип | UK | ctl_action источника | Операция TFS |
+| Стратегия | Тип | UK | `ctl_action` из источника | Операция TFS |
 | :--- | :--- | :--- | :--- | :--- |
-| `APPEND` | INC | NO UK | любое (игнорируется) | `I` |
+| `APPEND` | INC | нет | любое (игнорируется) | `I` |
 | `FULL_UK` | FULL | UK | любое кроме `D` | `I` |
-| `FULL_UK` | FULL | UK | `D` | **отброс** |
-| `FULL_NO_UK` | FULL | NO UK | любое кроме `D` | `I` |
-| `FULL_NO_UK` | FULL | NO UK | `D` | **отброс** |
-| `INC` | INC | UK | любое кроме `D` | `U` (запись есть) / `I` (нет) |
-| `INC` | INC | — | `D` | `D` (запись есть) / **отброс** (нет) |
+| `FULL_UK` | FULL | UK | `D` | отброс |
+| `FULL_NO_UK` | FULL | нет | любое кроме `D` | `I` |
+| `FULL_NO_UK` | FULL | нет | `D` | отброс |
+| `INC` | INC | UK | любое кроме `D` | `U` (есть запись) / `I` (нет) |
+| `INC` | INC | — | `D` | `D` (есть запись) / отброс (нет) |
 
-> **Примечания:**
-> - При всех `FULL%`-стратегиях TFS предварительно отправляет `op_type=D` для всех записей snp (очистка слоя), затем загружает новые данные. Строки с `ctl_action=D` из источника при этом отбрасываются.
-> - При `APPEND` поле `ctl_action` игнорируется TFS; блок `before` должен отсутствовать, `op_type` и `ctl_action` всегда `I`.
-> - При `INC` некорректное значение `ctl_action` из источника приводит к ошибке в модуле `pkg-snp` — важно передавать корректное значение.
-> - Таблицы без первичного ключа не поддерживаются `pkg-diff/hist`, `pkg-snp`; при необходимости добавляется суррогатный ключ.
+> При `FULL*`-стратегиях TFS предварительно удаляет все записи snp, затем загружает новые. Строки с `ctl_action=D` отбрасываются.
 
 ---
 
-## ➕ Как добавить новую выгрузку
+## Системные поля (добавляются автоматически)
 
-Все настройки хранятся в таблице `export.er_wf_meta`. Параметры, отличные от дефолтных, указываются в поле `params` как JSON.
+| Поле | Позиция | SQL | Описание |
+| :--- | :--- | :--- | :--- |
+| `export_time` | первая | `{export_time}` | Правая граница дельты (`time_to`), подставляется рантаймом |
+| `ctl_action` | последняя | `'I'` | Тип действия |
+| `ctl_validfrom` | последняя | `now64(6)` | Время выгрузки (мкс) |
 
-### Автоматическое определение полей
+---
 
-Если `fields = []` или `['*']`, система выполнит `DESCRIBE TABLE` и включит все колонки.
+## Как добавить новую выгрузку
 
-### Bootstrap (первый запуск)
-
-Для новых таблиц запись в `extract_history` создаётся автоматически с `time_from = lower_bound`. На стенде `dev` таблица `er_wf_meta` создаётся автоматически если её нет.
-
-### Пример: простая delta-выгрузка
+### Простая delta-выгрузка
 
 ```sql
 INSERT INTO export.er_wf_meta
     (extract_name, db_name, replica, schema_name, uk, sql_from, sql_where, params)
 VALUES (
-    'my_table',                  -- имя выгрузки (= имя таблицы в CH без схемы)
-    'my_database',               -- БД в ClickHouse
-    'hrplatform_datalab',        -- реплика (маршрут в TFS)
-    'target_schema',             -- схема в целевой системе TFS
-    ['id'],                      -- Unique Key
-    'my_database.my_table',      -- FROM-часть
-    '{condition}',               -- WHERE (плейсхолдер подставляется рантаймом)
+    'my_table',
+    'my_database',
+    'hrplatform_datalab',
+    'target_schema',
+    ['id'],
+    'my_database.my_table',
+    '{condition}',
     '{"strategy": "FULL_UK", "auto_confirm": 0}'
 );
 ```
 
-### Пример: delta-выгрузка с JOIN
+### Delta с JOIN
 
 ```sql
 INSERT INTO export.er_wf_meta
-    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_join, sql_where, params)
+    (extract_name, db_name, replica, schema_name, uk,
+     sql_from, sql_join, sql_where, params)
 VALUES (
     'my_table',
     'my_database',
@@ -261,9 +249,7 @@ VALUES (
 );
 ```
 
-> `sql_join` содержит **полное** JOIN-выражение (включая ключевое слово: `JOIN`, `LEFT JOIN`, `INNER JOIN` и т.п.).
-
-### Пример: тяжёлый запрос с CTE и настройками CH
+### Тяжёлый запрос с CTE и SETTINGS CH
 
 ```sql
 INSERT INTO export.er_wf_meta
@@ -276,35 +262,39 @@ VALUES (
     'target_schema',
     ['id'],
     'WITH cte AS (SELECT id, max(updated_at) AS updated_at FROM my_database.my_heavy_table GROUP BY id)',
-    'cte',                                           -- FROM-часть = псевдоним CTE
+    'cte',
     '{condition}',
     'max_threads=2, max_memory_usage=10000000000',
     '{"strategy": "FULL_UK"}'
 );
 ```
 
-> `sql_with` — полный WITH-блок (включая ключевое слово `WITH`); вставляется перед `SELECT`.
-> `sql_settings` — строка в формате ClickHouse SETTINGS: `key=value, key2=value2`.
+### Recent-режим
 
-> Для автоматического включения всех полей оставьте `fields = []`.
-> Для recent-режима установите `is_recent = 1` и добавьте `"recent_interval"` в `params`.
+```sql
+INSERT INTO export.er_wf_meta
+    (extract_name, db_name, replica, schema_name, uk, sql_from, is_recent, params)
+VALUES (
+    'my_table',
+    'my_database',
+    'hrplatform_datalab',
+    'target_schema',
+    ['id'],
+    'my_database.my_table',
+    1,
+    '{"recent_interval": 120}'  -- окно 120 мин
+);
+```
+
+> Для recent-режима `sql_where` не нужен — условие формируется автоматически по `time_field`.
 
 ---
 
-## 🔧 Системные поля (добавляются автоматически)
+## Технические детали
 
-| Поле | Позиция | SQL | Описание |
-| :--- | :--- | :--- | :--- |
-| `export_time` | первая | `{export_time}` | Правая граница дельты (`time_to`), подставляется рантаймом |
-| `ctl_action` | последняя | `'I'` | Тип действия (всегда `I`; для `D`-записей используйте INC-стратегию) |
-| `ctl_validfrom` | последняя | `now64(6)` | Время выгрузки с точностью до микросекунды (`YYYY-MM-DD HH:mm:ss.SSSSSS`) |
-
----
-
-## 🛠️ Технические детали
-
-- **Pool**: таски выполняются в пуле `datalab_export_er` (20 слотов), создаётся автоматически DAG-ом `export_er_sync`.
+- **Hive reserved words**: `build_meta` автоматически добавляет суффикс `_` к именам колонок, совпадающим с зарезервированными словами Hive (все версии 1.2–4.0). Изменение отражается в `.meta`-файле и гарантирует корректную загрузку в KAP.
+- **send_empty**: при `send_empty=1` и нулевой дельте `pack_zip` создаёт ZIP с пустым CSV (только строка заголовка) + TKT + META и отправляет Kafka-уведомление. Это соответствует требованию TFS: "пустой пакет выгружается по расписанию даже при отсутствии изменений".
+- **Pool**: пул `datalab_export_er` (20 слотов) создаётся автоматически DAG-ом `export_er_sync`.
 - **Стриминг**: ZIP-архивация потребляет минимум памяти — `stream_zip` + multipart-загрузка в S3 без буферизации всего файла.
-- **Изоляция**: фреймворк минимизирует зависимости от общих `plugins`, используя собственные хелперы в `er_config.py`.
-- **Идемпотентность синхронизации**: `export_er_sync` пишет Variable только если данные изменились.
-- **Соответствие стандарту ТФС**: имена файлов — нижний регистр; `ctl_validfrom` — `now64(6)` (мкс); META содержит `mask_file`, `description`, `length`/`precision`/`scale`; UK — массив массивов; частота — не чаще 1 пакета/час (`increment=3600`, `selfrun_timeout=60`).
+- **Изоляция**: фреймворк не зависит от общих `plugins`, используя собственные хелперы в `er_config.py`.
+- **Идемпотентность**: `export_er_sync` записывает Variable только если данные изменились.

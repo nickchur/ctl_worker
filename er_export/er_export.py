@@ -198,15 +198,15 @@ def _kafka_accept_any(msg) -> bool:
     return True
 
 
-def _pre_kafka(scenario: str):
+def _pre_kafka(scenario: str, notify_kafka: bool = True):
     """Фабрика pre_execute для ProduceToTopicOperator.
 
-    Пропускает отправку если данных нет или режим тестовый.
+    Пропускает отправку если notify_kafka=False или данных нет.
     Динамически подставляет имя summary-файла в аргументы продюсера.
     """
     def pre_execute(context):
-        if ENV_STAND == 'DEV':
-            raise AirflowSkipException("Kafka notification skipped in test mode")
+        if not notify_kafka:
+            raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
         summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
         if not summary_tkt:
             raise AirflowSkipException("No data exported, skipping notification")
@@ -214,17 +214,17 @@ def _pre_kafka(scenario: str):
     return pre_execute
 
 
-def _pre_await(auto_confirm=False):
+def _pre_await(auto_confirm=False, notify_kafka: bool = True):
     """Фабрика pre_execute для AwaitMessageSensor.
 
-    Пропускает ожидание если: auto_confirm=True, тестовый режим, или данных не было.
+    Пропускает ожидание если: auto_confirm=True, notify_kafka=False, или данных не было.
     Позволяет использовать один оператор вместо EmptyOperator/AwaitMessageSensor switch.
     """
     def pre_execute(context):
         if auto_confirm:
             raise AirflowSkipException("Auto confirm enabled, skipping wait")
-        if ENV_STAND == 'DEV':
-            raise AirflowSkipException("Kafka wait skipped in test mode")
+        if not notify_kafka:
+            raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
         summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
         if not summary_tkt:
             raise AirflowSkipException("No data exported, skipping wait")
@@ -313,11 +313,12 @@ def _er_init(cfg, **context):
         'increment':       str,
         'selfrun_timeout': str,
         'strategy':        str,
+        'notify_kafka':    lambda v: 1 if v else 0,
         'auto_confirm':    lambda v: 1 if v else 0,
         'max_file_size':   str,
     }
     for key, transform in key_map.items():
-        if p.get(key) not in (None, ''):
+        if p.get(key) not in (None, '', 'None'):
             result[key] = transform(p[key])
     
     add_note({k: result.get(k) for k in key_map}, level='Task,DAG', title='⚙️ Delta State')
@@ -568,6 +569,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'description':     params.get('description', ''),
         # ── Параметры из er_wf_meta.params (DEFAULT_PARAMS + overrides) ─────
         'strategy':        p['strategy'],
+        'notify_kafka':    bool(p['notify_kafka']),
         'auto_confirm':    p['auto_confirm'],
         'confirm_timeout': p['confirm_timeout'],
         'increment':       p['increment'],
@@ -601,7 +603,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 description='SQL WHERE-условие. Переопределяет условие из состояния дельты.',
             ),
             'is_current': Param(
-                '', type=['string', 'null'], enum=['', 'true', 'false'], title='Is current',
+                'None', type='string', enum=['None', 'true', 'false'], title='Is current',
                 description='Принудительно пометить состояние как актуальное (не запускать следующий цикл).',
             ),
             'increment': Param(
@@ -623,6 +625,10 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                     'остальные+UK→обновление, остальные без UK→вставка. '
                     'APPEND — только добавление; ctl_action игнорируется TFS, всегда I.'
                 ),
+            ),
+            'notify_kafka': Param(
+                bool(p['notify_kafka']), type='boolean', title='Notify Kafka',
+                description='True = отправлять уведомления в Kafka; False = пропустить (стенд).',
             ),
             'auto_confirm': Param(
                 bool(p['auto_confirm']), type='boolean', title='Auto confirm',
@@ -666,12 +672,12 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
             task_id='notify_tfs', topic=cfg['kafka_out_topic'], producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
-            delivery_callback=ON_DELIVERY, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
+            delivery_callback=ON_DELIVERY, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario'], cfg['notify_kafka']),
         )
         t_wait = AwaitMessageSensor(
             task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']],
             apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME,
-            execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm'))
+            execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm'), cfg['notify_kafka'])
         )
         
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)

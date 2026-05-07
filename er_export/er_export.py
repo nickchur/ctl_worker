@@ -279,7 +279,7 @@ def _er_init(cfg, **context):
             state = {
                 'num_state': 0, 'extract_time': lb, 'extract_count': None,
                 'loaded': None, 'sent': None, 'confirmed': None,
-                'increment': int(cfg.get('increment', 60)),
+                'increment': int(cfg.get('increment', 60)) * 60,
                 'overlap': int(cfg.get('overlap', 0)),
                 'time_field': tf,
                 'time_from': lb, 'time_to': lb, 'current_time': lb,
@@ -289,9 +289,9 @@ def _er_init(cfg, **context):
             cur = cur_res[0]
             result = {**reg, **(cur if 'condition' in cur else _format_cur_state(cur))}
     else:
-        ri  = int(cfg.get('recent_interval', 3600))
+        ri  = int(cfg.get('recent_interval', 60))
         now = pendulum.now('UTC').replace(microsecond=0)
-        t0  = now.subtract(seconds=ri)
+        t0  = now.subtract(minutes=ri)
         reg.update({
             'extract_time':    f"'{now}'",
             'extract_count':   'null',
@@ -583,6 +583,8 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'xstream_sanitize': 'True' if p['xstream_sanitize'] else 'False',
         'sanitize_array':   'True' if p['sanitize_array'] else 'False',
         'sanitize_list':    p['sanitize_list'],
+        'export_timeout':   p['export_timeout'],
+        'notify_timeout':   p['notify_timeout'],
     }
 
     dag = DAG(
@@ -606,7 +608,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 description='Принудительно пометить состояние как актуальное (не запускать следующий цикл).',
             ),
             'increment': Param(
-                p['increment'], type=['integer', 'null'], title='Increment (сек)',
+                p['increment'], type=['integer', 'null'], title='Increment (мин)',
                 description='Шаг дельты: time_to = time_from + increment.',
             ),
             'selfrun_timeout': Param(
@@ -634,8 +636,16 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 description='True = не ждать Kafka-подтверждения от TFS.',
             ),
             'confirm_timeout': Param(
-                p['confirm_timeout'], type='integer', title='Confirm timeout (сек)',
+                p['confirm_timeout'], type='integer', title='Confirm timeout (мин)',
                 description='Максимальное время ожидания подтверждения из Kafka.',
+            ),
+            'export_timeout': Param(
+                p['export_timeout'], type='integer', title='Export timeout (мин)',
+                description='Максимальное время выгрузки в S3.',
+            ),
+            'notify_timeout': Param(
+                p['notify_timeout'], type='integer', title='Notify timeout (мин)',
+                description='Максимальное время отправки уведомления в Kafka TFS.',
             ),
             'max_file_size': Param(
                 None, type=['integer', 'null'], title='Max file size',
@@ -668,6 +678,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             task_id='export_to_s3', s3_bucket=BUCKET, s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
             aws_conn_id=S3_CONN, clickhouse_conn_id=CH_ID,
             sql=sql_exp, compression=None, replace=True, post_file_check=False, pre_execute=_pre_exp,
+            execution_timeout=timedelta(minutes=cfg['export_timeout']),
         )
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
@@ -675,11 +686,12 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             pool=f"tfs_{cfg['scenario']}",
             producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
             delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(cfg['scenario'], cfg['notify_kafka']),
+            execution_timeout=timedelta(minutes=cfg['notify_timeout']),
         )
         t_wait = AwaitMessageSensor(
             task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_TOPIC],
             apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed',
-            execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm'), cfg['notify_kafka'])
+            execution_timeout=timedelta(minutes=cfg.get('confirm_timeout', 60)), pre_execute=_pre_await(cfg.get('auto_confirm'), cfg['notify_kafka'])
         )
         
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)

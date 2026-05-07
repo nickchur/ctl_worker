@@ -666,7 +666,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         t_init, t_meta = _er_init(cfg=cfg), _er_build_meta(cfg=cfg)
         t_exp = HrpClickNativeToS3ListOperator(
             task_id='export_to_s3', s3_bucket=BUCKET, s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
-            aws_conn_id=S3_CONN, clickhouse_conn_id=CH_ID, conn_id=CH_ID,
+            aws_conn_id=S3_CONN, clickhouse_conn_id=CH_ID,
             sql=sql_exp, compression=None, replace=True, post_file_check=False, pre_execute=_pre_exp,
         )
         t_zip = _er_pack_zip(cfg=cfg)

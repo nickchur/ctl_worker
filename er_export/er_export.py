@@ -52,6 +52,70 @@ TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
 VAR_NAME        = _cfg['VAR_NAME']
 
+# Hive keywords (all versions, reserved + non-reserved) — имена колонок из этого набора
+# получают суффикс '_' согласно требованиям KAP/TFS (раздел 11 документации ЕР).
+HIVE_RESERVED: frozenset = frozenset({
+    # 1.2 non-reserved
+    'add','admin','after','analyze','archive','asc','before','bucket','buckets','cascade',
+    'change','cluster','clustered','clusterstatus','collection','columns','comment','compact',
+    'compactions','compute','concatenate','continue','data','databases','datetime','day',
+    'dbproperties','deferred','defined','delimited','dependency','desc','directories',
+    'directory','disable','distribute','enable','escaped','exclusive','explain','export',
+    'fields','file','fileformat','first','format','formatted','functions','hold_ddltime',
+    'hour','idxproperties','ignore','index','indexes','inpath','inputdriver','inputformat',
+    'items','jar','keys','limit','lines','load','location','lock','locks','logical','long',
+    'mapjoin','materialized','metadata','minus','minute','month','msck','noscan','no_drop',
+    'offline','option','outputdriver','outputformat','overwrite','owner','partitioned',
+    'partitions','plus','pretty','principals','protection','purge','read','readonly',
+    'rebuild','recordreader','recordwriter','regexp','reload','rename','repair','replace',
+    'replication','restrict','rewrite','rlike','role','roles','schema','schemas','second',
+    'semi','serde','serdeproperties','server','sets','shared','show','show_database',
+    'skewed','sort','sorted','ssl','statistics','stored','streamtable','string','struct',
+    'tables','tblproperties','temporary','terminated','tinyint','touch','transactions',
+    'unarchive','undo','uniontype','unlock','unset','unsigned','uri','use','utc','view',
+    'while','year',
+    # 1.2 reserved
+    'all','alter','and','array','as','authorization','between','bigint','binary','boolean',
+    'both','by','case','cast','char','column','conf','create','cross','cube','current',
+    'current_date','current_timestamp','cursor','database','date','decimal','delete',
+    'describe','distinct','double','drop','else','end','exchange','exists','extended',
+    'external','false','fetch','float','following','for','from','full','function','grant',
+    'group','grouping','having','if','import','in','inner','insert','int','intersect',
+    'interval','into','is','join','lateral','left','less','like','local','macro','map',
+    'more','none','not','null','of','on','or','order','out','outer','over','partialscan',
+    'partition','percent','preceding','preserve','procedure','range','reads','reduce',
+    'revoke','right','rollup','row','rows','select','set','smallint','table','tablesample',
+    'then','timestamp','to','transform','trigger','true','truncate','unbounded','union',
+    'uniquejoin','update','user','using','utc_tmestamp','values','varchar','when','where',
+    'window','with',
+    # 2.0+
+    'autocommit','isolation','level','offset','snapshot','transaction','work','write',
+    'commit','only','rollback','start',
+    # 2.1+
+    'abort','key','last','norely','novalidate','nulls','rely','validate',
+    'cache','constraint','foreign','primary','references',
+    # 2.2+
+    'days','dayofweek','dump','hours','matched','merge','minutes','months','quarter',
+    'repl','seconds','status','views','week','weeks','years',
+    'except','extract','floor','integer','precision',
+    # 2.3+
+    'detail','expression','operator','summary','vectorization','wait',
+    # 3.0+
+    'activate','active','alloc_fraction','check','default','do','enforced','kill',
+    'management','mapping','move','path','plan','plans','pool','query',
+    'query_parallelism','reoptimization','resource','scheduling_policy','unmanaged',
+    'workload','zone',
+    'any','application','dec','numeric','sync','time','timestamplocaltz','unique',
+    # 4.0+
+    'ast','at','branch','cbo','cost','cron','dcproperties','debug','disabled',
+    'distributed','enabled','every','execute','executed','expire_snapshots','joincost',
+    'managed','managedlocation','optimize','remote','respect','retain','retention',
+    'scheduled','set_current_snapshot','snapshots','spec','system_time','system_version',
+    'tag','transactional','trim','type','unknown','url','within',
+    'compactionid','connector','connectors','convert','ddl','force','leading','older',
+    'pkfk_join','prepare','qualify','real','some','than','trailing',
+})
+
 ON_DELIVERY = f'{__name__}.on_delivery'   # dot-notation для delivery_callback
 
 # ── SQL Builders ──────────────────────────────────────────────────────────────
@@ -324,6 +388,7 @@ def _er_init(cfg, **context):
         'xstream_sanitize': lambda v: 'True' if v else 'False',
         'sanitize_array':   lambda v: 'True' if v else 'False',
         'sanitize_list':    str,
+        'send_empty':       lambda v: 'True' if v else 'False',
     }
     for key, transform in key_map.items():
         if p.get(key) not in (None, '', 'None'):
@@ -357,18 +422,22 @@ def _er_build_meta(cfg, **context):
             "description": comment or None,
         }
 
+    def _safe(name: str) -> str:
+        return name + '_' if name.lower() in HIVE_RESERVED else name
+
     fields = cfg.get('fields', ['*'])
     if not fields or fields in (['*'], '*'):
-        data_cols = [ch_cols[r[0]] for r in rows]
+        data_cols = [{**ch_cols[r[0]], "column_name": _safe(r[0])} for r in rows]
     else:
         data_cols = []
         for f in fields:
             name = f.split()[-1] if ' as ' in f.lower() else f
-            data_cols.append(ch_cols.get(name, {
+            base = ch_cols.get(name, {
                 "column_name": name, "source_type": "STRING", "length": None,
                 "notnull": False, "precision": None, "scale": None,
                 "description": f"Calculated: {f}",
-            }))
+            })
+            data_cols.append({**base, "column_name": _safe(base["column_name"])})
 
     meta = {
         "mask_file":   None,
@@ -408,7 +477,34 @@ def _er_pack_zip(cfg, **context):
     meta_s  = ti.xcom_pull(task_ids="build_meta",   key='meta_json')
 
     if not s3_keys:
-        ti.xcom_push(key="summary_tkt_name", value="")
+        send_empty = context['params'].get('send_empty', cfg.get('send_empty', False))
+        if not send_empty:
+            ti.xcom_push(key="summary_tkt_name", value="")
+            return
+
+        meta_obj = json.loads(meta_s)
+        header   = "\t".join(c["column_name"] for c in meta_obj["columns"]) + "\n"
+        ts0    = pendulum.now("UTC").format("YYYYMMDDHHmmss")
+        csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts0}__0_1_0.csv".lower()
+        meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts0}__0_1_0.meta".lower()
+        tkt_n  = f"{cfg['replica']}__{ts0}.tkt".lower()
+        zip_n  = f"{cfg['replica']}__{ts0}__{cfg['tbl']}__0_1_0.zip".lower()
+        mtime  = pendulum.now("UTC").naive()
+        members = [
+            (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{csv_n};0".encode()]),
+            (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
+            (csv_n,  mtime, S_IFREG | 0o600, ZIP_32, [header.encode()]),
+        ]
+        zip_bytes = b''.join(stream_zip(members))
+        hook_e = S3Hook(aws_conn_id=S3_CONN)
+        hook_e.load_bytes(zip_bytes, key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
+        ts1 = pendulum.now("UTC").format("YYYYMMDDHHmmss")
+        summary_tkt = f"{cfg['replica']}__{ts1}.tkt".lower()
+        hook_e.load_bytes(zip_n.encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
+        ti.xcom_push(key="zip_name_list",    value=[zip_n])
+        ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
+        ti.xcom_push(key="total_row_count",  value=0)
+        add_note({"📦 pack_zip (empty)": [zip_n]}, title="rows=0 send_empty=True", level='task,dag', context=context)
         return
 
     hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
@@ -588,6 +684,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'xstream_sanitize': 'True' if p['xstream_sanitize'] else 'False',
         'sanitize_array':   'True' if p['sanitize_array'] else 'False',
         'sanitize_list':    p['sanitize_list'],
+        'send_empty':       bool(p['send_empty']),
         'export_timeout':   p['export_timeout'],
         'notify_timeout':   p['notify_timeout'],
     }
@@ -671,6 +768,10 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             'sanitize_list': Param(
                 p['sanitize_list'], type='string', title='Sanitize List',
                 description='Список колонок для санитизации (через запятую). Пусто — не переопределять.',
+            ),
+            'send_empty': Param(
+                bool(p['send_empty']), type='boolean', title='Send Empty',
+                description='True = слать пустой ZIP+Kafka при нулевой дельте (требование TFS).',
             ),
         },
     )

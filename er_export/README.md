@@ -183,8 +183,6 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | `auto_confirm` | `1` | `1` = не ждать Kafka-подтверждения |
 | `confirm_timeout` | `3600` | Таймаут ожидания подтверждения, сек |
 | **Файлы и сжатие** | | |
-| `compression_type` | `'none'` | Тип сжатия: `none` / `gzip` / `zstd` |
-| `compression_ext` | `''` | Расширение сжатого файла |
 | `max_file_size` | `''` | Ограничение размера CSV, байт; `''` = без ограничений |
 | **Формат и санитизация** | | |
 | `format` | `'TSVWithNames'` | Формат выгрузки ClickHouse |

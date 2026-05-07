@@ -58,10 +58,10 @@ DEF_ARGS = {
     "aws_conn_id":        S3_CONN,
     "clickhouse_conn_id": CH_ID,
     "conn_id":            CH_ID,
-    "kafka_config_id":    "tfs-kafka-out",   # продюсер → TFS
+    "kafka_out_conn":     "tfs-kafka-out",   # продюсер → TFS
     "kafka_in_conn":      "tfs-kafka-in",    # консьюмер ← TFS (подтверждения)
     "kafka_in_topic":     "TFS.HRPLT.OUT",
-    "topic":              TOPIC,
+    "kafka_out_topic":    TOPIC,
 }
 
 # 🔢 Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
@@ -96,10 +96,10 @@ TYPE_MAP: dict[str, str] = {
 }
 
 # 📎 Служебные поля: ключ sql — выражение для SELECT, остальное — метаданные колонки для .meta TFS
-EXTRA_COLS_PRE = [
+EXTRA_PRE = [
     {"sql": "{export_time} as export_time", "column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
-EXTRA_COLS_SUF = [
+EXTRA_SUF = [
     {"sql": "'I' as ctl_action",            "column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None, "description": None},
     {"sql": "now64(6) as ctl_validfrom",    "column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
@@ -233,9 +233,7 @@ DEFAULT_PARAMS: dict = {
     'auto_confirm':      1,            # 1 = не ждать Kafka-подтверждения от TFS
     'confirm_timeout':   3600,         # таймаут ожидания подтверждения, сек
 
-    # ── Файлы и сжатие ───────────────────────────────────────────────────────
-    'compression_type':  'none',       # тип сжатия: none | gzip | zstd
-    'compression_ext':   '',           # расширение сжатого файла, если нужно
+    # ── Файлы ────────────────────────────────────────────────────────────────
     'max_file_size':     '',           # ограничение размера CSV-файла, байт; '' = без ограничений
 
     # ── Формат и санитизация ─────────────────────────────────────────────────
@@ -262,8 +260,8 @@ def get_config() -> dict:
         'DEF_ARGS':       DEF_ARGS,
         'ENV_STAND':      ENV_STAND,
         'ENV_SPACE':      ENV_SPACE,
-        'EXTRA_COLS_PRE':  EXTRA_COLS_PRE,
-        'EXTRA_COLS_SUF':  EXTRA_COLS_SUF,
+        'EXTRA_PRE':  EXTRA_PRE,
+        'EXTRA_SUF':  EXTRA_SUF,
         'LIMITS':         LIMITS,
         'BUCKET':         BUCKET,
         'TFS_MAP':        TFS_MAP,

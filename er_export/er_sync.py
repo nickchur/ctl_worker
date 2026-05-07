@@ -30,6 +30,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pendulum
 from airflow.decorators import dag, task
 from logging import getLogger
@@ -73,6 +75,7 @@ def _ensure_pool() -> None:
     catchup=False,
     tags=["DataLab", "CI02420667", "ER", "sync"],
     is_paused_upon_creation=True,
+    doc_md="```\n" + json.dumps(_cfg, indent=4, default=str) + "\n```",
 )
 def er_sync_dag():
 

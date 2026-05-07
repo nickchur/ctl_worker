@@ -40,8 +40,8 @@ CH_ID          = _cfg['CH_ID']
 TYPE_MAP       = _cfg['TYPE_MAP']
 DEF_ARGS       = _cfg['DEF_ARGS']
 ENV_STAND      = _cfg['ENV_STAND']
-EXTRA_COLS_PRE  = _cfg['EXTRA_COLS_PRE']
-EXTRA_COLS_SUF  = _cfg['EXTRA_COLS_SUF']
+EXTRA_PRE  = _cfg['EXTRA_PRE']
+EXTRA_SUF  = _cfg['EXTRA_SUF']
 LIMITS         = _cfg['LIMITS']
 BUCKET         = _cfg['BUCKET']
 TFS_MAP        = _cfg['TFS_MAP']
@@ -258,8 +258,6 @@ def _er_init(cfg, **context):
     reg = {
         'lower_bound':        f"'{lb}'",
         'selfrun_timeout':    str(cfg.get('selfrun_timeout', 10)),
-        'compression_type':   cfg.get('compression_type', 'none'),
-        'compression_ext':    cfg.get('compression_ext', ''),
         'max_file_size':      cfg.get('max_file_size', ''),
         'pg_array_format':    cfg.get('pg_array_format', 'False'),
         'format_params':      cfg.get('csv_format_params', ''),
@@ -372,7 +370,7 @@ def _er_build_meta(cfg, **context):
         "PK":          cfg['PK'],
         "UK":          [cfg['UK']] if cfg['UK'] else [],
         "params":      {"separation": "\t"},
-        "columns":     [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_COLS_PRE] + data_cols + [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_COLS_SUF],
+        "columns":     [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_PRE] + data_cols + [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_SUF],
     }
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
     add_note({"🗂️ build_meta": [c["column_name"] for c in meta["columns"]]}, level='task,dag', context=context)
@@ -536,7 +534,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         """Читает SQL-метадату по ключу и добавляет обязательные поля (export_time, ctl_*)."""
         m = params.get(key)
         if isinstance(m, dict) and "fields" not in m:
-            m = {**m, "fields": [c['sql'] for c in EXTRA_COLS_PRE] + fields + [c['sql'] for c in EXTRA_COLS_SUF]}
+            m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + fields + [c['sql'] for c in EXTRA_SUF]}
         return build_sql(m)
 
     sql_delta, sql_recent = _prep_sql('sql_stmt_export_delta'), _prep_sql('sql_stmt_export_recent')
@@ -563,7 +561,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'PK':              params.get('PK', []),
         'UK':              params.get('UK', []),
         # ── Kafka ────────────────────────────────────────────────────────────
-        'topic':           DEF_ARGS['topic'],
+        'kafka_out_topic': DEF_ARGS['kafka_out_topic'],
         'kafka_in_conn':   DEF_ARGS['kafka_in_conn'],
         'kafka_in_topic':  DEF_ARGS['kafka_in_topic'],
         # ── Метаданные ───────────────────────────────────────────────────────
@@ -578,8 +576,6 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'time_field':      p['time_field'],
         'overlap':         p['overlap'],
         'recent_interval': p['recent_interval'],
-        'compression_type': p['compression_type'],
-        'compression_ext':  p['compression_ext'],
         'max_file_size':    str(p['max_file_size']),
         'format_params':    p['csv_format_params'],
         'pg_array_format':  'True' if p['pg_array_format'] else 'False',
@@ -640,10 +636,6 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 None, type=['integer', 'null'], title='Max file size',
                 description='Ограничение размера CSV-файла, байт. None — без ограничений.',
             ),
-            'topic': Param(
-                cfg['topic'], type='string', title='Topic',
-                description='Kafka-топик для отправки уведомлений в TFS.',
-            ),
         },
     )
 
@@ -673,7 +665,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         )
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
-            task_id='notify_tfs', topic="{{ params.topic }}", producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
+            task_id='notify_tfs', topic=cfg['kafka_out_topic'], producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
             delivery_callback=ON_DELIVERY, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario']),
         )
         t_wait = AwaitMessageSensor(

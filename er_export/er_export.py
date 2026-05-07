@@ -201,14 +201,14 @@ def _kafka_accept_any(msg) -> bool:
     return True
 
 
-def _pre_kafka(scenario: str, notify_kafka: bool = True):
+def _pre_kafka(scenario: str):
     """Фабрика pre_execute для ProduceToTopicOperator.
 
     Пропускает отправку если notify_kafka=False или данных нет.
     Динамически подставляет имя summary-файла в аргументы продюсера.
     """
     def pre_execute(context):
-        if not notify_kafka:
+        if not context['params'].get('notify_kafka', True):
             raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
         summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
         if not summary_tkt:
@@ -217,16 +217,17 @@ def _pre_kafka(scenario: str, notify_kafka: bool = True):
     return pre_execute
 
 
-def _pre_await(auto_confirm=False, notify_kafka: bool = True):
+def _pre_await():
     """Фабрика pre_execute для AwaitMessageSensor.
 
     Пропускает ожидание если: auto_confirm=True, notify_kafka=False, или данных не было.
     Позволяет использовать один оператор вместо EmptyOperator/AwaitMessageSensor switch.
     """
     def pre_execute(context):
-        if auto_confirm:
+        p = context['params']
+        if p.get('auto_confirm', False):
             raise AirflowSkipException("Auto confirm enabled, skipping wait")
-        if not notify_kafka:
+        if not p.get('notify_kafka', True):
             raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
         summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
         if not summary_tkt:
@@ -685,13 +686,13 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             task_id='notify_tfs', kafka_config_id=KAFKA_OUT_CONN, topic=KAFKA_OUT_TOPIC,
             pool=f"tfs_{cfg['scenario']}",
             producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
-            delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(cfg['scenario'], cfg['notify_kafka']),
+            delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(cfg['scenario']),
             execution_timeout=timedelta(minutes=cfg['notify_timeout']),
         )
         t_wait = AwaitMessageSensor(
             task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_TOPIC],
             apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed',
-            execution_timeout=timedelta(minutes=cfg.get('confirm_timeout', 60)), pre_execute=_pre_await(cfg.get('auto_confirm'), cfg['notify_kafka'])
+            execution_timeout=timedelta(minutes=cfg.get('confirm_timeout', 60)), pre_execute=_pre_await()
         )
         
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)

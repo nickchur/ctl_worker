@@ -671,7 +671,8 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         )
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
-            task_id='notify_tfs', topic=cfg['kafka_out_topic'], producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
+            task_id='notify_tfs', kafka_config_id=DEF_ARGS['kafka_out_conn'], topic=cfg['kafka_out_topic'],
+            producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
             delivery_callback=ON_DELIVERY, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario'], cfg['notify_kafka']),
         )
         t_wait = AwaitMessageSensor(

@@ -43,8 +43,11 @@ else:
     CH_ID   = 'dlab-click'
     S3_CONN = 's3-tfs-hrplt'
 
-BUCKET = 'tfshrplt'
-TOPIC  = 'TFS.HRPLT.IN'
+BUCKET         = 'tfshrplt'
+TOPIC          = 'TFS.HRPLT.IN'
+KAFKA_OUT_CONN = 'tfs-kafka-out'
+KAFKA_IN_CONN  = 'tfs-kafka-in'
+KAFKA_IN_TOPIC = 'TFS.HRPLT.OUT'
 
 # 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
@@ -52,16 +55,9 @@ TFS_MAP = {
 }
 
 DEF_ARGS = {
-    "owner":              "DataLab (CI02420667)",
-    "retries":            3,
-    "retry_delay":        timedelta(minutes=5),
-    "aws_conn_id":        S3_CONN,
-    "clickhouse_conn_id": CH_ID,
-    "conn_id":            CH_ID,
-    "kafka_out_conn":     "tfs-kafka-out",   # продюсер → TFS
-    "kafka_in_conn":      "tfs-kafka-in",    # консьюмер ← TFS (подтверждения)
-    "kafka_in_topic":     "TFS.HRPLT.OUT",
-    "kafka_out_topic":    TOPIC,
+    "owner":       "DataLab (CI02420667)",
+    "retries":     3,
+    "retry_delay": timedelta(minutes=5),
 }
 
 # 🔢 Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
@@ -265,6 +261,10 @@ def get_config() -> dict:
         'EXTRA_SUF':  EXTRA_SUF,
         'LIMITS':         LIMITS,
         'BUCKET':         BUCKET,
+        'TOPIC':          TOPIC,
+        'KAFKA_OUT_CONN': KAFKA_OUT_CONN,
+        'KAFKA_IN_CONN':  KAFKA_IN_CONN,
+        'KAFKA_IN_TOPIC': KAFKA_IN_TOPIC,
         'TFS_MAP':        TFS_MAP,
         'S3_CONN':        S3_CONN,
         'VAR_NAME':       VAR_NAME,

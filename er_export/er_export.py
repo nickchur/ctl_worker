@@ -40,10 +40,14 @@ CH_ID          = _cfg['CH_ID']
 TYPE_MAP       = _cfg['TYPE_MAP']
 DEF_ARGS       = _cfg['DEF_ARGS']
 ENV_STAND      = _cfg['ENV_STAND']
-EXTRA_PRE  = _cfg['EXTRA_PRE']
-EXTRA_SUF  = _cfg['EXTRA_SUF']
+EXTRA_PRE      = _cfg['EXTRA_PRE']
+EXTRA_SUF      = _cfg['EXTRA_SUF']
 LIMITS         = _cfg['LIMITS']
 BUCKET         = _cfg['BUCKET']
+TOPIC          = _cfg['TOPIC']
+KAFKA_OUT_CONN = _cfg['KAFKA_OUT_CONN']
+KAFKA_IN_CONN  = _cfg['KAFKA_IN_CONN']
+KAFKA_IN_TOPIC = _cfg['KAFKA_IN_TOPIC']
 TFS_MAP        = _cfg['TFS_MAP']
 S3_CONN        = _cfg['S3_CONN']
 VAR_NAME       = _cfg['VAR_NAME']
@@ -561,10 +565,6 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'fields':          fields,
         'PK':              params.get('PK', []),
         'UK':              params.get('UK', []),
-        # ── Kafka ────────────────────────────────────────────────────────────
-        'kafka_out_topic': DEF_ARGS['kafka_out_topic'],
-        'kafka_in_conn':   DEF_ARGS['kafka_in_conn'],
-        'kafka_in_topic':  DEF_ARGS['kafka_in_topic'],
         # ── Метаданные ───────────────────────────────────────────────────────
         'description':     params.get('description', ''),
         # ── Параметры из er_wf_meta.params (DEFAULT_PARAMS + overrides) ─────
@@ -667,16 +667,17 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         t_init, t_meta = _er_init(cfg=cfg), _er_build_meta(cfg=cfg)
         t_exp = HrpClickNativeToS3ListOperator(
             task_id='export_to_s3', s3_bucket=BUCKET, s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
+            aws_conn_id=S3_CONN, clickhouse_conn_id=CH_ID, conn_id=CH_ID,
             sql=sql_exp, compression=None, replace=True, post_file_check=False, pre_execute=_pre_exp, pool=POOL_NAME,
         )
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
-            task_id='notify_tfs', kafka_config_id=DEF_ARGS['kafka_out_conn'], topic=cfg['kafka_out_topic'],
+            task_id='notify_tfs', kafka_config_id=KAFKA_OUT_CONN, topic=TOPIC,
             producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
             delivery_callback=ON_DELIVERY, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario'], cfg['notify_kafka']),
         )
         t_wait = AwaitMessageSensor(
-            task_id='wait_confirm', kafka_config_id=cfg['kafka_in_conn'], topics=[cfg['kafka_in_topic']],
+            task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_TOPIC],
             apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME,
             execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm'), cfg['notify_kafka'])
         )

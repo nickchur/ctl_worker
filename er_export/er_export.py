@@ -1,5 +1,4 @@
-"""
-🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
+"""🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
 
 Жизненный цикл одного запуска:
   init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm → save_status → schedule_next

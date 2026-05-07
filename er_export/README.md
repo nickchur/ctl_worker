@@ -18,14 +18,14 @@
 
 Поведение фреймворка управляется двумя переменными окружения.
 
-**`AIRFLOW__CTL_PIN`** — переключает CH-коннект и источник секретов:
+**`ENV_SPACE`** — переключает CH-коннект и источник секретов:
 
-| Наличие | CH-коннект | S3 | Секреты |
+| Значение | CH-коннект | S3 | Секреты |
 | :--- | :--- | :--- | :--- |
-| не задана | `dlab-click` | `s3-tfs-hrplt` | стандартные Airflow connections |
-| задана (любое значение) | `dlab-click-test` | `s3-archive` | Vault `/vault/secrets/application` |
+| (не задана) | `dlab-click` | `s3-tfs-hrplt` | стандартные Airflow connections |
+| `ALPHA` | `dlab-click-test` | `s3-archive` | Vault `/vault/secrets/application` |
 
-**`ENV_STAND`** — определяет ограничения и поведение на стенде (значение приводится к uppercase):
+**`ENVIRONMENT`** — определяет ограничения и поведение на стенде (значение приводится к uppercase):
 
 | Значение | Лимит строк | Kafka / подтверждение |
 | :--- | :--- | :--- |

@@ -236,7 +236,7 @@ def _pre_await(auto_confirm=False, notify_kafka: bool = True):
 
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
-@task(task_id='init', pool=POOL_NAME)
+@task(task_id='init')
 def _er_init(cfg, **context):
     """⚙️ Инициализирует состояние выгрузки и возвращает словарь SQL-литералов для шаблонов.
 
@@ -329,7 +329,7 @@ def _er_init(cfg, **context):
     return result
 
 
-@task(task_id='build_meta', pool=POOL_NAME)
+@task(task_id='build_meta')
 def _er_build_meta(cfg, **context):
     """🗂️ Строит .meta JSON с описанием структуры таблицы для ЕР/TFS.
 
@@ -381,7 +381,7 @@ def _er_build_meta(cfg, **context):
     add_note({"🗂️ build_meta": [c["column_name"] for c in meta["columns"]]}, level='task,dag', context=context)
 
 
-@task(task_id='pack_zip', pool=POOL_NAME)
+@task(task_id='pack_zip')
 def _er_pack_zip(cfg, **context):
     """📦 Упаковывает CSV-файлы из S3 в ZIP-архивы формата ЕР и загружает обратно в S3.
 
@@ -452,7 +452,7 @@ def _er_pack_zip(cfg, **context):
     add_note({"📦 pack_zip": uploaded}, title=f"rows={total_rows} files={total}", level='task,dag', context=context)
 
 
-@task(task_id='save_status', trigger_rule='none_failed', pool=POOL_NAME)
+@task(task_id='save_status', trigger_rule='none_failed')
 def _er_save_status(cfg, **context):
     """💾 Записывает результат выгрузки в export.extract_history.
 
@@ -483,7 +483,7 @@ def _er_save_status(cfg, **context):
     )
 
 
-@task(task_id='schedule_next', pool=POOL_NAME)
+@task(task_id='schedule_next')
 def _er_schedule_next(cfg, **context):
     """⏭️ Запускает следующий цикл дельты, если time_to ещё не догнал текущее время.
 
@@ -668,17 +668,17 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         t_exp = HrpClickNativeToS3ListOperator(
             task_id='export_to_s3', s3_bucket=BUCKET, s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
             aws_conn_id=S3_CONN, clickhouse_conn_id=CH_ID, conn_id=CH_ID,
-            sql=sql_exp, compression=None, replace=True, post_file_check=False, pre_execute=_pre_exp, pool=POOL_NAME,
+            sql=sql_exp, compression=None, replace=True, post_file_check=False, pre_execute=_pre_exp,
         )
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
             task_id='notify_tfs', kafka_config_id=KAFKA_OUT_CONN, topic=KAFKA_OUT_TOPIC,
             producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
-            delivery_callback=ON_DELIVERY, pool=POOL_NAME, pre_execute=_pre_kafka(cfg['scenario'], cfg['notify_kafka']),
+            delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(cfg['scenario'], cfg['notify_kafka']),
         )
         t_wait = AwaitMessageSensor(
             task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_KAFKA_OUT_TOPIC],
-            apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed', pool=POOL_NAME,
+            apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed',
             execution_timeout=timedelta(seconds=cfg.get('confirm_timeout', 3600)), pre_execute=_pre_await(cfg.get('auto_confirm'), cfg['notify_kafka'])
         )
         

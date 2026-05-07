@@ -54,10 +54,16 @@ TFS_MAP = {
     "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
 }
 
+POOL_NAME   = 'datalab_export_er'
+POOL_SLOTS  = 20
+
 DEF_ARGS = {
-    "owner":       "DataLab (CI02420667)",
-    "retries":     3,
-    "retry_delay": timedelta(minutes=5),
+    "owner":            "DataLab (CI02420667)",
+    "retries":          3,
+    "retry_delay":      timedelta(minutes=5),
+    "pool":             POOL_NAME,
+    "email_on_failure": False,
+    "email_on_retry":   False,
 }
 
 # 🔢 Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
@@ -99,9 +105,6 @@ EXTRA_SUF = [
     {"sql": "'I' as ctl_action",            "column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None, "description": None},
     {"sql": "now64(6) as ctl_validfrom",    "column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
-
-POOL_NAME   = 'datalab_export_er'
-POOL_SLOTS  = 20
 
 def obj_load(key: str, default: any = None) -> any:
     """📥 Читает объект из Airflow Variable (JSON). При отсутствии возвращает default или {}."""

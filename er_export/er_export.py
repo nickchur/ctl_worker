@@ -264,7 +264,7 @@ def _er_init(cfg, **context):
         'selfrun_timeout':    str(cfg.get('selfrun_timeout', 10)),
         'max_file_size':      cfg.get('max_file_size', ''),
         'pg_array_format':    cfg.get('pg_array_format', 'False'),
-        'format_params':      cfg.get('csv_format_params', ''),
+        'format_params':      cfg.get('format_params', ''),
         'xstream_sanitize':   cfg.get('xstream_sanitize', 'False'),
         'sanitize_array':     cfg.get('sanitize_array', 'False'),
         'sanitize_list':      cfg.get('sanitize_list', ''),
@@ -318,8 +318,12 @@ def _er_init(cfg, **context):
         'selfrun_timeout': str,
         'strategy':        str,
         'notify_kafka':    lambda v: 1 if v else 0,
-        'auto_confirm':    lambda v: 1 if v else 0,
-        'max_file_size':   str,
+        'auto_confirm':     lambda v: 1 if v else 0,
+        'max_file_size':    str,
+        'pg_array_format':  lambda v: 'True' if v else 'False',
+        'xstream_sanitize': lambda v: 'True' if v else 'False',
+        'sanitize_array':   lambda v: 'True' if v else 'False',
+        'sanitize_list':    str,
     }
     for key, transform in key_map.items():
         if p.get(key) not in (None, '', 'None'):
@@ -651,6 +655,22 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             'max_file_size': Param(
                 None, type=['integer', 'null'], title='Max file size',
                 description='Ограничение размера CSV-файла, байт. None — без ограничений.',
+            ),
+            'pg_array_format': Param(
+                bool(p['pg_array_format']), type='boolean', title='PG Array Format',
+                description='PostgreSQL-формат массивов в TSV.',
+            ),
+            'xstream_sanitize': Param(
+                bool(p['xstream_sanitize']), type='boolean', title='XStream Sanitize',
+                description='Экранировать спецсимволы XStream.',
+            ),
+            'sanitize_array': Param(
+                bool(p['sanitize_array']), type='boolean', title='Sanitize Array',
+                description='Санитизировать CH-массивы в строки.',
+            ),
+            'sanitize_list': Param(
+                p['sanitize_list'], type='string', title='Sanitize List',
+                description='Список колонок для санитизации (через запятую). Пусто — не переопределять.',
             ),
         },
     )

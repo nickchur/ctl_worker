@@ -41,10 +41,8 @@ CH_ID          = _cfg['CH_ID']
 TYPE_MAP       = _cfg['TYPE_MAP']
 DEF_ARGS       = _cfg['DEF_ARGS']
 ENV_STAND      = _cfg['ENV_STAND']
-EXTRA_COLS_PRE = _cfg['EXTRA_COLS_PRE']
-EXTRA_COLS_SUF = _cfg['EXTRA_COLS_SUF']
-MANDATORY_PRE  = _cfg['MANDATORY_PRE']
-MANDATORY_SUF  = _cfg['MANDATORY_SUF']
+EXTRA_COLS_PRE  = _cfg['EXTRA_COLS_PRE']
+EXTRA_COLS_SUF  = _cfg['EXTRA_COLS_SUF']
 LIMITS         = _cfg['LIMITS']
 BUCKET         = _cfg['BUCKET']
 TFS_MAP        = _cfg['TFS_MAP']
@@ -375,7 +373,7 @@ def _er_build_meta(cfg, **context):
         "PK":          cfg['PK'],
         "UK":          [cfg['UK']] if cfg['UK'] else [],
         "params":      {"separation": "\t"},
-        "columns":     EXTRA_COLS_PRE + data_cols + EXTRA_COLS_SUF,
+        "columns":     [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_COLS_PRE] + data_cols + [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_COLS_SUF],
     }
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
     add_note({"🗂️ build_meta": [c["column_name"] for c in meta["columns"]]}, level='task,dag', context=context)
@@ -539,7 +537,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         """Читает SQL-метадату по ключу и добавляет обязательные поля (export_time, ctl_*)."""
         m = params.get(key)
         if isinstance(m, dict) and "fields" not in m:
-            m = {**m, "fields": MANDATORY_PRE + fields + MANDATORY_SUF}
+            m = {**m, "fields": [c['sql'] for c in EXTRA_COLS_PRE] + fields + [c['sql'] for c in EXTRA_COLS_SUF]}
         return build_sql(m)
 
     sql_delta, sql_recent = _prep_sql('sql_stmt_export_delta'), _prep_sql('sql_stmt_export_recent')

@@ -1,11 +1,11 @@
 """
 ⚙️ Конфигурация и константы фреймворка ER-выгрузок.
 
-CH-коннект и S3 определяются наличием переменной AIRFLOW__CTL_PIN:
-  🔑 есть  → dlab-click-test + s3-archive, секреты из Vault.
-  🏭 нет   → dlab-click + s3-tfs-hrplt.
+CH-коннект и S3 определяются переменной ENV_SPACE:
+  🔑 ALPHA → dlab-click-test + s3-archive, секреты из Vault.
+  🏭 иначе → dlab-click + s3-tfs-hrplt.
 
-Поведение на стенде управляется ENV_STAND (PROM / UAT / QA / IFT / DEV).
+Поведение на стенде управляется ENVIRONMENT (PROM / UAT / QA / IFT / DEV).
 """
 from __future__ import annotations
 
@@ -14,10 +14,13 @@ import json
 import os
 from datetime import timedelta
 
+ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
+ENV_SPACE = os.getenv("ENV_SPACE", "").strip().upper()
+
 CH_BD    = 'export'
 VAR_NAME = "datalab_er_wfs"
 
-if os.getenv("AIRFLOW__CTL_PIN"):
+if ENV_SPACE == "ALPHA":
     CH_ID = 'dlab-click-test'
     with open('/vault/secrets/application') as f:
         secrets = json.load(f)
@@ -43,8 +46,6 @@ else:
 
 BUCKET = 'tfshrplt'
 TOPIC  = 'TFS.HRPLT.IN'
-
-ENV_STAND = os.getenv("ENV_STAND", "").strip().upper()
 
 # 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
@@ -95,19 +96,14 @@ TYPE_MAP: dict[str, str] = {
     "Array":       "STRING",
 }
 
-# 📎 SQL-выражения, автоматически добавляемые в SELECT каждой выгрузки
-MANDATORY_PRE = ["{export_time} as export_time"]          # подставляется рантаймом из состояния дельты
-MANDATORY_SUF = ["'I' as ctl_action", "now64(6) as ctl_validfrom"]
-
-# 🗂️ Описания служебных колонок для .meta-файла TFS (порядок: PRE + data + SUF)
+# 📎 Служебные поля: ключ sql — выражение для SELECT, остальное — метаданные колонки для .meta TFS
 EXTRA_COLS_PRE = [
-    {"column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
+    {"sql": "{export_time} as export_time", "column_name": "export_time",   "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
 EXTRA_COLS_SUF = [
-    {"column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None, "description": None},
-    {"column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
+    {"sql": "'I' as ctl_action",            "column_name": "ctl_action",    "source_type": "VARCHAR",   "length": 10,   "notnull": False, "precision": None, "scale": None, "description": None},
+    {"sql": "now64(6) as ctl_validfrom",    "column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
-EXTRA_COLS = EXTRA_COLS_PRE + EXTRA_COLS_SUF  # полный список служебных колонок
 
 POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
@@ -266,11 +262,9 @@ def get_config() -> dict:
         'TYPE_MAP':       TYPE_MAP,
         'DEF_ARGS':       DEF_ARGS,
         'ENV_STAND':      ENV_STAND,
-        'EXTRA_COLS':     EXTRA_COLS,
-        'EXTRA_COLS_PRE': EXTRA_COLS_PRE,
-        'EXTRA_COLS_SUF': EXTRA_COLS_SUF,
-        'MANDATORY_PRE':  MANDATORY_PRE,
-        'MANDATORY_SUF':  MANDATORY_SUF,
+        'ENV_SPACE':      ENV_SPACE,
+        'EXTRA_COLS_PRE':  EXTRA_COLS_PRE,
+        'EXTRA_COLS_SUF':  EXTRA_COLS_SUF,
         'LIMITS':         LIMITS,
         'BUCKET':         BUCKET,
         'TFS_MAP':        TFS_MAP,

@@ -164,7 +164,7 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         """
         cl = get_current_load('gp_pool')
         if cl['pool_slots'] - cl['scheduled'] <= 1:
-            msg = "🔥 Sysytem is overloaded"
+            msg = "🔥 System is overloaded"
             add_note(msg, context, level='Task,DAG')
             raise AirflowSkipException(msg)
 

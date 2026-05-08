@@ -199,9 +199,6 @@ def set_pause(wf_name, cat):
 def _publish_stats(lid, eid, result):
     res = int(result['res']) if result.get('res') is not None else -99
     logs = {}
-    if result.get('html'):
-        ctl_send_html(result['html'], lid, eid)
-        result['html'] = ''
     statval({'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 11,
              'avalue': [pendulum.now(get_config()["tz"]).format('YYYY-MM-DD HH:mm:ss')]}, logs=logs)
     if res > 0:
@@ -225,6 +222,9 @@ def _publish_stats(lid, eid, result):
 
 def _emit_datasets(lid, eids, result, context):
     res = int(result['res']) if result.get('res') is not None else -99
+    if result.get('html') and eids:
+        ctl_send_html(result['html'], lid, int(eids[0].split('/')[0]))
+        result['html'] = ''
     msg = {}
     for eid_str in eids:
         eid = int(eid_str.split('/')[0])
@@ -235,9 +235,11 @@ def _emit_datasets(lid, eids, result, context):
             f"{ind}/url": f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}",
             f"{ind}/dt": pendulum.now(get_config()["tz"]).format('YYYY-MM-DD HH:mm:ss'),
         }
+        ent_key = f"{ind}/{ent_name}"
+        msg.setdefault(ent_key, {})
         for k, l in logs.items():
             v = ast.literal_eval(l)
-            msg[f"{ind}/{ent_name}"] = {v['stat_id']: v['avalue'][0]}
+            msg[ent_key][v['stat_id']] = v['avalue'][0]
             ext[f"{ind}/{v['stat_id']}"] = v['avalue'][0]
         add_note(msg, context, level='Task')
         if res > 0:
@@ -286,6 +288,7 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
     ctl_set_status(lid, status, result)
 
     if action == 'retry':
+        retry.setdefault('try', 1)
         now = pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
         new_time = eval_delta(now, retry.get('delay'))
         for _ in range(1, retry.get('try')):
@@ -302,7 +305,6 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
         'time': (pendulum.now(get_config()['tz']) - pendulum.parse(sdt, tz=get_config()['tz'])).in_words(locale='ru'),
     }
     add_note({**data, 'action': action, 'obj': lid}, context, level='Task,DAG', title='Log')
-    context['task_instance'].xcom_push(key='logs', value={})
 
     return status, action, res_msg, res_icon
 

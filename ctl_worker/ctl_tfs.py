@@ -1,14 +1,41 @@
-"""### 📁 DAG: TFS → S3 (перемещение файлов)
+"""### 📁 CTL TFS → S3
 
-Каждые 5 минут ожидает файлы в TFS и копирует их в S3 (`edpetl-files`). После копирования публикует `DatasetAlias("TFS/<profile>")`.
+Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
+
+---
+
+#### `CTL.<profile>.tfs_sensor` — по расписанию
+
+Каждые N минут (параметр `tfs_interval`, по умолчанию 5 мин) опрашивает все `tfs-in`-источники из конфига. При обнаружении файлов копирует их в S3 и публикует `DatasetAlias("TFS/<profile>")`.
 
 | Параметр (UI) | Описание |
 |---|---|
-| `path` | `conn_id://bucket/prefix/mask` |
+| `path` | `conn_id://bucket/prefix/mask` (при ручном запуске) |
 | `tfs_id` | Идентификатор источника |
 | `compress` | Сжать при копировании |
 | `done` | Удалить исходник после копирования |
 | `unzip` | Распаковать ZIP-архив |
+
+---
+
+#### `CTL.<profile>.tfs_kafka` — по событию Kafka
+
+Запускается внешним триггером. Читает сообщение `TransferFileCephRq` из Kafka, копирует указанные в XML файлы в S3, затем отправляет квитанцию `TransferFileCephRs` (StatusCode=0 при успехе, 104 при ошибке).
+
+`ScenarioId` из XML используется как `tfs_id`; `RqUID` — в квитанцию.
+
+| Параметр (UI) | Описание |
+|---|---|
+| `path` | Базовый путь в TFS: `conn_id://bucket/prefix/` |
+| `tfs_id` | Fallback-идентификатор (если `ScenarioId` пуст) |
+| `compress` | Сжать при копировании |
+| `done` | Удалить исходник после копирования |
+| `unzip` | Распаковать ZIP-архив |
+| `kafka` | `kafka_config_id` входящего соединения |
+| `topic` | Топик входящих сообщений |
+| `timeout` | Таймаут ожидания (мин, по умолчанию 60) |
+| `kafka_out` | `kafka_config_id` для квитанции (необязательно) |
+| `topic_out` | Топик квитанций (необязательно) |
 """
 
 from airflow import DAG
@@ -86,7 +113,7 @@ def _on_delivery_tfs(err, msg) -> None:
 
 @task(map_index_template="{{ path[0] }}", outlets=[DatasetAlias(f"TFS/{profile}")],)
 def tfs_copy(path: str, **context):
-    """ Копирование файла из TFS в S3 """
+    """Копирует файл из TFS в S3; при unzip — распаковывает архив; при ошибке перемещает в tfs-errors."""
     ti = context['ti']
     src_path = path[0]
     src_info = path[1]
@@ -217,7 +244,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
         timeout=pendulum.duration(hours=24),
     )
     def tfs_wait(**context):
-        """ Ожидание появления файла в TFS """
+        """Сканирует TFS-источники по маске; при ручном запуске берёт path из params."""
         ti = context['ti']
         manual = context['run_id'].startswith('manual__')
         params = context['params']
@@ -304,9 +331,11 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
         "topic_out": Param('', type="string", description="Kafka topic для квитанции"),
     },
     on_failure_callback=on_callback,
+    doc_md=__doc__,
 ) as dag_kafka:
 
     def _pre_kafka_wait(context):
+        """Устанавливает kafka_config_id/topics/execution_timeout — поля не поддерживают шаблонизацию."""
         p = context['params']
         if not p.get('kafka') or not p.get('topic'):
             raise AirflowFailException("Params 'kafka' and 'topic' are required")
@@ -367,6 +396,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
         return ret_keys
 
     def _pre_receipt(context):
+        """Проверяет статусы tfs_copy и формирует аргументы квитанции TransferFileCephRs."""
         p = context['params']
         if not p.get('kafka_out') or not p.get('topic_out'):
             from airflow.exceptions import AirflowSkipException

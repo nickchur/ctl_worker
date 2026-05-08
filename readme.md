@@ -16,7 +16,7 @@ ctl_worker/          # DAG'и Airflow
 ├── ctl_config.py    # 🔐 Управление конфигурацией через Airflow Variables (PIN-защита)
 ├── ctl_checker.py   # 🔍 Диагностика доступности CTL API
 ├── ctl_yml.py       # 💾 Экспорт конфигурации CTL в YAML (бэкап / миграция)
-├── ctl_tfs.py       # 📁 Перемещение файлов из TFS в S3, публикация Dataset
+├── ctl_tfs.py       # 📁 TFS → S3: по расписанию (tfs_sensor) и по Kafka-событию (tfs_kafka) с квитанцией
 ├── ctl_test.py      # 🧪 Ручное тестирование и симуляции без влияния на продакшн
 └── ctl_test_conn.py # 🔌 Проверка доступности всех подключений
 

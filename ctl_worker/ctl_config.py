@@ -21,10 +21,19 @@ from airflow.models import Variable, Param
 from plugins.utils import on_callback, add_note, default_args, str2timedelta, get_conns_by_type, get_conn 
 from plugins.s3_utils import s3_set_ttl, s3_create_bucket
 import os
+import base64
+import json
 import pendulum
 
 from logging import  getLogger
 logger = getLogger('airflow.task')
+
+def get_scrt(s: str) -> str:
+    """Читает секрет из /vault/secrets/application и декодирует base64 → UTF-8."""
+    with open('/vault/secrets/application') as f:
+        secrets = json.load(f)
+    return base64.b64decode(secrets[s]).decode()
+
 
 conf = Variable.get('ctl_config', default_var={}, deserialize_json=True)
 
@@ -142,7 +151,7 @@ with DAG(f'CTL.{config["profile"]}.config',
         
         config = context["params"]
         pin = config.pop('CTL_PIN')
-        if pin == os.getenv("AIRFLOW__CTL_PIN"):
+        if pin == get_scrt("AIRFLOW__CTL_PIN"):
             from plugins.ctl_utils import ctl_obj_save # type: ignore
             # Save config to Variable
             ctl_obj_save('ctl_config', config, var=True)

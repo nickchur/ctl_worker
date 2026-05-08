@@ -34,7 +34,7 @@ import json
 
 import pendulum
 from airflow.decorators import dag, task
-from logging import getLogger
+import logging
 
 try:
     from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_save, add_note  # type: ignore
@@ -50,7 +50,7 @@ POOL_NAME  = _cfg['POOL_NAME']
 POOL_SLOTS = _cfg['POOL_SLOTS']
 TFS_MAP    = _cfg['TFS_MAP']
 
-logger = getLogger("airflow.task")
+logger = logging.getLogger("airflow.task")
 
 # Пул для таска синхронизации — намеренно не POOL_NAME,
 # чтобы sync не занимал слоты экспортного пула.
@@ -107,7 +107,7 @@ def _ensure_pool() -> None:
 def er_sync_dag():
 
     @task(task_id="sync", pool=SYNC_POOL)
-    def sync():
+    def sync(**context):
         """🔄 Читает er_wf_meta, собирает словарь выгрузок и сохраняет в Airflow Variable.
 
         🧪 DEV: создаёт таблицу er_wf_meta если её нет; пропускает обновление при пустой таблице.
@@ -197,10 +197,10 @@ def er_sync_dag():
             entry = {
                 "replica":  row["replica"],
                 "schema":   row["schema_name"],
-                "schedule": row.get("schedule") or "55 0 * * *",
+                "schedule": row["schedule"] or "55 0 * * *",
                 "PK":       row["pk"],
                 "UK":       row["uk"],
-                "params":   row.get("params", "{}"),
+                "params":   row["params"] or "{}",
                 sql_key:    sql_val,
             }
             if row["fields"]:
@@ -212,10 +212,13 @@ def er_sync_dag():
 
             wfs[table_key] = entry
 
+        if not wfs:
+            raise ValueError("🚫 All records were filtered out (empty sql_from or replica not in TFS_MAP) — aborting to avoid overwriting Variable with empty dict")
+
         logger.info("✅ Загружено %d выгрузок из export.er_wf_meta", len(wfs))
         # 💾 obj_save пропускает запись если данные не изменились (сравнение JSON)
         obj_save(VAR_NAME, wfs)
-        add_note({"✅ er_sync": list(wfs)}, title=f"загружено {len(wfs)} выгрузок")
+        add_note({"✅ er_sync": list(wfs)}, title=f"загружено {len(wfs)} выгрузок", level='task,dag', context=context)
 
     sync()
 

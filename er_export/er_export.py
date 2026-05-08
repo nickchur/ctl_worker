@@ -594,27 +594,14 @@ def _er_schedule_next(cfg, **context):
     Запуск откладывается на selfrun_timeout минут, чтобы избежать гонки с источником.
     Для recent-режима is_current всегда True — автозапуск не нужен.
     """
-    from airflow.models import DagRun
-    from airflow.utils.types import DagRunType
-    from airflow.utils.state import DagRunState
-    from airflow.utils.session import create_session
+    from airflow.api.common.trigger_dag import trigger_dag
     dp = context['ti'].xcom_pull(task_ids="init")
     if str(dp.get('is_current')).lower() in ('true', 't', '1'):
         add_note("✅ delta is current — next run not scheduled", level='task,dag', context=context)
         return
 
     next_run = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
-    run_id = f"manual__{next_run.isoformat()}_{str(uuid.uuid4())[:8]}"
-    with create_session() as session:
-        session.add(DagRun(
-            dag_id=cfg['dag_id'],
-            run_id=run_id,
-            execution_date=next_run,
-            run_type=DagRunType.MANUAL,
-            state=DagRunState.QUEUED,
-            external_trigger=True,
-            conf={},
-        ))
+    trigger_dag(dag_id=cfg['dag_id'], execution_date=next_run, conf={}, replace_microseconds=False)
     add_note(f"⏭️ next run scheduled at {next_run.format('YYYY-MM-DD HH:mm:ss')} UTC", level='task,dag', context=context)
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────

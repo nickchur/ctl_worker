@@ -37,9 +37,9 @@ from airflow.decorators import dag, task
 from logging import getLogger
 
 try:
-    from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_save
+    from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_save, add_note
 except ImportError:
-    from er_export.er_config import get_config, get_dict, obj_save
+    from er_export.er_config import get_config, get_dict, obj_save, add_note
 
 _cfg       = get_config()
 CH_ID      = _cfg['CH_ID']
@@ -51,6 +51,19 @@ POOL_SLOTS = _cfg['POOL_SLOTS']
 TFS_MAP    = _cfg['TFS_MAP']
 
 logger = getLogger("airflow.task")
+
+# Пул для таска синхронизации — намеренно не POOL_NAME,
+# чтобы sync не занимал слоты экспортного пула.
+SYNC_POOL = "default_pool"
+
+# Ключи _cfg, которые не нужны в doc_md (содержат функции или слишком многословны).
+_HIDDEN_CFG_KEYS = frozenset({'DEF_ARGS', 'TYPE_MAP', 'EXTRA_PRE', 'EXTRA_SUF'})
+_doc_cfg = {k: v for k, v in _cfg.items() if k not in _HIDDEN_CFG_KEYS}
+
+
+def _q(s: str) -> str:
+    """Экранирует одинарные кавычки для подстановки в ClickHouse-строковый литерал."""
+    return s.replace("'", "''")
 
 
 def _ensure_pool() -> None:
@@ -70,7 +83,8 @@ def _ensure_pool() -> None:
     }
 
     with create_session() as session:
-        existing = {p.pool for p in session.query(Pool).all()}
+        needed = {POOL_NAME} | set(tfs_pools)
+        existing = {p.pool for p in session.query(Pool).filter(Pool.pool.in_(needed)).all()}
         if POOL_NAME not in existing:
             session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS, description='Пул для ER-выгрузок', include_deferred=False))
         for pool_name, (slots, desc) in tfs_pools.items():
@@ -88,11 +102,11 @@ def _ensure_pool() -> None:
     catchup=False,
     tags=["DataLab", "CI02420667", "ER", "sync"],
     is_paused_upon_creation=True,
-    doc_md="```\n" + json.dumps(_cfg, indent=4, default=str) + "\n```",
+    doc_md="```\n" + json.dumps(_doc_cfg, indent=4, default=str) + "\n```",
 )
 def er_sync_dag():
 
-    @task(task_id="sync", pool="default_pool")
+    @task(task_id="sync", pool=SYNC_POOL)
     def sync():
         """🔄 Читает er_wf_meta, собирает словарь выгрузок и сохраняет в Airflow Variable.
 
@@ -129,15 +143,21 @@ def er_sync_dag():
                     is_active       UInt8         DEFAULT 1              COMMENT '0 = запись игнорируется при синхронизации в Variable',
                     updated_at      DateTime      DEFAULT now()          COMMENT 'Версия строки для ReplacingMergeTree'
                 )
+                -- DEV: non-replicated engine; production uses ReplicatedReplacingMergeTree
                 ENGINE = ReplacingMergeTree(updated_at)
                 ORDER BY (db_name, extract_name)
             """)
             logger.info("🧪 DEV: ensured export.er_wf_meta exists")
 
-        rows = get_dict(
-            hook,
-            "SELECT * FROM export.er_wf_meta FINAL WHERE is_active = 1",
-        )
+        rows = get_dict(hook, """
+            SELECT
+                extract_name, db_name, replica, schema_name,
+                pk, uk, fields,
+                sql_from, sql_where, sql_join, sql_with, sql_settings,
+                params, description, schedule, is_recent
+            FROM export.er_wf_meta FINAL
+            WHERE is_active = 1
+        """)
 
         if not rows:
             if ENV_STAND == 'DEV':
@@ -150,15 +170,22 @@ def er_sync_dag():
         no_desc = [(r["db_name"], r["extract_name"]) for r in rows if not r["description"]]
         ch_comments: dict[tuple[str, str], str] = {}
         if no_desc:
-            cond = " OR ".join(f"(database='{db}' AND name='{tbl}')" for db, tbl in no_desc)
+            pairs = ", ".join(f"('{_q(db)}', '{_q(tbl)}')" for db, tbl in no_desc)
             ch_comments = {
                 (r["database"], r["name"]): r["comment"]
-                for r in get_dict(hook, f"SELECT database, name, comment FROM system.tables WHERE {cond}")
+                for r in get_dict(hook, f"SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})")
             }
 
         wfs = {}
         for row in rows:
             table_key = f"{row['db_name']}.{row['extract_name']}"
+
+            if not row["sql_from"]:
+                logger.warning("⚠️ Skipping %s: sql_from is empty", table_key)
+                continue
+            if row["replica"] not in TFS_MAP:
+                logger.warning("⚠️ Skipping %s: replica '%s' not found in TFS_MAP", table_key, row["replica"])
+                continue
 
             # 🔀 is_recent определяет ключ SQL-запроса: фабрика er_export.py проверяет наличие одного из двух
             sql_key = "sql_stmt_export_recent" if row["is_recent"] else "sql_stmt_export_delta"
@@ -189,6 +216,7 @@ def er_sync_dag():
         logger.info("✅ Загружено %d выгрузок из export.er_wf_meta", len(wfs))
         # 💾 obj_save пропускает запись если данные не изменились (сравнение JSON)
         obj_save(VAR_NAME, wfs)
+        add_note({"✅ er_sync": list(wfs)}, title=f"загружено {len(wfs)} выгрузок")
 
     sync()
 

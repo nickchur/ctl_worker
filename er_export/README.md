@@ -48,7 +48,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 
 | Таск | Описание |
 | :--- | :--- |
-| `init` | ⚙️ Инициализирует состояние дельты из `export.extract_current_vw`. При первом запуске — bootstrap от `lower_bound`. Применяет переопределения из DAG Params. |
+| `init` | ⚙️ Delta: читает состояние из `export.extract_current_vw`; при первом запуске — bootstrap от `lower_bound`. Recent: вычисляет окно `[now() - recent_interval, now()]` без обращения к CH. Применяет переопределения из DAG Params. |
 | `build_meta` | 🗂️ Генерирует `.meta` JSON (`DESCRIBE TABLE`). Имена колонок, совпадающие с зарезервированными словами Hive, получают суффикс `_`. |
 | `export_to_s3` | 📤 Нативная выгрузка ClickHouse → S3 (`HrpClickNativeToS3ListOperator`). |
 | `pack_zip` | 📦 Потоковая упаковка CSV + `.meta` + `.tkt` в ZIP (`stream_zip`). При `send_empty=True` и нулевой дельте — пустой CSV с заголовком. |
@@ -295,4 +295,4 @@ VALUES (
 - 💧 **Стриминг**: ZIP-архивация потребляет минимум памяти — `stream_zip` + multipart-загрузка в S3 без буферизации всего файла.
 - 🔒 **Изоляция**: фреймворк не зависит от общих `plugins`, используя собственные хелперы в `er_config.py`.
 - ✅ **Идемпотентность**: `export_er_sync` записывает Variable только если данные изменились.
-- 📝 **on_failure_callback**: при падении любого таска `on_callback` автоматически добавляет заметку с трейсом в Airflow UI (Task и DAG Run).
+- 📝 **on_callback**: при падении таска добавляет заметку с трейсом в Airflow UI на уровне Task и DAG Run; при успехе — на уровне Task. Используется как `on_failure_callback` и `on_success_callback`.

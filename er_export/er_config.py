@@ -12,7 +12,9 @@ import base64
 import json
 import logging
 import os
+import unicodedata
 from datetime import timedelta
+from typing import Any
 
 ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
 ENV_SPACE = os.getenv("ENV_SPACE", "").strip().upper()
@@ -133,6 +135,7 @@ DEF_ARGS = {
     "email_on_failure": False,
     "email_on_retry":   False,
     "on_failure_callback": on_callback,
+    "on_success_callback": on_callback,
 }
 
 # 🔢 Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
@@ -175,20 +178,20 @@ EXTRA_SUF = [
     {"sql": "now64(6) as ctl_validfrom",    "column_name": "ctl_validfrom", "source_type": "TIMESTAMP", "length": None, "notnull": False, "precision": None, "scale": None, "description": None},
 ]
 
-def obj_load(key: str, default: any = None) -> any:
+
+def obj_load(key: str, default: Any = None) -> Any:
     """📥 Читает объект из Airflow Variable (JSON). При отсутствии возвращает default или {}."""
     from airflow.models import Variable
     return Variable.get(key, default_var=default if default is not None else {}, deserialize_json=True)
 
 
-def obj_save(key: str, data: any) -> None:
+def obj_save(key: str, data: Any) -> None:
     """📤 Сохраняет объект в Airflow Variable (JSON).
 
     Пропускает запись если данные не изменились (сравнение JSON).
     Обновляет description переменной метаданными: {'ts': ..., 'len': ..., 'size': ...}.
     """
     from airflow.models import Variable
-    import json
     import pendulum
 
     # Сравниваем с текущим значением — пропускаем лишнюю запись в БД
@@ -233,6 +236,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
 
     MAX_NOTE_LEN = 1000
 
+
     if not context:
         try:
             context = get_current_context()
@@ -249,7 +253,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
         msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
         msg = '```\n' + msg + '\n```'
 
-    logger.info(f"📝 Note added to {level} {title}:\n{msg}")
+    logger.info("📝 Note added to %s %s:\n%s", level, title, msg)
 
     with create_session() as session:
         for lvl in list(set(level.upper().split(',')))[:2]:
@@ -258,7 +262,6 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
             session.expire(obj)
 
             if title:
-                import unicodedata
                 # Если title не начинается с emoji — добавляем стандартный префикс
                 if not unicodedata.category(title[0]) == 'So':
                     title = "📝 " + title
@@ -323,23 +326,23 @@ def get_params(row: dict) -> dict:
 def get_config() -> dict:
     """📦 Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта."""
     return {
-        'CH_ID':          CH_ID,
-        'TYPE_MAP':       TYPE_MAP,
-        'DEF_ARGS':       DEF_ARGS,
-        'ENV_STAND':      ENV_STAND,
-        'ENV_SPACE':      ENV_SPACE,
-        'EXTRA_PRE': EXTRA_PRE,
-        'EXTRA_SUF': EXTRA_SUF,
-        'LIMITS':         LIMITS,
-        'BUCKET':         BUCKET,
-        'KAFKA_OUT_TOPIC':          KAFKA_OUT_TOPIC,
-        'KAFKA_OUT_CONN': KAFKA_OUT_CONN,
-        'KAFKA_IN_CONN':  KAFKA_IN_CONN,
+        'CH_ID':           CH_ID,
+        'TYPE_MAP':        TYPE_MAP,
+        'DEF_ARGS':        DEF_ARGS,
+        'ENV_STAND':       ENV_STAND,
+        'ENV_SPACE':       ENV_SPACE,       # TODO: удалить после удаления ALPHA-блока
+        'EXTRA_PRE':       EXTRA_PRE,
+        'EXTRA_SUF':       EXTRA_SUF,
+        'LIMITS':          LIMITS,
+        'BUCKET':          BUCKET,
+        'KAFKA_OUT_TOPIC': KAFKA_OUT_TOPIC,
+        'KAFKA_OUT_CONN':  KAFKA_OUT_CONN,
+        'KAFKA_IN_CONN':   KAFKA_IN_CONN,
         'KAFKA_IN_TOPIC':  KAFKA_IN_TOPIC,
-        'TFS_MAP':        TFS_MAP,
-        'S3_CONN':        S3_CONN,
-        'VAR_NAME':       VAR_NAME,
-        'POOL_NAME':      POOL_NAME,
-        'POOL_SLOTS':     POOL_SLOTS,
-        'DEFAULT_PARAMS': DEFAULT_PARAMS,
+        'TFS_MAP':         TFS_MAP,
+        'S3_CONN':         S3_CONN,
+        'VAR_NAME':        VAR_NAME,
+        'POOL_NAME':       POOL_NAME,
+        'POOL_SLOTS':      POOL_SLOTS,
+        'DEFAULT_PARAMS':  DEFAULT_PARAMS,
     }

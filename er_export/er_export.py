@@ -300,6 +300,7 @@ def _pre_await(context):
     if not summary_tkt:
         raise AirflowSkipException("No data exported, skipping wait")
 
+
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
 class _ZipReader:
@@ -398,8 +399,8 @@ def _er_init(cfg, **context):
         'increment':       str,
         'selfrun_timeout': str,
         'strategy':        str,
-        'notify_kafka':    lambda v: 1 if v else 0,
-        'auto_confirm':     lambda v: 1 if v else 0,
+        'notify_kafka':    lambda v: 'True' if v else 'False',
+        'auto_confirm':     lambda v: 'True' if v else 'False',
         'max_file_size':    str,
         'pg_array_format':  lambda v: 'True' if v else 'False',
         'xstream_sanitize': lambda v: 'True' if v else 'False',
@@ -527,7 +528,7 @@ def _er_pack_zip(cfg, **context):
 
     hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
     base_ts, uploaded = pendulum.now("UTC"), []
-    ts_s = lambda s: base_ts.add(seconds=s).format("YYYYMMDDHHmmss")  # переопределяется в цикле
+    ts_s = None  # type: ignore  # всегда переопределяется в цикле (s3_keys непустой)
 
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
         ts_s = lambda s, _i=i: base_ts.add(seconds=_i*2 + s).format("YYYYMMDDHHmmss")
@@ -626,7 +627,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
 
     db, tbl = table_key.split(".", maxsplit=1)
     replica, schema = params['replica'], params['schema']
-    if p.get('format', 'TSVWithNames') != 'TSVWithNames':
+    if p['format'] != 'TSVWithNames':
         raise AirflowFailException("Only TSVWithNames format is supported.")
 
     scen, prefix = TFS_MAP[replica]
@@ -811,7 +812,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         t_wait = AwaitMessageSensor(
             task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_TOPIC],
             apply_function=KAFKA_ACCEPT_ANY, trigger_rule='none_failed',
-            execution_timeout=timedelta(minutes=cfg.get('confirm_timeout', 60)), pre_execute=_pre_await
+            execution_timeout=timedelta(minutes=cfg['confirm_timeout']), pre_execute=_pre_await
         )
 
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)

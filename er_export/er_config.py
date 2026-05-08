@@ -63,7 +63,7 @@ logger = logging.getLogger("airflow.task")
 
 
 def _on_callback(context, level=None):
-    """Обработчик on_failure_callback — формирует заметку о статусе таска/DAG в Airflow UI."""
+    """Обработчик on_failure_callback/on_success_callback — формирует заметку о статусе таска/DAG в Airflow UI."""
     from airflow.utils.state import TaskInstanceState
     import pendulum
 
@@ -235,7 +235,6 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
     from pprint import PrettyPrinter
 
     MAX_NOTE_LEN = 1000
-
 
     if not context:
         try:

@@ -8,17 +8,17 @@
 
 ```
 ctl_worker/          # DAG'и Airflow
-├── ctl_worker.py    # ⚙️ Основной исполнительный DAG (инициализация → выполнение → финализация)
-├── ctl_sensor.py    # 📡 Сенсор: опрос CTL API и запуск DAG'ов по событиям
-├── ctl_loader.py    # 📥 Выгрузка метаданных из CTL в S3 / Airflow Variables
-├── ctl_monitor.py   # 📊 Мониторинг SLA, retry-логика, автоматические действия
-├── ctl_events.py    # 🔔 Публикация Airflow Dataset'ов при изменениях в CTL
-├── ctl_config.py    # 🔐 Управление конфигурацией через Airflow Variables (PIN-защита)
-├── ctl_checker.py   # 🔍 Диагностика доступности CTL API
-├── ctl_yml.py       # 💾 Экспорт конфигурации CTL в YAML (бэкап / миграция)
+├── ctl_worker.py    # ⚙️ Динамическая генерация DAG'ов (1 на workflow): SQL в GP → публикация → retry
+├── ctl_sensor.py    # 📡 Опрос CTL (1 мин): фильтрует активные загрузки и запускает DAG'и
+├── ctl_loader.py    # 📥 Выгрузка метаданных CTL в S3 + Airflow Variables (workflows, сущности, события)
+├── ctl_monitor.py   # 📊 Анализ загрузок (15 мин): SLA, retry, reStarted, Aborted
+├── ctl_events.py    # 🔔 Публикация Dataset'ов CTL/{profile}/{eid}/{ename} для запуска зависимых DAG'ов
+├── ctl_config.py    # 🔐 Инициализация конфигурации в Airflow Variable ctl_config (PIN-защита)
+├── ctl_checker.py   # 🔍 Ручная диагностика CTL API: HTTP-запросы с шаблонами URL
+├── ctl_yml.py       # 💾 Экспорт конфигурации CTL в YAML-файлы в S3 (бэкап / IaC)
 ├── ctl_tfs.py       # 📁 TFS → S3: по расписанию (tfs_sensor) и по Kafka-событию (tfs_kafka) с квитанцией
-├── ctl_test.py      # 🧪 Ручное тестирование и симуляции без влияния на продакшн
-└── ctl_test_conn.py # 🔌 Проверка доступности всех подключений
+├── ctl_test.py      # 🧪 Симулятор: тестовые события / Dataset-сигналы / случайные триггеры
+└── ctl_test_conn.py # 🔌 Мониторинг подключений (CTL, GP, PG, S3) с backoff
 
 tools/                   # Служебные DAG'и (ручной запуск) → tools/readme.md
 ├── db_cleanup.py        # 🧹 Очистка метадаты Airflow старше N дней

@@ -116,7 +116,8 @@ HIVE_RESERVED: frozenset = frozenset({
     'pkfk_join','prepare','qualify','real','some','than','trailing',
 })
 
-ON_DELIVERY = f'{__name__}.on_delivery'   # dot-notation для delivery_callback
+ON_DELIVERY      = f'{__name__}.on_delivery'        # dot-notation для delivery_callback
+KAFKA_ACCEPT_ANY = f'{__name__}._kafka_accept_any'  # dot-notation для apply_function
 
 # ── SQL Builders ──────────────────────────────────────────────────────────────
 
@@ -284,22 +285,20 @@ def _pre_kafka(scenario: str):
     return pre_execute
 
 
-def _pre_await():
-    """Фабрика pre_execute для AwaitMessageSensor.
+def _pre_await(context):
+    """pre_execute для AwaitMessageSensor.
 
     Пропускает ожидание если: auto_confirm=True, notify_kafka=False, или данных не было.
     Позволяет использовать один оператор вместо EmptyOperator/AwaitMessageSensor switch.
     """
-    def pre_execute(context):
-        p = context['params']
-        if p.get('auto_confirm', False):
-            raise AirflowSkipException("Auto confirm enabled, skipping wait")
-        if not p.get('notify_kafka', True):
-            raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
-        summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
-        if not summary_tkt:
-            raise AirflowSkipException("No data exported, skipping wait")
-    return pre_execute
+    p = context['params']
+    if p.get('auto_confirm', False):
+        raise AirflowSkipException("Auto confirm enabled, skipping wait")
+    if not p.get('notify_kafka', True):
+        raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
+    summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
+    if not summary_tkt:
+        raise AirflowSkipException("No data exported, skipping wait")
 
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
@@ -316,6 +315,7 @@ class _ZipReader:
             except StopIteration: break
         chunk, self._b = bytes(self._b[:n]), self._b[n:]
         return chunk
+
 
 @task(task_id='init')
 def _er_init(cfg, **context):
@@ -410,8 +410,8 @@ def _er_init(cfg, **context):
     for key, transform in key_map.items():
         if p.get(key) not in (None, '', 'None'):
             result[key] = transform(p[key])
-    
-    add_note({k: result.get(k) for k in key_map}, level='Task,DAG', title='⚙️ Delta State')
+
+    add_note({k: result.get(k) for k in key_map}, level='Task,DAG', context=context, title='⚙️ Delta State')
     return result
 
 
@@ -426,6 +426,8 @@ def _er_build_meta(cfg, **context):
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = context['ti'].xcom_pull(task_ids="init")
+    if dp is None:
+        raise AirflowFailException("XCom 'init' is None — init task failed before returning")
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
     rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
 
@@ -533,7 +535,7 @@ def _er_pack_zip(cfg, **context):
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.meta".lower()
         tkt_n  = f"{cfg['replica']}__{ts_s(1)}.tkt".lower()
         zip_n  = f"{cfg['replica']}__{ts_s(2)}__{cfg['tbl']}__{i+1}_{total}_{rows}.zip".lower()
-        
+
         s3_body = hook.get_key(key=key, bucket_name=BUCKET).get()["Body"]
         mtime = base_ts.add(seconds=i*2).naive()
         members = [
@@ -547,7 +549,7 @@ def _er_pack_zip(cfg, **context):
 
     summary_tkt = f"{cfg['replica']}__{ts_s(3)}.tkt".lower()
     hook.load_bytes("\n".join(uploaded).encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
-    
+
     total_rows = sum(int(r) for r in counts)
     ti.xcom_push(key="zip_name_list",    value=uploaded)
     ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
@@ -567,11 +569,11 @@ def _er_save_status(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     ti, dp = context['ti'], context['ti'].xcom_pull(task_ids="init")
     if not dp: return
-    
+
     rows = ti.xcom_pull(task_ids="pack_zip", key='total_row_count') or 0
     zips = ti.xcom_pull(task_ids="pack_zip", key='zip_name_list') or []
     zip_arr = "[" + ", ".join(f"'{z}'" for z in zips) + "]"
-    
+
     ClickHouseHook(clickhouse_conn_id=CH_ID).execute(f"""
         INSERT INTO export.extract_history (
             extract_name, extract_time, extract_count, loaded, sent, confirmed,
@@ -611,7 +613,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
 
     table_key — ключ вида "db_name.extract_name"
     params    — словарь из Variable datalab_er_wfs (одна запись er_wf_meta):
-                replica, schema, format, PK, UK, params (JSON),
+                replica, schema, PK, UK, params (JSON),
                 sql_stmt_export_delta | sql_stmt_export_recent, fields, description
 
     Возвращает (dag_id, dag) для регистрации в globals().
@@ -808,10 +810,10 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         )
         t_wait = AwaitMessageSensor(
             task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_TOPIC],
-            apply_function="er_export.er_export._kafka_accept_any", trigger_rule='none_failed',
-            execution_timeout=timedelta(minutes=cfg.get('confirm_timeout', 60)), pre_execute=_pre_await()
+            apply_function=KAFKA_ACCEPT_ANY, trigger_rule='none_failed',
+            execution_timeout=timedelta(minutes=cfg.get('confirm_timeout', 60)), pre_execute=_pre_await
         )
-        
+
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)
 
     return cfg['dag_id'], dag

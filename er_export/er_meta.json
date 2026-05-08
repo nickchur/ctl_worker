@@ -5,7 +5,7 @@
     "schedule": "55 0 * * *",
     "PK": [],
     "UK": ["person_uuid", "item_id"],
-    "params": "{\"strategy\": \"FULL_UK\", \"increment\": 60, \"selfrun_timeout\": 10}",
+    "params": "{\"selfrun_timeout\": 10}",
     "fields": [
       "insert_time",
       "header_id",
@@ -29,7 +29,7 @@
     "schedule": "*/15 * * * *",
     "PK": [],
     "UK": ["course_id", "person_uuid"],
-    "params": "{\"strategy\": \"FULL_UK\", \"recent_interval\": 30, \"notify_kafka\": 0}",
+    "params": "{\"recent_interval\": 30, \"notify_kafka\": 0}",
     "fields": [],
     "description": "Активность по курсам (recent, скользящее окно 30 мин)",
     "sql_stmt_export_recent": {

@@ -1,9 +1,4 @@
 {
-  "_comment": [
-    "Формат Airflow Variable 'datalab_er_wfs' (≠ схема CH-таблицы er_wf_meta).",
-    "Генерируется DAG-ом export_er_sync из export.er_wf_meta FINAL.",
-    "Поле 'params' — JSON-строка внутри JSON: хранится в CH как String, json.loads() при чтении."
-  ],
   "evolution.lc_items_opened": {
     "replica": "hrplatform_datalab",
     "schema": "learning",

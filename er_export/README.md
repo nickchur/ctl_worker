@@ -20,27 +20,23 @@ ClickHouse → S3 (CSV → ZIP) → Kafka (XML-уведомление) → TFS
 | :--- | :--- |
 | `er_export.py` | Фабрика DAG-ов. Динамически создаёт DAG для каждой активной выгрузки. Содержит бизнес-логику: SQL-билдеры, таски, Kafka-хелперы. |
 | `er_sync.py` | DAG синхронизации `export_er_sync`. Синхронизирует `export.er_wf_meta` → Airflow Variable `datalab_er_wfs`. Создаёт пулы. |
-| `er_config.py` | Конфигурация и утилиты. Константы, маппинг типов, `DEFAULT_PARAMS`, хелперы `obj_load`, `obj_save`, `add_note`, `get_params`. |
+| `er_config.py` | Конфигурация и утилиты. Константы, маппинг типов, `DEFAULT_PARAMS`, хелперы `obj_load`, `obj_save`, `add_note`, `get_params`, `on_callback`. |
 | `er_wf_meta.sql` | DDL управляющей таблицы `export.er_wf_meta`. |
+| `er_meta.json` | Пример формата Airflow Variable `datalab_er_wfs` (delta + recent). Поле `params` — JSON-строка внутри JSON: хранится в CH как `String`, десериализуется при чтении через `get_params`. |
 
 ---
 
 ## 🌍 Стенды и поведение
 
-**`ENV_SPACE`** — переключает CH-коннект и источник секретов:
+**`ENVIRONMENT`** — ограничения строк при выгрузке:
 
-| Значение | CH-коннект | S3 | Секреты |
-| :--- | :--- | :--- | :--- |
-| (не задана) | `dlab-click` | `s3-tfs-hrplt` | стандартные Airflow connections |
-| `ALPHA` | `dlab-click-test` | `s3-archive` | Vault `/vault/secrets/application` |
+| Значение | Лимит строк |
+| :--- | :--- |
+| `PROM` | без ограничений |
+| `UAT`, `QA`, `IFT` | 100 строк |
+| `DEV` | 100 строк; `export_er_sync` создаёт `export.er_wf_meta` автоматически если таблица отсутствует |
 
-**`ENVIRONMENT`** — ограничения и поведение на стенде:
-
-| Значение | Лимит строк | Kafka / подтверждение |
-| :--- | :--- | :--- |
-| `PROM` | без ограничений | штатный режим |
-| `UAT`, `QA`, `IFT` | 100 строк | штатный режим |
-| `DEV` | 100 строк | **пропускается** (`notify_tfs`, `wait_confirm` — skip) |
+Поведение Kafka-уведомлений и ожидания подтверждения управляется параметрами `notify_kafka` и `auto_confirm`, а не стендом.
 
 ---
 
@@ -147,6 +143,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | `schedule` | String | `'55 0 * * *'` | Cron-расписание первичного запуска DAG |
 | `is_recent` | UInt8 | `0` | `0` = delta, `1` = recent |
 | `is_active` | UInt8 | `1` | `0` = запись игнорируется синхронизацией |
+| `updated_at` | DateTime64(3) | `now64(3)` | Версия строки для ReplacingMergeTree; читать с `FINAL` |
 
 ---
 
@@ -174,7 +171,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | `max_file_size` | `''` | Ограничение размера CSV, байт; `''` = без ограничений |
 | `send_empty` | `0` | `1` = слать пустой ZIP+Kafka при нулевой дельте (требование TFS) |
 | **🔧 Формат и санитизация** | | |
-| `format` | `'TSVWithNames'` | Формат выгрузки ClickHouse |
+| `format` | `'TSVWithNames'` | Формат выгрузки ClickHouse; **единственное поддерживаемое значение** — изменение вызывает ошибку при создании DAG |
 | `pg_array_format` | `0` | `1` = PostgreSQL-формат массивов в TSV |
 | `csv_format_params` | `''` | Доп. параметры форматирования (dict-литерал) |
 | `xstream_sanitize` | `0` | `1` = экранировать спецсимволы XStream |
@@ -298,3 +295,4 @@ VALUES (
 - 💧 **Стриминг**: ZIP-архивация потребляет минимум памяти — `stream_zip` + multipart-загрузка в S3 без буферизации всего файла.
 - 🔒 **Изоляция**: фреймворк не зависит от общих `plugins`, используя собственные хелперы в `er_config.py`.
 - ✅ **Идемпотентность**: `export_er_sync` записывает Variable только если данные изменились.
+- 📝 **on_failure_callback**: при падении любого таска `on_callback` автоматически добавляет заметку с трейсом в Airflow UI (Task и DAG Run).

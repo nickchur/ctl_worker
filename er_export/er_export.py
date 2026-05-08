@@ -138,7 +138,10 @@ def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
     if sql_meta.get("with"): parts.append(sql_meta['with'])
 
     fields = sql_meta.get("fields", [])
-    fields_str = f",\n{indent}".join(fields) if isinstance(fields, list) else fields
+    if isinstance(fields, list):
+        fields_str = f",\n{indent}".join(fields) if fields else "*"
+    else:
+        fields_str = fields or "*"
     parts.append(f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}")
 
     if sql_meta.get("joins"):    parts.append(sql_meta['joins'])
@@ -299,6 +302,20 @@ def _pre_await():
     return pre_execute
 
 # ── Tasks ───────────────────────────────────────────────────────────────────
+
+class _ZipReader:
+    """Адаптер stream_zip (генератор байт) → file-like object для S3 multipart upload."""
+    def __init__(self, g): self._g, self._b = g, bytearray()
+    def read(self, n=-1):
+        if n < 0:
+            self._b.extend(b''.join(self._g))
+            d, self._b = bytes(self._b), bytearray()
+            return d
+        while len(self._b) < n:
+            try: self._b.extend(next(self._g))
+            except StopIteration: break
+        chunk, self._b = bytes(self._b[:n]), self._b[n:]
+        return chunk
 
 @task(task_id='init')
 def _er_init(cfg, **context):
@@ -495,9 +512,8 @@ def _er_pack_zip(cfg, **context):
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
             (csv_n,  mtime, S_IFREG | 0o600, ZIP_32, [header.encode()]),
         ]
-        zip_bytes = b''.join(stream_zip(members))
         hook_e = S3Hook(aws_conn_id=S3_CONN)
-        hook_e.load_bytes(zip_bytes, key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
+        hook_e.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
         ts1 = pendulum.now("UTC").format("YYYYMMDDHHmmss")
         summary_tkt = f"{cfg['replica']}__{ts1}.tkt".lower()
         hook_e.load_bytes(zip_n.encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
@@ -509,23 +525,10 @@ def _er_pack_zip(cfg, **context):
 
     hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
     base_ts, uploaded = pendulum.now("UTC"), []
-
-    # stream_zip возвращает генератор байт, а load_file_obj ожидает file-like object
-    class _Reader:
-        def __init__(self, g): self._g, self._b = g, bytearray()
-        def read(self, n=-1):
-            if n < 0:
-                self._b.extend(b''.join(self._g))
-                d, self._b = bytes(self._b), bytearray()
-                return d
-            while len(self._b) < n:
-                try: self._b.extend(next(self._g))
-                except StopIteration: break
-            chunk, self._b = bytes(self._b[:n]), self._b[n:]
-            return chunk
+    ts_s = lambda s: base_ts.add(seconds=s).format("YYYYMMDDHHmmss")  # переопределяется в цикле
 
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
-        ts_s = lambda s: base_ts.add(seconds=i*2 + s).format("YYYYMMDDHHmmss")
+        ts_s = lambda s, _i=i: base_ts.add(seconds=_i*2 + s).format("YYYYMMDDHHmmss")
         csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.csv".lower()
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.meta".lower()
         tkt_n  = f"{cfg['replica']}__{ts_s(1)}.tkt".lower()
@@ -538,7 +541,7 @@ def _er_pack_zip(cfg, **context):
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
             (csv_n,  mtime, S_IFREG | 0o600, ZIP_32, s3_body.iter_chunks(chunk_size=8*1024*1024)),
         ]
-        hook.load_file_obj(_Reader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
+        hook.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
         hook.delete_objects(bucket=BUCKET, keys=[key])
         uploaded.append(zip_n)
 
@@ -556,8 +559,9 @@ def _er_pack_zip(cfg, **context):
 def _er_save_status(cfg, **context):
     """💾 Записывает результат выгрузки в export.extract_history.
 
-    Запускается только при полном успехе (all_success), поэтому confirmed=null —
-    ожидает Kafka-подтверждения от TFS (или остаётся null при auto_confirm).
+    trigger_rule=none_failed: запускается при успехе или при skipped-тасках
+    (wait_confirm пропускается при auto_confirm=True или отсутствии данных).
+    confirmed=null — ожидает Kafka-подтверждения от TFS (или остаётся null при auto_confirm).
     extract_time берётся из XCom init как SQL-литерал (уже в кавычках).
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
@@ -590,22 +594,27 @@ def _er_schedule_next(cfg, **context):
     Запуск откладывается на selfrun_timeout минут, чтобы избежать гонки с источником.
     Для recent-режима is_current всегда True — автозапуск не нужен.
     """
-    from airflow.models import DagBag
+    from airflow.models import DagRun
     from airflow.utils.types import DagRunType
     from airflow.utils.state import DagRunState
+    from airflow.utils.session import create_session
     dp = context['ti'].xcom_pull(task_ids="init")
     if str(dp.get('is_current')).lower() in ('true', 't', '1'):
         add_note("✅ delta is current — next run not scheduled", level='task,dag', context=context)
         return
 
     next_run = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
-    dag = DagBag().get_dag(cfg['dag_id'])
-    dag.create_dagrun(
-        run_type=DagRunType.MANUAL,
-        execution_date=next_run,
-        state=DagRunState.QUEUED,
-        external_trigger=True,
-    )
+    run_id = f"manual__{next_run.isoformat()}_{str(uuid.uuid4())[:8]}"
+    with create_session() as session:
+        session.add(DagRun(
+            dag_id=cfg['dag_id'],
+            run_id=run_id,
+            execution_date=next_run,
+            run_type=DagRunType.MANUAL,
+            state=DagRunState.QUEUED,
+            external_trigger=True,
+            conf={},
+        ))
     add_note(f"⏭️ next run scheduled at {next_run.format('YYYY-MM-DD HH:mm:ss')} UTC", level='task,dag', context=context)
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────

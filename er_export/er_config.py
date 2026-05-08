@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from datetime import timedelta
 
@@ -56,6 +57,74 @@ TFS_MAP = {
 POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
 
+logger = logging.getLogger("airflow.task")
+
+
+def _on_callback(context, level=None):
+    """Обработчик on_failure_callback — формирует заметку о статусе таска/DAG в Airflow UI."""
+    from airflow.utils.state import TaskInstanceState
+    import pendulum
+
+    ti = context.get('task_instance')
+    dag_run = context.get('dag_run')
+    dag_id = ti.dag_id
+    dag_state = dag_run.state
+
+    if not level:
+        if dag_state.lower() in ('success', 'failed') or not context.get('task'):
+            level = 'DAG'
+        else:
+            level = 'task'
+
+    if level == 'DAG':
+        tis = dag_run.get_task_instances()
+        finished_tis = [t for t in tis if t.end_date is not None]
+        task = sorted(finished_tis, key=lambda x: x.end_date, reverse=True)[0] if finished_tis else ti
+    else:
+        task = ti
+
+    task_id = task.task_id
+    map_index = task.map_index
+    map_ind_str = getattr(task, 'rendered_map_index', '')
+    try_number = task.try_number
+    state = task.state
+
+    msg = context.get('exception')
+
+    map_str = f"   *Map Index*: ({map_index}) **{map_ind_str}**" if str(map_index) != '-1' else ""
+    try_str = f"   *Try number*: **{try_number}**" if try_number > 1 else ""
+    msg_str = f"```\n{str(msg)[:1000]}\n```\n" if msg else ""
+
+    task_msg = '❌ FAILED' if state.lower() == 'failed' else '✅ SUCCESS' if state.lower() == 'success' else state.upper()
+
+    message = f"*{pendulum.now().format('DD.MM.YYYY HH:mm:ss zz')}*\n\n"
+
+    if level == 'DAG':
+        dag_msg = '❌ FAILED' if dag_state.lower() == 'failed' else '✅ SUCCESS'
+        message += f"*DAG:* **{dag_id}**: **{dag_msg}**\n\n"
+    else:
+        message += (
+            f"*Task:* **{task_id}**: **{task_msg}**\n\n"
+            f"{try_str}{map_str}\n\n"
+            f"{msg_str}"
+        )
+
+    add_note(message, context, level, add=True)
+
+    if state == TaskInstanceState.SUCCESS:
+        logger.info(message)
+    elif state == TaskInstanceState.FAILED:
+        logger.error(message)
+        if level != 'DAG':
+            add_note(message, context, level='DAG', add=True)
+    else:
+        logger.warning(message)
+
+
+def on_callback(context, level=None):
+    return _on_callback(context, level)
+
+
 DEF_ARGS = {
     "owner":            "DataLab (CI02420667)",
     "retries":          3,
@@ -63,6 +132,7 @@ DEF_ARGS = {
     "pool":             POOL_NAME,
     "email_on_failure": False,
     "email_on_retry":   False,
+    "on_failure_callback": on_callback,
 }
 
 # 🔢 Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
@@ -135,10 +205,8 @@ def obj_save(key: str, data: any) -> None:
 
     # Вычисляем человекочитаемый размер для description
     size_val = float(len(new_json.encode('utf-8')))
-    unit = 'B'
-    for u in ['B', 'KB', 'MB', 'GB']:
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size_val < 1024.0:
-            unit = u
             break
         size_val /= 1024.0
 
@@ -162,9 +230,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
     from airflow.utils.session import create_session
     from airflow.operators.python import get_current_context
     from pprint import PrettyPrinter
-    import logging
 
-    logger = logging.getLogger("airflow.task")
     MAX_NOTE_LEN = 1000
 
     if not context:

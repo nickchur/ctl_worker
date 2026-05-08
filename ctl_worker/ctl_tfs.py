@@ -22,6 +22,10 @@ from airflow.sensors.base import PokeReturnValue
 from airflow.datasets import DatasetAlias, Dataset
 
 from airflow.providers.apache.kafka.sensors.kafka import AwaitMessageSensor
+from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
+from airflow.utils.session import create_session
+from airflow.models import TaskInstance
+from airflow.utils.state import State
 
 from plugins.utils import readable_size, add_note, on_callback, str2timedelta
 from plugins.s3_utils import s3_move_s3, s3_path_parse, s3_from_zip, s3_keys
@@ -56,6 +60,28 @@ tfs_interval = str2timedelta(get_config().get('tfs_interval','minutes=5'))
 def _kafka_accept_any(msg) -> bool:
     """apply_function для AwaitMessageSensor: принимает любое сообщение из топика."""
     return True
+
+
+def _produce_receipt(rq_uid: str, status_code: int, status_desc: str):
+    """Генератор квитанции TransferFileCephRs для ProduceToTopicOperator."""
+    message = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<TransferFileCephRs>'
+        f'<RqUID>{rq_uid}</RqUID>'
+        f'<RqTm>{pendulum.now().format("YYYY-MM-DDTHH:mm:ss.SSSZ")}</RqTm>'
+        f'<StatusCode>{status_code}</StatusCode>'
+        f'<StatusDesc>{status_desc}</StatusDesc>'
+        f'</TransferFileCephRs>'
+    )
+    logger.info("Receipt prepared: rq_uid=%s status=%s", rq_uid, status_code)
+    yield None, message
+
+
+def _on_delivery_tfs(err, msg) -> None:
+    """Delivery-колбэк: падает при ошибке доставки в Kafka."""
+    if err:
+        raise AirflowFailException(f"Kafka delivery failed: {err}")
+    logger.info("Receipt delivered to %s [%s]", msg.topic(), msg.partition())
 
 
 @task(map_index_template="{{ path[0] }}", outlets=[DatasetAlias(f"TFS/{profile}")],)
@@ -271,9 +297,11 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
         "compress": False,
         "done":     False,
         "unzip":    False,
-        "kafka":    Param('', type="string", description="kafka_config_id"),
-        "topic":    Param('', type="string", description="Kafka topic"),
-        "timeout":  Param(60, type="integer", description="Таймаут ожидания сообщения (мин)"),
+        "kafka":     Param('', type="string", description="kafka_config_id"),
+        "topic":     Param('', type="string", description="Kafka topic"),
+        "timeout":   Param(60, type="integer", description="Таймаут ожидания сообщения (мин)"),
+        "kafka_out": Param('', type="string", description="kafka_config_id для отправки квитанции"),
+        "topic_out": Param('', type="string", description="Kafka topic для квитанции"),
     },
     on_failure_callback=on_callback,
 ) as dag_kafka:
@@ -309,8 +337,12 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
         root = ET.fromstring(msg_value)
         file_infos = root.findall('.//{*}FileInfo') or root.findall('.//FileInfo')
 
+        rq_uid      = (root.findtext('.//{*}RqUID')      or root.findtext('.//RqUID')      or '').strip()
+        scenario_id = (root.findtext('.//{*}ScenarioId') or root.findtext('.//ScenarioId') or '').strip()
+        ti.xcom_push(key='rq_uid', value=rq_uid)
+
         tfs_prm = {**s3_path_parse(params['path']), **{
-            'tfs_id':   params.get('tfs_id', 'manual'),
+            'tfs_id':   scenario_id or params.get('tfs_id', 'manual'),
             'compress': params.get('compress', False),
             'done':     params.get('done', False),
             'unzip':    params.get('unzip', False),
@@ -334,6 +366,39 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
         add_note(ret_keys, context, level='DAG,Task', title='Kafka Files')
         return ret_keys
 
+    def _pre_receipt(context):
+        p = context['params']
+        if not p.get('kafka_out') or not p.get('topic_out'):
+            from airflow.exceptions import AirflowSkipException
+            raise AirflowSkipException("kafka_out/topic_out not set, skipping receipt")
+        context['task'].kafka_config_id = p['kafka_out']
+        context['task'].topic = p['topic_out']
+
+        ti = context['task_instance']
+        rq_uid = ti.xcom_pull(task_ids='tfs_wait', key='rq_uid') or ''
+
+        with create_session() as session:
+            copy_tis = session.query(TaskInstance).filter(
+                TaskInstance.dag_id == ti.dag_id,
+                TaskInstance.run_id == ti.run_id,
+                TaskInstance.task_id == 'tfs_copy',
+            ).all()
+        has_error = any(t.state in (State.FAILED, State.UPSTREAM_FAILED) for t in copy_tis)
+        status_code = 104 if has_error else 0
+        status_desc = 'Successful' if status_code == 0 else 'Transfer failed'
+        context['task'].producer_function_args = [rq_uid, status_code, status_desc]
+
+    send_receipt = ProduceToTopicOperator(
+        task_id='send_receipt',
+        kafka_config_id='',
+        topic='',
+        producer_function=_produce_receipt,
+        delivery_callback=_on_delivery_tfs,
+        pre_execute=_pre_receipt,
+        trigger_rule='all_done',
+    )
+
     path_list = tfs_wait()
     kafka_sensor >> path_list
-    tfs_copy.partial().expand(path=path_list)
+    copies = tfs_copy.partial().expand(path=path_list)
+    copies >> send_receipt

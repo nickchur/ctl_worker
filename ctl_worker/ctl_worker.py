@@ -43,7 +43,7 @@ from operator import and_, or_
 from pprint import PrettyPrinter
 
 
-from plugins.utils import add_note, on_callback, str2timedelta, update_dag_pause, safe_eval, readable 
+from plugins.utils import add_note, on_callback, str2timedelta, update_dag_pause, safe_eval, readable
 from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete
 from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, 
@@ -62,40 +62,18 @@ archive = get_config().get('archive_category', 'p1080.ARCHIVE')
 enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 ctl_events = ctl_obj_load('ctl_events')
 
-def req(url, method='get', data={}, log=True, logs=None):
-    """Унифицированный интерфейс к API CTL:
-    - Автоматически маршрутизирует запросы.
-    - Поддерживает `/statval/m`, `/loading/status` и другие.
-    - Логирует все вызовы.
-    """
+def statval(data, log=False, logs=None):
     if log:
-        logger.info(dict(url=url, method=method, data=data))
-    
+        logger.info(dict(url='/statval/m', method='post', data=data))
     if type(logs) == dict:
-        ind = len(logs)
-        logs[ind] = str(data)
+        logs[len(logs)] = str(data)
     elif type(logs) == list:
         logs.append(str(data))
-    
-    if url == '/statval/m':
-        lid = data['loading_id']
-        eid = data['entity_id']
-        sid = data['stat_id']
-        url = f'/v4/api/loading/{lid}/entity/{eid}/stat/{sid}/statval?profile={profile}'
-        json = data['avalue']
-        ret = ctl_api(url, method, json=json)
-    # elif url == '/loading/status':
-    #     lid = data['loading_id']
-    #     ret = ctl_api(f'/v4/api/loading/{lid}/status', method, json=data)
-    elif not url.startswith('/v'):
-        url = '/v5/api' + url 
-        ret = ctl_api(url, method, data)
-    elif url.startswith('/v4'):
-        ret = ctl_api(url, method, json=data)
-    else:
-        ret = ctl_api(url, method, data)
-    
-    return ret
+    lid = data['loading_id']
+    eid = data['entity_id']
+    sid = data['stat_id']
+    url = f'/v4/api/loading/{lid}/entity/{eid}/stat/{sid}/statval?profile={profile}'
+    return ctl_api(url, 'post', json=data['avalue'])
 
 def get_params(context):
     ti = context['task_instance']
@@ -216,7 +194,118 @@ def set_pause(wf_name, cat):
             update_dag_pause(dag_id = f'CTL.{wf_name}', paused=is_paused)
         except Exception as e:
             logger.debug(f"Failed to update pause state for {wf_name}: {e}")
-    
+
+
+def _publish_stats(lid, eid, result):
+    res = int(result['res']) if result.get('res') is not None else -99
+    logs = {}
+    if result.get('html'):
+        ctl_send_html(result['html'], lid, eid)
+        result['html'] = ''
+    statval({'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 11,
+             'avalue': [pendulum.now(get_config()["tz"]).format('YYYY-MM-DD HH:mm:ss')]}, logs=logs)
+    if res > 0:
+        statval({'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 2,
+                 'avalue': ['1']}, logs=logs)
+        if result.get('cdc'):
+            statval({'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 1,
+                     'avalue': [str(result['cdc'])]}, logs=logs)
+        if result.get('hub'):
+            statval({'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 56,
+                     'avalue': [json.dumps(result['hub'])]}, logs=logs)
+            if result['hub'].get('dataBusiness'):
+                statval({'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 55,
+                         'avalue': [json.dumps(dict(dataBusiness=result['hub']['dataBusiness']))]}, logs=logs)
+    if result.get('stat'):
+        for k, v in result['stat'].items():
+            statval({'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': int(k),
+                     'avalue': [v]}, logs=logs)
+    return logs
+
+
+def _emit_datasets(lid, eids, result, context):
+    res = int(result['res']) if result.get('res') is not None else -99
+    msg = {}
+    for eid_str in eids:
+        eid = int(eid_str.split('/')[0])
+        logs = _publish_stats(lid, eid, result)
+        ent_name = enames[eid]
+        ind = f'{lid}/{profile}/{eid}'
+        ext = {
+            f"{ind}/url": f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}",
+            f"{ind}/dt": pendulum.now(get_config()["tz"]).format('YYYY-MM-DD HH:mm:ss'),
+        }
+        for k, l in logs.items():
+            v = ast.literal_eval(l)
+            msg[f"{ind}/{ent_name}"] = {v['stat_id']: v['avalue'][0]}
+            ext[f"{ind}/{v['stat_id']}"] = v['avalue'][0]
+        add_note(msg, context, level='Task')
+        if res > 0:
+            ds = Dataset(f'CTL/{profile}/{eid}/{ent_name}')
+            add_note(ds, context, level='Task')
+            context['outlet_events'][f"CTL/{profile}/{eid}"].add(ds, extra=ext)
+    logger.info(f"✅ {context['outlet_events']}")
+    for outlet, value in context['outlet_events'].items():
+        add_note(value.extra, context, level='Task', title=outlet)
+    return msg
+
+
+def _finalize_status(lid, wid, result, wf, wf_prm, context):
+    sdt = wf_prm['af_sdt'][:19]
+    retry = wf_prm['wfp_retry']
+    res = int(result['res']) if result.get('res') is not None else -99
+
+    tmpl = ctl_api(f'/v4/api/wf/{wid}/tmpl') or {}
+    if tmpl.get('id') != 2:
+        if tmpl.get('id'):
+            ctl_api(f'/v4/api/wf/{wid}/tmpl/{tmpl["id"]}', 'delete')
+        ctl_api(f'/v4/api/wf/{wid}/tmpl/2', 'put')
+
+    if res > 0:
+        res_msg, res_icon = 'ok', '✅'
+        retry['ok'] = retry.get('ok', 0) + 1
+    elif res == 0:
+        res_msg, res_icon = 'no', '⚠️'
+        retry['no'] = retry.get('no', 0) + 1
+    else:
+        res_msg, res_icon = 'error', '❌'
+        retry['err'] = retry.get('err', 0) + 1
+
+    retry_on = retry.get('on', ['error'])
+    if retry.get('left', 0) > 0 and (res_msg in retry_on or str(res) in retry_on):
+        status, action = 'ERRORCHECK', 'retry'
+    else:
+        if retry.get('try'):
+            ctl_set_status(lid, 'RUNNING', f"END {retry}")
+        if retry.get('ok', 0) > 0 or retry.get('no', 0) > 0:
+            status, action = 'SUCCESS', 'Completed'
+        else:
+            status = 'ERROR'
+            action = 'Aborted' if wf.get('faultTolerance', {}).get('abortOnFailure', False) else 'Completed'
+
+    ctl_set_status(lid, status, result)
+
+    if action == 'retry':
+        now = pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
+        new_time = eval_delta(now, retry.get('delay'))
+        for _ in range(1, retry.get('try')):
+            new_time = eval_delta(new_time, retry.get('add'))
+        ctl_set_status(lid, 'TIME-WAIT', dict(time=new_time, retry=retry))
+    else:
+        ctl_set_completed(lid, action)
+
+    data = {
+        'wf': wf['name'],
+        'retry': retry,
+        'sdt': sdt,
+        'run_type': wf_prm.get('wfp_run_type', 'UNKNOWN'),
+        'time': (pendulum.now(get_config()['tz']) - pendulum.parse(sdt, tz=get_config()['tz'])).in_words(locale='ru'),
+    }
+    add_note({**data, 'action': action, 'obj': lid}, context, level='Task,DAG', title='Log')
+    context['task_instance'].xcom_push(key='logs', value={})
+
+    return status, action, res_msg, res_icon
+
 
 for w in ctl_obj_load('ctl_workflows').values():
     if w.get('profile') != profile: continue
@@ -627,7 +716,7 @@ for w in ctl_obj_load('ctl_workflows').values():
             # Проверяем статус загрузки
             ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
-                
+
             # TEST !!!
             test_mode = wf_prm.get('wf_test_mode', get_config().get('test_mode', False))
             # test_mode = test_mode if isinstance(test_mode, (list, tuple)) else [test_mode, ]
@@ -636,14 +725,14 @@ for w in ctl_obj_load('ctl_workflows').values():
             # TEST !!!
             if test_mode:
                 rand = random.random()
-                if False and len(test_mode) > 2 and isinstance(test_mode[2], str): 
+                if False and len(test_mode) > 2 and isinstance(test_mode[2], str):
                     test_mode_str = test_mode[2]
                     rand = safe_eval(test_mode_str)
                 else:
                     rand = int((rand ** 3) * 45*60)
-                
+
                 exe = f"'Ok Test work',pg_sleep({rand})" # TEST !!!
-            
+
 
             wfp = {}
             retry = wf_prm.get('wfp_retry', {})
@@ -684,21 +773,19 @@ for w in ctl_obj_load('ctl_workflows').values():
             res = gp_exe(sql=sql, ti=ti, timeout=int(wf_timeout.total_seconds())) 
             # res['ts'] = pendulum.duration(seconds= int(time.time() - ts)).in_words()
             res['ts'] = str(timedelta(seconds=int(time.time() - ts)))
-            
+
             # TEST !!!
             if test_mode:
                 rand = random.random()
-                if False and len(test_mode) > 3 and isinstance(test_mode[3], str): 
+                if False and len(test_mode) > 3 and isinstance(test_mode[3], str):
                     test_mode_str = test_mode[3]
                     rand = safe_eval(test_mode_str)
                 else:
                     # rand = 'random.randint(0, 2)' # TEST !!!
                     rand = int(rand * (2 - 0 + 1)) + 0
-                
+
                 res['res'] = int(rand) # TEST !!!
-                
-            # res['icon'] = '✅' if res.get('res') > 0 else ('⚠️' if res.get('res') == 0 else '❌')
-            
+
             ti.xcom_push(key='result', value=res)
             add_note(res, context, level='Task,DAG', title='Result')
 
@@ -710,328 +797,43 @@ for w in ctl_obj_load('ctl_workflows').values():
                 pass
 
         outlets = [DatasetAlias(f"CTL/{profile}/{e}") for e in w_eids]
-        @task(outlets=outlets,) # execution_timeout=end_task_to) # trigger_rule = 'none_failed'
-        def run_end(wf, **context): #outlet_events,
-            """### Публикация статистики по сущностям
-
-            Для каждой сущности (`eid`) из `wf_entity`:
-            - Записывает статистики в CTL:
-            - `LAST_LOADED_TIME`
-            - `CHANGE`, `MAX_CDC_DATE`
-            - `METRIC_QUALITY`, `METRIC_ACTUALITY`
-            - Произвольные `stat_id`.
-            - Если данные загружены (`res > 0`) — генерирует `Dataset` событие.
-
-            **XCom Output:** `msg` — краткая запись о действиях.
-
-            **Особенности:**
-            - Поддерживает длинные сообщения (разбивка по 5000 символов).
-            - Отправляет события в `CTL/{profile}/entities`.
-            """
-            
+        @task(outlets=outlets,)
+        def run_end(wf, **context):
             ti = context['task_instance']
             chk_any_conn('ctl')
-            # Параметры
             wf_prm = get_params(context)
-            
-            # Результат
-            result = ti.xcom_pull(key='result', task_ids=f'run_exe')
+
+            result = ti.xcom_pull(key='result', task_ids='run_exe')
             if not result:
                 add_note("⚠️ Result is empty", context, level='Task,DAG')
                 raise AirflowSkipException("⚠️ Result is empty")
-            
-            # Статистика по сущностям
+
             eids = ti.xcom_pull(key='eids', task_ids='run_prm')
             add_note(eids, context, level='Task', title='Entities')
 
-            # eids = [eid,] if isinstance(eid, str) else eid
-            # logger.info(f'🔍 {wf["name"]} {eids}')
-
             lid = wf_prm.get('loading_id', 0)
-            
-            # Проверяем статус загрузки
             ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
-            
-            msg = {}
-            for eid in eids:
-                eid = int(eid.split('/')[0])
-                
-                res = int(result['res']) if result.get('res') is not None else -99
-                logs = {}
-                
-                # Если результат содержит html
-                if result.get('html'):
-                    ctl_send_html(result['html'], lid, eid, wf['name'])
-                    result['html'] = ''
 
-                # data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 61
-                #         , 'avalue': [str(ret)]}
-                # req('/statval/m', 'post', data, log=False, logs=logs)  # CORRECTION_STATUS
-
-                data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 11
-                    , 'avalue': [pendulum.now(get_config()["tz"]).format('YYYY-MM-DD HH:mm:ss')]}
-                req('/statval/m', 'post', data, log=False, logs=logs)  # LAST_LOADED_TIME
-
-                # Если данные загружены
-                if res > 0:
-                    # Записать статистики CHANGE
-                    data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 2
-                        , 'avalue': ['1']}
-                    req('/statval/m', 'post', data, log=False, logs=logs)  # CHANGE
-
-                    if result.get('cdc'):
-                        data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 1
-                            , 'avalue': [str(result['cdc'])]}
-                        req('/statval/m', 'post', data, log=False, logs=logs)  # MAX_CDC_DATE
-
-                    # Записать статистики для DATA_HUB
-                    if result.get('hub'):
-                        data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 56
-                            , 'avalue': [json.dumps(result['hub'])]}
-                        req('/statval/m', 'post', data, log=False, logs=logs)  # METRIC_QUALITY
-
-                        if result['hub'].get('dataBusiness'):
-                            data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 55
-                                , 'avalue': [json.dumps(dict(dataBusiness=result['hub']['dataBusiness']))]}
-                            req('/statval/m', 'post', data, log=False, logs=logs)  # METRIC_ACTUALUTY
-
-                # elif res < 0:
-                #     data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': 99
-                #             , 'avalue': [str(res)]}
-                #     req('/statval/m', 'post', data, log=False, logs=logs)  # MBX_ERROR
-
-                # Записать произвольные статистики
-                if result.get('stat'):
-                    for k, v in result['stat'].items():
-                        data = {'loading_id': lid, 'entity_id': eid, 'profile_name': profile, 'stat_id': int(k)
-                            , 'avalue': [v]}
-                        req('/statval/m', 'post', data, log=False, logs=logs)  # 5-BUSNINESS_DATE
-
-                ent_name = enames[eid]
-                ind = f'{lid}/{profile}/{eid}'
-                ext = {}
-                ext[f"{ind}/url"] = f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}"
-                ext[f"{ind}/dt"] = pendulum.now(get_config()["tz"]).format('YYYY-MM-DD HH:mm:ss')
-
-                for k, l in logs.items():
-                    v = ast.literal_eval(l)
-                    msg[f"{ind}/{ent_name}"] = { v['stat_id'] : v['avalue'][0]}
-                    ext[f"{ind}/{v['stat_id']}"] = v['avalue'][0]
-                
-                add_note(msg, context, level='Task')
-
-                if res > 0:
-                # if not ctl_events.get(f"{profile}/{eid}/2") and res > 0:
-                    sts = '' if res > 0 else ('.NO_NEW' if res == 0 else '.ERROR')
-                    ds = Dataset(f'CTL/{profile}/{eid}/{ent_name}{sts}')
-                    add_note(ds, context, level='Task')
-                    context['outlet_events'][f"CTL/{profile}/{eid}"].add(ds, extra=ext)    
-            
-            logger.info(f"✅ {context['outlet_events']}")
-            for outlet, value in context['outlet_events'].items():
-                # logger.info(f"✅ {outlet} {value}")
-                add_note(value.extra, context, level='Task', title=outlet)
-                # value.add(ds,extra=ext) 
-            
-            # return msg
+            msg = _emit_datasets(lid, eids, result, context)
             ti.xcom_push(key='eids', value=json.dumps(msg, default=str))
 
+            status, action, res_msg, res_icon = _finalize_status(lid, int(wf['id']), result, wf, wf_prm, context)
 
-        # @task(pool='ctl_pool')
-        # def run_sts(wf, **context): 
-            """### Анализ результата и принятие решения
+            title = f"{status_icons[status]}{status} {action.upper()}\n\n"
+            note = f"{res_icon} {result.get('msg') or res_msg.upper()}\n\n"
+            add_note(note, context, level='DAG,Task', title=title)
 
-            - Определяет статус: `SUCCESS`, `ERROR`, `TIME-WAIT` (retry).
-            - Учитывает:
-            - Код возврата.
-            - Настройки retry (`wf_retry_cnt`, `delay`, `on`).
-            - Специальные коды (например, `-7` → циклический retry).
-            - Обновляет статус в CTL:
-            - `ERRORCHECK` + `TIME-WAIT` — если нужен retry.
-            - `SUCCESS` / `ERROR` — если завершён.
-
-            **XCom Output:** `(status, action, res_icon, res_msg)` — финальное состояние.
-
-            **Особенности:**
-            - Поддерживает `eval_delta` для отложенных запусков.
-            - Логирует всё в `ctl_api` и `add_note`.
-            """ 
-            
-            # chk_any_conn('ctl')
-            # ti = context['task_instance']
-            # wf_prm = get_params(context)
-            
-            # lid = int(wf_prm['loading_id'])
-            # # Проверяем статус загрузки
-            # ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
-            # ti.xcom_push(key='status', value=json.dumps(ld_sts, default=str))
-
-            wid = int(wf['id'])
-            sdt = wf_prm['af_sdt'][:19]
-            retry = wf_prm['wfp_retry']
-
-            # left = retry.get('left')
-            logs = None
-            res = int(result['res']) if result.get('res') is not None else -99
-            # left = retry['left'] if retry.get('left') else 0
-
-            # Выбор шаблона писем с детализацией
-            # tmpls = ctl_api(f'/tmpl/loading/{lid}/OUT_STATUS_NOTICE') or []
-            # tmpl = next(iter(tmpls), None)
-            tmpl = ctl_api(f'/v4/api/wf/{wid}/tmpl') or {}
-            
-            if tmpl.get('id') != 2:
-                    if tmpl.get('id'):
-                        ctl_api(f'/v4/api/wf/{wid}/tmpl/{tmpl["id"]}', 'delete')
-                    # ctl_api(f'/v4/api/wf/{wid}/tmpl/1', 'delete')
-                    # ctl_api(f'/v4/api/wf/{wid}/tmpl/2', 'delete')
-                    ctl_api(f'/v4/api/wf/{wid}/tmpl/2', 'put')
-    
-            # Обработка Результата
-            # Эти коды возврвта не считаются ошибками, нужно повторить запуск
-            # -4 - unique, -5 - ztest, -7 - ctl_run
-            # if res in (-7,) and retry.get('left', 0) > -10 and retry.get('left', 0) <= 0:
-            #     err_retry = True
-            #     retry['delay'] = config['error_loop'] if config.get('error_loop') else "hours=+1"
-            # else:
-            err_retry = False
-
-            if res > 0:
-                res_msg = 'ok'
-                retry['ok'] = retry['ok'] + 1 if retry.get('ok') else 1
-                res_icon = '✅'
-            elif res == 0:
-                res_msg = 'no'
-                retry['no'] = retry['no'] + 1 if retry.get('no') else 1
-                res_icon = '⚠️'
-            elif err_retry:
-                res_msg = 'retry'
-                retry['err'] = retry['err'] + 1 if retry.get('err') else 1
-                res_icon = '♻️'
-            else:
-                res_msg = 'error'
-                retry['err'] = retry['err'] + 1 if retry.get('err') else 1
-                res_icon = '❌'
-
-
-            logs = {}
-            retry_on = retry.get('on',['error'])
-            
-            # Если нужна повторная попытка
-            if (retry.get('left', 0) > 0 and (res_msg in retry_on or str(res) in retry_on)) or err_retry:
-                retry['left'] = retry.get('left', 0)
-                retry['try'] = retry.get('try', 1)
-
-                status = 'ERRORCHECK'
-                action = 'retry'
-
-            # Если все попытки закончились
-            else:
-                if retry.get('try'):
-                    ctl_set_status(lid, 'RUNNING', f"END {retry}")
-
-                if retry.get('ok', 0) > 0 or retry.get('no', 0) > 0:
-                    status =  'SUCCESS'
-                    action = 'Completed'
-                else:
-                    status = 'ERROR'
-                    if wf.get('faultTolerance', {}).get('abortOnFailure', False):
-                        action = 'Aborted'
-                    else:
-                        action = 'Completed'
-
-            # ctl_set_status(lid, status, json.dumps(ret))
-            ctl_set_status(lid, status, result)
-            # add_note(result, context, level='Task', title=status)
-                
-            
-            if action == 'retry':
-                # new_time = eval_delta(sdt, retry.get('delay'))
-                now = pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
-                new_time = eval_delta(now, retry.get('delay'))
-                
-                for k in range(1, retry.get('try')): 
-                    new_time = eval_delta(new_time, retry.get('add'))
-
-                ctl_set_status(lid, 'TIME-WAIT', dict(time=new_time, retry=retry))
-            else:
-                # ctl_api(f'v4/api/loading/{lid}/{action.lower()}', 'put') # Completed/Aborted
-                ctl_set_completed(lid, action) # Completed/Aborted
-
-                
-            data = { #**retry,
-                'wf': wf['name'], 
-                'retry': retry, 
-                'sdt': f'{sdt}',
-                'run_type': wf_prm.get('wfp_run_type','UNKNOWN'),
-                'time': ( pendulum.now(get_config()['tz']) - pendulum.parse(sdt, tz=get_config()['tz']) ).in_words(locale='ru'),
-                # 'ret': result,
-            }
-            # logging(data, action=action, obj=lid, log=context)
-            add_note({**data, 'action': action, 'obj': lid }, context, level='Task,DAG', title='Log')
-            
-            ti.xcom_push(key='logs', value=logs)
-            
-            # sts = (status, action, res_icon, res_msg, result)
-            # ti.xcom_push(key='status', value=sts)
-            
-        
-        # @task(pool='ctl_pool', trigger_rule = 'none_failed')
-        # def run_end(wf, **context):
-        #     ti = context['task_instance']
-            # sts = ti.xcom_pull(key='status', task_ids='run_sts')
-            # if not sts:
-            #     msg = '⚠️ Status is empty'
-            #     add_note(msg, context, level='Task,DAG')
-            #     raise AirflowSkipException(msg)
-
-            """### Установка финального статуса DAG
-
-            - Принимает результат из `run_sts`.
-            - Устанавливает состояние DAG:
-            - `SUCCESS` — если `res_msg == 'ok'`
-            - `SKIPPED` — если `res_msg == 'no'`
-            - `FAILED` — если `res_msg == 'error'`
-            - Эмулирует состояние через прямое обновление `TaskInstance`.
-
-            **Поведение:**
-            - При `retry` — выбрасывает `AirflowSkipException`.
-            - При `error` — выбрасывает `AirflowFailException`.
-
-            **Цель:** корректное отображение в интерфейсе Airflow.
-            """
-            
-            # status, action, res_icon, res_msg, ret = sts
-            # msg = (
-            title = f"{status_icons[status]}{status} {action.upper()}\n\n" 
-            msg = f"{res_icon} {result.get('msg') if result.get('msg') else res_msg.upper()}\n\n"
-                # f"{ret.get('msg')}"
-            # )
-            add_note(msg, context, level='DAG,Task', title=title)
-
-            # ti = context['task_instance']
-            dag_id = ti.dag_id
-            run_id = ti.run_id
-            task_id = 'run_exe'
-
-            if res_msg == 'error':
-                state = State.FAILED
-            elif res_msg == 'no':
-                state = State.SKIPPED
-            else:
-                state = State.SUCCESS
-
+            state = State.FAILED if res_msg == 'error' else (State.SKIPPED if res_msg == 'no' else State.SUCCESS)
             with create_session() as session:
                 other_ti = session.query(TaskInstance).filter(
-                    TaskInstance.dag_id == dag_id,
-                    TaskInstance.run_id == run_id,
-                    TaskInstance.task_id == task_id
+                    TaskInstance.dag_id == ti.dag_id,
+                    TaskInstance.run_id == ti.run_id,
+                    TaskInstance.task_id == 'run_exe'
                 ).first()
-
                 if other_ti:
                     other_ti.set_state(state)
-            
+
             if action == 'retry':
                 raise AirflowSkipException()
             elif status == 'ERROR':

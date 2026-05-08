@@ -32,7 +32,6 @@ import pendulum
 from logging import  getLogger
 logger = getLogger('airflow.task')
 
-MAX_XCOM = 500
 MAX_WFS = 25
 
 action_icons = { 
@@ -108,7 +107,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         now = pendulum.now(get_config()['tz'])
         # wfs = ctl_obj_load('ctl_workflows')
         
-        war = {}
+        sla_notes = {}
         res = {}
         actions = {}
         stats = {}
@@ -262,8 +261,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 if action in ['Skipped', 'New']:
                     continue
                 elif action in ['notFound', 'SLA']:
-                    if len(war) < MAX_XCOM: 
-                        war[lid] = r
+                    sla_notes[lid] = f"{r['icon']} {r['wfn']} {r['time']}"
                     continue
                 else:
                     if len(res) < MAX_WFS:
@@ -277,9 +275,9 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         stats = { f'{status_icons[s]}  {s}': v for s,v in stats.items()}
         add_note(stats, context, level='Task,DAG', title='Status')
         
-        # all={k:str(v) for k,v in all.items()}
-        ti.xcom_push(key='SLA', value=war)
-        
+        if sla_notes:
+            add_note(sla_notes, context, level='Task', title='SLA')
+
         chk_any_conn('ctl', **context)
         
         if res:
@@ -317,44 +315,34 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             if action in ['notFound', 'Skipped', 'New', 'SLA']:
                 continue
 
-            # Status
-            # retry = ctl_get_retry(retry=None, logs='', params=ld['loading_status'], wf=wfs[wid])
-            # if retry:
-            #     r['retry'] = retry
-            # if action in ['reStarted',]:
-            #     if retry.get('try'):
-            #         prm['wfp_retry']  = str(retry)
-            
-            
-            # Status ABORTING
-            if action not in ['Completed']:
-                # data={'loading_id': lid, 'status': 'ABORTING', 'log': f'{action} {r}'}
-                # if active: ctl_api(f'/v4/api/loading/{lid}/status', 'put', json=data)
-                if active: ctl_set_status(lid, 'ABORTING', f'{action} {r}')
+            try:
+                # Status ABORTING
+                if action not in ['Completed']:
+                    if active: ctl_set_status(lid, 'ABORTING', f'{action} {r}')
 
+                # Status RUNNING
+                if action in ['reRunned',]:
+                    if active: ctl_set_status(lid, 'RUNNING', '')
+                    continue
 
-            # Status RUNNING
-            if action in ['reRunned',]:
-                # data={'loading_id': lid, 'status': 'RUNNING', 'log': ''}
-                # if active: ctl_api(f'/v4/api/loading/{lid}/status', 'put', json=data)
-                if active: ctl_set_status(lid, 'RUNNING', '')
-                continue
-            
-            # Schedule delete
-            if scheduled:
-                if active: ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                # Schedule delete
+                if scheduled:
+                    if active: ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
 
-            # Close Completed/Aborted
-            if active: ctl_api(f"/v4/api/loading/{lid}/{'completed' if action=='Completed' else 'aborted'}", 'put') 
+                # Close Completed/Aborted
+                if active: ctl_api(f"/v4/api/loading/{lid}/{'completed' if action=='Completed' else 'aborted'}", 'put')
 
-            # Start and Schedule
-            if action in ['reStarted', 'Stopped']:
-                prm = { k:str(v) for k,v in r.items() if k.startswith('wf') }
-                if active: ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={scheduled}", "post", json=prm)
-            
-            # Schedule start
-            elif scheduled:
-                if active: ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+                # Start and Schedule
+                if action in ['reStarted', 'Stopped']:
+                    prm = { k:str(v) for k,v in r.items() if k.startswith('wf') }
+                    if active: ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={scheduled}", "post", json=prm)
+
+                # Schedule start
+                elif scheduled:
+                    if active: ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+
+            except Exception as e:
+                logger.error(f"ctl_action failed for lid={lid} action={action}: {e}")
 
     
     ctl_action(res = ctl_monitor())

@@ -162,22 +162,23 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
 
         **Источник:** `/v4/api/loading` (через `ctl_loading_load`)
         """
-        ctl_api()
-        
         cl = get_current_load('gp_pool')
         if cl['pool_slots'] - cl['scheduled'] <= 1:
             msg = "🔥 Sysytem is overloaded"
             add_note(msg, context, level='Task,DAG')
             raise AirflowSkipException(msg)
-        
-        data={
-                'alive': '["ACTIVE"]', 
-                'engines': '["dummy"]',
-                'profile_ids': f'[{profile_id}]', 
-                # 'category_ids': str(category_ids),
-                'status': '["RUNNING","TIME-WAIT","EVENT-WAIT"]',
+
+        data = {
+            'alive': '["ACTIVE"]',
+            'engines': '["dummy"]',
+            'profile_ids': f'[{profile_id}]',
+            'status': '["RUNNING","TIME-WAIT","EVENT-WAIT"]',
         }
-        tsk = ctl_loading_load(data, save=False)
+        try:
+            ctl_api()
+            tsk = ctl_loading_load(data, save=False)
+        except Exception as e:
+            raise AirflowFailException(f"CTL API недоступен: {e}") from e
 
         branch = []
         lid_skiped = {}

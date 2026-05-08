@@ -38,9 +38,9 @@ ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/export/er_wf_m
 ORDER BY (db_name, extract_name);
 
 
--- Пример: delta-выгрузка с JOIN и нестандартными параметрами.
+-- Пример: delta-выгрузка с JOIN и переопределённым selfrun_timeout.
 -- sql_join содержит полное JOIN-выражение (включая ключевое слово JOIN/LEFT JOIN/INNER JOIN и т.п.).
--- Поля strategy, increment, auto_confirm и др. передаются через params JSON.
+-- В params указываются только отличия от DEFAULT_PARAMS (er_config.py); остальные берутся по умолчанию.
 -- Повторный INSERT той же (db_name, extract_name) не заменяет строку мгновенно —
 -- дедупликация происходит при фоновом MERGE; для немедленного чтения актуальной версии использовать FINAL.
 INSERT INTO export.er_wf_meta
@@ -54,5 +54,5 @@ VALUES (
     'evolution.lc_items_opened t1',
     'LEFT JOIN evolution_export.lc_items_opened_exp t2 ON t1.person_uuid = t2.person_uuid AND t1.item_id = t2.item_id',
     '{condition}',
-    '{"strategy": "FULL_UK", "increment": 60, "selfrun_timeout": 10, "auto_confirm": 1}'
+    '{"selfrun_timeout": 10}'
 );

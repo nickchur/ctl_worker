@@ -657,7 +657,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'schema_name':     schema,
         'replica':         replica,
         'scenario':        scen,
-        's3_prefix':       f"{prefix}/{replica}",
+        's3_prefix':       prefix,
         # ── SQL ──────────────────────────────────────────────────────────────
         'sql_get_current': sql_cur_delta(tbl) if sql_delta else None,  # None → recent-режим
         # ── Схема ────────────────────────────────────────────────────────────

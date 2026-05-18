@@ -239,23 +239,24 @@ def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool, int | None, i
     return mapping.get(base, "STRING"), notnull, length, precision, scale
 
 
-def produce_msg(scenario_id: str, file_name: str, throttle_delay: int = 1):
-    """Генератор Kafka-сообщений для TFS: отдаёт одно XML-уведомление о передаче файла.
+def produce_msg(scenario_id: str, file_names: list[str], throttle_delay: int = 1):
+    """Генератор Kafka-сообщений для TFS: отдаёт XML-уведомление о передаче каждого файла.
 
-    throttle_delay — пауза перед отправкой (сек), защита от перегрузки брокера.
+    throttle_delay — пауза перед каждой отправкой (сек), защита от перегрузки брокера.
     Функция — генератор (yield key, value), как того требует ProduceToTopicOperator.
     """
-    time.sleep(throttle_delay)
-    rq_uuid = str(uuid.uuid4()).replace('-', '')
-    message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    for file_name in file_names:
+        time.sleep(throttle_delay)
+        rq_uuid = str(uuid.uuid4()).replace('-', '')
+        message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <TransferFileCephRq>
     <RqUID>{rq_uuid}</RqUID>
     <RqTm>{pendulum.now().format('YYYY-MM-DDTHH:mm:ss.SSSZ')}</RqTm>
     <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
     <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
 </TransferFileCephRq>"""
-    logger.info("Kafka message prepared: %s", rq_uuid)
-    yield None, message
+        logger.info("Kafka message prepared: %s", rq_uuid)
+        yield None, message
 
 
 def on_delivery(err: Exception | None, msg) -> None:
@@ -281,7 +282,8 @@ def _pre_kafka(scenario: str):
         summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
         if not summary_tkt:
             raise AirflowSkipException("No data exported, skipping notification")
-        context['task'].producer_function_args = [scenario, summary_tkt]
+        zip_names = context['ti'].xcom_pull(task_ids="pack_zip", key='zip_name_list') or []
+        context['task'].producer_function_args = [scenario, [summary_tkt] + zip_names]
     return pre_execute
 
 
@@ -765,8 +767,8 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 description='Санитизировать CH-массивы в строки.',
             ),
             'sanitize_list': Param(
-                p['sanitize_list'], type='string', title='Sanitize List',
-                description='Список колонок для санитизации (через запятую). Пусто — не переопределять.',
+                p['sanitize_list'], type=['string', 'null'], title='Sanitize List',
+                description='JSON-массив пар [[pattern, replacement], ...] для re.sub по каждой строке. Пусто — не переопределять.',
             ),
             'send_empty': Param(
                 bool(p['send_empty']), type='boolean', title='Send Empty',
@@ -805,7 +807,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         t_msg = ProduceToTopicOperator(
             task_id='notify_tfs', kafka_config_id=KAFKA_OUT_CONN, topic=KAFKA_OUT_TOPIC,
             pool=f"tfs_{cfg['scenario']}",
-            producer_function=produce_msg, producer_function_args=[cfg['scenario'], ''],
+            producer_function=produce_msg, producer_function_args=[cfg['scenario'], []],
             delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(cfg['scenario']),
             execution_timeout=timedelta(minutes=cfg['notify_timeout']),
         )

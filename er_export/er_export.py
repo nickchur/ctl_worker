@@ -274,7 +274,7 @@ def _pre_kafka(scenario: str):
     """Фабрика pre_execute для ProduceToTopicOperator.
 
     Пропускает отправку если notify_kafka=False или данных нет.
-    Динамически подставляет имя summary-файла в аргументы продюсера.
+    Динамически подставляет список файлов (summary TKT + ZIP) в аргументы продюсера.
     """
     def pre_execute(context):
         if not context['params'].get('notify_kafka', True):
@@ -487,7 +487,7 @@ def _er_pack_zip(cfg, **context):
 
     Имена файлов — строго нижний регистр, расширение архива .zip (стандарт ЕР).
     После упаковки исходные CSV удаляются из S3.
-    Summary TKT (снаружи архива) перечисляет все ZIP-файлы пакета — передаётся в Kafka.
+    Summary TKT (снаружи архива) перечисляет все ZIP-файлы пакета — передаётся в Kafka вместе с именами ZIP.
     """
     from stat import S_IFREG
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook

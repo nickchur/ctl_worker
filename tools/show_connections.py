@@ -39,7 +39,7 @@ def tools_show_connections():
         backend = get_custom_secret_backend()
         if not hasattr(backend, '_local_connections'):
             msg = f"{backend} has no attr `_local_connections`"
-            add_note(msg, context)
+            add_note(msg, context, level='DAG,task')
             return msg
 
         local_connections: dict[str, Connection] = backend._local_connections
@@ -64,7 +64,7 @@ def tools_show_connections():
 
         import pandas as pd
         df = pd.DataFrame(rows)[['conn_type', 'conn_id', 'host', 'port', 'schema', 'description']]
-        add_note(f"```\n{df.to_string(index=False)}\n```", context, title=f"Connections ({len(rows)})")
+        add_note(f"```\n{df.to_string(index=False)}\n```", context, level='DAG,task', title=f"Connections ({len(rows)})")
         return dict(by_type)
 
     show_connections()

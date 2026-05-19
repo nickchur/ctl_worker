@@ -109,6 +109,31 @@ _CUSTOM_TABLES = {
 }
 
 
+def _log_sql(sql, bind, msg="SQL"):
+    """Логирует SQL с подставленными параметрами (упрощённо)."""
+    try:
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.sql import text as sa_text
+        if isinstance(sql, str):
+            sql = sa_text(sql)
+        compiled = sql.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+        q = str(compiled)
+        # Подставляем значения
+        for k, v in bind.items():
+            if isinstance(v, (pendulum.DateTime, pendulum.Date)):
+                v = f"'{v.isoformat()}'"
+            elif isinstance(v, str):
+                v = f"'{v}'"
+            elif v is None:
+                v = 'NULL'
+            else:
+                v = str(v)
+            q = q.replace(f":{k}", v)
+        logger.info(f"{msg}:\n{q}")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось развернуть SQL: {sql} | Параметры: {bind}")
+
+
 def add_note(msg, context=None, level='task', add=True, title='', compact=False, duration=None):
     if not context:
         context = get_current_context()
@@ -167,6 +192,7 @@ def db_vacuum(table, full=False, timeout=3600):
     sql = f"VACUUM {mode} main.{table}"
     with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
         conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
+        logger.info(f"🔧 VACUUM: {sql}")
         conn.execute(text(sql))
         pool_proxy = conn.connection
         psy = getattr(pool_proxy, 'dbapi_connection', None) or getattr(pool_proxy, 'connection', None) or pool_proxy
@@ -284,6 +310,7 @@ def tools_db_cleanup():
             session.execute(text(f"SET lock_timeout = '{lock_timeout}'"))
             t = f'main.{tbl}'
             bind = {'cutoff': cutoff}
+            logger.info(f"⚙️ Параметры очистки: retention_days={retention_days}, cutoff={cutoff}, dry_run={dry_run}, batch_size={batch_size}")
 
             if tbl in _CUSTOM_TABLES:
                 # Таблицы вне стандартного Airflow cleanup — простой WHERE + safety-фильтр
@@ -334,6 +361,7 @@ def tools_db_cleanup():
                         w = base_where + (f' AND {batch_extra}' if batch_extra else '')
                         return text(f"DELETE FROM {t} WHERE {w}")
 
+            _log_sql(count_sql, bind, f"📊 COUNT {tbl}")
             row = session.execute(count_sql, bind).fetchone()
             count, min_date, max_date = row[0] or 0, row[1], row[2]
 
@@ -350,6 +378,7 @@ def tools_db_cleanup():
                         f" ORDER BY {pk} LIMIT :lim)"
                     )
                     while True:
+                        _log_sql(pk_delete, {**bind, 'lim': batch_size}, f"🗑️ DELETE {tbl}")
                         res = session.execute(pk_delete, {**bind, 'lim': batch_size})
                         session.commit()
                         if res.rowcount == 0:
@@ -365,12 +394,14 @@ def tools_db_cleanup():
                         b_s = start.add(seconds=step * j)
                         b_e = cutoff if j == n_batches - 1 else start.add(seconds=step * (j + 1))
                         batch_extra = f"{p}{col} >= :b_s AND {p}{col} < :b_e"
+                        _log_sql(make_delete(batch_extra), {**bind, 'b_s': b_s, 'b_e': b_e}, f"🗑️ DELETE {tbl}")
                         session.execute(make_delete(batch_extra), {**bind, 'b_s': b_s, 'b_e': b_e})
                         session.commit()
                         batches += 1
                         if on_batch:
                             on_batch(batches, n_batches, count, min_date, idx)
                 else:
+                    _log_sql(make_delete(), bind, f"🗑️ DELETE {tbl}")
                     session.execute(make_delete(), bind)
                     session.commit()
                     batches = 1
@@ -528,7 +559,7 @@ def tools_db_cleanup():
             after_b  = total_bytes or 0
             before_b = before.get(relname)
             delta_b  = (after_b - before_b) if before_b is not None else None
-            delta_s  = (('-' if delta_b < 0 else '+') + readable_size(abs(delta_b))) if delta_b is not None else '—'
+            delta_s  = (('-' if delta_b < 0 else '+') + readable_size(abs(delta_b))) if delta_b else ''
             data.append({
                 'table':      relname,
                 'after':      readable_size(after_b),
@@ -556,7 +587,7 @@ def tools_db_cleanup():
         if before:
             total_before = sum(before.get(r[0], r[1] or 0) for r in rows)
             total_delta  = total_after - total_before
-            delta_str    = ('-' if total_delta < 0 else '+') + readable_size(abs(total_delta))
+            delta_str    = (('-' if total_delta < 0 else '+') + readable_size(abs(total_delta))) if total_delta else '-'
             before_str   = readable_size(total_before)
         else:
             delta_str  = '—'

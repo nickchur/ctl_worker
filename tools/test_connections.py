@@ -20,7 +20,7 @@
 - **ctl / http** → `KerberosHttp GET /v5/api/info`
 - **clickhouse** → `SELECT version()` через `ClickHouseHook`
 - **kafka** → `list_topics()` через `KafkaAdminClientHook`
-- **trino** → `SELECT current_user, current_catalog, current_schema` через `SQLExecuteQueryOperator`
+- **trino** → `SELECT current_user, current_catalog, current_schema` через `TrinoHook`
 - остальные → `⏭ пропуск`
 
 **Таски** независимы — сбой одного не блокирует остальные.
@@ -132,14 +132,9 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
             result = sorted(meta.topics.keys())[:10]
 
         elif conn_type == 'trino':
-            from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator  # type: ignore
-            op = SQLExecuteQueryOperator(
-                task_id=f'_chk_{conn_id}',
-                conn_id=conn_id,
-                sql='SELECT current_user, current_catalog, current_schema',
-                do_xcom_push=False,
-            )
-            result = op.execute(context)
+            from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
+            hook = TrinoHook(trino_conn_id=conn_id)
+            result = hook.get_first('SELECT current_user, current_catalog, current_schema')
 
         else:
             raise ValueError(f"Unsupported conn_type: {conn_type}")

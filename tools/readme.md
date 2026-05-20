@@ -19,4 +19,5 @@
 | `s3_to_s3_test.py` | `tools_s3_to_s3_test` | Находит файлы по маске и копирует/перемещает их S3→S3 |
 | `db_cleanup.py` | `tools_db_cleanup` | Очищает метадату Airflow старше N дней |
 | `show_connections.py` | `tools_show_connections` | Показывает все подключения из secret backend, сгруппированные по типу |
+| `tools_test_conn.py` | `tools_test_conn` | Проверяет каждое соединение из secret backend; таски сгруппированы по типу, TFS — отдельная группа |
 | `dummy.py` | `dummy_dag` | Шаблон DAG для проверки отображения Markdown в Airflow UI |

@@ -15,6 +15,8 @@
 | `--no-drop-gen`  | Не генерировать DROP автоматически                                   |
 | `--cascade`      | Добавить CASCADE в авто-генерируемые DROP (по умолчанию: без CASCADE)|
 | `--strict-alter` | ALTER без CREATE и без файла на диске → ERROR (по умолчанию WARNING) |
+| `--readme`       | Сгенерировать README.md в папке задачи (опционально)                 |
+| `--author`       | Имя автора для README.md (default: git config user.name)             |
 | `--encoding`     | Кодировка входного файла (default: utf-8)                           |
 | `--warn-only`    | ERROR-уровень не завершает с кодом 1                                |
 
@@ -38,8 +40,10 @@
 """
 
 import argparse
+import datetime
 import logging
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
@@ -584,6 +588,75 @@ def write_file(path: Path, content: str, dry_run: bool, issues: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# README generator
+# ---------------------------------------------------------------------------
+
+def _git_user() -> str:
+    """Return git user.name from local config, or empty string on failure."""
+    try:
+        return subprocess.check_output(
+            ['git', 'config', 'user.name'],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return ''
+
+
+def generate_readme(
+    task_dir: Path,
+    repo_root: Path,
+    creates: list,
+    drops: list,
+    alters: list,
+    passthroughs: list,
+    author: str,
+) -> str:
+    task_id   = task_dir.name
+    date_str  = datetime.date.today().isoformat()
+    author    = author or _git_user() or '—'
+
+    def _obj_rows(objects: list, op_label: str) -> list:
+        return [
+            f"| `{o.schema}.{o.name}` | {o.obj_type.value} | {op_label} |"
+            for o in sorted(objects, key=lambda o: (o.obj_type.value, o.schema, o.name))
+        ]
+
+    rows  = _obj_rows(creates, 'CREATE')
+    rows += _obj_rows(alters,  'ALTER')
+    rows += _obj_rows(
+        [d for d in drops if d.source_offset >= 0],   # skip auto-generated
+        'DROP',
+    )
+
+    table = (
+        '| Объект | Тип | Операция |\n'
+        '|--------|-----|----------|\n'
+        + ('\n'.join(rows) if rows else '| — | — | — |')
+    )
+
+    notes = []
+    if any(d.source_offset < 0 for d in drops):
+        auto_n = sum(1 for d in drops if d.source_offset < 0)
+        notes.append(f'- Авто-сгенерировано DROP-скриптов: **{auto_n}**')
+    if passthroughs:
+        notes.append(f'- Нераспознанных блоков (passthrough.sql): **{len(passthroughs)}**')
+    notes_block = ('\n'.join(notes) + '\n') if notes else ''
+
+    return (
+        f'# {task_id}\n\n'
+        f'| | |\n'
+        f'|-|-|\n'
+        f'| **Дата** | {date_str} |\n'
+        f'| **Автор** | {author} |\n'
+        f'| **Исходный файл** | {task_dir.name}/ |\n\n'
+        f'## Изменения\n\n'
+        f'{table}\n\n'
+        + (f'## Примечания\n\n{notes_block}\n' if notes_block else '')
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -611,6 +684,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Кодировка входного файла (default: utf-8)')
     p.add_argument('--warn-only', action='store_true',
                    help='ERROR не завершает с кодом 1')
+    p.add_argument('--readme', action='store_true',
+                   help='Сгенерировать README.md в папке задачи с описанием изменений')
+    p.add_argument('--author', default='',
+                   help='Имя автора для README.md (по умолчанию: git config user.name)')
     p.add_argument('-v', '--verbose', action='store_true')
     return p
 
@@ -741,7 +818,20 @@ def main(argv=None):
         logger.info("--- sql_order_file.txt (preview) ---")
         print(order_content)
 
-    # --- Step 10: annotate source ---
+    # --- Step 10: README.md ---
+    if args.readme:
+        readme_content = generate_readme(
+            task_dir, repo_root, creates, drops, alters, passthroughs, args.author,
+        )
+        readme_path = task_dir / 'README.md'
+        write_file(readme_path, readme_content, args.dry_run, issues)
+        if not args.dry_run:
+            logger.info(f"  README.md → {readme_path.relative_to(repo_root)}")
+        else:
+            logger.info("--- README.md (preview) ---")
+            print(readme_content)
+
+    # --- Step 11: annotate source ---
     if not args.no_annotate:
         annotated   = annotate_source(raw, moves)
         annot_path  = input_path.with_suffix('.annotated.sql')
@@ -749,7 +839,7 @@ def main(argv=None):
             annot_path.write_text(annotated, encoding='utf-8')
             logger.info(f"  Аннотированный файл → {annot_path.name}")
 
-    # --- Step 11: report issues ---
+    # --- Step 12: report issues ---
     print()
     if issues:
         for issue in issues:

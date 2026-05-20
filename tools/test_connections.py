@@ -8,7 +8,7 @@
 | `tfs` | `tfs` в conn_id **и** conn_type == `aws` |
 | `s3` | conn_type == `aws`, без `tfs` в имени |
 | `postgres` | conn_type == `postgres` |
-| `http` | conn_type == `http` или `ctl*` |
+| `ctl` | conn_type == `http` или `ctl*` |
 | `clickhouse` | conn_type == `sqlite` или `clickhouse` |
 | `kafka` | conn_type == `kafka` |
 | `trino` | conn_type == `trino` |
@@ -17,7 +17,7 @@
 Поддерживаемые типы проверок:
 - **postgres** → `SELECT current_user, current_database(), inet_server_addr()`
 - **s3** → `list_buckets()`
-- **http** → `KerberosHttp GET /v5/api/info`
+- **ctl / http** → `KerberosHttp GET /v5/api/info`
 - **clickhouse** → `SELECT version()` через `ClickHouseHook`
 - **kafka** → `list_topics()` через `KafkaAdminClientHook`
 - **trino** → `SELECT current_user, current_catalog, current_schema` через `TrinoHook`
@@ -57,7 +57,7 @@ _GROUP_TOOLTIP: dict[str, str] = {
     'tfs':        'TFS-соединения',
     'postgres':   'PostgreSQL',
     's3':         'S3 / Object Storage',
-    'http':       'HTTP (KerberosHttp)',
+    'ctl':        'CTL / HTTP (KerberosHttp)',
     'clickhouse': 'ClickHouse',
     'kafka':      'Kafka',
     'trino':      'Trino',
@@ -93,8 +93,8 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
             group = 'clickhouse'
         elif group == 'aws':
             group = 's3'
-        elif group.startswith('ctl'):
-            group = 'http'
+        elif group == 'http' or group.startswith('ctl'):
+            group = 'ctl'
         elif group not in _TYPE_MAP and group not in ('clickhouse', 'kafka', 'trino'):
             group = 'other'
         type_groups[group][cid] = conn
@@ -160,6 +160,8 @@ def _test_one(conn_id: str, conn_type: str, **context) -> dict:
     Неподдерживаемый тип — skip-заметка без ошибки.
     """
     chk_type = _TYPE_MAP.get(conn_type)
+    if chk_type is None and conn_type.startswith('ctl'):
+        chk_type = 'KerberosHttp'
     if chk_type is not None:
         data = {'type': chk_type, 'conn_id': conn_id}
         chk_any_conn(id=conn_id, data=data, **context)
@@ -209,7 +211,7 @@ def test_connections():
                 all_tasks.append(t)
 
     # --- Type groups ---
-    for group_name in ('postgres', 's3', 'http', 'clickhouse', 'kafka', 'trino', 'other'):
+    for group_name in ('postgres', 's3', 'ctl', 'clickhouse', 'kafka', 'trino', 'other'):
         conns = _type_groups.get(group_name, {})
         if not conns:
             continue

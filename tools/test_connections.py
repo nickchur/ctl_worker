@@ -189,7 +189,7 @@ def _test_one(conn_id: str, conn_type: str, **context) -> dict:
     },
     start_date=pendulum.datetime(2026, 1, 21, tz=pendulum.UTC),
     schedule_interval=None,
-    tags=['EDP_ETL', 'tools'],
+    tags=['EDP_ETL', 'tools', 'conn'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

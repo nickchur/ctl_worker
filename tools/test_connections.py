@@ -5,9 +5,9 @@
 
 | Группа | Условие |
 |---|---|
-| `tfs` | `tfs` в conn_id (приоритет над типом); всегда проверяется как S3 |
+| `tfs` | `tfs` в conn_id **и** conn_type == `aws` |
+| `s3` | conn_type == `aws`, без `tfs` в имени |
 | `postgres` | conn_type == `postgres` |
-| `s3` | conn_type == `aws` |
 | `http` | conn_type == `http` |
 | `clickhouse` | conn_type == `sqlite` или `clickhouse` |
 | `kafka` | conn_type == `kafka` |
@@ -81,7 +81,7 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
     tfs_group = {
         cid: conn
         for cid, conn in local_connections.items()
-        if 'tfs' in cid.lower()
+        if 'tfs' in cid.lower() and conn.conn_type == 'aws'
     }
 
     type_groups: dict[str, dict[str, Connection]] = defaultdict(dict)

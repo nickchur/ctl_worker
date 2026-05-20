@@ -28,9 +28,9 @@
 
 | Группа | conn_type | Проверка | Результат |
 |---|---|---|---|
-| `tfs` | `aws` (всегда) | `list_buckets()` (S3) | все TFS-коннекты — S3, проверяются как S3 |
+| `tfs` | `aws` + `tfs` в имени | `list_buckets()` (S3) | TFS S3-коннекты, отдельная группа |
+| `s3` | `aws`, без `tfs` в имени | `list_buckets()` | список бакетов |
 | `postgres` | `postgres` | `SELECT current_user, current_database(), inet_server_addr()` | пользователь, БД, адрес сервера |
-| `s3` | `aws` | `list_buckets()` | список бакетов |
 | `http` | `http` | `GET /v5/api/info` (KerberosHttp) | JSON-ответ API |
 | `clickhouse` | `clickhouse`, `sqlite` | `SELECT version()` (ClickHouseHook) | версия сервера |
 | `kafka` | `kafka` | `list_topics()` (KafkaAdminClientHook) | первые 10 топиков |

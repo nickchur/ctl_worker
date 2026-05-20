@@ -9,7 +9,9 @@
 | `postgres` | conn_type == `postgres` |
 | `s3` | conn_type == `aws` |
 | `http` | conn_type == `http` |
-| `clickhouse` | conn_type == `sqlite` |
+| `clickhouse` | conn_type == `sqlite` или `clickhouse` |
+| `kafka` | conn_type == `kafka` |
+| `trino` | conn_type == `trino` |
 | `other` | всё остальное |
 
 Поддерживаемые типы проверок:
@@ -53,6 +55,8 @@ _GROUP_TOOLTIP: dict[str, str] = {
     's3':         'S3 / Object Storage',
     'http':       'HTTP (KerberosHttp)',
     'clickhouse': 'ClickHouse',
+    'kafka':      'Kafka',
+    'trino':      'Trino',
     'other':      'Прочие соединения',
 }
 
@@ -85,7 +89,7 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
             group = 'clickhouse'
         elif group == 'aws':
             group = 's3'
-        elif group not in _TYPE_MAP and group not in ('clickhouse',):
+        elif group not in _TYPE_MAP and group not in ('clickhouse', 'kafka', 'trino'):
             group = 'other'
         type_groups[group][cid] = conn
 
@@ -155,7 +159,7 @@ def tools_test_conn():
                 all_tasks.append(t)
 
     # --- Type groups ---
-    for group_name in ('postgres', 's3', 'http', 'clickhouse', 'other'):
+    for group_name in ('postgres', 's3', 'http', 'clickhouse', 'kafka', 'trino', 'other'):
         conns = _type_groups.get(group_name, {})
         if not conns:
             continue

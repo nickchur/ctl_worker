@@ -67,9 +67,9 @@ class SqlObject:
     obj_type:    ObjType
     schema:      str
     name:        str
-    raw_sql:     str
-    source_line: int          # -1 для авто-сгенерированных
-    depends_on:  list = field(default_factory=list)   # list[str] "schema.name"
+    raw_sql:       str
+    source_offset: int        # char offset in original file; -1 for auto-generated
+    depends_on:    list = field(default_factory=list)   # list[str] "schema.name"
     dest_path:   Optional[Path] = None
 
 
@@ -107,31 +107,43 @@ _DOLLAR_TAG = re.compile(r'\$([A-Za-z0-9_]*)\$')
 
 
 def split_statements(sql_text: str) -> list:
-    """Split SQL text into individual statements respecting dollar-quoting."""
+    """Split SQL text into individual statements respecting dollar-quoting.
+
+    Returns list of (statement_text, start_offset) where start_offset is the
+    character index of the first non-whitespace character of the statement in
+    sql_text. This offset is used to reconstruct source order for annotation.
+    """
     statements = []
-    buf = []
-    i = 0
-    n = len(sql_text)
+    buf        = []
+    i          = 0
+    n          = len(sql_text)
+    stmt_start = -1   # offset of first non-ws char in current statement
     in_line_comment  = False
     in_block_comment = False
     in_single_quote  = False
     in_double_quote  = False
     dollar_tag       = None
 
+    def _push(ch: str) -> None:
+        nonlocal stmt_start
+        if stmt_start == -1 and not ch.isspace():
+            stmt_start = i
+        buf.append(ch)
+
     while i < n:
         c = sql_text[i]
 
         if in_line_comment:
-            buf.append(c)
+            _push(c)
             if c == '\n':
                 in_line_comment = False
             i += 1
             continue
 
         if in_block_comment:
-            buf.append(c)
+            _push(c)
             if sql_text[i:i+2] == '*/':
-                buf.append('/')
+                _push('/')
                 i += 2
                 in_block_comment = False
             else:
@@ -139,9 +151,9 @@ def split_statements(sql_text: str) -> list:
             continue
 
         if in_single_quote:
-            buf.append(c)
+            _push(c)
             if c == "'" and sql_text[i:i+2] == "''":
-                buf.append("'")
+                _push("'")
                 i += 2
             elif c == "'":
                 in_single_quote = False
@@ -151,7 +163,7 @@ def split_statements(sql_text: str) -> list:
             continue
 
         if in_double_quote:
-            buf.append(c)
+            _push(c)
             if c == '"':
                 in_double_quote = False
             i += 1
@@ -160,36 +172,37 @@ def split_statements(sql_text: str) -> list:
         if dollar_tag is not None:
             tag_len = len(dollar_tag)
             if sql_text[i:i+tag_len] == dollar_tag:
-                buf.append(dollar_tag)
+                for ch in dollar_tag:
+                    _push(ch)
                 i += tag_len
                 dollar_tag = None
             else:
-                buf.append(c)
+                _push(c)
                 i += 1
             continue
 
         # Detect start of special regions
         if sql_text[i:i+2] == '--':
             in_line_comment = True
-            buf.append(c)
+            _push(c)
             i += 1
             continue
 
         if sql_text[i:i+2] == '/*':
             in_block_comment = True
-            buf.append(c)
+            _push(c)
             i += 1
             continue
 
         if c == "'":
             in_single_quote = True
-            buf.append(c)
+            _push(c)
             i += 1
             continue
 
         if c == '"':
             in_double_quote = True
-            buf.append(c)
+            _push(c)
             i += 1
             continue
 
@@ -197,25 +210,27 @@ def split_statements(sql_text: str) -> list:
             m = _DOLLAR_TAG.match(sql_text, i)
             if m:
                 dollar_tag = m.group(0)
-                buf.append(dollar_tag)
+                for ch in dollar_tag:
+                    _push(ch)
                 i += len(dollar_tag)
                 continue
 
         if c == ';':
             stmt = ''.join(buf).strip()
             if stmt:
-                statements.append(stmt)
+                statements.append((stmt, stmt_start))
             buf = []
+            stmt_start = -1
             i += 1
             continue
 
-        buf.append(c)
+        _push(c)
         i += 1
 
     # Trailing content without semicolon
     stmt = ''.join(buf).strip()
     if stmt:
-        statements.append(stmt)
+        statements.append((stmt, stmt_start))
 
     return statements
 
@@ -291,7 +306,7 @@ def classify_statement(raw: str) -> Optional[SqlObject]:
                 schema=_norm(m.group('schema')),
                 name=_norm(m.group('name')),
                 raw_sql=raw,
-                source_line=0,
+                source_offset=0,
             )
     return None
 
@@ -533,13 +548,24 @@ def build_order_file(
 # ---------------------------------------------------------------------------
 
 def annotate_source(raw: str, moves: list) -> str:
-    """Insert '-- MOVED TO: ...' comment above each moved statement."""
-    result = raw
-    for stmt, path in moves:
-        comment = f"-- MOVED TO: {path}\n"
-        # Replace only the first occurrence of this exact statement
-        result = result.replace(stmt, comment + stmt, 1)
-    return result
+    """Insert '-- MOVED TO: ...' comment above each moved statement.
+
+    moves: list of (stmt_text, dest_path, source_offset), sorted ascending
+    by source_offset. Using an advancing cursor guarantees that duplicate
+    identical statements are annotated at their correct positions in order.
+    """
+    parts  = []
+    cursor = 0
+    for stmt, path, _offset in moves:
+        pos = raw.find(stmt, cursor)
+        if pos == -1:
+            continue
+        parts.append(raw[cursor:pos])
+        parts.append(f"-- MOVED TO: {path}\n")
+        parts.append(stmt)
+        cursor = pos + len(stmt)
+    parts.append(raw[cursor:])
+    return ''.join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -630,15 +656,14 @@ def main(argv=None):
     alters:       list[SqlObject] = []
     passthroughs: list[str]       = []
 
-    line_counter = 1
-    for stmt in raw_stmts:
+    for stmt, offset in raw_stmts:
         obj = classify_statement(stmt)
         if obj is None:
             passthroughs.append(stmt)
             logger.debug(f"Passthrough: {stmt[:80].strip()!r}")
         else:
-            obj.source_line = line_counter
-            obj.depends_on  = extract_dependencies(obj)
+            obj.source_offset = offset
+            obj.depends_on    = extract_dependencies(obj)
             if obj.op == Op.CREATE:
                 creates.append(obj)
             elif obj.op == Op.DROP:
@@ -646,7 +671,6 @@ def main(argv=None):
             else:
                 alters.append(obj)
             logger.debug(f"{obj.op.value.upper()} {obj.obj_type.value} {obj.schema}.{obj.name}")
-        line_counter += stmt.count('\n') + 1
 
     logger.info(f"CREATE={len(creates)}, DROP={len(drops)}, ALTER={len(alters)}, passthrough={len(passthroughs)}")
 
@@ -665,7 +689,7 @@ def main(argv=None):
                 auto_drop = SqlObject(
                     op=Op.DROP, obj_type=obj.obj_type,
                     schema=obj.schema, name=obj.name,
-                    raw_sql=auto_sql, source_line=-1,
+                    raw_sql=auto_sql, source_offset=-1,
                 )
                 drops.append(auto_drop)
 
@@ -675,20 +699,21 @@ def main(argv=None):
         obj.dest_path = dest_path_for(repo_root, task_dir, obj.op, obj)
 
     # --- Step 8: write files ---
-    moves = []   # (original_stmt, relative_path) for annotation
+    moves = []   # (stmt_text, rel_path, source_offset) for annotation
     for obj in all_objects:
         content = obj.raw_sql + ';'
         write_file(obj.dest_path, content, args.dry_run, issues)
-        if obj.source_line >= 0:
+        if obj.source_offset >= 0:
             try:
                 rel = obj.dest_path.relative_to(repo_root)
             except ValueError:
                 rel = obj.dest_path
-            moves.append((obj.raw_sql, rel))
+            moves.append((obj.raw_sql, rel, obj.source_offset))
         if args.dry_run:
             logger.info(f"  [dry-run] → {obj.dest_path.relative_to(repo_root)}")
         else:
             logger.info(f"  Записан → {obj.dest_path.relative_to(repo_root)}")
+    moves.sort(key=lambda t: t[2])   # ascending source order → correct cursor advance
 
     # Write passthrough.sql
     if passthroughs:
@@ -709,7 +734,7 @@ def main(argv=None):
 
     # --- Step 10: annotate source ---
     if not args.no_annotate:
-        annotated   = annotate_source(raw, [(stmt, rel) for stmt, rel in moves])
+        annotated   = annotate_source(raw, moves)
         annot_path  = input_path.with_suffix('.annotated.sql')
         if not args.dry_run:
             annot_path.write_text(annotated, encoding='utf-8')

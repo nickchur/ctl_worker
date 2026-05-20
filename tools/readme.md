@@ -34,7 +34,7 @@
 | `ctl` | `http`, `ctl*` | `GET /v5/api/info` (KerberosHttp) | JSON-ответ API |
 | `clickhouse` | `clickhouse`, `sqlite` | `SELECT version()` (ClickHouseHook) | версия сервера |
 | `kafka` | `kafka` | `list_topics()` (KafkaAdminClientHook) | первые 10 топиков |
-| `trino` | `trino` | `SELECT current_user, current_catalog, current_schema` (TrinoHook) | пользователь и каталог |
+| `trino` | `trino` | `SELECT current_user, current_catalog, current_schema` (SQLExecuteQueryOperator) | пользователь и каталог |
 | `other` | прочие | — | `⏭ пропуск` |
 
 **Поведение:** таски независимы — сбой одного не блокирует остальные.

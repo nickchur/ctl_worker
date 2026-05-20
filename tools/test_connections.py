@@ -144,6 +144,12 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
         add_note({'result': str(result)}, context, title=msg)
         return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
 
+    except ImportError as err:
+        msg = f"⏭ {conn_id}: провайдер не установлен — {err}"
+        add_note(msg, context, level='task', title=f"⏭ {conn_id}")
+        logger.warning(msg)
+        return {'status': 'skip', 'conn_id': conn_id, 'conn_type': conn_type}
+
     except Exception as err:
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
         add_note(err, context, level='Task,DAG', title=msg)

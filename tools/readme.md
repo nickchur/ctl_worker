@@ -21,3 +21,21 @@
 | `show_connections.py` | `tools_show_connections` | Показывает все подключения из secret backend, сгруппированные по типу |
 | `test_connections.py` | `test_connections` | Проверяет каждое соединение из secret backend; таски сгруппированы по типу, TFS — отдельная группа |
 | `dummy.py` | `dummy_dag` | Шаблон DAG для проверки отображения Markdown в Airflow UI |
+
+---
+
+## test_connections — проверки по типу
+
+| Группа | conn_type | Проверка | Результат |
+|---|---|---|---|
+| `tfs` | любой | по типу ниже | коннекты с `tfs` в имени, приоритет над группой |
+| `postgres` | `postgres` | `SELECT current_user, current_database(), inet_server_addr()` | пользователь, БД, адрес сервера |
+| `s3` | `aws` | `list_buckets()` | список бакетов |
+| `http` | `http` | `GET /v5/api/info` (KerberosHttp) | JSON-ответ API |
+| `clickhouse` | `clickhouse`, `sqlite` | `SELECT version()` (ClickHouseHook) | версия сервера |
+| `kafka` | `kafka` | `list_topics()` (KafkaAdminClientHook) | первые 10 топиков |
+| `trino` | `trino` | `SELECT current_user, current_catalog, current_schema` (TrinoHook) | пользователь и каталог |
+| `other` | прочие | — | `⏭ пропуск` |
+
+**Поведение:** `soft_fail=True` — сбой одного таска не блокирует остальные.
+Таск `summary` (trigger: `all_done`) пишет итоговую таблицу ✅/❌/⏭ в DAG note.

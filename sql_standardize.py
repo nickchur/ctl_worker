@@ -14,6 +14,7 @@
 | `--no-annotate`  | Не создавать аннотированную копию исходного файла                   |
 | `--no-drop-gen`  | Не генерировать DROP автоматически                                   |
 | `--cascade`      | Добавить CASCADE в авто-генерируемые DROP (по умолчанию: без CASCADE)|
+| `--strict-alter` | ALTER без CREATE и без файла на диске → ERROR (по умолчанию WARNING) |
 | `--encoding`     | Кодировка входного файла (default: utf-8)                           |
 | `--warn-only`    | ERROR-уровень не завершает с кодом 1                                |
 
@@ -417,6 +418,49 @@ def run_validations(creates: list, drops: list, issues: list) -> None:
             ))
 
 
+def check_alter_targets(
+    alters: list,
+    creates: list,
+    repo_root: Path,
+    issues: list,
+    strict: bool = False,
+) -> None:
+    """Validate that each ALTER has a reachable target object.
+
+    Three cases:
+    1. CREATE for the same object exists in this task → OK, ALTER follows CREATE.
+    2. No CREATE in task, but sql/create/.../name.sql exists on disk → WARNING
+       (object exists in repo, ALTER is an incremental change — probably fine).
+    3. No CREATE in task and no file on disk → WARNING (default) or ERROR (--strict-alter).
+    """
+    create_keys = {(o.schema, o.name) for o in creates}
+    for obj in alters:
+        key = (obj.schema, obj.name)
+        if key in create_keys:
+            continue   # handled by order file: ALTER goes right after CREATE
+
+        existing_file = (
+            repo_root / 'sql' / 'create' / obj.schema / obj.obj_type.value / f"{obj.name}.sql"
+        )
+        if existing_file.exists():
+            issues.append(ValidationIssue(
+                'WARNING',
+                f"ALTER для {obj.schema}.{obj.name} без CREATE в задаче "
+                f"(объект найден на диске: {existing_file.relative_to(repo_root)})",
+                obj,
+            ))
+        else:
+            level = 'ERROR' if strict else 'WARNING'
+            issues.append(ValidationIssue(
+                level,
+                f"ALTER для {obj.schema}.{obj.name} без CREATE в задаче "
+                f"и без файла на диске — объект может не существовать"
+                + (" (используйте --strict-alter=false чтобы понизить до WARNING)" if strict else
+                   " (используйте --strict-alter чтобы повысить до ERROR)"),
+                obj,
+            ))
+
+
 def check_dependency_order(creates: list, drops: list, issues: list) -> None:
     """Warn when a CREATE object depends on another object being modified in this task."""
     modified_keys = {(o.schema, o.name) for o in creates + drops}
@@ -532,6 +576,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Не генерировать DROP автоматически')
     p.add_argument('--cascade', action='store_true',
                    help='Добавить CASCADE в авто-генерируемые DROP (по умолчанию без CASCADE)')
+    p.add_argument('--strict-alter', action='store_true',
+                   help='ALTER без CREATE в задаче и без файла на диске → ERROR вместо WARNING')
     p.add_argument('--encoding', default='utf-8',
                    help='Кодировка входного файла (default: utf-8)')
     p.add_argument('--warn-only', action='store_true',
@@ -608,6 +654,7 @@ def main(argv=None):
     issues: list[ValidationIssue] = []
     run_validations(creates, drops, issues)
     check_dependency_order(creates, drops, issues)
+    check_alter_targets(alters, creates, repo_root, issues, strict=args.strict_alter)
 
     # --- Step 6: auto-generate missing DROPs ---
     if not args.no_drop_gen:

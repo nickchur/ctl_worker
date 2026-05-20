@@ -225,47 +225,57 @@ def split_statements(sql_text: str) -> list:
 
 _STRIP_COMMENTS = re.compile(r'--[^\n]*|/\*.*?\*/', re.DOTALL)
 
+# Matches both plain identifiers and double-quoted identifiers.
+_IDENT = r'(?:"[^"]+"|\w+)'
+
 _PATTERNS = [
     (re.compile(
-        r'CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?P<schema>\w+)\.(?P<name>\w+)',
+        rf'CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.CREATE, ObjType.VIEW),
 
     (re.compile(
-        r'CREATE\s+(?:EXTERNAL\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<schema>\w+)\.(?P<name>\w+)',
+        rf'CREATE\s+(?:EXTERNAL\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.CREATE, ObjType.TABLE),
 
     (re.compile(
-        r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+(?P<schema>\w+)\.(?P<name>\w+)',
+        rf'CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.CREATE, ObjType.PROC),
 
     (re.compile(
-        r'DROP\s+VIEW\s+(?:IF\s+EXISTS\s+)?(?P<schema>\w+)\.(?P<name>\w+)',
+        rf'DROP\s+VIEW\s+(?:IF\s+EXISTS\s+)?(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.DROP, ObjType.VIEW),
 
     (re.compile(
-        r'DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<schema>\w+)\.(?P<name>\w+)',
+        rf'DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.DROP, ObjType.TABLE),
 
     (re.compile(
-        r'DROP\s+(?:FUNCTION|PROCEDURE)\s+(?:IF\s+EXISTS\s+)?(?P<schema>\w+)\.(?P<name>\w+)',
+        rf'DROP\s+(?:FUNCTION|PROCEDURE)\s+(?:IF\s+EXISTS\s+)?(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.DROP, ObjType.PROC),
 
     (re.compile(
-        r'ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<schema>\w+)\.(?P<name>\w+)',
+        rf'ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.ALTER, ObjType.TABLE),
 
     (re.compile(
-        r'ALTER\s+(?:MATERIALIZED\s+)?VIEW\s+(?P<schema>\w+)\.(?P<name>\w+)',
+        rf'ALTER\s+(?:MATERIALIZED\s+)?VIEW\s+(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.ALTER, ObjType.VIEW),
 ]
+
+
+def _norm(ident: str) -> str:
+    """Normalise a SQL identifier: strip outer double-quotes, lowercase unquoted names."""
+    if ident.startswith('"') and ident.endswith('"'):
+        return ident[1:-1]   # quoted → strip quotes, preserve case
+    return ident.lower()     # unquoted → lowercase (PostgreSQL default)
 
 
 def classify_statement(raw: str) -> Optional[SqlObject]:
@@ -277,8 +287,8 @@ def classify_statement(raw: str) -> Optional[SqlObject]:
             return SqlObject(
                 op=op,
                 obj_type=obj_type,
-                schema=m.group('schema').lower(),
-                name=m.group('name').lower(),
+                schema=_norm(m.group('schema')),
+                name=_norm(m.group('name')),
                 raw_sql=raw,
                 source_line=0,
             )
@@ -290,7 +300,7 @@ def classify_statement(raw: str) -> Optional[SqlObject]:
 # ---------------------------------------------------------------------------
 
 _REF_PATTERN = re.compile(
-    r'\b(?:FROM|JOIN)\s+(?P<schema>\w+)\.(?P<name>\w+)',
+    rf'\b(?:FROM|JOIN)\s+(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
     re.IGNORECASE,
 )
 
@@ -300,8 +310,8 @@ def extract_dependencies(obj: SqlObject) -> list:
     seen = set()
     refs = []
     for m in _REF_PATTERN.finditer(obj.raw_sql):
-        s = m.group('schema').lower()
-        n = m.group('name').lower()
+        s = _norm(m.group('schema'))
+        n = _norm(m.group('name'))
         if s in KNOWN_SCHEMAS and not (s == obj.schema and n == obj.name):
             key = f"{s}.{n}"
             if key not in seen:

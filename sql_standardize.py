@@ -717,6 +717,12 @@ def main(argv=None):
 
     # Write passthrough.sql
     if passthroughs:
+        if len(passthroughs) > 5:
+            issues.append(ValidationIssue(
+                'WARNING',
+                f"Обнаружено {len(passthroughs)} нераспознанных блоков — убедитесь, "
+                f"что среди них нет DDL/DML, который должен быть разделён по папкам",
+            ))
         passthrough_path = task_dir / 'passthrough.sql'
         passthrough_content = '\n\n'.join(s + ';' for s in passthroughs)
         write_file(passthrough_path, passthrough_content, args.dry_run, issues)

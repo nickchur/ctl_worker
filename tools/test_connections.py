@@ -190,7 +190,7 @@ def _test_one(conn_id: str, conn_type: str, **context) -> dict:
     is_paused_upon_creation=True,
     max_active_runs=1,
 )
-def tools_test_conn():
+def test_connections():
 
     all_tasks = []
 
@@ -264,4 +264,4 @@ def tools_test_conn():
         all_tasks >> summary_task
 
 
-tools_test_conn()
+test_connections()

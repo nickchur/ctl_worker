@@ -18,6 +18,9 @@
 - **postgres** → `SELECT current_user, current_database(), inet_server_addr()`
 - **s3** → `list_buckets()`
 - **http** → `KerberosHttp GET /v5/api/info`
+- **clickhouse** → `SELECT version()` через `ClickHouseHook`
+- **kafka** → `list_topics()` через `KafkaAdminClientHook`
+- **trino** → `SELECT current_user, current_catalog, current_schema` через `TrinoHook`
 - остальные → `⏭ пропуск`
 
 **Таски:** `soft_fail=True` — сбой одного не блокирует остальные.
@@ -25,6 +28,7 @@
 """
 
 import re
+import time
 from collections import defaultdict
 
 import pendulum
@@ -108,21 +112,64 @@ def _safe_id(conn_id: str) -> str:
 # Функция проверки одного соединения
 # ---------------------------------------------------------------------------
 
-def _test_one(conn_id: str, conn_type: str, **context) -> dict:
-    """Проверяет одно соединение через chk_any_conn.
+def _check_native(conn_id: str, conn_type: str, **context) -> dict:
+    """Проверяет ClickHouse / Kafka / Trino напрямую (без chk_any_conn)."""
+    ti = context['ti']
+    ts = time.time()
+    try:
+        if conn_type in ('sqlite', 'clickhouse'):
+            from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook  # type: ignore
+            hook = ClickHouseHook(clickhouse_conn_id=conn_id)
+            result = hook.get_records('SELECT version()')
 
-    Если тип не поддерживается — пишет skip-заметку и возвращает без ошибки.
+        elif conn_type == 'kafka':
+            from airflow.providers.apache.kafka.hooks.client import KafkaAdminClientHook  # type: ignore
+            hook = KafkaAdminClientHook(kafka_config_id=conn_id)
+            admin = hook.get_conn()
+            meta = admin.list_topics(timeout=5)
+            result = sorted(meta.topics.keys())[:10]
+
+        elif conn_type == 'trino':
+            from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
+            hook = TrinoHook(trino_conn_id=conn_id)
+            result = hook.get_first('SELECT current_user, current_catalog, current_schema')
+
+        else:
+            raise ValueError(f"Unsupported conn_type: {conn_type}")
+
+        logger.info("🔍 %s", result)
+        msg = f"✅ {time.time() - ts:.2f} sec chk_{conn_id}_conn"
+        add_note({'result': str(result)}, context, title=msg)
+        return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
+
+    except Exception as err:
+        msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
+        add_note(err, context, level='Task,DAG', title=msg)
+        raise
+
+
+_NATIVE_TYPES = frozenset(('sqlite', 'clickhouse', 'kafka', 'trino'))
+
+
+def _test_one(conn_id: str, conn_type: str, **context) -> dict:
+    """Проверяет одно соединение.
+
+    Postgres/S3/HTTP — через chk_any_conn; ClickHouse/Kafka/Trino — напрямую.
+    Неподдерживаемый тип — skip-заметка без ошибки.
     """
     chk_type = _TYPE_MAP.get(conn_type)
-    if chk_type is None:
-        msg = f"⏭ conn_type='{conn_type}' — проверка не реализована"
-        add_note(msg, context, level='task', title=f"⏭ {conn_id}")
-        logger.info(msg)
-        return {'status': 'skip', 'conn_id': conn_id, 'conn_type': conn_type}
+    if chk_type is not None:
+        data = {'type': chk_type, 'conn_id': conn_id}
+        chk_any_conn(id=conn_id, data=data, **context)
+        return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
 
-    data = {'type': chk_type, 'conn_id': conn_id}
-    chk_any_conn(id=conn_id, data=data, **context)
-    return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
+    if conn_type in _NATIVE_TYPES:
+        return _check_native(conn_id, conn_type, **context)
+
+    msg = f"⏭ conn_type='{conn_type}' — проверка не реализована"
+    add_note(msg, context, level='task', title=f"⏭ {conn_id}")
+    logger.info(msg)
+    return {'status': 'skip', 'conn_id': conn_id, 'conn_type': conn_type}
 
 
 # ---------------------------------------------------------------------------

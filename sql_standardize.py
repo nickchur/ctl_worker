@@ -231,7 +231,7 @@ _IDENT = r'(?:"[^"]+"|\w+)'
 
 _PATTERNS = [
     (re.compile(
-        rf'CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
+        rf'CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?VIEW\s+(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.CREATE, ObjType.VIEW),
 
@@ -246,7 +246,7 @@ _PATTERNS = [
     ), Op.CREATE, ObjType.PROC),
 
     (re.compile(
-        rf'DROP\s+VIEW\s+(?:IF\s+EXISTS\s+)?(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
+        rf'DROP\s+(?:MATERIALIZED\s+)?VIEW\s+(?:IF\s+EXISTS\s+)?(?P<schema>{_IDENT})\.(?P<name>{_IDENT})',
         re.IGNORECASE,
     ), Op.DROP, ObjType.VIEW),
 

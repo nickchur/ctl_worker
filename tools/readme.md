@@ -31,7 +31,7 @@
 | `tfs` | `aws` + `tfs` в имени | `list_buckets()` (S3) | TFS S3-коннекты, отдельная группа |
 | `s3` | `aws`, без `tfs` в имени | `list_buckets()` | список бакетов |
 | `postgres` | `postgres` | `SELECT current_user, current_database(), inet_server_addr()` | пользователь, БД, адрес сервера |
-| `http` | `http`, `ctlDevDevDfSbrfRu` | `GET /v5/api/info` (KerberosHttp) | JSON-ответ API |
+| `http` | `http`, `ctl*` | `GET /v5/api/info` (KerberosHttp) | JSON-ответ API |
 | `clickhouse` | `clickhouse`, `sqlite` | `SELECT version()` (ClickHouseHook) | версия сервера |
 | `kafka` | `kafka` | `list_topics()` (KafkaAdminClientHook) | первые 10 топиков |
 | `trino` | `trino` | `SELECT current_user, current_catalog, current_schema` (TrinoHook) | пользователь и каталог |

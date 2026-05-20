@@ -8,7 +8,7 @@
 | `tfs` | `tfs` в conn_id **и** conn_type == `aws` |
 | `s3` | conn_type == `aws`, без `tfs` в имени |
 | `postgres` | conn_type == `postgres` |
-| `http` | conn_type == `http` |
+| `http` | conn_type == `http` или `ctlDevDevDfSbrfRu` |
 | `clickhouse` | conn_type == `sqlite` или `clickhouse` |
 | `kafka` | conn_type == `kafka` |
 | `trino` | conn_type == `trino` |
@@ -93,6 +93,8 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
             group = 'clickhouse'
         elif group == 'aws':
             group = 's3'
+        elif group == 'ctlDevDevDfSbrfRu':
+            group = 'http'
         elif group not in _TYPE_MAP and group not in ('clickhouse', 'kafka', 'trino'):
             group = 'other'
         type_groups[group][cid] = conn

@@ -5,7 +5,7 @@
 
 | Группа | Условие |
 |---|---|
-| `tfs` | `tfs` в conn_id (приоритет над типом) |
+| `tfs` | `tfs` в conn_id (приоритет над типом); всегда проверяется как S3 |
 | `postgres` | conn_type == `postgres` |
 | `s3` | conn_type == `aws` |
 | `http` | conn_type == `http` |
@@ -195,14 +195,15 @@ def test_connections():
     all_tasks = []
 
     # --- TFS group (priority) ---
+    # Все TFS-коннекты — S3 (conn_type='aws'), проверяем как S3 независимо от conn_type объекта.
     if _tfs_group:
         with TaskGroup(group_id='tfs', tooltip=_GROUP_TOOLTIP['tfs']):
             for conn_id, conn in sorted(_tfs_group.items()):
                 t = task(
                     task_id=_safe_id(conn_id),
                     soft_fail=True,
-                    doc_md=f'Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)',
-                )(_test_one)(conn_id=conn_id, conn_type=conn.conn_type)
+                    doc_md=f'Проверка `{conn_id}` (S3)',
+                )(_test_one)(conn_id=conn_id, conn_type='aws')
                 all_tasks.append(t)
 
     # --- Type groups ---

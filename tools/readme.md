@@ -28,7 +28,7 @@
 
 | Группа | conn_type | Проверка | Результат |
 |---|---|---|---|
-| `tfs` | любой | по типу ниже | коннекты с `tfs` в имени, приоритет над группой |
+| `tfs` | `aws` (всегда) | `list_buckets()` (S3) | все TFS-коннекты — S3, проверяются как S3 |
 | `postgres` | `postgres` | `SELECT current_user, current_database(), inet_server_addr()` | пользователь, БД, адрес сервера |
 | `s3` | `aws` | `list_buckets()` | список бакетов |
 | `http` | `http` | `GET /v5/api/info` (KerberosHttp) | JSON-ответ API |

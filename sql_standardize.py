@@ -13,6 +13,7 @@
 | `--dry-run`      | Только парсинг и валидация, файлы не записываются                   |
 | `--no-annotate`  | Не создавать аннотированную копию исходного файла                   |
 | `--no-drop-gen`  | Не генерировать DROP автоматически                                   |
+| `--cascade`      | Добавить CASCADE в авто-генерируемые DROP (по умолчанию: без CASCADE)|
 | `--encoding`     | Кодировка входного файла (default: utf-8)                           |
 | `--warn-only`    | ERROR-уровень не завершает с кодом 1                                |
 
@@ -334,15 +335,23 @@ def find_repo_root(start: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 _DROP_TEMPLATES = {
-    ObjType.TABLE: 'DROP TABLE IF EXISTS {schema}.{name} CASCADE;',
-    ObjType.VIEW:  'DROP VIEW IF EXISTS {schema}.{name} CASCADE;',
-    ObjType.PROC:  'DROP FUNCTION IF EXISTS {schema}.{name} CASCADE;',
+    ObjType.TABLE: 'DROP TABLE IF EXISTS {schema}.{name}{cascade};',
+    ObjType.VIEW:  'DROP VIEW IF EXISTS {schema}.{name}{cascade};',
+    ObjType.PROC:  'DROP FUNCTION IF EXISTS {schema}.{name}{cascade};',
 }
 
 
-def generate_drop(obj: SqlObject) -> str:
-    body = _DROP_TEMPLATES[obj.obj_type].format(schema=obj.schema, name=obj.name)
-    return f"-- AUTO-GENERATED: verify CASCADE doesn't drop unintended objects\n{body}"
+def generate_drop(obj: SqlObject, cascade: bool = False) -> str:
+    cascade_clause = ' CASCADE' if cascade else ''
+    body = _DROP_TEMPLATES[obj.obj_type].format(
+        schema=obj.schema, name=obj.name, cascade=cascade_clause,
+    )
+    note = (
+        '-- AUTO-GENERATED: CASCADE включён — убедитесь что лишних объектов не удалится'
+        if cascade else
+        '-- AUTO-GENERATED'
+    )
+    return f"{note}\n{body}"
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +387,7 @@ def run_validations(creates: list, drops: list, issues: list) -> None:
         if key not in drop_keys:
             issues.append(ValidationIssue(
                 'WARNING',
-                f"Нет DROP для {obj.schema}.{obj.name} — будет авто-сгенерирован с CASCADE",
+                f"Нет DROP для {obj.schema}.{obj.name} — будет авто-сгенерирован",
                 obj,
             ))
 
@@ -511,6 +520,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Не создавать аннотированную копию исходного файла')
     p.add_argument('--no-drop-gen', action='store_true',
                    help='Не генерировать DROP автоматически')
+    p.add_argument('--cascade', action='store_true',
+                   help='Добавить CASCADE в авто-генерируемые DROP (по умолчанию без CASCADE)')
     p.add_argument('--encoding', default='utf-8',
                    help='Кодировка входного файла (default: utf-8)')
     p.add_argument('--warn-only', action='store_true',
@@ -593,7 +604,7 @@ def main(argv=None):
         drop_keys = {(d.schema, d.name) for d in drops}
         for obj in creates:
             if (obj.schema, obj.name) not in drop_keys:
-                auto_sql  = generate_drop(obj)
+                auto_sql  = generate_drop(obj, cascade=args.cascade)
                 auto_drop = SqlObject(
                     op=Op.DROP, obj_type=obj.obj_type,
                     schema=obj.schema, name=obj.name,

@@ -23,8 +23,8 @@
 - **trino** → `SELECT current_user, current_catalog, current_schema` через `TrinoHook`
 - остальные → `⏭ пропуск`
 
-**Таски:** `soft_fail=True` — сбой одного не блокирует остальные.
-**summary** — финальный таск, пишет таблицу ✅/❌/⏭ в DAG note.
+**Таски** независимы — сбой одного не блокирует остальные.
+**summary** — финальный таск (`trigger_rule=all_done`), пишет таблицу ✅/❌/⏭ в DAG note.
 """
 
 import re
@@ -205,7 +205,6 @@ def tools_test_connections():
             for conn_id, conn in sorted(_tfs_group.items()):
                 t = task(
                     task_id=_safe_id(conn_id),
-                    soft_fail=True,
                     doc_md=f'Проверка `{conn_id}` (S3)',
                 )(_test_one)(conn_id=conn_id, conn_type='aws')
                 all_tasks.append(t)
@@ -221,7 +220,6 @@ def tools_test_connections():
                 # aws conn_type нормализован в 's3' для группы, но conn_type у объекта — 'aws'
                 t = task(
                     task_id=_safe_id(conn_id),
-                    soft_fail=True,
                     doc_md=f'Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)',
                 )(_test_one)(conn_id=conn_id, conn_type=conn.conn_type)
                 all_tasks.append(t)

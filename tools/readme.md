@@ -37,5 +37,5 @@
 | `trino` | `trino` | `SELECT current_user, current_catalog, current_schema` (TrinoHook) | пользователь и каталог |
 | `other` | прочие | — | `⏭ пропуск` |
 
-**Поведение:** `soft_fail=True` — сбой одного таска не блокирует остальные.
+**Поведение:** таски независимы — сбой одного не блокирует остальные.
 Таск `summary` (trigger: `all_done`) пишет итоговую таблицу ✅/❌/⏭ в DAG note.

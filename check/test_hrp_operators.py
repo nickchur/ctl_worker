@@ -8,6 +8,7 @@
 import os
 import sys
 import pendulum
+import re
 from datetime import timedelta
 
 from airflow import DAG
@@ -53,6 +54,14 @@ from sber_app_dataplatform_etl_core.hrp_operators import (
 from sber_app_dataplatform_etl_core.hrp_operators.postgres_to_s3 import HrpPostgresToS3ListOperator
 from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_to_datacatalog import ClickHouseDQExportOperator
 
+def parse_s3_url(url):
+    """Парсит URL формата conn_id://bucket/prefix."""
+    match = re.match(r"([^:]+)://([^/]+)/?(.*)", url)
+    if not match:
+        return "s3_default", "test-bucket", ""
+    conn_id, bucket, prefix = match.groups()
+    return conn_id, bucket, prefix
+
 default_args = {
     'owner': 'DataLab (CI02420667)',
     'retries': 0,
@@ -69,9 +78,7 @@ with DAG(
     params={
         "pg_conn_id": Param("", type=["string", "null"], title="Postgres Connection ID"),
         "ch_conn_id": Param("", type=["string", "null"], title="ClickHouse Connection ID"),
-        "s3_conn_id": Param("s3_default", type="string", title="S3 Connection ID"),
-        "s3_bucket": Param("test-bucket", type="string", title="S3 Bucket"),
-        "s3_prefix": Param("test_hrp/{{ run_id }}", type="string", title="S3 Prefix"),
+        "s3_url": Param("s3_default://test-bucket/test_hrp/{{ run_id }}", type="string", title="S3 URL (conn_id://bucket/prefix)"),
         
         "test_pg_to_s3": Param(True, type="boolean", title="Test PG -> S3"),
         "test_s3_to_ch": Param(True, type="boolean", title="Test S3 -> CH"),
@@ -81,6 +88,13 @@ with DAG(
         "test_db_utils": Param(True, type="boolean", title="Test DB Utils"),
     }
 ) as dag:
+
+    # Извлекаем компоненты S3 URL для использования в операторах
+    # В Airflow операторах мы можем использовать макросы для парсинга
+    s3_conn_macro = "{{ params.s3_url.split('://')[0] }}"
+    s3_bucket_macro = "{{ params.s3_url.split('://')[1].split('/')[0] }}"
+    # Префикс может содержать слеши, поэтому объединяем остаток
+    s3_prefix_macro = "{{ '/'.join(params.s3_url.split('://')[1].split('/')[1:]) }}"
 
     # ---------------------------------------------------------------------------
     # 0. PRE-EXECUTE CHECKS (Conditional Skipping)
@@ -150,9 +164,9 @@ with DAG(
         test_pg_s3_csv = HrpPostgresToS3Operator(
             task_id='test_pg_s3_csv',
             postgres_conn_id="{{ params.pg_conn_id }}",
-            aws_conn_id="{{ params.s3_conn_id }}",
-            s3_bucket="{{ params.s3_bucket }}",
-            s3_key="{{ params.s3_prefix }}/pg_source.csv",
+            aws_conn_id=s3_conn_macro,
+            s3_bucket=s3_bucket_macro,
+            s3_key=s3_prefix_macro + ("/pg_source.csv" if s3_prefix_macro else "pg_source.csv"),
             sql="SELECT * FROM test_hrp_source_pg",
             file_format='csv'
         )
@@ -160,9 +174,9 @@ with DAG(
         test_pg_s3_list = HrpPostgresToS3ListOperator(
             task_id='test_pg_s3_list',
             postgres_conn_id="{{ params.pg_conn_id }}",
-            aws_conn_id="{{ params.s3_conn_id }}",
-            s3_bucket="{{ params.s3_bucket }}",
-            s3_prefix="{{ params.s3_prefix }}/list/",
+            aws_conn_id=s3_conn_macro,
+            s3_bucket=s3_bucket_macro,
+            s3_prefix=s3_prefix_macro + ("/list/" if s3_prefix_macro else "list/"),
             tables=['test_hrp_source_pg']
         )
         
@@ -179,9 +193,9 @@ with DAG(
         test_s3_ch = HrpS3ToClickhouseTableOperator(
             task_id='test_s3_ch',
             clickhouse_conn_id="{{ params.ch_conn_id }}",
-            aws_conn_id="{{ params.s3_conn_id }}",
-            s3_bucket="{{ params.s3_bucket }}",
-            s3_key="{{ params.s3_prefix }}/pg_source.csv",
+            aws_conn_id=s3_conn_macro,
+            s3_bucket=s3_bucket_macro,
+            s3_key=s3_prefix_macro + ("/pg_source.csv" if s3_prefix_macro else "pg_source.csv"),
             table="test_hrp_target_ch"
         )
         
@@ -198,18 +212,18 @@ with DAG(
         test_ch_s3_table = HrpClickhouseTableToS3Operator(
             task_id='test_ch_s3_table',
             clickhouse_conn_id="{{ params.ch_conn_id }}",
-            aws_conn_id="{{ params.s3_conn_id }}",
-            s3_bucket="{{ params.s3_bucket }}",
-            s3_key="{{ params.s3_prefix }}/ch_table.csv",
+            aws_conn_id=s3_conn_macro,
+            s3_bucket=s3_bucket_macro,
+            s3_key=s3_prefix_macro + ("/ch_table.csv" if s3_prefix_macro else "ch_table.csv"),
             table="test_hrp_source_ch"
         )
 
         test_ch_s3_native = HrpClickNativeToS3Operator(
             task_id='test_ch_s3_native',
             clickhouse_conn_id="{{ params.ch_conn_id }}",
-            aws_conn_id="{{ params.s3_conn_id }}",
-            s3_bucket="{{ params.s3_bucket }}",
-            s3_key="{{ params.s3_prefix }}/ch_native.csv",
+            aws_conn_id=s3_conn_macro,
+            s3_bucket=s3_bucket_macro,
+            s3_key=s3_prefix_macro + ("/ch_native.csv" if s3_prefix_macro else "ch_native.csv"),
             sql="SELECT * FROM test_hrp_source_ch"
         )
         
@@ -270,53 +284,52 @@ with DAG(
         check = ShortCircuitOperator(
             task_id='pre_execute',
             python_callable=lambda p: p['test_s3_utils'],
-            # S3 тесты не зависят от PG/CH коннектов
             op_args=[dag.params]
         )
 
         test_s3_to_s3 = HrpS3ToS3Operator(
             task_id='test_s3_to_s3',
-            aws_conn_id="{{ params.s3_conn_id }}",
-            source_bucket="{{ params.s3_bucket }}",
-            source_key="{{ params.s3_prefix }}/ch_table.csv",
-            dest_bucket="{{ params.s3_bucket }}",
-            dest_key="{{ params.s3_prefix }}/ch_table_copy.csv"
+            aws_conn_id=s3_conn_macro,
+            source_bucket=s3_bucket_macro,
+            source_key=s3_prefix_macro + ("/ch_table.csv" if s3_prefix_macro else "ch_table.csv"),
+            dest_bucket=s3_bucket_macro,
+            dest_key=s3_prefix_macro + ("/ch_table_copy.csv" if s3_prefix_macro else "ch_table_copy.csv")
         )
 
         test_s3_archive = HrpS3ArchiveOperator(
             task_id='test_s3_archive',
-            aws_conn_id="{{ params.s3_conn_id }}",
-            bucket="{{ params.s3_bucket }}",
-            key="{{ params.s3_prefix }}/ch_native.csv",
-            archive_bucket="{{ params.s3_bucket }}",
-            archive_key="{{ params.s3_prefix }}/archive/ch_native.csv"
+            aws_conn_id=s3_conn_macro,
+            bucket=s3_bucket_macro,
+            key=s3_prefix_macro + ("/ch_native.csv" if s3_prefix_macro else "ch_native.csv"),
+            archive_bucket=s3_bucket_macro,
+            archive_key=s3_prefix_macro + ("/archive/ch_native.csv" if s3_prefix_macro else "archive/ch_native.csv")
         )
 
         test_s3_hash = HrpCheckS3FileHash(
             task_id='test_s3_hash',
-            aws_conn_id="{{ params.s3_conn_id }}",
-            bucket="{{ params.s3_bucket }}",
-            key="{{ params.s3_prefix }}/pg_source.csv"
+            aws_conn_id=s3_conn_macro,
+            bucket=s3_bucket_macro,
+            key=s3_prefix_macro + ("/pg_source.csv" if s3_prefix_macro else "pg_source.csv")
         )
 
         test_s3_list = HrpS3ListKeysOperator(
             task_id='test_s3_list',
-            aws_conn_id="{{ params.s3_conn_id }}",
-            bucket="{{ params.s3_bucket }}",
-            prefix="{{ params.s3_prefix }}/"
+            aws_conn_id=s3_conn_macro,
+            bucket=s3_bucket_macro,
+            prefix=s3_prefix_macro + ("/" if s3_prefix_macro else "")
         )
 
         test_s3_read = HrpS3FileReadOperator(
             task_id='test_s3_read',
-            aws_conn_id="{{ params.s3_conn_id }}",
-            s3_bucket="{{ params.s3_bucket }}",
-            s3_key="{{ params.s3_prefix }}/pg_source.csv"
+            aws_conn_id=s3_conn_macro,
+            s3_bucket=s3_bucket_macro,
+            s3_key=s3_prefix_macro + ("/pg_source.csv" if s3_prefix_macro else "pg_source.csv")
         )
 
         test_s3_view = HrpS3BucketViewerOperator(
             task_id='test_s3_view',
-            aws_conn_id="{{ params.s3_conn_id }}",
-            bucket="{{ params.s3_bucket }}"
+            aws_conn_id=s3_conn_macro,
+            bucket=s3_bucket_macro
         )
 
         check >> [test_s3_to_s3, test_s3_archive, test_s3_hash, test_s3_list, test_s3_read, test_s3_view]

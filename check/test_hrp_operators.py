@@ -67,8 +67,8 @@ with DAG(
     catchup=False,
     tags=['test', 'hrp_operators'],
     params={
-        "pg_conn_id": Param("", type="string", title="Postgres Connection ID"),
-        "ch_conn_id": Param("", type="string", title="ClickHouse Connection ID"),
+        "pg_conn_id": Param("", type=["string", "null"], title="Postgres Connection ID"),
+        "ch_conn_id": Param("", type=["string", "null"], title="ClickHouse Connection ID"),
         "s3_conn_id": Param("s3_default", type="string", title="S3 Connection ID"),
         "s3_bucket": Param("test-bucket", type="string", title="S3 Bucket"),
         "s3_prefix": Param("test_hrp/{{ run_id }}", type="string", title="S3 Prefix"),

@@ -459,17 +459,18 @@ def chk_any_conn(id, data=None, **context):
             else:
                 from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
                 hook = PostgresHook(postgres_conn_id=data['conn_id'])
-                result = query_to_dict(hook, 'SELECT current_user, current_database(), inet_server_addr()', timeout=10)[0]
+                result = query_to_dict(hook, 'SELECT current_user, current_database(), inet_server_addr()', timeout=15)[0]
             
         elif data['type'] == 'S3':
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook # type: ignore
-            hook = S3Hook(aws_conn_id=data['conn_id'])
+            from botocore.config import Config # type: ignore
+            hook = S3Hook(aws_conn_id=data['conn_id'], config=Config(connect_timeout=15, read_timeout=15))
             result = hook.get_conn().list_buckets()['Buckets']
             
         elif data['type'] == 'KerberosHttp':
             from hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
             hook = KerberosHttpHook(method='GET', http_conn_id=data['conn_id'])
-            response = hook.run('/v5/api/info', headers={'Accept': 'application/json'})
+            response = hook.run('/v5/api/info', headers={'Accept': 'application/json'}, timeout=15)
             response.raise_for_status()
             result = response.json()
         else:

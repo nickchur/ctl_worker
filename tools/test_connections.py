@@ -121,19 +121,22 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
     try:
         if conn_type in ('sqlite', 'clickhouse'):
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook  # type: ignore
-            hook = ClickHouseHook(clickhouse_conn_id=conn_id)
+            # Используем таймауты для clickhouse-driver
+            hook = ClickHouseHook(clickhouse_conn_id=conn_id, connect_timeout=15, send_receive_timeout=15)
             result = hook.get_records('SELECT version()')
 
         elif conn_type == 'kafka':
             from airflow.providers.apache.kafka.hooks.client import KafkaAdminClientHook  # type: ignore
             hook = KafkaAdminClientHook(kafka_config_id=conn_id)
             admin = hook.get_conn()
-            meta = admin.list_topics(timeout=5)
+            # Увеличиваем таймаут до 15 секунд
+            meta = admin.list_topics(timeout=15)
             result = sorted(meta.topics.keys())[:10]
 
         elif conn_type == 'trino':
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
-            hook = TrinoHook(trino_conn_id=conn_id)
+            # TrinoHook может принимать дополнительные параметры для trino.dbapi.connect
+            hook = TrinoHook(trino_conn_id=conn_id, request_timeout=15)
             result = hook.get_first('SELECT current_user, current_catalog, current_schema')
 
         else:

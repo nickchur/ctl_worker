@@ -19,23 +19,8 @@
 | `s3_to_s3_test.py` | `tools_s3_to_s3_test` | Находит файлы по маске и копирует/перемещает их S3→S3 |
 | `db_cleanup.py` | `tools_db_cleanup` | Очищает метадату Airflow старше N дней |
 | `show_connections.py` | `tools_show_connections` | Показывает все подключения из secret backend, сгруппированные по типу |
-| `test_connections.py` | `tools_test_connections` | Проверяет каждое соединение из secret backend; таски сгруппированы по типу, TFS — отдельная группа |
 | `dummy.py` | `dummy_dag` | Шаблон DAG для проверки отображения Markdown в Airflow UI |
 
 ---
 
-## test_connections — проверки по типу
-
-| Группа | conn_type | Проверка | Результат |
-|---|---|---|---|
-| `tfs` | `aws` + `tfs` в имени | `list_buckets()` (S3) | TFS S3-коннекты, отдельная группа |
-| `s3` | `aws`, без `tfs` в имени | `list_buckets()` | список бакетов |
-| `postgres` | `postgres` | `SELECT current_user, current_database(), inet_server_addr()` | пользователь, БД, адрес сервера |
-| `ctl` | `http`, `ctl*` | `GET /v5/api/info` (KerberosHttp) | JSON-ответ API |
-| `clickhouse` | `clickhouse`, `sqlite` | `SELECT version()` (ClickHouseHook) | версия сервера |
-| `kafka` | `kafka` | `list_topics()` (KafkaAdminClientHook) | первые 10 топиков |
-| `trino` | `trino` | `SELECT current_user, current_catalog, current_schema` (TrinoHook) | пользователь и каталог |
-| `other` | прочие | — | `⏭ пропуск` |
-
-**Поведение:** таски независимы — сбой одного не блокирует остальные.
-Таск `summary` (trigger: `all_done`) пишет итоговую таблицу ✅/❌/⏭ в DAG note.
+## dummy — пример Markdown

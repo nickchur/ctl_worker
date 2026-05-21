@@ -22,6 +22,40 @@
 5.  **s3_utils**: Проверка утилит S3 (копирование, архивация, проверка хэш-сумм, чтение файлов).
 6.  **db_utils**: Выполнение команд на кластере ClickHouse и DDL в Postgres.
 
+## Поддерживаемые операторы
+
+Ниже представлен список кастомных операторов, доступных в пакете `hrp_operators` и покрытых тестами в данном стенде:
+
+### 📥 Загрузка в S3
+*   `HrpPostgresToS3Operator` — выгрузка из Postgres в S3.
+*   `HrpPostgresToS3ListOperator` — пакетная выгрузка списка таблиц из Postgres в S3.
+*   `HrpClickhouseTableToS3Operator` — выгрузка таблицы ClickHouse в S3.
+*   `HrpClickhouseQueryToS3Operator` — выгрузка результата SQL-запроса ClickHouse в S3.
+*   `HrpClickNativeToS3Operator` — нативная выгрузка ClickHouse в S3.
+*   `HrpClickNativeToS3ListOperator` — нативная пакетная выгрузка из ClickHouse в S3.
+
+### 📤 Загрузка из S3
+*   `HrpS3ToClickhouseTableOperator` — загрузка из S3 в таблицу ClickHouse.
+*   `HrpS3ToClickhouseTransformedOperator` — загрузка из S3 с трансформацией в ClickHouse.
+
+### 🔄 Межбазовое и внутреннее перемещение
+*   `HrpS3ToS3Operator` — копирование данных внутри S3.
+*   `HrpPostgresToPostgresOperator` — переливка данных между инстансами Postgres.
+*   `HrpPostgresIncarnationInsertOperator` — вставка инкарнаций данных в Postgres.
+*   `HrpClickhouseToPostgresOperator` — переливка из ClickHouse в Postgres.
+*   `HrpClickhouseToPostgresIncarnationOperator` — переливка инкарнаций из ClickHouse в Postgres.
+*   `HrpPostgresToClickhouseOperator` — переливка из Postgres в ClickHouse.
+
+### 🛠️ Инструменты и утилиты
+*   `HrpClickHouseClusterOperator` — выполнение команд на кластере ClickHouse.
+*   `HrpPostgresDDL` — выполнение DDL-запросов в Postgres.
+*   `HrpS3ArchiveOperator` — архивация файлов в S3.
+*   `HrpCheckS3FileHash` — проверка хэш-суммы файлов в S3.
+*   `ClickHouseDQExportOperator` — экспорт метрик качества данных (DQ) в DataCatalog.
+*   `HrpS3ListKeysOperator` — получение списка ключей (файлов) в S3.
+*   `HrpS3FileReadOperator` — чтение содержимого файла из S3.
+*   `HrpS3BucketViewerOperator` — просмотр содержимого бакета S3.
+
 ---
 
 ## Как запустить тесты

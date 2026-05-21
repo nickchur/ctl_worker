@@ -15,6 +15,7 @@ from airflow.models.param import Param
 from airflow.decorators import task, task_group
 from airflow.operators.python import ShortCircuitOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
+
 # Предполагаем наличие ClickHouseOperator, если нет - используем Python
 try:
     from airflow_clickhouse_plugin.operators.clickhouse_operator import ClickHouseOperator
@@ -66,8 +67,8 @@ with DAG(
     catchup=False,
     tags=['test', 'hrp_operators'],
     params={
-        "postgres_conn_id": Param("postgres_default", type="string", title="Postgres Connection ID"),
-        "clickhouse_conn_id": Param("clickhouse_default", type="string", title="ClickHouse Connection ID"),
+        "pg_conn_id": Param("", type="string", title="Postgres Connection ID"),
+        "ch_conn_id": Param("", type="string", title="ClickHouse Connection ID"),
         "s3_conn_id": Param("s3_default", type="string", title="S3 Connection ID"),
         "s3_bucket": Param("test-bucket", type="string", title="S3 Bucket"),
         "s3_prefix": Param("test_hrp/{{ run_id }}", type="string", title="S3 Prefix"),
@@ -82,12 +83,24 @@ with DAG(
 ) as dag:
 
     # ---------------------------------------------------------------------------
+    # 0. PRE-EXECUTE CHECKS (Conditional Skipping)
+    # ---------------------------------------------------------------------------
+
+    @task
+    def has_pg_conn(pg_id):
+        return bool(pg_id)
+
+    @task
+    def has_ch_conn(ch_id):
+        return bool(ch_id)
+
+    # ---------------------------------------------------------------------------
     # 1. SETUP: Создание таблиц и данных
     # ---------------------------------------------------------------------------
 
     setup_pg = PostgresOperator(
         task_id='setup_pg',
-        postgres_conn_id="{{ params.postgres_conn_id }}",
+        postgres_conn_id="{{ params.pg_conn_id }}",
         sql="""
         CREATE TABLE IF NOT EXISTS test_hrp_source_pg (id INT, name TEXT, dt DATE);
         CREATE TABLE IF NOT EXISTS test_hrp_target_pg (id INT, name TEXT, dt DATE);
@@ -104,7 +117,7 @@ with DAG(
     if ClickHouseOperator:
         setup_ch = ClickHouseOperator(
             task_id='setup_ch',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             sql="""
             CREATE TABLE IF NOT EXISTS test_hrp_source_ch (id Int32, name String, dt Date) ENGINE = MergeTree() ORDER BY id;
             CREATE TABLE IF NOT EXISTS test_hrp_target_ch (id Int32, name String, dt Date) ENGINE = MergeTree() ORDER BY id;
@@ -119,9 +132,7 @@ with DAG(
         )
     else:
         @task
-        def setup_ch_python(**context):
-            # Заглушка, если нет ClickHouseOperator
-            pass
+        def setup_ch_python(**context): pass
         setup_ch = setup_ch_python()
 
     # ---------------------------------------------------------------------------
@@ -131,14 +142,14 @@ with DAG(
     @task_group(group_id='pg_to_s3')
     def pg_to_s3_group():
         check = ShortCircuitOperator(
-            task_id='check_flag',
-            python_callable=lambda p: p['test_pg_to_s3'],
+            task_id='pre_execute',
+            python_callable=lambda p: p['test_pg_to_s3'] and p['pg_conn_id'],
             op_args=[dag.params]
         )
 
         test_pg_s3_csv = HrpPostgresToS3Operator(
             task_id='test_pg_s3_csv',
-            postgres_conn_id="{{ params.postgres_conn_id }}",
+            postgres_conn_id="{{ params.pg_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
             s3_bucket="{{ params.s3_bucket }}",
             s3_key="{{ params.s3_prefix }}/pg_source.csv",
@@ -148,7 +159,7 @@ with DAG(
 
         test_pg_s3_list = HrpPostgresToS3ListOperator(
             task_id='test_pg_s3_list',
-            postgres_conn_id="{{ params.postgres_conn_id }}",
+            postgres_conn_id="{{ params.pg_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
             s3_bucket="{{ params.s3_bucket }}",
             s3_prefix="{{ params.s3_prefix }}/list/",
@@ -160,34 +171,33 @@ with DAG(
     @task_group(group_id='s3_to_ch')
     def s3_to_ch_group():
         check = ShortCircuitOperator(
-            task_id='check_flag',
-            python_callable=lambda p: p['test_s3_to_ch'],
+            task_id='pre_execute',
+            python_callable=lambda p: p['test_s3_to_ch'] and p['ch_conn_id'],
             op_args=[dag.params]
         )
 
         test_s3_ch = HrpS3ToClickhouseTableOperator(
             task_id='test_s3_ch',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
             s3_bucket="{{ params.s3_bucket }}",
             s3_key="{{ params.s3_prefix }}/pg_source.csv",
             table="test_hrp_target_ch"
         )
         
-        # Зависимость от выгрузки в S3 (для примера цепочки)
         check >> test_s3_ch
 
     @task_group(group_id='ch_to_s3')
     def ch_to_s3_group():
         check = ShortCircuitOperator(
-            task_id='check_flag',
-            python_callable=lambda p: p['test_ch_to_s3'],
+            task_id='pre_execute',
+            python_callable=lambda p: p['test_ch_to_s3'] and p['ch_conn_id'],
             op_args=[dag.params]
         )
 
         test_ch_s3_table = HrpClickhouseTableToS3Operator(
             task_id='test_ch_s3_table',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
             s3_bucket="{{ params.s3_bucket }}",
             s3_key="{{ params.s3_prefix }}/ch_table.csv",
@@ -196,7 +206,7 @@ with DAG(
 
         test_ch_s3_native = HrpClickNativeToS3Operator(
             task_id='test_ch_s3_native',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
             s3_bucket="{{ params.s3_bucket }}",
             s3_key="{{ params.s3_prefix }}/ch_native.csv",
@@ -208,15 +218,15 @@ with DAG(
     @task_group(group_id='db_to_db')
     def db_to_db_group():
         check = ShortCircuitOperator(
-            task_id='check_flag',
-            python_callable=lambda p: p['test_db_to_db'],
+            task_id='pre_execute',
+            python_callable=lambda p: p['test_db_to_db'] and p['pg_conn_id'] and p['ch_conn_id'],
             op_args=[dag.params]
         )
 
         test_pg_pg = HrpPostgresToPostgresOperator(
             task_id='test_pg_pg',
-            source_postgres_conn_id="{{ params.postgres_conn_id }}",
-            target_postgres_conn_id="{{ params.postgres_conn_id }}",
+            source_postgres_conn_id="{{ params.pg_conn_id }}",
+            target_postgres_conn_id="{{ params.pg_conn_id }}",
             sql="SELECT * FROM test_hrp_source_pg",
             target_table="test_hrp_target_pg",
             pre_sql="TRUNCATE TABLE test_hrp_target_pg"
@@ -224,31 +234,31 @@ with DAG(
 
         test_ch_pg = HrpClickhouseToPostgresOperator(
             task_id='test_ch_pg',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
-            postgres_conn_id="{{ params.postgres_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
+            postgres_conn_id="{{ params.pg_conn_id }}",
             sql="SELECT * FROM test_hrp_source_ch",
             target_table="test_hrp_target_pg"
         )
         
         test_pg_ch = HrpPostgresToClickhouseOperator(
             task_id='test_pg_ch',
-            postgres_conn_id="{{ params.postgres_conn_id }}",
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
+            postgres_conn_id="{{ params.pg_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             sql="SELECT * FROM test_hrp_source_pg",
             target_table="test_hrp_target_ch"
         )
 
         test_ch_pg_inc = HrpClickhouseToPostgresIncarnationOperator(
             task_id='test_ch_pg_inc',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
-            postgres_conn_id="{{ params.postgres_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
+            postgres_conn_id="{{ params.pg_conn_id }}",
             sql="SELECT id, name, dt, 1 as incarnation_id FROM test_hrp_source_ch",
             target_table="test_hrp_inc_pg"
         )
 
         test_pg_inc = HrpPostgresIncarnationInsertOperator(
             task_id='test_pg_inc',
-            postgres_conn_id="{{ params.postgres_conn_id }}",
+            postgres_conn_id="{{ params.pg_conn_id }}",
             sql="SELECT id, name, dt, 2 as incarnation_id FROM test_hrp_source_pg",
             target_table="test_hrp_inc_pg"
         )
@@ -258,8 +268,9 @@ with DAG(
     @task_group(group_id='s3_utils')
     def s3_utils_group():
         check = ShortCircuitOperator(
-            task_id='check_flag',
+            task_id='pre_execute',
             python_callable=lambda p: p['test_s3_utils'],
+            # S3 тесты не зависят от PG/CH коннектов
             op_args=[dag.params]
         )
 
@@ -313,27 +324,27 @@ with DAG(
     @task_group(group_id='db_utils')
     def db_utils_group():
         check = ShortCircuitOperator(
-            task_id='check_flag',
-            python_callable=lambda p: p['test_db_utils'],
+            task_id='pre_execute',
+            python_callable=lambda p: p['test_db_utils'] and p['pg_conn_id'] and p['ch_conn_id'],
             op_args=[dag.params]
         )
 
         test_ch_cluster = HrpClickHouseClusterOperator(
             task_id='test_ch_cluster',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             sql="SELECT 1",
             cluster="default_cluster"
         )
 
         test_pg_ddl = HrpPostgresDDL(
             task_id='test_pg_ddl',
-            postgres_conn_id="{{ params.postgres_conn_id }}",
+            postgres_conn_id="{{ params.pg_conn_id }}",
             sql="CREATE TEMPORARY TABLE temp_test (id INT)"
         )
 
         test_ch_dq = ClickHouseDQExportOperator(
             task_id='test_ch_dq',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             sql="SELECT count(*) FROM test_hrp_source_ch",
             target_table="test_hrp_dq_metrics"
         )
@@ -346,7 +357,7 @@ with DAG(
 
     cleanup_pg = PostgresOperator(
         task_id='cleanup_pg',
-        postgres_conn_id="{{ params.postgres_conn_id }}",
+        postgres_conn_id="{{ params.pg_conn_id }}",
         sql="""
         DROP TABLE IF EXISTS test_hrp_source_pg;
         DROP TABLE IF EXISTS test_hrp_target_pg;
@@ -358,7 +369,7 @@ with DAG(
     if ClickHouseOperator:
         cleanup_ch = ClickHouseOperator(
             task_id='cleanup_ch',
-            clickhouse_conn_id="{{ params.clickhouse_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             sql="""
             DROP TABLE IF EXISTS test_hrp_source_ch;
             DROP TABLE IF EXISTS test_hrp_target_ch;
@@ -376,4 +387,14 @@ with DAG(
     # Зависимости
     # ---------------------------------------------------------------------------
 
-    [setup_pg, setup_ch] >> pg_to_s3_group() >> s3_to_ch_group() >> ch_to_s3_group() >> db_to_db_group() >> s3_utils_group() >> db_utils_group() >> [cleanup_pg, cleanup_ch]
+    can_pg = has_pg_conn("{{ params.pg_conn_id }}")
+    can_ch = has_ch_conn("{{ params.ch_conn_id }}")
+
+    can_pg >> setup_pg >> pg_to_s3_group()
+    can_ch >> setup_ch >> ch_to_s3_group()
+    
+    [pg_to_s3_group(), ch_to_s3_group()] >> s3_to_ch_group() >> db_to_db_group() >> s3_utils_group() >> db_utils_group() >> [cleanup_pg, cleanup_ch]
+    
+    # Убеждаемся, что cleanup_pg зависит от can_pg, а cleanup_ch от can_ch
+    can_pg >> cleanup_pg
+    can_ch >> cleanup_ch

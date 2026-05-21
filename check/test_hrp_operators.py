@@ -78,7 +78,7 @@ with DAG(
     params={
         "pg_conn_id": Param("", type=["string", "null"], title="Postgres Connection ID"),
         "ch_conn_id": Param("", type=["string", "null"], title="ClickHouse Connection ID"),
-        "s3_url": Param("s3_default://test-bucket/test_hrp/{{ run_id }}", type="string", title="S3 URL (conn_id://bucket/prefix)"),
+        "s3_url": Param("s3://test-bucket", type=["string", "null"], title="S3 URL (conn_id://bucket/prefix)"),
         
         "test_pg_to_s3": Param(True, type="boolean", title="Test PG -> S3"),
         "test_s3_to_ch": Param(True, type="boolean", title="Test S3 -> CH"),
@@ -91,10 +91,10 @@ with DAG(
 
     # Извлекаем компоненты S3 URL для использования в операторах
     # В Airflow операторах мы можем использовать макросы для парсинга
-    s3_conn_macro = "{{ params.s3_url.split('://')[0] }}"
-    s3_bucket_macro = "{{ params.s3_url.split('://')[1].split('/')[0] }}"
+    s3_conn_macro = "{{ params.s3_url.split('://')[0] if '://' in params.s3_url else '' }}"
+    s3_bucket_macro = "{{ params.s3_url.split('://')[1].split('/')[0] if '://' in params.s3_url else '' }}"
     # Префикс может содержать слеши, поэтому объединяем остаток
-    s3_prefix_macro = "{{ '/'.join(params.s3_url.split('://')[1].split('/')[1:]) }}"
+    s3_prefix_macro = "{{ '/'.join(params.s3_url.split('://')[1].split('/')[1:]) if '://' in params.s3_url else '' }}"
 
     # ---------------------------------------------------------------------------
     # 0. PRE-EXECUTE CHECKS (Conditional Skipping)
@@ -157,7 +157,7 @@ with DAG(
     def pg_to_s3_group():
         check = ShortCircuitOperator(
             task_id='pre_execute',
-            python_callable=lambda p: p['test_pg_to_s3'] and p['pg_conn_id'],
+            python_callable=lambda p: p['test_pg_to_s3'] and p['pg_conn_id'] and p['s3_url'],
             op_args=[dag.params]
         )
 
@@ -186,7 +186,7 @@ with DAG(
     def s3_to_ch_group():
         check = ShortCircuitOperator(
             task_id='pre_execute',
-            python_callable=lambda p: p['test_s3_to_ch'] and p['ch_conn_id'],
+            python_callable=lambda p: p['test_s3_to_ch'] and p['ch_conn_id'] and p['s3_url'],
             op_args=[dag.params]
         )
 
@@ -205,7 +205,7 @@ with DAG(
     def ch_to_s3_group():
         check = ShortCircuitOperator(
             task_id='pre_execute',
-            python_callable=lambda p: p['test_ch_to_s3'] and p['ch_conn_id'],
+            python_callable=lambda p: p['test_ch_to_s3'] and p['ch_conn_id'] and p['s3_url'],
             op_args=[dag.params]
         )
 
@@ -283,7 +283,7 @@ with DAG(
     def s3_utils_group():
         check = ShortCircuitOperator(
             task_id='pre_execute',
-            python_callable=lambda p: p['test_s3_utils'],
+            python_callable=lambda p: p['test_s3_utils'] and p['s3_url'],
             op_args=[dag.params]
         )
 

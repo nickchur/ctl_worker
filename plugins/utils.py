@@ -164,7 +164,12 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
                 new_note = f"{ new_note}\n\n---\n{obj.note if obj.note else '' }"
                 
             # Лимит длины
-            obj.note = new_note[:MAX_NOTE_LEN]
+            try:
+                obj.note = new_note[:MAX_NOTE_LEN]
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"Failed to update note for {l}: {e}")
 
 def on_callback(context, level=None): return _on_callback(context, level)
 

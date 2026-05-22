@@ -138,20 +138,41 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
                 meta = admin.list_topics(timeout=15)
                 result = sorted(meta.topics.keys())[:10]
             except KafkaException as err:
-                # Специальная обработка ошибки отсутствия CA сертификатов (system lib)
-                if 'ssl.ca.location failed' in str(err):
-                    sys_ca = next((p for p in ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt'] if os.path.exists(p)), None)
-                    if sys_ca:
-                        logger.warning("Kafka SSL CA failed, retrying with system bundle: %s", sys_ca)
-                        conf = hook.get_connection(conn_id).extra_dejson
-                        conf['ssl.ca.location'] = sys_ca
-                        from confluent_kafka.admin import AdminClient
-                        admin = AdminClient(conf)
-                        meta = admin.list_topics(timeout=15)
-                        result = sorted(meta.topics.keys())[:10]
-                        add_note(f"⚠️ Kafka SSL CA workaround: used {sys_ca}", context)
-                    else:
-                        raise
+                # Специальная обработка ошибки отсутствия SSL сертификатов/ключей
+                err_str = str(err)
+                if 'failed' in err_str and (
+                    'ssl.ca.location' in err_str or 
+                    'ssl.certificate.location' in err_str or 
+                    'ssl.key.location' in err_str
+                ):
+                    conf = hook.get_connection(conn_id).extra_dejson
+                    
+                    # 1. Если упал CA, пробуем системный бандл
+                    if 'ssl.ca.location failed' in err_str:
+                        sys_ca = next((p for p in ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt'] if os.path.exists(p)), None)
+                        if sys_ca:
+                            logger.warning("Kafka SSL CA failed, retrying with system bundle: %s", sys_ca)
+                            conf['ssl.ca.location'] = sys_ca
+                            from confluent_kafka.admin import AdminClient
+                            admin = AdminClient(conf)
+                            meta = admin.list_topics(timeout=15)
+                            result = sorted(meta.topics.keys())[:10]
+                            add_note(f"⚠️ Kafka SSL CA workaround: used {sys_ca}", context)
+                            return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
+
+                    # 2. Если упал сертификат или ключ, проверяем существование файлов
+                    missing_files = []
+                    for k in ('ssl.certificate.location', 'ssl.key.location', 'ssl.ca.location'):
+                        path = conf.get(k)
+                        if path and not os.path.exists(path):
+                            missing_files.append(f"{k}='{path}'")
+                    
+                    if missing_files:
+                        msg = f"❌ Kafka SSL ERROR: missing files on worker: {', '.join(missing_files)}"
+                        add_note(msg, context, level='task', title=f"❌ {conn_id}")
+                        raise AirflowFailException(msg) from err
+                    
+                    raise
                 else:
                     raise
 

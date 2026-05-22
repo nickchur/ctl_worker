@@ -179,14 +179,23 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
                                 logger.info("Kafka SSL still failing after CA fix: %s", err_str)
 
                     # 2. Если все еще падает на сертификатах (или упал сразу certificate/key)
-                    # Пробуем форсированно отключить проверку сертификатов
-                    if any(x in err_str for x in ('ssl.certificate.location failed', 'ssl.key.location failed', 'ssl.ca.location failed')):
-                        logger.warning("Kafka certificates missing or invalid, retrying with verification disabled")
+                    # Пробуем форсированно отключить проверку сертификатов и УДАЛИТЬ пути к файлам
+                    if any(x in err_str for x in ('failed', 'system lib')) and any(y in err_str for y in ('ssl.ca.location', 'ssl.certificate.location', 'ssl.key.location')):
+                        logger.warning("Kafka certificates missing or invalid, retrying with verification disabled and paths stripped")
+                        
+                        # 3. Сохраняем информацию о недостающих файлах для диагностики, но продолжаем
+                        missing_files = []
+                        diag_conf = KafkaAdminClientHook(kafka_config_id=conn_id).get_connection(conn_id).extra_dejson
+                        for k in ('ssl.certificate.location', 'ssl.key.location', 'ssl.ca.location'):
+                            path = diag_conf.get(k)
+                            if path and not os.path.exists(path):
+                                missing_files.append(f"{k}='{path}'")
+                        
                         # Очищаем пути к файлам, которые заставляют librdkafka искать их
                         for k in ('ssl.certificate.location', 'ssl.key.location', 'ssl.ca.location'):
                             conf.pop(k, None)
                         
-                        # Отключаем проверку (для отладочной проверки соединения этого достаточно)
+                        # Отключаем проверку
                         conf['enable.ssl.certificate.verification'] = 'false'
                         conf['ssl.endpoint.identification.algorithm'] = 'none'
                         
@@ -194,25 +203,20 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
                             admin = AdminClient(conf)
                             meta = admin.list_topics(timeout=15)
                             result = sorted(meta.topics.keys())[:10]
-                            add_note("⚠️ Kafka SSL workaround: certificate verification DISABLED", context)
+                            msg = "⚠️ Kafka SSL workaround: certificate verification DISABLED"
+                            if missing_files:
+                                msg += f" (missing on worker: {', '.join(missing_files)})"
+                            add_note(msg, context)
                             return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
                         except Exception as err3:
                             last_err = err3
                             logger.error("Kafka failed even with disabled verification: %s", err3)
                     
-                    # 3. Если ничего не помогло, проверяем существование файлов для диагностики
-                    missing_files = []
-                    # Используем исходный конфиг для диагностики путей
-                    diag_conf = KafkaAdminClientHook(kafka_config_id=conn_id).get_connection(conn_id).extra_dejson
-                    for k in ('ssl.certificate.location', 'ssl.key.location', 'ssl.ca.location'):
-                        path = diag_conf.get(k)
-                        if path and not os.path.exists(path):
-                            missing_files.append(f"{k}='{path}'")
-                    
+                    # 4. Если ничего не помогло, кидаем AirflowFailException с последней ошибкой
                     if missing_files:
                         msg = f"❌ Kafka SSL ERROR: missing files on worker: {', '.join(missing_files)}"
                         add_note(msg, context, level='task', title=f"❌ {conn_id}")
-                        raise AirflowFailException(msg) from last_err
+                        raise AirflowFailException(f"{msg}. Last Kafka error: {last_err}") from last_err
                     
                     raise AirflowFailException(f"Kafka error: {last_err}") from last_err
                 else:

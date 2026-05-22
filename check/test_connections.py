@@ -34,7 +34,7 @@ from collections import defaultdict
 import pendulum
 from airflow.configuration import get_custom_secret_backend
 from airflow.decorators import dag, task
-from airflow.exceptions import AirflowSkipException
+from airflow.exceptions import AirflowSkipException, AirflowFailException
 from airflow.models import Connection
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
@@ -141,12 +141,15 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
             result = hook.get_first('SELECT current_user, current_catalog, current_schema')
 
         else:
-            raise ValueError(f"Unsupported conn_type: {conn_type}")
+            raise AirflowFailException(f"Unsupported conn_type: {conn_type}")
 
         logger.info("🔍 %s", result)
         msg = f"✅ {time.time() - ts:.2f} sec chk_{conn_id}_conn"
         add_note({'result': str(result)}, context, title=msg)
         return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
+
+    except AirflowSkipException:
+        raise
 
     except ImportError as err:
         msg = f"⏭ {conn_id}: провайдер не установлен — {err}"
@@ -157,7 +160,7 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
     except Exception as err:
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
         add_note(err, context, level='Task,DAG', title=msg)
-        raise
+        raise AirflowFailException(f"{msg}: {err}") from err
 
 
 _NATIVE_TYPES = frozenset(('sqlite', 'clickhouse', 'kafka', 'trino'))

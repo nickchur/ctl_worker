@@ -483,6 +483,9 @@ def chk_any_conn(id, data=None, **context):
         msg = f"✅ {time.time()-ts:.2f} sec chk_{id}_conn"
         add_note({'try':try_number, 'sdt':sdt}, context, title=msg)
         
+    except AirflowSkipException:
+        raise
+
     except ImportError as err:
         msg = f"⏭ {id}: провайдер не установлен — {err}"
         add_note(msg, context, level='task', title=f"⏭ {id}")
@@ -497,8 +500,7 @@ def chk_any_conn(id, data=None, **context):
         logger.error(response)      
         msg = f"❌ {time.time()-ts:.2f} sec chk_{id}_conn ERROR Try {try_number} {sdt}"
         add_note(err, context, level='Task,DAG', title=msg)
-        # raise AirflowFailException(msg)
-        raise err
+        raise AirflowFailException(f"{msg}: {err}") from err
 
         
 def ctl_wf_norm(wf, connectedEntities=None):

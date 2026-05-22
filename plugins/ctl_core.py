@@ -464,13 +464,24 @@ def chk_any_conn(id, data=None, **context):
         elif data['type'] == 'S3':
             from airflow.providers.amazon.aws.hooks.s3 import S3Hook # type: ignore
             from botocore.config import Config # type: ignore
-            hook = S3Hook(aws_conn_id=data['conn_id'], config=Config(connect_timeout=15, read_timeout=15))
+            
+            # Явно извлекаем verify из экстра для надежности
+            hook = S3Hook(aws_conn_id=data['conn_id'])
+            verify = hook.get_connection(data['conn_id']).extra_dejson.get('verify', True)
+            if isinstance(verify, str): verify = verify.lower() == 'true'
+
+            hook = S3Hook(aws_conn_id=data['conn_id'], verify=verify, config=Config(connect_timeout=15, read_timeout=15))
             result = hook.get_conn().list_buckets()['Buckets']
             
         elif data['type'] == 'KerberosHttp':
             from hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
             hook = KerberosHttpHook(method='GET', http_conn_id=data['conn_id'])
-            response = hook.run('/v5/api/info', headers={'Accept': 'application/json'}, timeout=15)
+            
+            # HttpHook.run принимает параметры requests через extra_options
+            verify = hook.get_connection(data['conn_id']).extra_dejson.get('verify', True)
+            if isinstance(verify, str): verify = verify.lower() == 'true'
+
+            response = hook.run('/v5/api/info', headers={'Accept': 'application/json'}, extra_options={'timeout': 15, 'verify': verify})
             response.raise_for_status()
             result = response.json()
         else:

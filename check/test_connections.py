@@ -21,10 +21,10 @@
 - **clickhouse** → `SELECT version()` через `ClickHouseHook`
 - **kafka** → `list_topics()` через `KafkaAdminClientHook`
 - **trino** → `SELECT current_user, current_catalog, current_schema` через `TrinoHook`
-- остальные → `🟪 пропуск`
+- остальные → `☮️ пропуск`
 
 **Таски** независимы — сбой одного не блокирует остальные.
-**summary** — финальный таск (`trigger_rule=all_done`), пишет таблицу ✅/❌/🟪 в DAG note.
+**summary** — финальный таск (`trigger_rule=all_done`), пишет таблицу ✅/❌/☮️ в DAG note.
 """
 
 import re
@@ -152,8 +152,8 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
         raise
 
     except ImportError as err:
-        msg = f"🟪 {conn_id}: провайдер не установлен — {err}"
-        add_note(msg, context, level='task', title=f"🟪 {conn_id}")
+        msg = f"☮️ {conn_id}: провайдер не установлен — {err}"
+        add_note(msg, context, level='task', title=f"☮️ {conn_id}")
         logger.warning(msg)
         raise AirflowSkipException(msg) from err
 
@@ -183,8 +183,8 @@ def _test_one(conn_id: str, conn_type: str, **context) -> dict:
     if conn_type in _NATIVE_TYPES:
         return _check_native(conn_id, conn_type, **context)
 
-    msg = f"🟪 conn_type='{conn_type}' — проверка не реализована"
-    add_note(msg, context, level='task', title=f"🟪 {conn_id}")
+    msg = f"☮️ conn_type='{conn_type}' — проверка не реализована"
+    add_note(msg, context, level='task', title=f"☮️ {conn_id}")
     logger.info(msg)
     return {'status': 'skip', 'conn_id': conn_id, 'conn_type': conn_type}
 
@@ -266,11 +266,11 @@ def tools_test_connections():
             elif state in ('failed', 'upstream_failed'):
                 icon = '❌'; fail += 1
             else:
-                icon = '🟪'; skip += 1
+                icon = '☮️'; skip += 1
             rows.append(f"| `{ti.task_id}` | {icon} {state} |")
 
         table = '| Соединение | Статус |\n|---|---|\n' + '\n'.join(rows)
-        headline = f"✅ {ok} / ❌ {fail} / 🟪 {skip}"
+        headline = f"✅ {ok} / ❌ {fail} / ☮️ {skip}"
         add_note(table, context, level='DAG', title=headline)
         logger.info("summary: %s", headline)
         return {'ok': ok, 'fail': fail, 'skip': skip}

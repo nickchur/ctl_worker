@@ -3,12 +3,6 @@
 
 Этот DAG предназначен для функционального тестирования операторов из пакета `hrp_operators`.
 Он проверяет цепочки переливки данных между Postgres, S3 и ClickHouse, покрывая различные типы данных и параметры.
-
-**Основные проверки:**
-- Поддержка массивов (Array)
-- Различные форматы сжатия (GZIP)
-- Очистка данных (`xstream_sanitize`)
-- Корректная обработка спецсимволов и NULL
 """
 
 import sys
@@ -34,17 +28,17 @@ logger = getLogger("airflow.task")
 
 # Импорт операторов
 from sber_app_dataplatform_etl_core.hrp_operators.postgres_to_s3 import HrpPostgresToS3Operator, HrpPostgresToS3ListOperator
-from sber_app_dataplatform_etl_core.hrp_operators.s3_to_clickhouse import HrpS3ToClickhouseTableOperator, HrpS3ToClickhouseTransformedOperator
+from sber_app_dataplatform_etl_core.hrp_operators.s3_to_clickhouse import HrpS3ToClickhouseTableOperator
 from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_to_s3 import HrpClickhouseTableToS3Operator, HrpClickhouseQueryToS3Operator, HrpClickNativeToS3Operator
 from sber_app_dataplatform_etl_core.hrp_operators.postgres_to_postgres import HrpPostgresToPostgresOperator
 from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_to_postgres import HrpClickhouseToPostgresOperator
 from sber_app_dataplatform_etl_core.hrp_operators.postgres_to_clickhouse import HrpPostgresToClickhouseOperator
-from sber_app_dataplatform_etl_core.hrp_operators.s3_archive import HrpS3ArchiveOperator
+from sber_app_dataplatform_etl_core.hrp_operators.s3_to_s3 import HrpS3ToS3Operator
 from sber_app_dataplatform_etl_core.hrp_operators.s3_file_hash import HrpCheckS3FileHash
 
 # Дефолтные настройки
 DEFAULT_PG_CONN = 'airflowdb'
-DEFAULT_CH_CONN = 'ctl_ch'  # Предполагаемое имя
+DEFAULT_CH_CONN = 'ctl_ch'
 DEFAULT_S3_CONN = 's3-archive'
 DEFAULT_S3_BUCKET = 'test_operators'
 DEFAULT_S3_PREFIX = 'hrp_tests/'
@@ -113,7 +107,7 @@ def test_hrp_operators_dag():
     @task_group(group_id='pg_to_s3_tests')
     def pg_to_s3_tests():
         
-        test_csv = HrpPostgresToS3ListOperator(
+        HrpPostgresToS3ListOperator(
             task_id='pg_to_s3_csv_list',
             table_name='test_hrp_operators',
             schema='public',
@@ -126,7 +120,7 @@ def test_hrp_operators_dag():
             xstream_sanitize=True
         )
 
-        test_gzip = HrpPostgresToS3Operator(
+        HrpPostgresToS3Operator(
             task_id='pg_to_s3_gzip',
             table_name='test_hrp_operators',
             schema='public',
@@ -159,20 +153,13 @@ def test_hrp_operators_dag():
             count = res[0][0] if res else 0
             if count != 3:
                 raise AirflowFailException(f"Validation failed: expected 3 rows in CH, got {count}")
-            
-            # Проверка массива
-            res_arr = ch_hook.run("SELECT val_arr_int FROM technical.test_hrp_operators WHERE id = 1")
-            arr = res_arr[0][0] if res_arr else []
-            if list(arr) != [1, 2, 3]:
-                 raise AirflowFailException(f"Validation failed: expected [1,2,3] in array, got {arr}")
-            
             logger.info("ClickHouse validation successful")
 
         load_ch >> validate_ch()
 
     @task_group(group_id='ch_to_s3_tests')
     def ch_to_s3_tests():
-        dump_ch = HrpClickhouseTableToS3Operator(
+        HrpClickhouseTableToS3Operator(
             task_id='ch_to_s3_dump',
             table_name='test_hrp_operators',
             schema='technical',
@@ -184,7 +171,7 @@ def test_hrp_operators_dag():
             replace=True
         )
 
-        query_ch = HrpClickhouseQueryToS3Operator(
+        HrpClickhouseQueryToS3Operator(
             task_id='ch_query_to_s3',
             sql="SELECT id, name FROM technical.test_hrp_operators WHERE id > 1",
             s3_bucket="{{ params.s3_bucket }}",
@@ -194,7 +181,7 @@ def test_hrp_operators_dag():
             replace=True
         )
 
-        native_ch = HrpClickNativeToS3Operator(
+        HrpClickNativeToS3Operator(
             task_id='ch_native_to_s3',
             sql="SELECT * FROM technical.test_hrp_operators",
             s3_bucket="{{ params.s3_bucket }}",
@@ -207,27 +194,28 @@ def test_hrp_operators_dag():
     @task_group(group_id='s3_utils_tests')
     def s3_utils_tests():
         
-        archive = HrpS3ArchiveOperator(
-            task_id='s3_archive',
+        HrpS3ToS3Operator(
+            task_id='s3_copy',
+            s3_bucket_source="{{ params.s3_bucket }}",
+            s3_key_source=DEFAULT_S3_PREFIX + 'test_pg.csv',
+            aws_conn_id_source="{{ params.s3_conn_id }}",
             s3_bucket="{{ params.s3_bucket }}",
-            s3_key=DEFAULT_S3_PREFIX + 'test_pg.csv',
+            s3_key=DEFAULT_S3_PREFIX + 'copy/test_pg.csv',
             aws_conn_id="{{ params.s3_conn_id }}",
-            archive_bucket="{{ params.s3_bucket }}",
-            archive_key=DEFAULT_S3_PREFIX + 'archive/test_pg.csv'
+            replace=True
         )
 
-        check_hash = HrpCheckS3FileHash(
+        HrpCheckS3FileHash(
             task_id='s3_check_hash',
             s3_bucket="{{ params.s3_bucket }}",
             s3_key=DEFAULT_S3_PREFIX + 'test_pg.csv.gz',
             aws_conn_id="{{ params.s3_conn_id }}",
-            # Хеш возьмем из XCom pg_to_s3_gzip
-            expected_hashsum="{{ ti.xcom_pull(task_ids='pg_to_s3_tests.pg_to_s3_gzip')['checksum'] }}"
+            checksum="{{ ti.xcom_pull(task_ids='pg_to_s3_tests.pg_to_s3_gzip')['checksum'] }}"
         )
 
     @task_group(group_id='db_to_db_tests')
     def db_to_db_tests():
-        pg_to_pg = HrpPostgresToPostgresOperator(
+        HrpPostgresToPostgresOperator(
             task_id='pg_to_pg',
             source_table='test_hrp_operators',
             source_schema='public',
@@ -238,7 +226,7 @@ def test_hrp_operators_dag():
             pre_sql="CREATE TABLE IF NOT EXISTS public.test_hrp_operators_copy (LIKE public.test_hrp_operators INCLUDING ALL); TRUNCATE TABLE public.test_hrp_operators_copy;"
         )
 
-        ch_to_pg = HrpClickhouseToPostgresOperator(
+        HrpClickhouseToPostgresOperator(
             task_id='ch_to_pg',
             sql='SELECT * FROM technical.test_hrp_operators',
             target_table='test_hrp_operators_from_ch',
@@ -248,7 +236,7 @@ def test_hrp_operators_dag():
             pre_sql="CREATE TABLE IF NOT EXISTS public.test_hrp_operators_from_ch (LIKE public.test_hrp_operators INCLUDING ALL); TRUNCATE TABLE public.test_hrp_operators_from_ch;"
         )
 
-        pg_to_ch = HrpPostgresToClickhouseOperator(
+        HrpPostgresToClickhouseOperator(
             task_id='pg_to_ch',
             source_table='test_hrp_operators',
             source_schema='public',

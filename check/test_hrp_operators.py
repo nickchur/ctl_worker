@@ -144,10 +144,11 @@ def test_hrp_operators_dag():
             task_id='s3_to_ch_load',
             s3_bucket="{{ params.s3_bucket }}",
             s3_key=DEFAULT_S3_PREFIX + 'test_pg.csv.gz',
-            ch_conn_id="{{ params.ch_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
-            table_name='technical.test_hrp_operators',
-            format='CSVWithNames',
+            table_name='test_hrp_operators',
+            schema='technical',
+            fmt='CSVWithNames',
             compression='gzip'
         )
 
@@ -173,10 +174,11 @@ def test_hrp_operators_dag():
     def ch_to_s3_tests():
         dump_ch = HrpClickhouseTableToS3Operator(
             task_id='ch_to_s3_dump',
-            table_name='technical.test_hrp_operators',
+            table_name='test_hrp_operators',
+            schema='technical',
             s3_bucket="{{ params.s3_bucket }}",
             s3_key=DEFAULT_S3_PREFIX + 'test_ch.csv.gz',
-            ch_conn_id="{{ params.ch_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
             compression='gzip',
             replace=True
@@ -187,7 +189,7 @@ def test_hrp_operators_dag():
             sql="SELECT id, name FROM technical.test_hrp_operators WHERE id > 1",
             s3_bucket="{{ params.s3_bucket }}",
             s3_key=DEFAULT_S3_PREFIX + 'test_ch_query.csv',
-            ch_conn_id="{{ params.ch_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
             replace=True
         )
@@ -197,7 +199,7 @@ def test_hrp_operators_dag():
             sql="SELECT * FROM technical.test_hrp_operators",
             s3_bucket="{{ params.s3_bucket }}",
             s3_key=DEFAULT_S3_PREFIX + 'test_ch_native.native',
-            ch_conn_id="{{ params.ch_conn_id }}",
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
             aws_conn_id="{{ params.s3_conn_id }}",
             replace=True
         )
@@ -227,8 +229,10 @@ def test_hrp_operators_dag():
     def db_to_db_tests():
         pg_to_pg = HrpPostgresToPostgresOperator(
             task_id='pg_to_pg',
-            source_table='public.test_hrp_operators',
-            target_table='public.test_hrp_operators_copy',
+            source_table='test_hrp_operators',
+            source_schema='public',
+            target_table='test_hrp_operators_copy',
+            target_schema='public',
             source_conn_id="{{ params.pg_conn_id }}",
             target_conn_id="{{ params.pg_conn_id }}",
             pre_sql="CREATE TABLE IF NOT EXISTS public.test_hrp_operators_copy (LIKE public.test_hrp_operators INCLUDING ALL); TRUNCATE TABLE public.test_hrp_operators_copy;"
@@ -236,19 +240,22 @@ def test_hrp_operators_dag():
 
         ch_to_pg = HrpClickhouseToPostgresOperator(
             task_id='ch_to_pg',
-            source_table='technical.test_hrp_operators',
-            target_table='public.test_hrp_operators_from_ch',
-            ch_conn_id="{{ params.ch_conn_id }}",
-            pg_conn_id="{{ params.pg_conn_id }}",
+            sql='SELECT * FROM technical.test_hrp_operators',
+            target_table='test_hrp_operators_from_ch',
+            target_schema='public',
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
+            target_conn_id="{{ params.pg_conn_id }}",
             pre_sql="CREATE TABLE IF NOT EXISTS public.test_hrp_operators_from_ch (LIKE public.test_hrp_operators INCLUDING ALL); TRUNCATE TABLE public.test_hrp_operators_from_ch;"
         )
 
         pg_to_ch = HrpPostgresToClickhouseOperator(
             task_id='pg_to_ch',
-            source_table='public.test_hrp_operators',
-            target_table='technical.test_hrp_operators_from_pg',
-            pg_conn_id="{{ params.pg_conn_id }}",
-            ch_conn_id="{{ params.ch_conn_id }}",
+            source_table='test_hrp_operators',
+            source_schema='public',
+            target_table='test_hrp_operators_from_pg',
+            target_schema='technical',
+            source_conn_id="{{ params.pg_conn_id }}",
+            target_conn_id="{{ params.ch_conn_id }}",
             pre_sql="CREATE TABLE IF NOT EXISTS technical.test_hrp_operators_from_pg AS technical.test_hrp_operators; TRUNCATE TABLE technical.test_hrp_operators_from_pg;"
         )
 

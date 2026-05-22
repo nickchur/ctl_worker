@@ -483,6 +483,12 @@ def chk_any_conn(id, data=None, **context):
         msg = f"✅ {time.time()-ts:.2f} sec chk_{id}_conn"
         add_note({'try':try_number, 'sdt':sdt}, context, title=msg)
         
+    except ImportError as err:
+        msg = f"⏭ {id}: провайдер не установлен — {err}"
+        add_note(msg, context, level='task', title=f"⏭ {id}")
+        logger.warning(msg)
+        raise AirflowSkipException(msg) from err
+        
     except Exception as err:
         if data.get('pool_slots') and not data.get('default', False):
             pool_slots(f'{id}_pool', slots=0)

@@ -151,7 +151,7 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
         msg = f"⏭ {conn_id}: провайдер не установлен — {err}"
         add_note(msg, context, level='task', title=f"⏭ {conn_id}")
         logger.warning(msg)
-        return {'status': 'skip', 'conn_id': conn_id, 'conn_type': conn_type}
+        raise AirflowSkipException(msg) from err
 
     except Exception as err:
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"

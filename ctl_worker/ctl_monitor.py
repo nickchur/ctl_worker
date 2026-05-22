@@ -10,7 +10,7 @@
 | ⚠️ `reStarted` | Перезапуск зависшей задачи |
 | 🚨 `SLA` | Нарушение времени выполнения |
 | 🛑 `Stopped` | Остановка вручную |
-| ⚪ `Skipped` | Пропуск без изменений |
+| ☮️ `Skipped` | Пропуск без изменений |
 """
 
 from airflow import DAG
@@ -43,7 +43,7 @@ action_icons = {
     
     'notFound': '❓', 
     'New':'⏳' ,
-    'Skipped': '⚪', 
+    'Skipped': '☮️', 
     'SLA': '🚨',
 }
 

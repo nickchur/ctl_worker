@@ -29,6 +29,7 @@
 
 import os
 import re
+import socket
 import time
 from collections import defaultdict
 
@@ -212,9 +213,28 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
                             last_err = err3
                             logger.error("Kafka failed even with disabled verification: %s", err3)
                     
-                    # 4. Если ничего не помогло, кидаем AirflowFailException с последней ошибкой
+                    # 4. Проверка доступности портов (TCP Ping) для диагностики сети
+                    network_diag = []
+                    hosts = conf.get('bootstrap.servers', '').split(',')
+                    for h in hosts:
+                        if not h: continue
+                        host, port = (h.split(':') + ['9092'])[:2]
+                        try:
+                            with socket.create_connection((host, int(port)), timeout=3):
+                                network_diag.append(f"✅ {h}")
+                        except Exception:
+                            network_diag.append(f"❌ {h}")
+                    
+                    if network_diag:
+                        add_note(f"🌐 Network reachability (TCP): {', '.join(network_diag)}", context)
+
+                    # 5. Если ничего не помогло, кидаем AirflowFailException с последней ошибкой
                     if missing_files:
                         msg = f"❌ Kafka SSL ERROR: missing files on worker: {', '.join(missing_files)}"
+                        if any('✅' in d for d in network_diag):
+                            msg += ". Port is OPEN (check mTLS/Certs)"
+                        else:
+                            msg += ". Port is CLOSED (check Firewall)"
                         add_note(msg, context, level='task', title=f"❌ {conn_id}")
                         raise AirflowFailException(f"{msg}. Last Kafka error: {last_err}") from last_err
                     

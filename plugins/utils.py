@@ -28,10 +28,31 @@ import pendulum
 import json
 import hashlib
 
-from logging import getLogger
+from logging import getLogger, Handler
 logger = getLogger("airflow.task")
 
 MAX_NOTE_LEN = 1000
+
+
+class LogCapture(Handler):
+    """ Перехват логов Airflow
+        _patch = [
+            getLogger('airflow.task'),
+            getLogger('airflow.utils.db_cleanup'),
+        ]
+        capture = LogCapture()
+        for _l in _patch:
+            _l.addHandler(capture)
+        pass
+        for _l in _patch:
+            _l.removeHandler(capture)
+    """
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
 
 
 # === Утилиты ===
@@ -434,6 +455,3 @@ def safe_eval(expr):
             raise ValueError(f"Недопустимое выражение: {ast.dump(node)}")
     
     return _eval(tree.body)
-
-
-

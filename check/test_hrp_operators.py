@@ -181,7 +181,7 @@ def test_hrp_operators_dag():
             replace=True
         )
 
-        HrpClickNativeToS3Operator(
+        native_ch = HrpClickNativeToS3Operator(
             task_id='ch_native_to_s3',
             sql="SELECT * FROM technical.test_hrp_operators",
             s3_bucket="{{ params.s3_bucket }}",
@@ -190,6 +190,18 @@ def test_hrp_operators_dag():
             aws_conn_id="{{ params.s3_conn_id }}",
             replace=True
         )
+
+        native_ch_json = HrpClickNativeToS3Operator(
+            task_id='ch_native_to_s3_json',
+            sql="SELECT * FROM technical.test_hrp_operators",
+            s3_bucket="{{ params.s3_bucket }}",
+            s3_key=DEFAULT_S3_PREFIX + 'test_ch_native.json',
+            clickhouse_conn_id="{{ params.ch_conn_id }}",
+            aws_conn_id="{{ params.s3_conn_id }}",
+            fmt='JSON',
+            replace=True
+        )
+
 
     @task_group(group_id='s3_utils_tests')
     def s3_utils_tests():

@@ -487,8 +487,8 @@ def chk_any_conn(id, data=None, **context):
         raise
 
     except ImportError as err:
-        msg = f"⏭ {id}: провайдер не установлен — {err}"
-        add_note(msg, context, level='task', title=f"⏭ {id}")
+        msg = f"🔹 {id}: провайдер не установлен — {err}"
+        add_note(msg, context, level='task', title=f"🔹 {id}")
         logger.warning(msg)
         raise AirflowSkipException(msg) from err
         

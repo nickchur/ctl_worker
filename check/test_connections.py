@@ -27,6 +27,7 @@
 **summary** — финальный таск (`trigger_rule=all_done`), пишет таблицу ✅/❌/☮️ в DAG note.
 """
 
+import os
 import re
 import time
 from collections import defaultdict
@@ -128,11 +129,31 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
 
         elif conn_type == 'kafka':
             from airflow.providers.apache.kafka.hooks.client import KafkaAdminClientHook  # type: ignore
-            hook = KafkaAdminClientHook(kafka_config_id=conn_id)
-            admin = hook.get_conn()
-            # Увеличиваем таймаут до 15 секунд
-            meta = admin.list_topics(timeout=15)
-            result = sorted(meta.topics.keys())[:10]
+            from confluent_kafka import KafkaException  # type: ignore
+
+            try:
+                hook = KafkaAdminClientHook(kafka_config_id=conn_id)
+                admin = hook.get_conn()
+                # Увеличиваем таймаут до 15 секунд
+                meta = admin.list_topics(timeout=15)
+                result = sorted(meta.topics.keys())[:10]
+            except KafkaException as err:
+                # Специальная обработка ошибки отсутствия CA сертификатов (system lib)
+                if 'ssl.ca.location failed' in str(err):
+                    sys_ca = next((p for p in ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt'] if os.path.exists(p)), None)
+                    if sys_ca:
+                        logger.warning("Kafka SSL CA failed, retrying with system bundle: %s", sys_ca)
+                        conf = hook.get_connection(conn_id).extra_dejson
+                        conf['ssl.ca.location'] = sys_ca
+                        from confluent_kafka.admin import AdminClient
+                        admin = AdminClient(conf)
+                        meta = admin.list_topics(timeout=15)
+                        result = sorted(meta.topics.keys())[:10]
+                        add_note(f"⚠️ Kafka SSL CA workaround: used {sys_ca}", context)
+                    else:
+                        raise
+                else:
+                    raise
 
         elif conn_type == 'trino':
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore

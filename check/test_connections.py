@@ -34,6 +34,7 @@ from collections import defaultdict
 import pendulum
 from airflow.configuration import get_custom_secret_backend
 from airflow.decorators import dag, task
+from airflow.exceptions import AirflowSkipException
 from airflow.models import Connection
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule

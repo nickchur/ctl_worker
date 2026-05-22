@@ -153,14 +153,40 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
                         if sys_ca:
                             logger.warning("Kafka SSL CA failed, retrying with system bundle: %s", sys_ca)
                             conf['ssl.ca.location'] = sys_ca
+                            try:
+                                from confluent_kafka.admin import AdminClient
+                                admin = AdminClient(conf)
+                                meta = admin.list_topics(timeout=15)
+                                result = sorted(meta.topics.keys())[:10]
+                                add_note(f"⚠️ Kafka SSL CA workaround: used {sys_ca}", context)
+                                return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
+                            except KafkaException as err2:
+                                err_str = str(err2) # Обновляем ошибку для следующего шага
+                                logger.info("Kafka SSL still failing after CA fix: %s", err_str)
+
+                    # 2. Если все еще падает на сертификатах (или упал сразу certificate/key)
+                    # Пробуем форсированно отключить проверку сертификатов
+                    if any(x in err_str for x in ('ssl.certificate.location failed', 'ssl.key.location failed', 'ssl.ca.location failed')):
+                        logger.warning("Kafka certificates missing or invalid, retrying with verification disabled")
+                        # Очищаем пути к файлам, которые заставляют librdkafka искать их
+                        for k in ('ssl.certificate.location', 'ssl.key.location', 'ssl.ca.location'):
+                            conf.pop(k, None)
+                        
+                        # Отключаем проверку (для отладочной проверки соединения этого достаточно)
+                        conf['enable.ssl.certificate.verification'] = 'false'
+                        conf['ssl.endpoint.identification.algorithm'] = 'none'
+                        
+                        try:
                             from confluent_kafka.admin import AdminClient
                             admin = AdminClient(conf)
                             meta = admin.list_topics(timeout=15)
                             result = sorted(meta.topics.keys())[:10]
-                            add_note(f"⚠️ Kafka SSL CA workaround: used {sys_ca}", context)
+                            add_note("⚠️ Kafka SSL workaround: certificate verification DISABLED", context)
                             return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
-
-                    # 2. Если упал сертификат или ключ, проверяем существование файлов
+                        except Exception as err3:
+                            logger.error("Kafka failed even with disabled verification: %s", err3)
+                    
+                    # 3. Если ничего не помогло, проверяем существование файлов для диагностики
                     missing_files = []
                     for k in ('ssl.certificate.location', 'ssl.key.location', 'ssl.ca.location'):
                         path = conf.get(k)

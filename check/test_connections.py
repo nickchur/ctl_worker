@@ -131,22 +131,36 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
             from airflow.providers.apache.kafka.hooks.client import KafkaAdminClientHook  # type: ignore
             from confluent_kafka import KafkaException  # type: ignore
 
+            conf = KafkaAdminClientHook(kafka_config_id=conn_id).get_connection(conn_id).extra_dejson
+            
+            # Поддержка verify/secure ключей
+            verify = conf.pop('verify', True)
+            if isinstance(verify, str): verify = verify.lower() == 'true'
+            if not verify:
+                conf['enable.ssl.certificate.verification'] = 'false'
+                conf['ssl.endpoint.identification.algorithm'] = 'none'
+            
+            secure = conf.pop('secure', None)
+            if secure is not None:
+                if isinstance(secure, str): secure = secure.lower() == 'true'
+                if secure and conf.get('security.protocol') in (None, 'plaintext'):
+                    conf['security.protocol'] = 'ssl'
+
             try:
-                hook = KafkaAdminClientHook(kafka_config_id=conn_id)
-                admin = hook.get_conn()
+                from confluent_kafka.admin import AdminClient
+                admin = AdminClient(conf)
                 # Увеличиваем таймаут до 15 секунд
                 meta = admin.list_topics(timeout=15)
                 result = sorted(meta.topics.keys())[:10]
             except KafkaException as err:
                 # Специальная обработка ошибки отсутствия SSL сертификатов/ключей
                 err_str = str(err)
+                last_err = err
                 if 'failed' in err_str and (
                     'ssl.ca.location' in err_str or 
                     'ssl.certificate.location' in err_str or 
                     'ssl.key.location' in err_str
                 ):
-                    conf = hook.get_connection(conn_id).extra_dejson
-                    
                     # 1. Если упал CA, пробуем системный бандл
                     if 'ssl.ca.location failed' in err_str:
                         sys_ca = next((p for p in ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt'] if os.path.exists(p)), None)
@@ -154,13 +168,13 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
                             logger.warning("Kafka SSL CA failed, retrying with system bundle: %s", sys_ca)
                             conf['ssl.ca.location'] = sys_ca
                             try:
-                                from confluent_kafka.admin import AdminClient
                                 admin = AdminClient(conf)
                                 meta = admin.list_topics(timeout=15)
                                 result = sorted(meta.topics.keys())[:10]
                                 add_note(f"⚠️ Kafka SSL CA workaround: used {sys_ca}", context)
                                 return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
                             except KafkaException as err2:
+                                last_err = err2
                                 err_str = str(err2) # Обновляем ошибку для следующего шага
                                 logger.info("Kafka SSL still failing after CA fix: %s", err_str)
 
@@ -177,30 +191,32 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
                         conf['ssl.endpoint.identification.algorithm'] = 'none'
                         
                         try:
-                            from confluent_kafka.admin import AdminClient
                             admin = AdminClient(conf)
                             meta = admin.list_topics(timeout=15)
                             result = sorted(meta.topics.keys())[:10]
                             add_note("⚠️ Kafka SSL workaround: certificate verification DISABLED", context)
                             return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
                         except Exception as err3:
+                            last_err = err3
                             logger.error("Kafka failed even with disabled verification: %s", err3)
                     
                     # 3. Если ничего не помогло, проверяем существование файлов для диагностики
                     missing_files = []
+                    # Используем исходный конфиг для диагностики путей
+                    diag_conf = KafkaAdminClientHook(kafka_config_id=conn_id).get_connection(conn_id).extra_dejson
                     for k in ('ssl.certificate.location', 'ssl.key.location', 'ssl.ca.location'):
-                        path = conf.get(k)
+                        path = diag_conf.get(k)
                         if path and not os.path.exists(path):
                             missing_files.append(f"{k}='{path}'")
                     
                     if missing_files:
                         msg = f"❌ Kafka SSL ERROR: missing files on worker: {', '.join(missing_files)}"
                         add_note(msg, context, level='task', title=f"❌ {conn_id}")
-                        raise AirflowFailException(msg) from err
+                        raise AirflowFailException(msg) from last_err
                     
-                    raise
+                    raise AirflowFailException(f"Kafka error: {last_err}") from last_err
                 else:
-                    raise
+                    raise AirflowFailException(f"Kafka error: {err}") from err
 
         elif conn_type == 'trino':
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore

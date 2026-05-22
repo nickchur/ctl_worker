@@ -136,40 +136,39 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
     logger.info(f"📝 Note added to {level} {title}:\n{msg}")
     
     # Используем новый контекстный менеджер для чистой сессии
-    with create_session() as session:
-        for l in list(set(level.upper().split(',')))[:2]:
-            new_note = msg.strip()
-            # Определяем объект (DagRun или TaskInstance)
-            if l == 'DAG':
-                obj = session.merge(context['dag_run'])
-            else:
-                obj = session.merge(context['task_instance'])
-            session.expire(obj)  # перечитать из БД: другой параллельный таск мог уже создать заметку
-            
-            # Логика заголовка
-            if title:
-                import unicodedata
-                # Если первый символ не эмодзи, то добавляем эмодзи
-                if not unicodedata.category(title[0]) == 'So':
-                    title = "📝 " + title
-
-                new_note = f"{title}\n---\n{new_note}"
-
-            if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
-                continue
+    try:
+        with create_session() as session:
+            for l in list(set(level.upper().split(',')))[:2]:
+                new_note = msg.strip()
+                # Определяем объект (DagRun или TaskInstance)
+                if l == 'DAG':
+                    obj = session.merge(context['dag_run'])
+                else:
+                    obj = session.merge(context['task_instance'])
+                session.expire(obj)  # перечитать из БД: другой параллельный таск мог уже создать заметку
                 
-            # Логика склейки заметки
-            # if add and obj.note:
-            if add:
-                new_note = f"{ new_note}\n\n---\n{obj.note if obj.note else '' }"
-                
-            # Лимит длины
-            try:
+                # Логика заголовка
+                if title:
+                    import unicodedata
+                    # Если первый символ не эмодзи, то добавляем эмодзи
+                    if not unicodedata.category(title[0]) == 'So':
+                        title = "📝 " + title
+
+                    new_note = f"{title}\n---\n{new_note}"
+
+                if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
+                    continue
+                    
+                # Логика склейки заметки
+                if add:
+                    new_note = f"{ new_note}\n\n---\n{obj.note if obj.note else '' }"
+                    
+                # Лимит длины
                 obj.note = new_note[:MAX_NOTE_LEN]
-                session.commit()
-            except Exception as e:
-                session.rollback()
-                logger.warning(f"Failed to update note for {l}: {e}")
+            
+            session.commit() # Явный коммит внутри контекста
+    except Exception as e:
+        logger.warning(f"Failed to update note: {e}")
 
 def on_callback(context, level=None): return _on_callback(context, level)
 

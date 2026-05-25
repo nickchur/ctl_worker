@@ -40,8 +40,11 @@ from airflow.models import Connection
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
-from plugins.ctl_core import chk_any_conn  # type: ignore
-from plugins.utils import add_note          # type: ignore
+try:
+    from plugins.ctl_core import chk_any_conn  # type: ignore
+    from plugins.utils import add_note          # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import add_note, chk_any_conn         # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")

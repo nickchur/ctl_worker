@@ -10,7 +10,10 @@ from airflow.configuration import get_custom_secret_backend
 from airflow.models import Connection, Variable
 from airflow.decorators import task, dag
 
-from plugins.utils import add_note
+try:
+    from plugins.utils import add_note  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import add_note  # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")

@@ -235,7 +235,7 @@ def _test_one(conn_id: str, conn_type: str, **context) -> dict:
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
     },
-    start_date=pendulum.datetime(2026, 1, 21, tz=pendulum.UTC),
+    start_date=pendulum.datetime(2026, 1, 1, tz=pendulum.UTC),
     schedule_interval=None,
     tags=['DataLab', 'tools', 'conn', 'AutoQA'],
     catchup=False,

@@ -18,19 +18,16 @@ logger = getLogger("airflow.task")
 
 @dag(
     doc_md=__doc__,
-    owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
-        'retries': 0,
-        'retry_delay': pendulum.duration(seconds=30),
+        'retries': 2,
     },
-    start_date=pendulum.datetime(2026, 1, 21, tz=pendulum.UTC),
+    start_date=pendulum.datetime(2026, 1, 1, tz=pendulum.UTC),
     schedule_interval=None,
-    tags=['EDP_ETL', 'tools'],
+    tags=['EDP_ETL', 'tools', 'conn', 'AutoQA'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
-    max_active_tasks=1,
 )
 def tools_show_connections():
 

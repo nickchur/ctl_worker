@@ -220,18 +220,17 @@ def _test_one(conn_id: str, conn_type: str, **context) -> dict:
 )
 def tools_test_connections():
 
-    all_tasks = []
+    groups = []
 
     # --- TFS group (priority) ---
-    # Все TFS-коннекты — S3 (conn_type='aws'), проверяем как S3 независимо от conn_type объекта.
     if _tfs_group:
-        with TaskGroup(group_id='tfs', tooltip=_GROUP_TOOLTIP['tfs']):
+        with TaskGroup(group_id='tfs', tooltip=_GROUP_TOOLTIP['tfs']) as tg_tfs:
             for conn_id, conn in sorted(_tfs_group.items()):
-                t = task(
+                task(
                     task_id=_safe_id(conn_id),
                     doc_md=f'Проверка `{conn_id}` (S3)',
                 )(_test_one)(conn_id=conn_id, conn_type='aws')
-                all_tasks.append(t)
+        groups.append(tg_tfs)
 
     # --- Type groups ---
     for group_name in ('postgres', 's3', 'ctl', 'clickhouse', 'kafka', 'trino', 'other'):
@@ -239,14 +238,13 @@ def tools_test_connections():
         if not conns:
             continue
         tooltip = _GROUP_TOOLTIP.get(group_name, group_name)
-        with TaskGroup(group_id=group_name, tooltip=tooltip):
+        with TaskGroup(group_id=group_name, tooltip=tooltip) as tg:
             for conn_id, conn in sorted(conns.items()):
-                # aws conn_type нормализован в 's3' для группы, но conn_type у объекта — 'aws'
-                t = task(
+                task(
                     task_id=_safe_id(conn_id),
                     doc_md=f'Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)',
                 )(_test_one)(conn_id=conn_id, conn_type=conn.conn_type)
-                all_tasks.append(t)
+        groups.append(tg)
 
     # --- Summary ---
     @task(task_id='summary', trigger_rule=TriggerRule.ALL_DONE)
@@ -287,8 +285,8 @@ def tools_test_connections():
         return {'ok': ok, 'fail': fail, 'skip': skip}
 
     summary_task = summary()
-    if all_tasks:
-        all_tasks >> summary_task
+    if groups:
+        groups >> summary_task
 
 
 tools_test_connections()

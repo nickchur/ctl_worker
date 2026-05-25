@@ -36,7 +36,7 @@ import pendulum
 from airflow.configuration import get_custom_secret_backend
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException, AirflowFailException
-from airflow.models import Connection
+from airflow.models import Connection, Variable
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
@@ -75,13 +75,37 @@ _GROUP_TOOLTIP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connection]]]:
-    """Читает secret backend и возвращает (tfs_group, type_groups)."""
+    """Читает Variable 'local_connections' или secret backend и возвращает (tfs_group, type_groups)."""
+    local_connections: dict[str, Connection] = {}
+
+    # 1. Пробуем загрузить из Variable (созданной в show_connections)
     try:
-        backend = get_custom_secret_backend()
-        local_connections: dict[str, Connection] = getattr(backend, '_local_connections', {})
+        var_data = Variable.get('local_connections', deserialize_json=True, default_var=None)
+        if var_data:
+            for ctype, conns in var_data.items():
+                for c in conns:
+                    # Нам нужно восстановить объект Connection для корректной фильтрации и работы тасков.
+                    # show_connections переименовал sqlite в clickhouse, восстанавливаем обратно если нужно.
+                    local_connections[c['conn_id']] = Connection(
+                        conn_id=c['conn_id'],
+                        conn_type=c.get('conn_type') or (ctype if ctype != 'clickhouse' else 'sqlite'),
+                        host=c['host'],
+                        port=c['port'],
+                        schema=c['schema'],
+                        description=c['description'],
+                        extra=c['extra']
+                    )
     except Exception as exc:
-        logger.warning("Не удалось прочитать secret backend: %s", exc)
-        return {}, defaultdict(dict)
+        logger.warning("Не удалось прочитать Variable local_connections: %s", exc)
+
+    # 2. Если Variable пуста или не найдена, читаем напрямую из secret backend
+    if not local_connections:
+        try:
+            backend = get_custom_secret_backend()
+            local_connections = getattr(backend, '_local_connections', {})
+        except Exception as exc:
+            logger.warning("Не удалось прочитать secret backend: %s", exc)
+            return {}, defaultdict(dict)
 
     tfs_group = {
         cid: conn

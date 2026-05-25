@@ -128,11 +128,18 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
             result = hook.get_records('SELECT version()')
 
         elif conn_type == 'kafka':
-            from airflow.providers.apache.kafka.hooks.client import KafkaAdminClientHook  # type: ignore
-            hook = KafkaAdminClientHook(kafka_config_id=conn_id)
-            admin = hook.get_conn()
+            import confluent_kafka.admin as kafka_admin
+            from airflow.hooks.base import BaseHook
+            
+            conn = BaseHook.get_connection(conn_id)
+            conf = conn.extra_dejson.copy()
+            if 'bootstrap.servers' not in conf:
+                conf['bootstrap.servers'] = f"{conn.host}:{conn.port or 9092}"
+            
+            # Используем напрямую класс из модуля
+            client = kafka_admin.AdminClient(conf)
             # Увеличиваем таймаут до 15 секунд
-            meta = admin.list_topics(timeout=15)
+            meta = client.list_topics(timeout=15)
             result = sorted(meta.topics.keys())[:10]
 
         elif conn_type == 'trino':

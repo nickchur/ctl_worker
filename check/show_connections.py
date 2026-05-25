@@ -7,7 +7,7 @@ from collections import defaultdict
 
 import pendulum
 from airflow.configuration import get_custom_secret_backend
-from airflow.models import Connection
+from airflow.models import Connection, Variable
 from airflow.decorators import task, dag
 
 from plugins.utils import add_note
@@ -65,6 +65,10 @@ def tools_show_connections():
         import pandas as pd
         df = pd.DataFrame(rows)[['conn_type', 'conn_id', 'host', 'port', 'schema', 'description']]
         add_note(f"```\n{df.to_string(index=False)}\n```", context, level='DAG,task', title=f"Connections ({len(rows)})")
+        
+        # Сохраняем в Variable для дальнейшего использования
+        Variable.set('local_connections', by_type, serialize_json=True)
+        
         return dict(by_type)
 
     show_connections()

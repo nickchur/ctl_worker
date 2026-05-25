@@ -107,6 +107,8 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
             logger.warning("Не удалось прочитать secret backend: %s", exc)
             return {}, defaultdict(dict)
 
+    logger.info("Found %d local connections total", len(local_connections))
+
     tfs_group = {
         cid: conn
         for cid, conn in local_connections.items()
@@ -127,6 +129,9 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
         elif group not in _TYPE_MAP and group not in ('clickhouse', 'kafka', 'trino'):
             group = 'other'
         type_groups[group][cid] = conn
+
+    for gname, gconns in type_groups.items():
+        logger.info("Group '%s' has %d connections", gname, len(gconns))
 
     return tfs_group, type_groups
 
@@ -150,8 +155,7 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
     try:
         if conn_type in ('sqlite', 'clickhouse'):
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook  # type: ignore
-            # Используем таймауты для clickhouse-driver
-            hook = ClickHouseHook(clickhouse_conn_id=conn_id, connect_timeout=15, send_receive_timeout=15)
+            hook = ClickHouseHook(clickhouse_conn_id=conn_id)
             result = hook.get_records('SELECT version()')
 
         elif conn_type == 'kafka':
@@ -163,16 +167,13 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
             if 'bootstrap.servers' not in conf:
                 conf['bootstrap.servers'] = f"{conn.host}:{conn.port or 9092}"
             
-            # Используем напрямую класс из модуля
             client = kafka_admin.AdminClient(conf)
-            # Увеличиваем таймаут до 15 секунд
             meta = client.list_topics(timeout=15)
             result = sorted(meta.topics.keys())[:10]
 
         elif conn_type == 'trino':
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
-            # TrinoHook может принимать дополнительные параметры для trino.dbapi.connect
-            hook = TrinoHook(trino_conn_id=conn_id, request_timeout=15)
+            hook = TrinoHook(trino_conn_id=conn_id)
             result = hook.get_first('SELECT current_user, current_catalog, current_schema')
 
         else:
@@ -249,10 +250,14 @@ def tools_test_connections():
     if _tfs_group:
         with TaskGroup(group_id='tfs', tooltip=_GROUP_TOOLTIP['tfs']) as tg_tfs:
             for conn_id, conn in sorted(_tfs_group.items()):
-                task(
+                @task(
                     task_id=_safe_id(conn_id),
                     doc_md=f'Проверка `{conn_id}` (S3)',
-                )(_test_one)(conn_id=conn_id, conn_type='aws')
+                )
+                def tfs_task(cid=conn_id, **kwargs):
+                    return _test_one(cid, conn_type='aws', **kwargs)
+                
+                tfs_task()
         groups.append(tg_tfs)
 
     # --- Type groups ---
@@ -263,10 +268,14 @@ def tools_test_connections():
         tooltip = _GROUP_TOOLTIP.get(group_name, group_name)
         with TaskGroup(group_id=group_name, tooltip=tooltip) as tg:
             for conn_id, conn in sorted(conns.items()):
-                task(
+                @task(
                     task_id=_safe_id(conn_id),
                     doc_md=f'Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)',
-                )(_test_one)(conn_id=conn_id, conn_type=conn.conn_type)
+                )
+                def check_task(cid=conn_id, ctype=conn.conn_type, **kwargs):
+                    return _test_one(cid, ctype, **kwargs)
+                
+                check_task()
         groups.append(tg)
 
     # --- Summary ---

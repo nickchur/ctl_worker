@@ -35,6 +35,8 @@ from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_to_postgres import 
 from sber_app_dataplatform_etl_core.hrp_operators.postgres_to_clickhouse import HrpPostgresToClickhouseOperator
 from sber_app_dataplatform_etl_core.hrp_operators.s3_to_s3 import HrpS3ToS3Operator
 from sber_app_dataplatform_etl_core.hrp_operators.s3_file_hash import HrpCheckS3FileHash
+from sber_app_dataplatform_etl_core.hrp_operators.s3_archive import HrpS3ArchiveOperator
+from sber_app_dataplatform_etl_core.hrp_operators.postgres_ddl import HrpPostgresDDL
 
 # Дефолтные настройки
 DEFAULT_PG_CONN = 'airflowdb'
@@ -181,7 +183,7 @@ def test_hrp_operators_dag():
             replace=True
         )
 
-        native_ch = HrpClickNativeToS3Operator(
+        HrpClickNativeToS3Operator(
             task_id='ch_native_to_s3',
             sql="SELECT * FROM technical.test_hrp_operators",
             s3_bucket="{{ params.s3_bucket }}",
@@ -191,7 +193,7 @@ def test_hrp_operators_dag():
             replace=True
         )
 
-        native_ch_json = HrpClickNativeToS3Operator(
+        HrpClickNativeToS3Operator(
             task_id='ch_native_to_s3_json',
             sql="SELECT * FROM technical.test_hrp_operators",
             s3_bucket="{{ params.s3_bucket }}",
@@ -217,6 +219,17 @@ def test_hrp_operators_dag():
             replace=True
         )
 
+        HrpS3ArchiveOperator(
+            task_id='s3_archive',
+            s3_keys_source=[DEFAULT_S3_PREFIX + 'test_pg.csv'],
+            s3_bucket_source="{{ params.s3_bucket }}",
+            aws_conn_id_source="{{ params.s3_conn_id }}",
+            s3_bucket="{{ params.s3_bucket }}",
+            s3_key=DEFAULT_S3_PREFIX + 'archive/test_pg.zip',
+            aws_conn_id="{{ params.s3_conn_id }}",
+            replace=True
+        )
+
         HrpCheckS3FileHash(
             task_id='s3_check_hash',
             s3_bucket="{{ params.s3_bucket }}",
@@ -235,7 +248,7 @@ def test_hrp_operators_dag():
             target_schema='public',
             source_conn_id="{{ params.pg_conn_id }}",
             target_conn_id="{{ params.pg_conn_id }}",
-            pre_sql="CREATE TABLE IF NOT EXISTS public.test_hrp_operators_copy (LIKE public.test_hrp_operators INCLUDING ALL); TRUNCATE TABLE public.test_hrp_operators_copy;"
+            truncate=True
         )
 
         HrpClickhouseToPostgresOperator(
@@ -245,7 +258,7 @@ def test_hrp_operators_dag():
             target_schema='public',
             clickhouse_conn_id="{{ params.ch_conn_id }}",
             target_conn_id="{{ params.pg_conn_id }}",
-            pre_sql="CREATE TABLE IF NOT EXISTS public.test_hrp_operators_from_ch (LIKE public.test_hrp_operators INCLUDING ALL); TRUNCATE TABLE public.test_hrp_operators_from_ch;"
+            truncate=True
         )
 
         HrpPostgresToClickhouseOperator(
@@ -256,7 +269,14 @@ def test_hrp_operators_dag():
             target_schema='technical',
             source_conn_id="{{ params.pg_conn_id }}",
             target_conn_id="{{ params.ch_conn_id }}",
-            pre_sql="CREATE TABLE IF NOT EXISTS technical.test_hrp_operators_from_pg AS technical.test_hrp_operators; TRUNCATE TABLE technical.test_hrp_operators_from_pg;"
+            target_truncate=True
+        )
+
+        HrpPostgresDDL(
+            task_id='pg_ddl_test',
+            table_name='test_hrp_operators',
+            schema='public',
+            postgres_conn_id="{{ params.pg_conn_id }}"
         )
 
     @task(trigger_rule=TriggerRule.ALL_DONE)

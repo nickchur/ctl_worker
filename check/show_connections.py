@@ -24,7 +24,7 @@ logger = getLogger("airflow.task")
     },
     start_date=pendulum.datetime(2026, 1, 1, tz=pendulum.UTC),
     schedule_interval=None,
-    tags=['EDP_ETL', 'tools', 'conn', 'AutoQA'],
+    tags=['DataLab', 'tools', 'conn', 'AutoQA'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

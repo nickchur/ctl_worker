@@ -230,14 +230,13 @@ def _test_one(conn_id: str, conn_type: str, **context) -> dict:
 
 @dag(
     doc_md=__doc__,
-    owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
-        'retries': 0,
+        'retries': 2,
     },
     start_date=pendulum.datetime(2026, 1, 21, tz=pendulum.UTC),
     schedule_interval=None,
-    tags=['EDP_ETL', 'tools', 'conn'],
+    tags=['DataLab', 'tools', 'conn', 'AutoQA'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

@@ -80,7 +80,7 @@ def tools_show_connections():
         add_note(table_str, context, level='DAG,task', title=f"Connections ({len(rows)})")
         
         # Сохраняем в Variable для дальнейшего использования
-        Variable.set('local_connections', by_type, serialize_json=True)
+        Variable.set('local_connections', dict(by_type), serialize_json=True)
         
         return dict(by_type)
 

@@ -70,9 +70,14 @@ def tools_show_connections():
                 logger.info("  [%s] %s: %s", conn_type, c['conn_id'], c['description'])
                 rows.append({'conn_type': conn_type, **c})
 
-        import pandas as pd
-        df = pd.DataFrame(rows)[['conn_type', 'conn_id', 'host', 'port', 'schema', 'description']]
-        add_note(f"```\n{df.to_string(index=False)}\n```", context, level='DAG,task', title=f"Connections ({len(rows)})")
+        # Формируем Markdown таблицу без pandas
+        headers = ['conn_type', 'conn_id', 'host', 'port', 'schema', 'description']
+        table_lines = ["| " + " | ".join(headers) + " |", "|-" + "-|-".join([""] * len(headers)) + "-|"]
+        for row in rows:
+            table_lines.append("| " + " | ".join(str(row.get(h, '')) for h in headers) + " |")
+        
+        table_str = "\n".join(table_lines)
+        add_note(table_str, context, level='DAG,task', title=f"Connections ({len(rows)})")
         
         # Сохраняем в Variable для дальнейшего использования
         Variable.set('local_connections', by_type, serialize_json=True)

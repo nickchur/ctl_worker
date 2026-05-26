@@ -51,6 +51,8 @@ def tools_show_connections():
             return msg
 
         local_connections: dict[str, Connection] = backend._local_connections
+        logger.info("Loaded %d connections from backend", len(local_connections))
+        
         by_type = defaultdict(list)
         for conn_id, conn in local_connections.items():
             by_type[conn.conn_type].append({

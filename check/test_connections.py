@@ -12,6 +12,7 @@
 | **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
 | **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
 | **trino** | тип `trino` | Валидация сессии через `TrinoHook` |
+| **redis** | тип `redis` | Проверка доступности через `RedisHook.get_conn().ping()` |
 | **other** | прочие | Помечаются символом `☮️` (пропуск) |
 
 **Особенности:**
@@ -60,6 +61,7 @@ _GROUP_TOOLTIP: dict[str, str] = {
     'clickhouse': 'ClickHouse',
     'kafka':      'Kafka',
     'trino':      'Trino',
+    'redis':      'Redis',
     'other':      'Прочие соединения',
 }
 
@@ -161,6 +163,11 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
             hook = TrinoHook(trino_conn_id=conn_id)
             result = hook.get_first('SELECT current_user, current_catalog, current_schema')
 
+        elif conn_type == 'redis':
+            from airflow.providers.redis.hooks.redis import RedisHook  # type: ignore
+            hook = RedisHook(redis_conn_id=conn_id)
+            result = f"PONG: {hook.get_conn().ping()}"
+
         else:
             raise AirflowFailException(f"Unsupported conn_type: {conn_type}")
 
@@ -184,7 +191,7 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
         raise AirflowFailException(f"{msg}: {err}") from err
 
 
-_NATIVE_TYPES = frozenset(('sqlite', 'clickhouse', 'kafka', 'trino'))
+_NATIVE_TYPES = frozenset(('sqlite', 'clickhouse', 'kafka', 'trino', 'redis'))
 
 
 def _test_one(conn_id: str, conn_type: str, **context) -> dict:
@@ -249,7 +256,7 @@ def tools_test_connections():
         groups.append(tg_tfs)
 
     # --- Type groups ---
-    for group_name in ('postgres', 's3', 'ctl', 'clickhouse', 'kafka', 'trino', 'other'):
+    for group_name in ('postgres', 's3', 'ctl', 'clickhouse', 'kafka', 'trino', 'redis', 'other'):
         conns = _type_groups.get(group_name, {})
         if not conns:
             continue

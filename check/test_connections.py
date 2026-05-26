@@ -288,12 +288,13 @@ def tools_test_connections():
         ok = fail = skip = 0
         error_rows = []
         all_rows = []
+        durations = []
+        icons = []
+        
         for ti in tis:
-            if ti.task_id == 'summary':
+            if ti.task_id == 'summary' or ti.task_id == 'check_variable':
                 continue
             
-            # Если state is None, значит таск не запустился (OOM, сбой планировщика и т.д.)
-            # Считаем это критической ошибкой (failed), а не пропуском.
             state = ti.state
             if state == 'success':
                 icon = '✅'; ok += 1
@@ -302,9 +303,16 @@ def tools_test_connections():
                 error_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} |")
             else:
                 icon = '☮️'; skip += 1
+            
+            icons.append(icon)
+            if ti.duration:
+                durations.append(ti.duration)
+                
             all_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} |")
 
-        headline = f"✅ {ok} / ❌ {fail} / ☮️ {skip}"
+        avg_time = sum(durations) / len(durations) if durations else 0
+        graph = "".join(icons)
+        headline = f"{graph}\n\n✅ {ok} / ❌ {fail} / ☮️ {skip} | 🕒 Avg: {avg_time:.2f}s"
         
         if fail > 0:
             table = '| Соединение | Статус |\n|---|---|\n' + '\n'.join(error_rows)
@@ -315,7 +323,7 @@ def tools_test_connections():
         table = '| Соединение | Статус |\n|---|---|\n' + '\n'.join(all_rows)
         add_note(table, context, level='DAG', title=headline)
         logger.info("summary: %s", headline)
-        return {'ok': ok, 'fail': fail, 'skip': skip}
+        return {'ok': ok, 'fail': fail, 'skip': skip, 'avg_time': avg_time}
 
     # --- Variable Check ---
     @task(task_id='check_variable')

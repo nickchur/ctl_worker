@@ -60,10 +60,15 @@ DEFAULT_S3_PREFIX = 'hrp_tests/'
 
 @dag(
     dag_id='test_hrp_operators',
-    schedule_interval=None,
+    ci='CI02420667',
+    schedule_interval='@once',
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     catchup=False,
+    is_paused_upon_creation=False,
     tags=['test', 'hrp', 'operators'],
+    default_args={
+        'owner': 'DataLab (CI02420667)',
+    },
     params={
         "pg_conn_id": Param(DEFAULT_PG_CONN, type="string"),
         "ch_conn_id": Param(DEFAULT_CH_CONN, type="string"),

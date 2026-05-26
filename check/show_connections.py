@@ -28,16 +28,17 @@ logger = getLogger("airflow.task")
 
 
 @dag(
+    ci='CI02420667',
     doc_md=__doc__,
     default_args={
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
     },
     start_date=pendulum.datetime(2026, 1, 1, tz=pendulum.UTC),
-    schedule_interval=None,
+    schedule_interval='@once',
     tags=['DataLab', 'tools', 'conn', 'AutoQA'],
     catchup=False,
-    is_paused_upon_creation=True,
+    is_paused_upon_creation=False,
     max_active_runs=1,
 )
 def tools_show_connections():

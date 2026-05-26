@@ -190,12 +190,15 @@ _NATIVE_TYPES = frozenset(('sqlite', 'clickhouse', 'kafka', 'trino'))
 def _test_one(conn_id: str, conn_type: str, **context) -> dict:
     """Проверяет одно соединение.
 
-    Postgres/S3/HTTP — через chk_any_conn; ClickHouse/Kafka/Trino — напрямую.
+    Postgres/S3/HTTP — через chk_any_conn (типы ctl* маппятся на KerberosHttp); 
+    ClickHouse/Kafka/Trino — напрямую.
     Неподдерживаемый тип — skip-заметка без ошибки.
     """
     chk_type = _TYPE_MAP.get(conn_type)
     if chk_type is None and conn_type.startswith('ctl'):
         chk_type = 'KerberosHttp'
+        logger.info("Connection '%s' has ctl-like type '%s', mapping to 'KerberosHttp'", conn_id, conn_type)
+
     if chk_type is not None:
         data = {'type': chk_type, 'conn_id': conn_id}
         chk_any_conn(id=conn_id, data=data, **context)

@@ -291,15 +291,18 @@ def tools_test_connections():
         for ti in tis:
             if ti.task_id == 'summary':
                 continue
-            state = ti.state or 'none'
+            
+            # Если state is None, значит таск не запустился (OOM, сбой планировщика и т.д.)
+            # Считаем это критической ошибкой (failed), а не пропуском.
+            state = ti.state
             if state == 'success':
                 icon = '✅'; ok += 1
-            elif state in ('failed', 'upstream_failed'):
+            elif state in ('failed', 'upstream_failed') or state is None:
                 icon = '❌'; fail += 1
-                error_rows.append(f"| `{ti.task_id}` | {icon} {state} |")
+                error_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} |")
             else:
                 icon = '☮️'; skip += 1
-            all_rows.append(f"| `{ti.task_id}` | {icon} {state} |")
+            all_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} |")
 
         headline = f"✅ {ok} / ❌ {fail} / ☮️ {skip}"
         

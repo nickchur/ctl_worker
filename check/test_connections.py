@@ -283,7 +283,8 @@ def tools_test_connections():
             )
 
         ok = fail = skip = 0
-        rows = []
+        error_rows = []
+        all_rows = []
         for ti in tis:
             if ti.task_id == 'summary':
                 continue
@@ -292,12 +293,20 @@ def tools_test_connections():
                 icon = '✅'; ok += 1
             elif state in ('failed', 'upstream_failed'):
                 icon = '❌'; fail += 1
+                error_rows.append(f"| `{ti.task_id}` | {icon} {state} |")
             else:
                 icon = '☮️'; skip += 1
-            rows.append(f"| `{ti.task_id}` | {icon} {state} |")
+            all_rows.append(f"| `{ti.task_id}` | {icon} {state} |")
 
-        table = '| Соединение | Статус |\n|---|---|\n' + '\n'.join(rows)
         headline = f"✅ {ok} / ❌ {fail} / ☮️ {skip}"
+        
+        if fail > 0:
+            table = '| Соединение | Статус |\n|---|---|\n' + '\n'.join(error_rows)
+            add_note(table, context, level='DAG', title=headline)
+            logger.info("summary: %s", headline)
+            raise AirflowFailException(f"Connections check failed: {headline}")
+        
+        table = '| Соединение | Статус |\n|---|---|\n' + '\n'.join(all_rows)
         add_note(table, context, level='DAG', title=headline)
         logger.info("summary: %s", headline)
         return {'ok': ok, 'fail': fail, 'skip': skip}

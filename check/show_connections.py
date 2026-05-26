@@ -1,6 +1,14 @@
-"""### 🔌 Список Airflow Connections
+"""### 🔌 DAG: Список Airflow Connections
 
-Показывает все подключения из secret backend, сгруппированные по типу.
+Выводит список всех подключений из secret backend, сгруппированных по их типу. 
+Используется для аудита доступных соединений и верификации конфигурации backend'а.
+
+| Функция | Описание |
+|---|---|
+| **Группировка** | Все соединения распределяются по `conn_type` |
+| **Аудит** | Вывод `host`, `port`, `schema` и `description` для каждого ID |
+| **Кэширование** | Сохраняет результат в Airflow Variable `local_connections` для ускорения работы `test_connections` |
+| **ClickHouse** | Автоматически подменяет `sqlite` на `clickhouse` для корректного отображения |
 """
 
 from collections import defaultdict

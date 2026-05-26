@@ -1,30 +1,23 @@
-"""### 🔌 Проверка всех Airflow Connections
+"""### 🔌 DAG: Проверка Airflow Connections
 
-Для каждого подключения из secret backend создаёт отдельный таск.
-Таски сгруппированы по типу соединения; коннекты с `tfs` в имени — отдельная группа.
+Автоматизированный аудит и тестирование всех подключений из secret backend. 
+Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
 
-| Группа | Условие |
-|---|---|
-| `tfs` | `tfs` в conn_id **и** conn_type == `aws` |
-| `s3` | conn_type == `aws`, без `tfs` в имени |
-| `postgres` | conn_type == `postgres` |
-| `ctl` | conn_type == `http` или `ctl*` |
-| `clickhouse` | conn_type == `sqlite` или `clickhouse` |
-| `kafka` | conn_type == `kafka` |
-| `trino` | conn_type == `trino` |
-| `other` | всё остальное |
+| Группа | Условие (conn_id / type) | Описание проверки |
+|---|---|---|
+| **tfs** | `tfs` в ID **и** тип `aws` | Проверка S3-бакетов через `list_buckets()` |
+| **s3** | тип `aws` (без tfs) | Проверка прав доступа к объектному хранилищу |
+| **postgres** | тип `postgres` | `SELECT current_user, current_database()` |
+| **ctl** | тип `http` или `ctl*` | Вызов `GET /v5/api/info` (Kerberos Auth) |
+| **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
+| **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
+| **trino** | тип `trino` | Валидация сессии через `TrinoHook` |
+| **other** | прочие | Помечаются символом `☮️` (пропуск) |
 
-Поддерживаемые типы проверок:
-- **postgres** → `SELECT current_user, current_database(), inet_server_addr()`
-- **s3** → `list_buckets()`
-- **ctl / http** → `KerberosHttp GET /v5/api/info`
-- **clickhouse** → `SELECT version()` через `ClickHouseHook`
-- **kafka** → `list_topics()` через `KafkaAdminClientHook`
-- **trino** → `SELECT current_user, current_catalog, current_schema` через `TrinoHook`
-- остальные → `☮️ пропуск`
-
-**Таски** независимы — сбой одного не блокирует остальные.
-**summary** — финальный таск (`trigger_rule=all_done`), пишет таблицу ✅/❌/☮️ в DAG note.
+**Особенности:**
+- **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
+- **Диагностика**: При сбое Kafka выполняется TCP Ping для разделения ошибок FW и SSL.
+- **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
 """
 
 import os

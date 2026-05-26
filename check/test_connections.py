@@ -69,7 +69,7 @@ _GROUP_TOOLTIP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connection]]]:
-    """Читает Variable 'local_connections' или secret backend и возвращает (tfs_group, type_groups)."""
+    """Читает Variable 'local_connections' и возвращает (tfs_group, type_groups)."""
     local_connections: dict[str, Connection] = {}
 
     # 1. Пробуем загрузить из Variable (созданной в show_connections)
@@ -91,15 +91,6 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
                     )
     except Exception as exc:
         logger.warning("Не удалось прочитать Variable local_connections: %s", exc)
-
-    # 2. Если Variable пуста или не найдена, читаем напрямую из secret backend
-    if not local_connections:
-        try:
-            backend = get_custom_secret_backend()
-            local_connections = getattr(backend, '_local_connections', {})
-        except Exception as exc:
-            logger.warning("Не удалось прочитать secret backend: %s", exc)
-            return {}, defaultdict(dict)
 
     logger.info("Found %d local connections total", len(local_connections))
 

@@ -28,7 +28,6 @@ logger = getLogger("airflow.task")
 
 
 @dag(
-    ci='CI02420667',
     doc_md=__doc__,
     default_args={
         'owner': 'DataLab (CI02420667)',

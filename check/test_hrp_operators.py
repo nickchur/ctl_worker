@@ -60,7 +60,6 @@ DEFAULT_S3_PREFIX = 'hrp_tests/'
 
 @dag(
     dag_id='test_hrp_operators',
-    ci='CI02420667',
     schedule_interval='@once',
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     catchup=False,

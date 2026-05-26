@@ -218,7 +218,6 @@ def _test_one(conn_id: str, conn_type: str, **context) -> dict:
 # ---------------------------------------------------------------------------
 
 @dag(
-    ci='CI02420667',
     doc_md=__doc__,
     default_args={
         'owner': 'DataLab (CI02420667)',

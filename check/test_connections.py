@@ -45,11 +45,16 @@ from logging import getLogger
 logger = getLogger("airflow.task")
 
 
-# Маппинг Airflow conn_type → тип для chk_any_conn
-_TYPE_MAP: dict[str, str] = {
-    'postgres': 'Postgres',
-    'aws':      'S3',
-    'http':     'KerberosHttp',
+# Маппинг Airflow conn_type → тип для chk_any_conn / нативная логика
+_CONN_CONFIG: dict[str, str] = {
+    'postgres':   'Postgres',
+    'aws':         'S3',
+    'http':        'KerberosHttp',
+    'sqlite':      'ClickHouse',
+    'clickhouse':  'ClickHouse',
+    'kafka':       'Kafka',
+    'trino':       'Trino',
+    'redis':       'Redis',
 }
 
 # Заголовки групп для tooltip в UI
@@ -113,7 +118,7 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
             group = 's3'
         elif group == 'http' or group.startswith('ctl'):
             group = 'ctl'
-        elif group not in _TYPE_MAP and group not in ('clickhouse', 'kafka', 'trino'):
+        elif group not in _CONN_CONFIG:
             group = 'other'
         type_groups[group][cid] = conn
 
@@ -132,20 +137,43 @@ def _safe_id(conn_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Функция проверки одного соединения
+# Объединенная функция проверки соединений
 # ---------------------------------------------------------------------------
 
-def _check_native(conn_id: str, conn_type: str, **context) -> dict:
-    """Проверяет ClickHouse / Kafka / Trino напрямую (без chk_any_conn)."""
+def _run_test(conn_id: str, conn_type: str, **context) -> dict:
+    """Единая точка входа для проверки всех типов соединений.
+
+    Postgres/S3/HTTP — через chk_any_conn (типы ctl* маппятся на KerberosHttp); 
+    ClickHouse/Kafka/Trino/Redis — напрямую.
+    """
     ti = context['ti']
     ts = time.time()
+    
+    # 1. Маппинг типа
+    chk_type = _CONN_CONFIG.get(conn_type)
+    if chk_type is None and conn_type.startswith('ctl'):
+        chk_type = 'KerberosHttp'
+        logger.info("Connection '%s' has ctl-like type '%s', mapping to 'KerberosHttp'", conn_id, conn_type)
+
+    if chk_type is None:
+        msg = f"☮️ conn_type='{conn_type}' — проверка не реализована"
+        add_note(msg, context, level='task', title=f"☮️ {conn_id}")
+        logger.info(msg)
+        return {'status': 'skip', 'conn_id': conn_id, 'conn_type': conn_type}
+
     try:
-        if conn_type in ('sqlite', 'clickhouse'):
+        # 2. Выполнение проверки
+        if chk_type in ('Postgres', 'S3', 'KerberosHttp'):
+            data = {'type': chk_type, 'conn_id': conn_id}
+            chk_any_conn(id=conn_id, data=data, **context)
+            result = "Success via chk_any_conn"
+
+        elif chk_type == 'ClickHouse':
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook  # type: ignore
             hook = ClickHouseHook(clickhouse_conn_id=conn_id)
             result = hook.execute('SELECT version()')
 
-        elif conn_type == 'kafka':
+        elif chk_type == 'Kafka':
             import confluent_kafka.admin as kafka_admin
             from airflow.hooks.base import BaseHook
             
@@ -158,22 +186,25 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
             meta = client.list_topics(timeout=15)
             result = sorted(meta.topics.keys())[:10]
 
-        elif conn_type == 'trino':
+        elif chk_type == 'Trino':
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
             hook = TrinoHook(trino_conn_id=conn_id)
             result = hook.get_first('SELECT current_user, current_catalog, current_schema')
 
-        elif conn_type == 'redis':
+        elif chk_type == 'Redis':
             from airflow.providers.redis.hooks.redis import RedisHook  # type: ignore
             hook = RedisHook(redis_conn_id=conn_id)
             result = f"PONG: {hook.get_conn().ping()}"
-
+        
         else:
-            raise AirflowFailException(f"Unsupported conn_type: {conn_type}")
+            raise AirflowFailException(f"Logic for {chk_type} not implemented in _run_test")
 
-        logger.info("🔍 %s", result)
-        msg = f"✅ {time.time() - ts:.2f} sec chk_{conn_id}_conn"
-        add_note({'result': str(result)}, context, title=msg)
+        # 3. Логирование и выход (для нативных проверок, chk_any_conn сам пишет ноту)
+        if chk_type not in ('Postgres', 'S3', 'KerberosHttp'):
+            logger.info("🔍 %s", result)
+            msg = f"✅ {time.time() - ts:.2f} sec chk_{conn_id}_conn"
+            add_note({'result': str(result)}, context, title=msg)
+
         return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
 
     except AirflowSkipException:
@@ -189,35 +220,6 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
         add_note(err, context, level='Task,DAG', title=msg)
         raise AirflowFailException(f"{msg}: {err}") from err
-
-
-_NATIVE_TYPES = frozenset(('sqlite', 'clickhouse', 'kafka', 'trino', 'redis'))
-
-
-def _test_one(conn_id: str, conn_type: str, **context) -> dict:
-    """Проверяет одно соединение.
-
-    Postgres/S3/HTTP — через chk_any_conn (типы ctl* маппятся на KerberosHttp); 
-    ClickHouse/Kafka/Trino — напрямую.
-    Неподдерживаемый тип — skip-заметка без ошибки.
-    """
-    chk_type = _TYPE_MAP.get(conn_type)
-    if chk_type is None and conn_type.startswith('ctl'):
-        chk_type = 'KerberosHttp'
-        logger.info("Connection '%s' has ctl-like type '%s', mapping to 'KerberosHttp'", conn_id, conn_type)
-
-    if chk_type is not None:
-        data = {'type': chk_type, 'conn_id': conn_id}
-        chk_any_conn(id=conn_id, data=data, **context)
-        return {'status': 'ok', 'conn_id': conn_id, 'conn_type': conn_type}
-
-    if conn_type in _NATIVE_TYPES:
-        return _check_native(conn_id, conn_type, **context)
-
-    msg = f"☮️ conn_type='{conn_type}' — проверка не реализована"
-    add_note(msg, context, level='task', title=f"☮️ {conn_id}")
-    logger.info(msg)
-    return {'status': 'skip', 'conn_id': conn_id, 'conn_type': conn_type}
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +252,7 @@ def tools_test_connections():
                     doc_md=f'Проверка `{conn_id}` (S3)',
                 )
                 def tfs_task(cid=conn_id, **kwargs):
-                    return _test_one(cid, conn_type='aws', **kwargs)
+                    return _run_test(cid, conn_type='aws', **kwargs)
                 
                 tfs_task()
         groups.append(tg_tfs)
@@ -268,7 +270,7 @@ def tools_test_connections():
                     doc_md=f'Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)',
                 )
                 def check_task(cid=conn_id, ctype=conn.conn_type, **kwargs):
-                    return _test_one(cid, ctype, **kwargs)
+                    return _run_test(cid, ctype, **kwargs)
                 
                 check_task()
         groups.append(tg)

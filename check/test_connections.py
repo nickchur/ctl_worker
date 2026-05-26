@@ -150,7 +150,7 @@ def _check_native(conn_id: str, conn_type: str, **context) -> dict:
         if conn_type in ('sqlite', 'clickhouse'):
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook  # type: ignore
             hook = ClickHouseHook(clickhouse_conn_id=conn_id)
-            result = hook.get_records('SELECT version()')
+            result = hook.execute('SELECT version()')
 
         elif conn_type == 'kafka':
             import confluent_kafka.admin as kafka_admin

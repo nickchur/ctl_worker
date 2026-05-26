@@ -311,9 +311,25 @@ def tools_test_connections():
         logger.info("summary: %s", headline)
         return {'ok': ok, 'fail': fail, 'skip': skip}
 
+    # --- Variable Check ---
+    @task(task_id='check_variable')
+    def check_variable():
+        """Проверяет наличие и наполненность переменной local_connections."""
+        var_data = Variable.get('local_connections', deserialize_json=True, default_var=None)
+        if not var_data:
+            raise AirflowFailException(
+                "Airflow Variable 'local_connections' не найдена или пуста. "
+                "Пожалуйста, запустите DAG 'tools_show_connections' для её генерации."
+            )
+        return var_data
+
+    check_var_task = check_variable()
     summary_task = summary()
+
     if groups:
-        groups >> summary_task
+        check_var_task >> groups >> summary_task
+    else:
+        check_var_task >> summary_task
 
 
 tools_test_connections()

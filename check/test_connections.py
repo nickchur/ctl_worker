@@ -122,7 +122,7 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
     return tfs_group, type_groups
 
 
-_groups_cache: tuple | None = None
+_groups_cache = None
 
 
 def _get_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connection]]]:

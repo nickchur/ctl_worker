@@ -324,8 +324,7 @@ for w in ctl_obj_load('ctl_workflows').values():
     tags=[w['profile'], 'CTL_wf', cat_full]
     tags.append('CTL_archive' if cat_full == archive else 'CTL')
     
-    # Определяем is_paused
-    set_pause(wf_name, cat_full)
+    # Определяем is_paused (вызов перенесён в run_prm, здесь не нужен)
 
     # Определение расписания и зависмости
     try:
@@ -356,9 +355,9 @@ for w in ctl_obj_load('ctl_workflows').values():
     # prm_task_to = task_time
     # tfs_task_to = (prm_task_to + task_time) if w.get('wf_tfs_in') else prm_task_to
     
-    exe_timeout = wf_params.get('wf_timeout', get_config().get('exe_timeout', 'hours=4')) 
+    exe_timeout = wf_params.get('wf_timeout', get_config().get('exe_timeout', 'hours=4'))
     try: exe_timeout = timedelta(minutes = int(exe_timeout))
-    except: exe_timeout = str2timedelta(exe_timeout)
+    except (ValueError, TypeError): exe_timeout = str2timedelta(exe_timeout)
     # exe_timeout += timedelta(minutes = +10)
     
     # exe_task_to = tfs_task_to + exe_timeout + task_time
@@ -430,7 +429,8 @@ for w in ctl_obj_load('ctl_workflows').values():
             """
             chk_any_conn('ctl')
             ti = context['task_instance']
-            
+            set_pause(wf['name'], wf['category'])
+
             wid = int(wf['id'])
             schedule_wf = params.get('schedule_wf', False)
             
@@ -598,9 +598,9 @@ for w in ctl_obj_load('ctl_workflows').values():
                 schema  = wf_prm.get('wf_tfs_schema')
                 truncate = str(wf_prm.get('wf_tfs_truncate', False)).lower() in ['true', 'yes']
 
-                wf_timeout = wf_prm.get('wf_timeout', get_config().get('gp_timeout', 'hours=3')) 
+                wf_timeout = wf_prm.get('wf_timeout', get_config().get('gp_timeout', 'hours=3'))
                 try: wf_timeout = timedelta(minutes = int(wf_timeout))
-                except: wf_timeout = str2timedelta(wf_timeout)
+                except (ValueError, TypeError): wf_timeout = str2timedelta(wf_timeout)
                 
                 if schema:
                     if not schema.startswith('s_grnplm_vd_hr_edp_'):
@@ -669,11 +669,10 @@ for w in ctl_obj_load('ctl_workflows').values():
                         s3_move_s3(new_path, arc_path)
                     except Exception as e:
                         s3_move_s3(new_path, err_path)
-                        add_note(e, context, level='Task,DAG', title='❌ Error')
-                        
-                        ctl_set_status(lid, 'ERROR', e)
+                        add_note(str(e), context, level='Task,DAG', title='❌ Error')
+                        ctl_set_status(lid, 'ERROR', str(e))
                         ctl_set_completed(lid, 'completed') # Completed/Aborted
-                        raise AirflowFailException(e)
+                        raise AirflowFailException(str(e)) from e
                 
                 if len(done_keys) > 0:
                     for done_key in done_keys:
@@ -757,9 +756,9 @@ for w in ctl_obj_load('ctl_workflows').values():
             if wf_prm.get('wf_zt_error') is not None: val['zte'] = wf_prm['wf_zt_error']   # ККД error
             if wf_prm.get('wf_zt_param') is not None: val['ztp'] = wf_prm['wf_zt_param']   # ККД параметры
 
-            wf_timeout = wf_prm.get('wf_timeout', get_config().get('gp_timeout', 'hours=3')) 
+            wf_timeout = wf_prm.get('wf_timeout', get_config().get('gp_timeout', 'hours=3'))
             try: wf_timeout = timedelta(minutes = int(wf_timeout))
-            except: wf_timeout = str2timedelta(wf_timeout)
+            except (ValueError, TypeError): wf_timeout = str2timedelta(wf_timeout)
             # wf_timeout += timedelta(seconds = -15)
             
             ti.xcom_push(key='run_prm', value={**val, 'timeout': str(wf_timeout)} )

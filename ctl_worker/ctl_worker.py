@@ -19,8 +19,6 @@ from airflow.datasets import DatasetAlias, Dataset
 from airflow.timetables.datasets import DatasetOrTimeSchedule
 from airflow.timetables.trigger import CronTriggerTimetable
 
-from airflow.utils.dates import days_ago
-
 from airflow.utils.state import State
 from airflow.utils.session import create_session #, provide_session
 from airflow.models import  Param, TaskInstance
@@ -60,14 +58,13 @@ archive = get_config().get('archive_category', 'p1080.ARCHIVE')
 # wfs_dict = ctl_obj_load('ctl_workflows')
 # ent_dict = ctl_obj_load('ctl_entities')
 enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
-ctl_events = ctl_obj_load('ctl_events')
 
 def statval(data, log=False, logs=None):
     if log:
         logger.info(dict(url='/statval/m', method='post', data=data))
-    if type(logs) == dict:
+    if isinstance(logs, dict):
         logs[len(logs)] = str(data)
-    elif type(logs) == list:
+    elif isinstance(logs, list):
         logs.append(str(data))
     lid = data['loading_id']
     eid = data['entity_id']
@@ -402,7 +399,7 @@ for w in ctl_obj_load('ctl_workflows').values():
             # 'on_execute_callback': None,
         },
         # start_date=days_ago(1),
-        start_date=pendulum.now('UTC').subtract(hours=1),
+        start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
         catchup=False,
         on_failure_callback=on_callback,
         # on_success_callback=on_callback,
@@ -446,7 +443,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                 res['prm'] = new_prm
                 
                 msg = '⚙️ Параметры были сохранены.'
-                add_note(res, context, level='DAG,Task', title=msg)
+                add_note(res, context, level='task,DAG', title=msg)
                 
             if not params.get('start_wf'):
                 msg = '⚠️ Задание не запущено.'
@@ -457,7 +454,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                     ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
                     msg += ' 💀 Задание снято с расписания.'
 
-                add_note('', context, level='DAG,Task', title=msg)
+                add_note('', context, level='task,DAG', title=msg)
                 raise AirflowSkipException(msg)
                 
 
@@ -536,14 +533,14 @@ for w in ctl_obj_load('ctl_workflows').values():
                 ctl_set_status(lid, 'RUNNING', 'NEW-AF ' + context['dag_run'].run_id)
                 
                 retry = ctl_get_retry(params=params, wf=wf)
-                wf_name = params.get('wfp_name', wf.get('name', ''))
-                
+                wfp_name = params.get('wfp_name', wf.get('name', ''))
+
                 if not params.get('af_sdt'):
                     params["af_sdt"] = pendulum.instance(ti.start_date).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
-                
+
                 params['loading_id'] = lid
                 params['wf_id'] = wid
-                params['wfp_name'] = wf_name
+                params['wfp_name'] = wfp_name
                 params['wfp_run_type'] = run_type
                 # params['wfp_status'] = 'RUNNING'
                 # params['wfp_status_log'] = ''
@@ -822,7 +819,7 @@ for w in ctl_obj_load('ctl_workflows').values():
 
             title = f"{status_icons[status]}{status} {action.upper()}\n\n"
             note = f"{res_icon} {result.get('msg') or res_msg.upper()}\n\n"
-            add_note(note, context, level='DAG,Task', title=title)
+            add_note(note, context, level='task,DAG', title=title)
 
             state = State.FAILED if res_msg == 'error' else (State.SKIPPED if res_msg == 'no' else State.SUCCESS)
             with create_session() as session:

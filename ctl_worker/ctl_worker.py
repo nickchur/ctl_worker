@@ -66,9 +66,9 @@ def statval(data, log=False, logs=None):
         logs[len(logs)] = str(data)
     elif isinstance(logs, list):
         logs.append(str(data))
-    lid = data['loading_id']
-    eid = data['entity_id']
-    sid = data['stat_id']
+    lid = data.get('loading_id')
+    eid = data.get('entity_id')
+    sid = data.get('stat_id')
     url = f'/v4/api/loading/{lid}/entity/{eid}/stat/{sid}/statval?profile={profile}'
     return ctl_api(url, 'post', json=data['avalue'])
 
@@ -243,7 +243,11 @@ def _emit_datasets(lid, eids, result, context):
         if res > 0:
             ds = Dataset(f'CTL/{profile}/{eid}/{ent_name}')
             add_note(ds, context, level='task')
-            context['outlet_events'][f"CTL/{profile}/{eid}"].add(ds, extra=ext)
+            outlet_key = f"CTL/{profile}/{eid}"
+            if outlet_key in context['outlet_events']:
+                context['outlet_events'][outlet_key].add(ds, extra=ext)
+            else:
+                logger.warning("outlet_events missing key %s — entity not in w_eids, dataset publish skipped", outlet_key)
     logger.info(f"✅ {context['outlet_events']}")
     for outlet, value in context['outlet_events'].items():
         add_note(value.extra, context, level='task', title=outlet)
@@ -365,7 +369,7 @@ for w in ctl_obj_load('ctl_workflows').values():
     conf = dict(
         schedule=schedule,
         tags=tags,
-        max_active_runs= 1 if w.get('singleLoading', True) else 1000,
+        max_active_runs= 1 if w.get('singleLoading', True) else 10,
         # dagrun_timeout=dagrun_timeout,
         is_paused_upon_creation= not w.get('scheduled', False),
     )
@@ -499,11 +503,9 @@ for w in ctl_obj_load('ctl_workflows').values():
                 run_type = params.get('wfp_run_type', 'AF-' + run_note.upper())
             add_note(f'🔍{run_type} {run_note}', context)
             
-            if params.get('loading_id'): # old loading
+            if context['dag_run'].conf.get('loading_id'): # old loading (explicit conf trigger)
 
-                dug_run = context['dag_run']
-                params = dug_run.conf
-
+                params = context['dag_run'].conf
                 lid = int(params['loading_id'])
                 # wid = int(params['wf_id'])
                 
@@ -524,7 +526,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                     
                 prm = { k:str(v) for k,v in params.items() if k.startswith('wf') }  
                 prm['wfp_run_type'] = run_type
-                    # ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                # ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
 
                 new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={schedule_wf}", "post", json=prm)
                 lid = int(new_lid['loadingId'])
@@ -800,7 +802,7 @@ for w in ctl_obj_load('ctl_workflows').values():
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
 
             msg = _emit_datasets(lid, eids, result, context)
-            ti.xcom_push(key='eids', value=json.dumps(msg, default=str))
+            ti.xcom_push(key='eids_result', value=json.dumps(msg, default=str))
 
             status, action, res_msg, res_icon = _finalize_status(lid, int(wf['id']), result, wf, wf_prm, context)
 

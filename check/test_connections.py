@@ -27,7 +27,6 @@ import time
 from collections import defaultdict
 
 import pendulum
-from airflow.configuration import get_custom_secret_backend
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException, AirflowFailException
 from airflow.models import Connection, Variable
@@ -75,35 +74,24 @@ _GROUP_TOOLTIP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connection]]]:
-    """Читает соединения из backend (no DB) или Variable (fallback) и возвращает (tfs_group, type_groups)."""
+    """Читает соединения из Variable и возвращает (tfs_group, type_groups)."""
     local_connections: dict[str, Connection] = {}
 
-    # 1. Приоритет: читаем напрямую из secret backend (in-memory, без DB-запроса)
     try:
-        backend = get_custom_secret_backend()
-        if hasattr(backend, '_local_connections') and backend._local_connections:
-            local_connections = dict(backend._local_connections)
-            logger.info("_load_groups: loaded %d conns from backend", len(local_connections))
+        var_data = Variable.get('local_connections', deserialize_json=True, default_var=None)
+        if var_data:
+            for ctype, conns in var_data.items():
+                for c in conns:
+                    local_connections[c['conn_id']] = Connection(
+                        conn_id=c['conn_id'],
+                        conn_type=c.get('conn_type') or (ctype if ctype != 'clickhouse' else 'sqlite'),
+                        host=c['host'],
+                        port=c['port'],
+                        schema=c['schema'],
+                        description=c['description'],
+                    )
     except Exception as exc:
-        logger.warning("_load_groups: backend unavailable: %s", exc)
-
-    # 2. Fallback: читаем из Variable (если backend не дал данных)
-    if not local_connections:
-        try:
-            var_data = Variable.get('local_connections', deserialize_json=True, default_var=None)
-            if var_data:
-                for ctype, conns in var_data.items():
-                    for c in conns:
-                        local_connections[c['conn_id']] = Connection(
-                            conn_id=c['conn_id'],
-                            conn_type=c.get('conn_type') or (ctype if ctype != 'clickhouse' else 'sqlite'),
-                            host=c['host'],
-                            port=c['port'],
-                            schema=c['schema'],
-                            description=c['description'],
-                        )
-        except Exception as exc:
-            logger.warning("_load_groups: Variable fallback failed: %s", exc)
+        logger.warning("_load_groups: failed to load local_connections: %s", exc)
 
     logger.info("Found %d local connections total", len(local_connections))
 

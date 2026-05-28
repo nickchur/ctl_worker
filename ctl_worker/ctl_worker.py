@@ -609,14 +609,14 @@ for w in ctl_obj_load('ctl_workflows').values():
                 s3 = get_config()['conns']['files']
                 path = f"{s3['conn_id']}://{s3['bucket']}/{prefix}{mask}"
 
+                lid = wf_prm.get('loading_id', 0)
+
                 if not prefix:
                     msg = f"✳️ TFS files are not required."
                     add_note(msg, context, level='Task,DAG')
                     ctl_set_status(lid, 'ERRORCHECK', msg)
                     ctl_set_completed(lid, 'completed') # Completed/Aborted
                     raise AirflowSkipException(msg)
-
-                lid = wf_prm.get('loading_id', 0)
                 # Проверяем статус загрузки
                 ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='TFS')
                 ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
@@ -721,13 +721,7 @@ for w in ctl_obj_load('ctl_workflows').values():
 
             # TEST !!!
             if test_mode:
-                rand = random.random()
-                if False and len(test_mode) > 2 and isinstance(test_mode[2], str):
-                    test_mode_str = test_mode[2]
-                    rand = safe_eval(test_mode_str)
-                else:
-                    rand = int((rand ** 3) * 45*60)
-
+                rand = int((random.random() ** 3) * 45*60)
                 exe = f"'Ok Test work',pg_sleep({rand})" # TEST !!!
 
 
@@ -773,15 +767,7 @@ for w in ctl_obj_load('ctl_workflows').values():
 
             # TEST !!!
             if test_mode:
-                rand = random.random()
-                if False and len(test_mode) > 3 and isinstance(test_mode[3], str):
-                    test_mode_str = test_mode[3]
-                    rand = safe_eval(test_mode_str)
-                else:
-                    # rand = 'random.randint(0, 2)' # TEST !!!
-                    rand = int(rand * (2 - 0 + 1)) + 0
-
-                res['res'] = int(rand) # TEST !!!
+                res['res'] = random.randint(0, 2) # TEST !!!
 
             ti.xcom_push(key='result', value=res)
             add_note(res, context, level='Task,DAG', title='Result')

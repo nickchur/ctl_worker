@@ -116,7 +116,8 @@ def parse_condition(cond, enames):
             else:
                 logger.warning("parse_condition: AND + timetable is not supported, schedule will be None")
                 return None
-        
+            #     return DatasetAndTimeSchedule(timetable=timetable, datasets=[combined_ds])
+
         return combined_ds or timetable
 
     return None
@@ -763,6 +764,7 @@ for w in ctl_obj_load('ctl_workflows').values():
 
             # TEST !!!
             if test_mode:
+                # rand = 'random.randint(0, 2)' # TEST !!!
                 res['res'] = random.randint(0, 2) # TEST !!!
 
             ti.xcom_push(key='result', value=res)

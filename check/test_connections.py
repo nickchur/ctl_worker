@@ -18,7 +18,6 @@
 **Особенности:**
 - **Оптимизация**: Использует Airflow Variable `local_connections` (создаваемую в `show_connections`) для ускорения получения списка соединений.
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
-- **Диагностика**: При сбое Kafka выполняется TCP Ping для разделения ошибок FW и SSL.
 - **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
 """
 
@@ -76,28 +75,35 @@ _GROUP_TOOLTIP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connection]]]:
-    """Читает Variable 'local_connections' и возвращает (tfs_group, type_groups)."""
+    """Читает соединения из backend (no DB) или Variable (fallback) и возвращает (tfs_group, type_groups)."""
     local_connections: dict[str, Connection] = {}
 
-    # 1. Пробуем загрузить из Variable (созданной в show_connections)
+    # 1. Приоритет: читаем напрямую из secret backend (in-memory, без DB-запроса)
     try:
-        var_data = Variable.get('local_connections', deserialize_json=True, default_var=None)
-        if var_data:
-            for ctype, conns in var_data.items():
-                for c in conns:
-                    # Нам нужно восстановить объект Connection для корректной фильтрации и работы тасков.
-                    # show_connections переименовал sqlite в clickhouse, восстанавливаем обратно если нужно.
-                    local_connections[c['conn_id']] = Connection(
-                        conn_id=c['conn_id'],
-                        conn_type=c.get('conn_type') or (ctype if ctype != 'clickhouse' else 'sqlite'),
-                        host=c['host'],
-                        port=c['port'],
-                        schema=c['schema'],
-                        description=c['description'],
-                        extra=c['extra']
-                    )
+        backend = get_custom_secret_backend()
+        if hasattr(backend, '_local_connections') and backend._local_connections:
+            local_connections = dict(backend._local_connections)
+            logger.info("_load_groups: loaded %d conns from backend", len(local_connections))
     except Exception as exc:
-        logger.warning("Не удалось прочитать Variable local_connections: %s", exc)
+        logger.warning("_load_groups: backend unavailable: %s", exc)
+
+    # 2. Fallback: читаем из Variable (если backend не дал данных)
+    if not local_connections:
+        try:
+            var_data = Variable.get('local_connections', deserialize_json=True, default_var=None)
+            if var_data:
+                for ctype, conns in var_data.items():
+                    for c in conns:
+                        local_connections[c['conn_id']] = Connection(
+                            conn_id=c['conn_id'],
+                            conn_type=c.get('conn_type') or (ctype if ctype != 'clickhouse' else 'sqlite'),
+                            host=c['host'],
+                            port=c['port'],
+                            schema=c['schema'],
+                            description=c['description'],
+                        )
+        except Exception as exc:
+            logger.warning("_load_groups: Variable fallback failed: %s", exc)
 
     logger.info("Found %d local connections total", len(local_connections))
 
@@ -128,12 +134,29 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
     return tfs_group, type_groups
 
 
-_tfs_group, _type_groups = _load_groups()
+_groups_cache: tuple | None = None
 
 
-def _safe_id(conn_id: str) -> str:
-    """Приводит conn_id к безопасному идентификатору таска."""
-    return re.sub(r'[^a-zA-Z0-9_.\-]', '_', conn_id)
+def _get_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connection]]]:
+    global _groups_cache
+    if _groups_cache is None:
+        _groups_cache = _load_groups()
+    return _groups_cache
+
+
+_tfs_group, _type_groups = _get_groups()
+
+
+def _safe_id(conn_id: str, seen: set[str]) -> str:
+    """Приводит conn_id к безопасному идентификатору таска; при коллизии добавляет суффикс _2, _3, ..."""
+    base = re.sub(r'[^a-zA-Z0-9_.\-]', '_', conn_id)
+    safe = base
+    i = 2
+    while safe in seen:
+        safe = f"{base}_{i}"
+        i += 1
+    seen.add(safe)
+    return safe
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +204,8 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
             conf = conn.extra_dejson.copy()
             if 'bootstrap.servers' not in conf:
                 conf['bootstrap.servers'] = f"{conn.host}:{conn.port or 9092}"
-            
+            conf.setdefault('socket.timeout.ms', 15000)
+
             client = kafka_admin.AdminClient(conf)
             meta = client.list_topics(timeout=15)
             result = sorted(meta.topics.keys())[:10]
@@ -218,8 +242,8 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
 
     except Exception as err:
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
-        add_note(err, context, level='Task,DAG', title=msg)
-        raise AirflowFailException(f"{msg}: {err}") from err
+        add_note(str(err), context, level='task,DAG', title=msg)
+        raise  # re-raise оригинальное исключение, чтобы сработал retries: 1
 
 
 # ---------------------------------------------------------------------------
@@ -230,10 +254,10 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     doc_md=__doc__,
     default_args={
         'owner': 'DataLab (CI02420667)',
-        'retries': 2,
+        'retries': 1,
     },
     start_date=pendulum.datetime(2026, 1, 1, tz=pendulum.UTC),
-    schedule_interval='@once',
+    schedule='@once',
     tags=['DataLab', 'tools', 'conn', 'AutoQA'],
     catchup=False,
     is_paused_upon_creation=False,
@@ -246,14 +270,15 @@ def tools_test_connections():
     # --- TFS group (priority) ---
     if _tfs_group:
         with TaskGroup(group_id='tfs', tooltip=_GROUP_TOOLTIP['tfs']) as tg_tfs:
+            seen: set[str] = set()
             for conn_id, conn in sorted(_tfs_group.items()):
                 @task(
-                    task_id=_safe_id(conn_id),
+                    task_id=_safe_id(conn_id, seen),
                     doc_md=f'Проверка `{conn_id}` (S3)',
                 )
                 def tfs_task(cid=conn_id, **kwargs):
                     return _run_test(cid, conn_type='aws', **kwargs)
-                
+
                 tfs_task()
         groups.append(tg_tfs)
 
@@ -264,14 +289,15 @@ def tools_test_connections():
             continue
         tooltip = _GROUP_TOOLTIP.get(group_name, group_name)
         with TaskGroup(group_id=group_name, tooltip=tooltip) as tg:
+            seen = set()
             for conn_id, conn in sorted(conns.items()):
                 @task(
-                    task_id=_safe_id(conn_id),
+                    task_id=_safe_id(conn_id, seen),
                     doc_md=f'Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)',
                 )
                 def check_task(cid=conn_id, ctype=conn.conn_type, **kwargs):
                     return _run_test(cid, ctype, **kwargs)
-                
+
                 check_task()
         groups.append(tg)
 
@@ -300,15 +326,15 @@ def tools_test_connections():
         icons = []
         
         for ti in tis:
-            if ti.task_id == 'summary' or ti.task_id == 'check_variable':
+            if ti.task_id == 'summary':
                 continue
             
             state = ti.state
             if state == 'success':
                 icon = '✅'; ok += 1
-            elif state in ('failed', 'upstream_failed') or state is None:
+            elif state in ('failed', 'upstream_failed'):
                 icon = '❌'; fail += 1
-                error_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} |")
+                error_rows.append(f"| `{ti.task_id}` | {icon} {state} |")
             else:
                 icon = '☮️'; skip += 1
             
@@ -333,25 +359,10 @@ def tools_test_connections():
         logger.info("summary: %s", headline)
         return {'ok': ok, 'fail': fail, 'skip': skip, 'avg_time': avg_time}
 
-    # --- Variable Check ---
-    @task(task_id='check_variable')
-    def check_variable():
-        """Проверяет наличие и наполненность переменной local_connections."""
-        var_data = Variable.get('local_connections', deserialize_json=True, default_var=None)
-        if not var_data:
-            raise AirflowFailException(
-                "Airflow Variable 'local_connections' не найдена или пуста. "
-                "Пожалуйста, запустите DAG 'tools_show_connections' для её генерации."
-            )
-        return var_data
-
-    check_var_task = check_variable()
     summary_task = summary()
 
     if groups:
-        check_var_task >> groups >> summary_task
-    else:
-        check_var_task >> summary_task
+        groups >> summary_task
 
 
 tools_test_connections()

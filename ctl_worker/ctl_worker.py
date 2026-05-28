@@ -389,7 +389,6 @@ for w in ctl_obj_load('ctl_workflows').values():
             # 'owner': 'EDP.ETL',
             'owner': profile,
             'depends_on_past': False,
-            'email': ['p1080@sber.ru'],
             'email_on_failure': False,
             'email_on_retry': False,
             'retries': 2,

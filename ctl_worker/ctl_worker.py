@@ -155,7 +155,7 @@ def get_schedule(w, enames):
         # Вариант Events
         elif event_sched_dict := w.get('wf_event_sched'):
             datasets = [
-                Dataset(f"CTL/{pes.split('/')[0]}/{pes.split('/')[1]}/{enames[int(pes.split('/')[1])]}")
+                Dataset(f"CTL/{pes.split('/')[0]}/{pes.split('/')[1]}/{enames.get(int(pes.split('/')[1]), pes.split('/')[1])}")
                 for pes, active in event_sched_dict.items() if active
             ]
             if datasets:
@@ -252,7 +252,7 @@ def _emit_datasets(lid, eids, result, context):
 
 def _finalize_status(lid, wid, result, wf, wf_prm, context):
     sdt = (wf_prm.get('af_sdt') or '')[:19]
-    retry = wf_prm['wfp_retry']
+    retry = wf_prm.get('wfp_retry', {})
     res = int(result['res']) if result.get('res') is not None else -99
 
     tmpl = ctl_api(f'/v4/api/wf/{wid}/tmpl') or {}
@@ -275,7 +275,7 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
     if retry.get('left', 0) > 0 and (res_msg in retry_on or str(res) in retry_on):
         status, action = 'ERRORCHECK', 'retry'
     else:
-        if retry.get('try'):
+        if retry.get('try', 0) > 0:
             ctl_set_status(lid, 'RUNNING', f"END {retry}")
         if retry.get('ok', 0) > 0 or retry.get('no', 0) > 0:
             status, action = 'SUCCESS', 'Completed'
@@ -325,6 +325,7 @@ for w in ctl_obj_load('ctl_workflows').values():
     try:
         schedule, tag = get_schedule(w, enames)
     except Exception as e:
+        logger.warning("get_schedule failed for %s: %s", wf_name, e)
         schedule, tag = None, 'AF_error'
     tags.append(tag)
     
@@ -550,7 +551,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                 
             # Статистика по сущностям
             eids = ctl_get_eids(wid, params)
-            eids = [f"{e}/{enames[e]}" for e in eids]
+            eids = [f"{e}/{enames.get(e, str(e))}" for e in eids]
             ti.xcom_push(key='eids', value=eids)
             add_note(eids, context, level='task,DAG',title=f"🔍 Entities")
             # params['eids'] = eids
@@ -662,7 +663,10 @@ for w in ctl_obj_load('ctl_workflows').values():
                         add_note(msg, context, level='task,DAG', title=f"✅ {key}")
                         s3_move_s3(new_path, arc_path)
                     except Exception as e:
-                        s3_move_s3(new_path, err_path)
+                        try:
+                            s3_move_s3(new_path, err_path)
+                        except Exception as move_err:
+                            logger.warning("Failed to move %s to err_path: %s", key, move_err)
                         add_note(str(e), context, level='task,DAG', title='❌ Error')
                         ctl_set_status(lid, 'ERROR', str(e))
                         ctl_set_completed(lid, 'completed') # Completed/Aborted
@@ -705,7 +709,7 @@ for w in ctl_obj_load('ctl_workflows').values():
             lid = wf_prm.get('loading_id', 0)
             wid = wf_prm.get('wf_id', 0)
             sdt = wf_prm.get('af_sdt', '')
-            exe = wf_prm.get('wf_exe', wf_prm.get('wf_exec')) 
+            exe = wf_prm.get('wf_exe', wf_prm.get('wf_exec')) or f'pr_{wf_name}()'
             
             # Проверяем статус загрузки
             ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')

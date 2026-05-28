@@ -25,7 +25,7 @@ from airflow.models import  Param, TaskInstance
 
 # from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
 from airflow.decorators import task
-from airflow.exceptions import AirflowFailException, AirflowSkipException, AirflowRescheduleException
+from airflow.exceptions import AirflowFailException, AirflowSkipException
 
 # from datetime import timedelta
 # from functools import partial
@@ -74,10 +74,10 @@ def statval(data, log=False, logs=None):
 
 def get_params(context):
     ti = context['task_instance']
-    wf_prm = ti.xcom_pull(key='params', task_ids=f'run_prm')
+    wf_prm = ti.xcom_pull(key='params', task_ids='run_prm')
     if not wf_prm:
         msg = "⚠️Params is empty"
-        add_note(msg, context, level='Task,DAG')
+        add_note(msg, context, level='task,DAG')
         raise AirflowSkipException(msg)
     return wf_prm
 
@@ -114,8 +114,8 @@ def parse_condition(cond, enames):
                 # Обязательно список [combined_ds]
                 return DatasetOrTimeSchedule(timetable=timetable, datasets=[combined_ds])
             else:
+                logger.warning("parse_condition: AND + timetable is not supported, schedule will be None")
                 return None
-            #     return DatasetAndTimeSchedule(timetable=timetable, datasets=[combined_ds])
         
         return combined_ds or timetable
 
@@ -301,7 +301,7 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
         'run_type': wf_prm.get('wfp_run_type', 'UNKNOWN'),
         'time': (pendulum.now(get_config()['tz']) - pendulum.parse(sdt, tz=get_config()['tz'])).in_words(locale='ru'),
     }
-    add_note({**data, 'action': action, 'obj': lid}, context, level='Task,DAG', title='Log')
+    add_note({**data, 'action': action, 'obj': lid}, context, level='task,DAG', title='Log')
 
     return status, action, res_msg, res_icon
 
@@ -311,9 +311,6 @@ for w in ctl_obj_load('ctl_workflows').values():
     if w.get('deleted', False): continue 
     
     cat_full = w['category']
-    cat_prfx = cat_full.split('.')[0]
-    cat_name = cat_full.split('.')[-1]
-    
     # wid = w['id']
     wf_name = w['name'] #.split('.')[-1]
     wf_short = w['name'].split('.')[-1]
@@ -555,7 +552,7 @@ for w in ctl_obj_load('ctl_workflows').values():
             eids = ctl_get_eids(wid, params)
             eids = [f"{e}/{enames[e]}" for e in eids]
             ti.xcom_push(key='eids', value=eids)
-            add_note(eids, context, level='Task,DAG',title=f"🔍 Entities")
+            add_note(eids, context, level='task,DAG',title=f"🔍 Entities")
             # params['eids'] = eids
                         
             tfs = params.get('wf_tfs_in')
@@ -573,7 +570,7 @@ for w in ctl_obj_load('ctl_workflows').values():
 
             ctl_url = f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}"
             msg = f"🔗 [Loading {lid}_{retry.get('try',1)} {run_type} {run_note}]({ctl_url})"
-            add_note(msg, context, level='Task,DAG')
+            add_note(msg, context, level='task,DAG')
             
             # return params
 
@@ -613,7 +610,7 @@ for w in ctl_obj_load('ctl_workflows').values():
 
                 if not prefix:
                     msg = f"✳️ TFS files are not required."
-                    add_note(msg, context, level='Task,DAG')
+                    add_note(msg, context, level='task,DAG')
                     ctl_set_status(lid, 'ERRORCHECK', msg)
                     ctl_set_completed(lid, 'completed') # Completed/Aborted
                     raise AirflowSkipException(msg)
@@ -637,7 +634,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                 
                 if len(keys) == 0:
                     msg = '⚠️ No new TFS files'
-                    add_note(msg, context, level='Task,DAG')
+                    add_note(msg, context, level='task,DAG')
                     ctl_set_status(lid, 'ERRORCHECK', msg)
                     ctl_set_completed(lid, 'completed') # Completed/Aborted
                     raise AirflowSkipException(msg)
@@ -662,11 +659,11 @@ for w in ctl_obj_load('ctl_workflows').values():
                         
                         msg = f"✅ {value}: {readable(rows, 1000)}"
                         ctl_set_status(lid, 'RUNNING', f'TFS-OK {msg}')
-                        add_note(msg, context, level='Task,DAG', title=f"✅ {key}")
+                        add_note(msg, context, level='task,DAG', title=f"✅ {key}")
                         s3_move_s3(new_path, arc_path)
                     except Exception as e:
                         s3_move_s3(new_path, err_path)
-                        add_note(str(e), context, level='Task,DAG', title='❌ Error')
+                        add_note(str(e), context, level='task,DAG', title='❌ Error')
                         ctl_set_status(lid, 'ERROR', str(e))
                         ctl_set_completed(lid, 'completed') # Completed/Aborted
                         raise AirflowFailException(str(e)) from e
@@ -725,7 +722,6 @@ for w in ctl_obj_load('ctl_workflows').values():
                 exe = f"'Ok Test work',pg_sleep({rand})" # TEST !!!
 
 
-            wfp = {}
             retry = wf_prm.get('wfp_retry', {})
             
             val = {
@@ -770,7 +766,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                 res['res'] = random.randint(0, 2) # TEST !!!
 
             ti.xcom_push(key='result', value=res)
-            add_note(res, context, level='Task,DAG', title='Result')
+            add_note(res, context, level='task,DAG', title='Result')
 
             # return eids
 
@@ -788,7 +784,7 @@ for w in ctl_obj_load('ctl_workflows').values():
 
             result = ti.xcom_pull(key='result', task_ids='run_exe')
             if not result:
-                add_note("⚠️ Result is empty", context, level='Task,DAG')
+                add_note("⚠️ Result is empty", context, level='task,DAG')
                 raise AirflowSkipException("⚠️ Result is empty")
 
             eids = ti.xcom_pull(key='eids', task_ids='run_prm')

@@ -227,7 +227,7 @@ def _emit_datasets(lid, eids, result, context):
     for eid_str in eids:
         eid = int(eid_str.split('/')[0])
         logs = _publish_stats(lid, eid, result)
-        ent_name = enames[eid]
+        ent_name = enames.get(eid, str(eid))
         ind = f'{lid}/{profile}/{eid}'
         ext = {
             f"{ind}/url": f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}",
@@ -239,19 +239,19 @@ def _emit_datasets(lid, eids, result, context):
             v = ast.literal_eval(l)
             msg[ent_key][v['stat_id']] = v['avalue'][0]
             ext[f"{ind}/{v['stat_id']}"] = v['avalue'][0]
-        add_note(msg, context, level='Task')
+        add_note(msg, context, level='task')
         if res > 0:
             ds = Dataset(f'CTL/{profile}/{eid}/{ent_name}')
-            add_note(ds, context, level='Task')
+            add_note(ds, context, level='task')
             context['outlet_events'][f"CTL/{profile}/{eid}"].add(ds, extra=ext)
     logger.info(f"✅ {context['outlet_events']}")
     for outlet, value in context['outlet_events'].items():
-        add_note(value.extra, context, level='Task', title=outlet)
+        add_note(value.extra, context, level='task', title=outlet)
     return msg
 
 
 def _finalize_status(lid, wid, result, wf, wf_prm, context):
-    sdt = wf_prm['af_sdt'][:19]
+    sdt = (wf_prm.get('af_sdt') or '')[:19]
     retry = wf_prm['wfp_retry']
     res = int(result['res']) if result.get('res') is not None else -99
 
@@ -300,7 +300,7 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
         'retry': retry,
         'sdt': sdt,
         'run_type': wf_prm.get('wfp_run_type', 'UNKNOWN'),
-        'time': (pendulum.now(get_config()['tz']) - pendulum.parse(sdt, tz=get_config()['tz'])).in_words(locale='ru'),
+        'time': (pendulum.now(get_config()['tz']) - pendulum.parse(sdt, tz=get_config()['tz'])).in_words(locale='ru') if sdt else '',
     }
     add_note({**data, 'action': action, 'obj': lid}, context, level='task,DAG', title='Log')
 
@@ -525,7 +525,6 @@ for w in ctl_obj_load('ctl_workflows').values():
                 prm['wfp_run_type'] = run_type
                     # ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
 
-                schedule_wf = params.get('schedule_wf', False)
                 new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={schedule_wf}", "post", json=prm)
                 lid = int(new_lid['loadingId'])
                 ctl_set_status(lid, 'RUNNING', 'NEW-AF ' + context['dag_run'].run_id)
@@ -558,7 +557,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                         
             tfs = params.get('wf_tfs_in')
             
-            if tfs is not None: 
+            if tfs:
                 tfs_mask = params.get('wf_tfs_mask', '*').strip(' ')
                 tfs_table = params.get('wf_tfs_table','')
                 tfs_schema = params.get('wf_tfs_schema','dia')
@@ -566,7 +565,7 @@ for w in ctl_obj_load('ctl_workflows').values():
             else:
                 ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
 
-            add_note(params, context, level='Task', title='Params')
+            add_note(params, context, level='task', title='Params')
             ti.xcom_push(key='params', value=params)
 
             ctl_url = f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}"
@@ -609,7 +608,7 @@ for w in ctl_obj_load('ctl_workflows').values():
 
                 lid = wf_prm.get('loading_id', 0)
 
-                if not prefix:
+                if not wf_prm.get('wf_tfs_in', '').strip():
                     msg = f"✳️ TFS files are not required."
                     add_note(msg, context, level='task,DAG')
                     ctl_set_status(lid, 'ERRORCHECK', msg)
@@ -619,15 +618,15 @@ for w in ctl_obj_load('ctl_workflows').values():
                 ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='TFS')
                 ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
                 
-                if '.done' in path:
-                    done_path = path.split('.done')[0]+'.done'
+                if '/.done' in path:
+                    done_path = path.split('/.done')[0] + '/.done'
                     done_mask = path.replace(done_path, '', 1)
                     done_keys = s3_keys(done_path)
                     keys = dict()
                     for done_key in done_keys:
-                        path = f"{s3['conn_id']}://{s3['bucket']}/" + done_key[:-5] + done_mask
-                        logger.info(f"🔍 {path}")
-                        keys = {**keys, **s3_keys(path)}
+                        key_path = f"{s3['conn_id']}://{s3['bucket']}/" + done_key[:-5] + done_mask
+                        logger.info(f"🔍 {key_path}")
+                        keys = {**keys, **s3_keys(key_path)}
                 else:
                     done_keys = {}
                     keys = s3_keys(path)
@@ -673,7 +672,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                     for done_key in done_keys:
                         done_path = f"{s3['conn_id']}://{s3['bucket']}/" + done_key
                         s3_delete(done_path)
-                        add_note(f"🗑️ .done deleted: {done_path}", context, level='Task')
+                        add_note(f"🗑️ .done deleted: {done_path}", context, level='task')
 
                 
                 # retry = ctl_get_retry(params=wf_prm, wf=wf)
@@ -750,7 +749,7 @@ for w in ctl_obj_load('ctl_workflows').values():
             # wf_timeout += timedelta(seconds = -15)
             
             ti.xcom_push(key='run_prm', value={**val, 'timeout': str(wf_timeout)} )
-            add_note({**val, 'timeout': str(wf_timeout)}, context, level='Task', title='Run_prm')
+            add_note({**val, 'timeout': str(wf_timeout)}, context, level='task', title='Run_prm')
 
 
             # gp_hook = PostgresHook(postgres_conn_id=config['gp_conn_id'])
@@ -790,7 +789,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                 raise AirflowSkipException("⚠️ Result is empty")
 
             eids = ti.xcom_pull(key='eids', task_ids='run_prm')
-            add_note(eids, context, level='Task', title='Entities')
+            add_note(eids, context, level='task', title='Entities')
 
             lid = wf_prm.get('loading_id', 0)
             ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')

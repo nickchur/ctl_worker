@@ -311,10 +311,8 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
     return status, action, res_msg, res_icon
 
 
-for w in ctl_obj_load('ctl_workflows').values():
-    if w.get('profile') != profile: continue
-    if w.get('deleted', False): continue 
-    
+def build_worker_dag(w):
+
     cat_full = w['category']
     # wid = w['id']
     wf_name = w['name'] #.split('.')[-1]
@@ -412,7 +410,7 @@ for w in ctl_obj_load('ctl_workflows').values():
     ) as dag:
 
 
-        @task(pool='ctl_pool', ) #   execution_timeout=prm_task_to,
+        @task(pool='ctl_pool', retries=0) #   execution_timeout=prm_task_to,  retries=0: POST /loading неидемпотентен — ретрай создаёт дубль loading_id
         def run_prm(wf, params=None, **context):
             """### Инициализация параметров и создание загрузки
 
@@ -686,7 +684,7 @@ for w in ctl_obj_load('ctl_workflows').values():
                 ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
                 
 
-        @task(pool='gp_pool', sla=sla_time, ) # execution_timeout=exe_task_to,)
+        @task(pool='gp_pool', sla=sla_time, retries=0) # execution_timeout=exe_task_to,)  retries=0: pr_swf_start_ctl неидемпотентна — ретрай = повторный ETL (повторы делает CTL через TIME-WAIT)
         def run_exe(wf, **context):
             """### Выполнение бизнес-логики в Greenplum
 
@@ -835,9 +833,25 @@ for w in ctl_obj_load('ctl_workflows').values():
         else:
             task_prm  >> task_exe
         
-        if wf_tfs_out: 
+        if wf_tfs_out:
             task_exe >> run_out(wf = w) >> task_end
         else:
             task_exe >> task_end
+
+    return dag
+
+
+for w in ctl_obj_load('ctl_workflows').values():
+    if w.get('profile') != profile:
+        continue
+    if w.get('deleted', False):
+        continue
+    try:
+        dag = build_worker_dag(w)
+        globals()[dag.dag_id] = dag
+    except Exception as e:
+        # Один битый workflow не должен ронять импорт модуля и забирать с собой ВСЕ остальные DAG'и
+        logger.exception("Не удалось построить DAG для workflow %s: %s", w.get('name'), e)
+        continue
     
     

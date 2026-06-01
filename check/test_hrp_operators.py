@@ -21,9 +21,12 @@
 import sys
 import os
 
-# Пути для импорта hrp_operators (настраиваются под окружение)
-sys.path.insert(0, '/home/sber-nschurkin/etl-core-develop/app-dataplatform-etl')
-sys.path.insert(0, '/home/sber-nschurkin/etl-core-cloud/app-dataplatform-etl/packages/hrp_operators/src')
+# Пути для локальной разработки. В продакшне пакет устанавливается через pip,
+# поэтому переменные не задаются и sys.path не изменяется.
+for _env_var in ('HRP_ETL_CORE_PATH', 'HRP_OPERATORS_SRC_PATH'):
+    _path = os.environ.get(_env_var)
+    if _path:
+        sys.path.insert(0, _path)
 
 from airflow.decorators import dag, task, task_group
 from airflow.models.param import Param
@@ -257,7 +260,7 @@ def test_hrp_operators_dag():
 
     @task_group(group_id='db_to_db_tests')
     def db_to_db_tests():
-        HrpPostgresToPostgresOperator(
+        pg_to_pg = HrpPostgresToPostgresOperator(
             task_id='pg_to_pg',
             source_table='test_hrp_operators',
             source_schema='public',
@@ -268,7 +271,15 @@ def test_hrp_operators_dag():
             truncate=True
         )
 
-        HrpClickhouseToPostgresOperator(
+        @task
+        def validate_pg_to_pg(params=None):
+            pg = PostgresHook(postgres_conn_id=params['pg_conn_id'])
+            count = pg.get_first("SELECT COUNT(*) FROM public.test_hrp_operators_copy")[0]
+            if count != 3:
+                raise AirflowFailException(f"pg_to_pg: expected 3 rows, got {count}")
+            logger.info("pg_to_pg validation OK: %d rows", count)
+
+        ch_to_pg = HrpClickhouseToPostgresOperator(
             task_id='ch_to_pg',
             sql='SELECT * FROM technical.test_hrp_operators',
             target_table='test_hrp_operators_from_ch',
@@ -278,7 +289,15 @@ def test_hrp_operators_dag():
             truncate=True
         )
 
-        HrpPostgresToClickhouseOperator(
+        @task
+        def validate_ch_to_pg(params=None):
+            pg = PostgresHook(postgres_conn_id=params['pg_conn_id'])
+            count = pg.get_first("SELECT COUNT(*) FROM public.test_hrp_operators_from_ch")[0]
+            if count != 3:
+                raise AirflowFailException(f"ch_to_pg: expected 3 rows, got {count}")
+            logger.info("ch_to_pg validation OK: %d rows", count)
+
+        pg_to_ch = HrpPostgresToClickhouseOperator(
             task_id='pg_to_ch',
             source_table='test_hrp_operators',
             source_schema='public',
@@ -289,12 +308,25 @@ def test_hrp_operators_dag():
             target_truncate=True
         )
 
+        @task
+        def validate_pg_to_ch(params=None):
+            ch = ClickHouseHook(clickhouse_conn_id=params['ch_conn_id'])
+            res = ch.run("SELECT count() FROM technical.test_hrp_operators_from_pg")
+            count = res[0][0] if res else 0
+            if count != 3:
+                raise AirflowFailException(f"pg_to_ch: expected 3 rows, got {count}")
+            logger.info("pg_to_ch validation OK: %d rows", count)
+
         HrpPostgresDDL(
             task_id='pg_ddl_test',
             table_name='test_hrp_operators',
             schema='public',
             postgres_conn_id="{{ params.pg_conn_id }}"
         )
+
+        pg_to_pg >> validate_pg_to_pg()
+        ch_to_pg >> validate_ch_to_pg()
+        pg_to_ch >> validate_pg_to_ch()
 
     @task(trigger_rule=TriggerRule.ALL_DONE)
     def cleanup(params=None):

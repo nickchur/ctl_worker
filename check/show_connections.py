@@ -61,7 +61,6 @@ def tools_show_connections():
                 'port': conn.port,
                 'schema': conn.schema,
                 'description': conn.description or 'No description',
-                'extra': conn.extra,
             })
         if 'sqlite' in by_type:
             by_type['clickhouse'] = by_type.pop('sqlite')
@@ -74,7 +73,7 @@ def tools_show_connections():
 
         # Формируем Markdown таблицу без pandas
         headers = ['conn_type', 'conn_id', 'host', 'port', 'schema', 'description']
-        table_lines = ["| " + " | ".join(headers) + " |", "|-" + "-|-".join([""] * len(headers)) + "-|"]
+        table_lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
         for row in rows:
             table_lines.append("| " + " | ".join(str(row.get(h, '')) for h in headers) + " |")
         

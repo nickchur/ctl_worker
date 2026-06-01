@@ -12,7 +12,7 @@
 | **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
 | **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
 | **trino** | тип `trino` | Валидация сессии через `TrinoHook` |
-| **redis** | тип `redis` | Проверка доступности через `RedisHook.get_conn().ping()` |
+| **redis** | тип `redis` | Проверка доступности через `redis.Redis(...).ping()` |
 | **other** | прочие | Помечаются символом `☮️` (пропуск) |
 
 **Особенности:**
@@ -205,9 +205,19 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
             result = hook.get_first("SELECT current_user, current_catalog, current_schema")
 
         elif chk_type == "Redis":
-            from airflow.providers.redis.hooks.redis import RedisHook  # type: ignore
-            hook = RedisHook(redis_conn_id=conn_id)
-            result = f"PONG: {hook.get_conn().ping()}"
+            import redis
+            from airflow.hooks.base import BaseHook
+
+            conn = BaseHook.get_connection(conn_id)
+            extra = conn.extra_dejson.copy()
+            client = redis.Redis(
+                host=conn.host,
+                port=conn.port or 6379,
+                password=conn.password or None,
+                db=int(extra.get("db", 0)),
+                socket_timeout=int(extra.get("socket_timeout", 15)),
+            )
+            result = f"PONG: {client.ping()}"
 
         else:
             raise AirflowFailException(f"Logic for {chk_type} not implemented in _run_test")

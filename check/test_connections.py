@@ -213,6 +213,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
             client = redis.Redis(
                 host=conn.host,
                 port=conn.port or 6379,
+                username=conn.login or None,
                 password=conn.password or None,
                 db=int(extra.get("db", 0)),
                 socket_timeout=int(extra.get("socket_timeout", 15)),

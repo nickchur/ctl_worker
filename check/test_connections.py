@@ -264,7 +264,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         raise
 
     except ImportError as err:
-        msg = f"☮️ {conn_id}: провайдер не установлен — {err}"
+        msg = f"Провайдер не установлен — {err}"
         add_note(msg, context, level="task", title=f"☮️ {conn_id}")
         logger.warning(msg)
         raise AirflowSkipException(msg) from err
@@ -371,7 +371,9 @@ def tools_test_connections():  # noqa: PLR0915
 
             state = ti.state
             raw_note = notes_map.get(ti.task_id, "")
-            first_line = next((ln.strip() for ln in raw_note.splitlines() if ln.strip()), "") if raw_note else ""
+            # first_line = (next((ln.strip() for ln in raw_note.splitlines() if ln.strip()), "")) if raw_note else ""
+            non_empty_lines = [ln.strip() for ln in raw_note.splitlines() if ln.strip()] if raw_note else []
+            first_line = non_empty_lines[2] if len(non_empty_lines) > 2 else ""
             reason = first_line[:120].replace("|", "\\|") or "—"
 
             if state == "success":

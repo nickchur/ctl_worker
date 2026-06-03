@@ -203,6 +203,35 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
             hook = TrinoHook(trino_conn_id=conn_id)
             result = hook.get_first("SELECT current_user, current_catalog, current_schema")
+            # from airflow.hooks.base import BaseHook
+            # import requests
+            
+            # conn = BaseHook.get_connection(conn_id)
+            
+            # # Параметры подключения к Trino
+            # host = conn.host
+            # port = conn.port or 8080
+            # user = conn.login or "airflow"
+            # catalog = conn.schema or "hive"
+            
+            # url = f"http://{host}:{port}/v1/statement"
+            
+            # # Выполнение запроса через REST API
+            # payload = {
+            #     "catalog": catalog,
+            #     "schema": "default",
+            #     "sql": "SELECT current_user, current_catalog, current_schema"
+            # }
+            
+            # response = requests.post(url, json=payload, timeout=15)
+            # response.raise_for_status()
+            # result_data = response.json()
+            
+            # if "data" in result_data and len(result_data["data"]) > 0:
+            #     row = result_data["data"][0]
+            #     result = f"user={row[0]}, catalog={row[1]}, schema={row[2]}"
+            # else:
+            #     result = "Trino OK (no data rows)"
 
         elif chk_type == "Redis":
             import redis
@@ -367,7 +396,9 @@ def tools_test_connections():  # noqa: PLR0915
             if ti.duration:
                 durations.append(ti.duration)
 
-            all_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} | {reason} |")
+            # Выводим только ошибки и скипы
+            if state != "success":
+                all_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} | {reason} |")
 
         avg_time = sum(durations) / len(durations) if durations else 0
         graph = "".join(icons)

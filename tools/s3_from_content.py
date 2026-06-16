@@ -130,8 +130,9 @@ def tools_s3_from_content():
         if not hook.check_for_bucket(bucket_name):
             raise AirflowSkipException(f"Бакет '{bucket_name}' не существует или недоступен для '{s3_conn_id}'")
 
-        # S3-совместимое хранилище TFS отвергает signed payload (XAmzContentSHA256Mismatch),
-        # поэтому грузим через put_object с UNSIGNED-PAYLOAD вместо hook.load_*.
+        # botocore по умолчанию шлёт x-amz-content-sha256=UNSIGNED-PAYLOAD по HTTPS,
+        # но шлюз TFS его не понимает и сверяет реальный хэш тела -> XAmzContentSHA256Mismatch.
+        # payload_signing_enabled=True заставляет класть в заголовок настоящий SHA256 тела.
         from botocore.config import Config
 
         # Мержим с конфигом из коннекта, чтобы не потерять его настройки
@@ -142,7 +143,7 @@ def tools_s3_from_content():
             endpoint_url=hook.conn_config.endpoint_url,
             region_name=hook.region_name,
             verify=hook.verify,
-            config=base_cfg.merge(Config(signature_version='s3v4', s3={'payload_signing_enabled': False})),
+            config=base_cfg.merge(Config(signature_version='s3v4', s3={'payload_signing_enabled': True})),
         )
 
         def _put(key: str, body: bytes):

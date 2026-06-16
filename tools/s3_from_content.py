@@ -134,10 +134,15 @@ def tools_s3_from_content():
         # поэтому грузим через put_object с UNSIGNED-PAYLOAD вместо hook.load_*.
         from botocore.config import Config
 
+        # Мержим с конфигом из коннекта, чтобы не потерять его настройки
+        # (verify/region/CA — иначе ловим SSL CERTIFICATE_VERIFY_FAILED).
+        base_cfg = hook.config or Config()
         client = hook.get_session().client(
             's3',
             endpoint_url=hook.conn_config.endpoint_url,
-            config=Config(signature_version='s3v4', s3={'payload_signing_enabled': False}),
+            region_name=hook.region_name,
+            verify=hook.verify,
+            config=base_cfg.merge(Config(signature_version='s3v4', s3={'payload_signing_enabled': False})),
         )
 
         def _put(key: str, body: bytes):

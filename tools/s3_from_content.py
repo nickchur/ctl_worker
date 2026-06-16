@@ -130,10 +130,13 @@ def tools_s3_from_content():
         if not hook.check_for_bucket(bucket_name):
             raise AirflowSkipException(f"Бакет '{bucket_name}' не существует или недоступен для '{s3_conn_id}'")
 
-        # botocore по умолчанию шлёт x-amz-content-sha256=UNSIGNED-PAYLOAD по HTTPS,
-        # но шлюз TFS его не понимает и сверяет реальный хэш тела -> XAmzContentSHA256Mismatch.
-        # payload_signing_enabled=True заставляет класть в заголовок настоящий SHA256 тела.
+        # Шлюз TFS отдаёт XAmzContentSHA256Mismatch и при UNSIGNED-PAYLOAD (дефолт botocore),
+        # и при настоящем SHA256 — т.е. это, похоже, мусорный catch-all шлюза, а не реальная
+        # сверка хэша. payload_signing_enabled=True оставляем как наиболее «правильный» режим
+        # (кладёт настоящий SHA256 тела); реальную причину выясняем по логу ответа ниже.
         from botocore.config import Config
+        from botocore.exceptions import ClientError
+        import botocore.handlers
 
         # Мержим с конфигом из коннекта, чтобы не потерять его настройки
         # (verify/region/CA — иначе ловим SSL CERTIFICATE_VERIFY_FAILED).
@@ -146,10 +149,20 @@ def tools_s3_from_content():
             config=base_cfg.merge(Config(signature_version='s3v4', s3={'payload_signing_enabled': True})),
         )
 
+        # Снимаем Expect: 100-continue — проксированные не-AWS S3 (haproxy) часто
+        # обрабатывают его некорректно, что выглядит как ошибка загрузки.
+        client.meta.events.unregister('before-call.s3', botocore.handlers.add_expect_header)
+
         def _put(key: str, body: bytes):
             if not replace and hook.check_for_key(key, bucket_name):
                 raise AirflowFailException(f"Ключ s3://{bucket_name}/{key} уже существует (replace=False)")
-            client.put_object(Bucket=bucket_name, Key=key, Body=body)
+            try:
+                client.put_object(Bucket=bucket_name, Key=key, Body=body)
+            except ClientError as e:
+                # botocore сворачивает ответ шлюза в ': Unknown' — логируем полный ответ,
+                # чтобы увидеть реальный код/сообщение/заголовки шлюза.
+                logger.error("PutObject отклонён шлюзом для %s: %s", key, e.response)
+                raise
 
         content = '\n'.join(content)
         content = content.replace('{{empty}}', '')

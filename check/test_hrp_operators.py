@@ -123,16 +123,16 @@ T_CH_TO_PG_INC = "hrp_ch_to_pg_inc"    # таргет ClickhouseToPostgresIncarn
 COMPRESSIONS_FULL = ["gzip", "zip", "tar.gz", None]
 COMPRESSIONS_PG_BASE = ["gzip", None]
 _CLABEL = {"gzip": "gzip", "zip": "zip", "tar.gz": "targz", None: "none"}
-_CEXT = {"gzip": ".csv.gz", "zip": ".csv.zip", "tar.gz": ".csv.tar.gz", None: ".csv"}
+_COMP_EXT = {"gzip": ".gz", "zip": ".zip", "tar.gz": ".tar.gz", None: ""}
 
 
 def clabel(c):
     return _CLABEL[c]
 
 
-def s3key(name, c):
-    """Ключ S3 для теста name и сжатия c (с корректным расширением)."""
-    return f"{S3_PREFIX}{name}_{clabel(c)}{_CEXT[c]}"
+def s3key(name, c, ext=".csv"):
+    """Ключ S3 для теста name, формата ext (.csv/.json) и сжатия c (с корректным расширением)."""
+    return f"{S3_PREFIX}{name}_{clabel(c)}{ext}{_COMP_EXT[c]}"
 
 
 # ───────────────────────── Единый источник данных ─────────────────────────────
@@ -404,7 +404,7 @@ def test_hrp_operators_dag():
         op = HrpClickNativeToS3ListOperator(
             task_id=f"ch_native_list_{clabel(c)}",
             sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
-            s3_bucket=BUCKET, s3_key=s3key("ch_native_list", c),
+            s3_bucket=BUCKET, s3_key=s3key("ch_native_list", c, ext=".json"),
             clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
             compression=c, replace=True, post_file_check=True, fmt="JSON",
         )
@@ -445,9 +445,12 @@ def test_hrp_operators_dag():
         table_name=T_S3_TO_CH, schema=CH_SCHEMA,
         fmt="CSV", compression="gzip", truncate=True,
     )
+    # HrpPostgresToS3ListOperator пишет файлы с номерным суффиксом (..._1.csv.gz),
+    # поэтому берём фактический ключ из XCom (s3_key_list), а не вычисляем литерально.
     s3_to_ch_tsv = HrpS3ToClickhouseTableOperator(
         task_id="s3_to_ch_tsv",
-        s3_bucket=BUCKET, s3_key=s3key("pg_to_s3_list", "gzip"),
+        s3_bucket=BUCKET,
+        s3_key="{{ ti.xcom_pull(task_ids='pg_to_s3_list_gzip', key='s3_key_list')[0] }}",
         clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
         table_name=T_S3_TO_CH_LIST, schema=CH_SCHEMA,
         fmt="TSVWithNames", compression="gzip", truncate=True,
@@ -510,7 +513,7 @@ def test_hrp_operators_dag():
             task_id=f"s3_to_s3_{clabel(c)}",
             s3_bucket_source=BUCKET, s3_key_source=s3key("pg_to_s3", None),
             aws_conn_id_source=S3_CONN, compression_source=None,
-            s3_bucket=BUCKET, s3_key=f"{S3_PREFIX}s3_to_s3_{clabel(c)}{_CEXT[c]}",
+            s3_bucket=BUCKET, s3_key=s3key("s3_to_s3", c),
             aws_conn_id=S3_CONN, compression=c, replace=True, post_file_check=True,
         )
         pg_to_s3_none >> s3s3
@@ -570,9 +573,15 @@ def test_hrp_operators_dag():
         logger.info("OK: s3_list_keys вернул %d ключей", len(names))
 
     v_list_keys = validate_list_keys()
-    pg_to_s3_gzip >> list_keys >> v_list_keys
-    pg_to_s3_gzip >> file_read
-    setup_pg_t >> bucket_viewer
+
+    # Гейт по run_viewer_tests (по аналогии с cluster_gate): при False вся группа viewers скипается.
+    @task.branch(task_id="viewer_gate")
+    def viewer_gate(params=None):
+        return ["s3_list_keys", "s3_file_read", "s3_bucket_viewer"] if params.get("run_viewer_tests") else []
+
+    viewer_gate_t = viewer_gate()
+    [pg_to_s3_gzip, setup_pg_t] >> viewer_gate_t >> [list_keys, file_read, bucket_viewer]
+    list_keys >> v_list_keys
 
     # ──────────────────────────── cluster ─────────────────────────────────────
     # ⚠ Требует system.clusters('datalab') и conn click-dlab-*. По умолчанию выключено.
@@ -654,7 +663,7 @@ def test_hrp_operators_dag():
         pg_to_pg, v_pg_to_pg, ch_to_pg, v_ch_to_pg, pg_to_ch, v_pg_to_ch,
         pg_inc, v_pg_inc, ch_to_pg_inc, v_ch_to_pg_inc,
         s3_archive, check_hash, pg_ddl, v_pg_ddl,
-        list_keys, v_list_keys, file_read, bucket_viewer,
+        viewer_gate_t, list_keys, v_list_keys, file_read, bucket_viewer,
         gate, cluster_op,
     ]
     all_tasks >> summary_t >> cleanup_t

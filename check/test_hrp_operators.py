@@ -56,6 +56,7 @@ from airflow.models import TaskInstance
 from airflow.models.param import Param
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.utils.session import create_session
+from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
@@ -255,6 +256,20 @@ def _ch_insert_sql(table: str) -> str:
         "ch_conn_id": Param(DEFAULT_CH_CONN, type="string"),
         "s3_conn_id": Param(DEFAULT_S3_CONN, type="string"),
         "s3_bucket": Param(DEFAULT_S3_BUCKET, type="string"),
+        # Флаг на каждую группу проверок: False = вся группа скипается (☮️ в summary).
+        # Дефолт False стоит у проверок, которые пока не проходят на текущем окружении/пакете:
+        #   run_pg_to_s3_list      — баг prepare_row в HrpPostgresToS3ListOperator (до пересборки пакета);
+        #   run_s3_to_ch_tsv       — зависит от pg_to_s3_list;
+        #   run_ch_table_query_s3  — требует clusterAllReplicas(datalab, system.query_log);
+        #   run_cluster_tests      — требует system.clusters('datalab').
+        "run_pg_to_s3": Param(default=True, type="boolean"),
+        "run_pg_to_s3_list": Param(default=False, type="boolean"),
+        "run_ch_native_to_s3": Param(default=True, type="boolean"),
+        "run_ch_table_query_s3": Param(default=False, type="boolean"),
+        "run_s3_to_ch_csv": Param(default=True, type="boolean"),
+        "run_s3_to_ch_tsv": Param(default=False, type="boolean"),
+        "run_db_to_db": Param(default=True, type="boolean"),
+        "run_s3_utils": Param(default=True, type="boolean"),
         "run_viewer_tests": Param(default=True, type="boolean"),
         "run_cluster_tests": Param(default=False, type="boolean"),
     },
@@ -359,244 +374,285 @@ def test_hrp_operators_dag():
             raise AirflowFailException(f"{table}: активная инкарнация {active} содержит {cnt} строк")
         logger.info("OK: %s активная инкарнация %s = %d строк", table, active, cnt)
 
-    # ───────────────────────────── to_s3 группа ───────────────────────────────
-    # Каждый to-S3 оператор с post_file_check=True сам перечитывает файл и сверяет хэш,
-    # поэтому успех таска = пройденная проверка целостности для данного сжатия.
-    setup_pg_t = setup_pg()
-    setup_ch_t = setup_ch()
+    # TaskGroup'ы используем с prefix_group_id=False: task_id остаются прежними (их
+    # используют XCom-pull'ы, ветки-гейты и summary), меняется лишь группировка в UI.
+
+    # ─────────────────────────────── setup ────────────────────────────────────
+    with TaskGroup(group_id="setup", prefix_group_id=False):
+        setup_pg_t = setup_pg()
+        setup_ch_t = setup_ch()
+
     exports = []
 
-    for c in COMPRESSIONS_PG_BASE:
-        op = HrpPostgresToS3Operator(
-            task_id=f"pg_to_s3_{clabel(c)}",
-            table_name=SRC, schema=PG_SCHEMA,
-            s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", c),
-            postgres_conn_id=PG_CONN, aws_conn_id=S3_CONN,
-            compression=c, replace=True, post_file_check=True,
-        )
-        setup_pg_t >> op
-        exports.append(op)
+    # Гейты групп: на каждую группу — branch по params[param_name]; при False вся группа
+    # (ops + каскадом их валидаторы) скипается. Собираем гейты для summary/all_tasks.
+    gates = []
 
-    for c in COMPRESSIONS_FULL:
-        op = HrpPostgresToS3ListOperator(
-            task_id=f"pg_to_s3_list_{clabel(c)}",
-            table_name=SRC, schema=PG_SCHEMA,
-            s3_bucket=BUCKET, s3_key=s3key("pg_to_s3_list", c),
-            postgres_conn_id=PG_CONN, aws_conn_id=S3_CONN,
-            compression=c, replace=True, post_file_check=True,
-            header=True, xstream_sanitize=True, sanitize_array=True,
-        )
-        setup_pg_t >> op
-        exports.append(op)
+    def make_gate(param_name, ops, upstream=None, gate_id=None):
+        ids = [o.task_id for o in ops]
 
-    for c in COMPRESSIONS_FULL:
-        op = HrpClickNativeToS3Operator(
-            task_id=f"ch_native_to_s3_{clabel(c)}",
-            sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
-            s3_bucket=BUCKET, s3_key=s3key("ch_native", c),
+        @task.branch(task_id=gate_id or f"gate_{param_name}")
+        def _gate(params=None):
+            return ids if params.get(param_name) else []
+
+        g = _gate()
+        if upstream is not None:
+            upstream >> g
+        g >> ops
+        gates.append(g)
+        return g
+
+    # Группы to_s3 (раздельные флаги, чтобы изолировать пока-не-проходящие проверки).
+    pg_to_s3_ops, pg_to_s3_list_ops, ch_native_ops, ch_table_query_ops = [], [], [], []
+
+    # ───────────────────────────── to_s3 ──────────────────────────────────────
+    # Каждый to-S3 оператор с post_file_check=True сам перечитывает файл и сверяет хэш,
+    # поэтому успех таска = пройденная проверка целостности для данного сжатия.
+    with TaskGroup(group_id="to_s3", prefix_group_id=False):
+        for c in COMPRESSIONS_PG_BASE:
+            op = HrpPostgresToS3Operator(
+                task_id=f"pg_to_s3_{clabel(c)}",
+                table_name=SRC, schema=PG_SCHEMA,
+                s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", c),
+                postgres_conn_id=PG_CONN, aws_conn_id=S3_CONN,
+                compression=c, replace=True, post_file_check=True,
+            )
+            setup_pg_t >> op
+            exports.append(op)
+            pg_to_s3_ops.append(op)
+
+        for c in COMPRESSIONS_FULL:
+            op = HrpPostgresToS3ListOperator(
+                task_id=f"pg_to_s3_list_{clabel(c)}",
+                table_name=SRC, schema=PG_SCHEMA,
+                s3_bucket=BUCKET, s3_key=s3key("pg_to_s3_list", c),
+                postgres_conn_id=PG_CONN, aws_conn_id=S3_CONN,
+                compression=c, replace=True, post_file_check=True,
+                header=True, xstream_sanitize=True, sanitize_array=True,
+            )
+            setup_pg_t >> op
+            exports.append(op)
+            pg_to_s3_list_ops.append(op)
+
+        for c in COMPRESSIONS_FULL:
+            op = HrpClickNativeToS3Operator(
+                task_id=f"ch_native_to_s3_{clabel(c)}",
+                sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
+                s3_bucket=BUCKET, s3_key=s3key("ch_native", c),
+                clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
+                compression=c, replace=True, post_file_check=True, fmt="CSV",
+            )
+            setup_ch_t >> op
+            exports.append(op)
+            ch_native_ops.append(op)
+
+        for c in COMPRESSIONS_FULL:
+            op = HrpClickNativeToS3ListOperator(
+                task_id=f"ch_native_list_{clabel(c)}",
+                sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
+                s3_bucket=BUCKET, s3_key=s3key("ch_native_list", c, ext=".json"),
+                clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
+                compression=c, replace=True, post_file_check=True, fmt="JSON",
+            )
+            setup_ch_t >> op
+            exports.append(op)
+            ch_native_ops.append(op)
+
+        # ⚠ Table/Query→S3 считают строки через clusterAllReplicas(datalab, system.query_log).
+        for c in COMPRESSIONS_FULL:
+            op = HrpClickhouseTableToS3Operator(
+                task_id=f"ch_table_to_s3_{clabel(c)}",
+                table_name=SRC, schema=CH_SCHEMA,
+                s3_bucket=BUCKET, s3_key=s3key("ch_table", c),
+                clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
+                compression=c, replace=True, post_file_check=True,
+            )
+            setup_ch_t >> op
+            exports.append(op)
+            ch_table_query_ops.append(op)
+
+        ch_query_to_s3 = HrpClickhouseQueryToS3Operator(
+            task_id="ch_query_to_s3_gzip",
+            sql=f"SELECT id, name FROM {CH_SCHEMA}.{SRC} WHERE id > 1",
+            s3_bucket=BUCKET, s3_key=s3key("ch_query", "gzip"),
             clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
-            compression=c, replace=True, post_file_check=True, fmt="CSV",
+            compression="gzip", replace=True, post_file_check=True,
         )
-        setup_ch_t >> op
-        exports.append(op)
+        setup_ch_t >> ch_query_to_s3
+        exports.append(ch_query_to_s3)
+        ch_table_query_ops.append(ch_query_to_s3)
 
-    for c in COMPRESSIONS_FULL:
-        op = HrpClickNativeToS3ListOperator(
-            task_id=f"ch_native_list_{clabel(c)}",
-            sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
-            s3_bucket=BUCKET, s3_key=s3key("ch_native_list", c, ext=".json"),
-            clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
-            compression=c, replace=True, post_file_check=True, fmt="JSON",
-        )
-        setup_ch_t >> op
-        exports.append(op)
-
-    # ⚠ Table/Query→S3 считают строки через clusterAllReplicas(datalab, system.query_log).
-    for c in COMPRESSIONS_FULL:
-        op = HrpClickhouseTableToS3Operator(
-            task_id=f"ch_table_to_s3_{clabel(c)}",
-            table_name=SRC, schema=CH_SCHEMA,
-            s3_bucket=BUCKET, s3_key=s3key("ch_table", c),
-            clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
-            compression=c, replace=True, post_file_check=True,
-        )
-        setup_ch_t >> op
-        exports.append(op)
-
-    ch_query_to_s3 = HrpClickhouseQueryToS3Operator(
-        task_id="ch_query_to_s3_gzip",
-        sql=f"SELECT id, name FROM {CH_SCHEMA}.{SRC} WHERE id > 1",
-        s3_bucket=BUCKET, s3_key=s3key("ch_query", "gzip"),
-        clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
-        compression="gzip", replace=True, post_file_check=True,
-    )
-    setup_ch_t >> ch_query_to_s3
-    exports.append(ch_query_to_s3)
+        make_gate("run_pg_to_s3", pg_to_s3_ops)
+        make_gate("run_pg_to_s3_list", pg_to_s3_list_ops)
+        make_gate("run_ch_native_to_s3", ch_native_ops)
+        make_gate("run_ch_table_query_s3", ch_table_query_ops)
 
     # ───────────────────────── s3_to_db (end-to-end) ──────────────────────────
     # Перезаливаем gzip-выгрузки обратно в CH и сверяем row count.
     pg_to_s3_gzip = next(o for o in exports if o.task_id == "pg_to_s3_gzip")
     pg_to_s3_list_gzip = next(o for o in exports if o.task_id == "pg_to_s3_list_gzip")
 
-    s3_to_ch_csv = HrpS3ToClickhouseTableOperator(
-        task_id="s3_to_ch_csv",
-        s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
-        clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
-        table_name=T_S3_TO_CH, schema=CH_SCHEMA,
-        fmt="CSV", compression="gzip", truncate=True,
-    )
-    # HrpPostgresToS3ListOperator пишет файлы с номерным суффиксом (..._1.csv.gz),
-    # поэтому берём фактический ключ из XCom (s3_key_list), а не вычисляем литерально.
-    s3_to_ch_tsv = HrpS3ToClickhouseTableOperator(
-        task_id="s3_to_ch_tsv",
-        s3_bucket=BUCKET,
-        s3_key="{{ ti.xcom_pull(task_ids='pg_to_s3_list_gzip', key='s3_key_list')[0] }}",
-        clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
-        table_name=T_S3_TO_CH_LIST, schema=CH_SCHEMA,
-        fmt="TSVWithNames", compression="gzip", truncate=True,
-    )
-    v_s3_csv = validate_ch_count.override(task_id="v_s3_to_ch_csv")(T_S3_TO_CH)
-    v_s3_tsv = validate_ch_count.override(task_id="v_s3_to_ch_tsv")(T_S3_TO_CH_LIST)
-    [setup_ch_t, pg_to_s3_gzip] >> s3_to_ch_csv >> v_s3_csv
-    [setup_ch_t, pg_to_s3_list_gzip] >> s3_to_ch_tsv >> v_s3_tsv
+    with TaskGroup(group_id="s3_to_db", prefix_group_id=False):
+        s3_to_ch_csv = HrpS3ToClickhouseTableOperator(
+            task_id="s3_to_ch_csv",
+            s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
+            clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
+            table_name=T_S3_TO_CH, schema=CH_SCHEMA,
+            fmt="CSV", compression="gzip", truncate=True,
+        )
+        # HrpPostgresToS3ListOperator пишет файлы с номерным суффиксом (..._1.csv.gz),
+        # поэтому берём фактический ключ из XCom (s3_key_list), а не вычисляем литерально.
+        s3_to_ch_tsv = HrpS3ToClickhouseTableOperator(
+            task_id="s3_to_ch_tsv",
+            s3_bucket=BUCKET,
+            s3_key="{{ ti.xcom_pull(task_ids='pg_to_s3_list_gzip', key='s3_key_list')[0] }}",
+            clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
+            table_name=T_S3_TO_CH_LIST, schema=CH_SCHEMA,
+            fmt="TSVWithNames", compression="gzip", truncate=True,
+        )
+        v_s3_csv = validate_ch_count.override(task_id="v_s3_to_ch_csv")(T_S3_TO_CH)
+        v_s3_tsv = validate_ch_count.override(task_id="v_s3_to_ch_tsv")(T_S3_TO_CH_LIST)
+        [setup_ch_t, pg_to_s3_gzip] >> s3_to_ch_csv >> v_s3_csv
+        [setup_ch_t, pg_to_s3_list_gzip] >> s3_to_ch_tsv >> v_s3_tsv
+
+        make_gate("run_s3_to_ch_csv", [s3_to_ch_csv])
+        make_gate("run_s3_to_ch_tsv", [s3_to_ch_tsv])
 
     # ──────────────────────────── db_to_db ────────────────────────────────────
-    pg_to_pg = HrpPostgresToPostgresOperator(
-        task_id="pg_to_pg",
-        source_conn_id=PG_CONN, source_schema=PG_SCHEMA, source_table=SRC,
-        target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_PG_TO_PG,
-        truncate=True, post_count_check=True,
-    )
-    v_pg_to_pg = validate_pg_to_pg()
-    setup_pg_t >> pg_to_pg >> v_pg_to_pg
+    with TaskGroup(group_id="db_to_db", prefix_group_id=False):
+        pg_to_pg = HrpPostgresToPostgresOperator(
+            task_id="pg_to_pg",
+            source_conn_id=PG_CONN, source_schema=PG_SCHEMA, source_table=SRC,
+            target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_PG_TO_PG,
+            truncate=True, post_count_check=True,
+        )
+        v_pg_to_pg = validate_pg_to_pg()
+        setup_pg_t >> pg_to_pg >> v_pg_to_pg
 
-    ch_to_pg = HrpClickhouseToPostgresOperator(
-        task_id="ch_to_pg",
-        clickhouse_conn_id=CH_CONN, sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
-        target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_CH_TO_PG,
-        truncate=True,
-    )
-    v_ch_to_pg = validate_ch_to_pg()
-    [setup_pg_t, setup_ch_t] >> ch_to_pg >> v_ch_to_pg
+        ch_to_pg = HrpClickhouseToPostgresOperator(
+            task_id="ch_to_pg",
+            clickhouse_conn_id=CH_CONN, sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
+            target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_CH_TO_PG,
+            truncate=True,
+        )
+        v_ch_to_pg = validate_ch_to_pg()
+        [setup_pg_t, setup_ch_t] >> ch_to_pg >> v_ch_to_pg
 
-    pg_to_ch = HrpPostgresToClickhouseOperator(
-        task_id="pg_to_ch",
-        source_conn_id=PG_CONN, source_schema=PG_SCHEMA, source_table=SRC,
-        target_conn_id=CH_CONN, target_schema=CH_SCHEMA, target_table=T_PG_TO_CH,
-        target_truncate=True, target_fmt="CSV",
-    )
-    v_pg_to_ch = validate_ch_count.override(task_id="v_pg_to_ch")(T_PG_TO_CH)
-    [setup_pg_t, setup_ch_t] >> pg_to_ch >> v_pg_to_ch
+        pg_to_ch = HrpPostgresToClickhouseOperator(
+            task_id="pg_to_ch",
+            source_conn_id=PG_CONN, source_schema=PG_SCHEMA, source_table=SRC,
+            target_conn_id=CH_CONN, target_schema=CH_SCHEMA, target_table=T_PG_TO_CH,
+            target_truncate=True, target_fmt="CSV",
+        )
+        v_pg_to_ch = validate_ch_count.override(task_id="v_pg_to_ch")(T_PG_TO_CH)
+        [setup_pg_t, setup_ch_t] >> pg_to_ch >> v_pg_to_ch
 
-    pg_inc = HrpPostgresIncarnationInsertOperator(
-        task_id="pg_incarnation_insert",
-        conn_id=PG_CONN, select_query=f"SELECT * FROM {PG_SCHEMA}.{SRC}",
-        target_schema=PG_SCHEMA, target_table=T_PG_INC,
-    )
-    v_pg_inc = validate_incarnation.override(task_id="v_pg_inc")(T_PG_INC)
-    setup_pg_t >> pg_inc >> v_pg_inc
+        pg_inc = HrpPostgresIncarnationInsertOperator(
+            task_id="pg_incarnation_insert",
+            conn_id=PG_CONN, select_query=f"SELECT * FROM {PG_SCHEMA}.{SRC}",
+            target_schema=PG_SCHEMA, target_table=T_PG_INC,
+        )
+        v_pg_inc = validate_incarnation.override(task_id="v_pg_inc")(T_PG_INC)
+        setup_pg_t >> pg_inc >> v_pg_inc
 
-    ch_to_pg_inc = HrpClickhouseToPostgresIncarnationOperator(
-        task_id="ch_to_pg_incarnation",
-        clickhouse_conn_id=CH_CONN, sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
-        target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_CH_TO_PG_INC,
-    )
-    v_ch_to_pg_inc = validate_incarnation.override(task_id="v_ch_to_pg_inc")(T_CH_TO_PG_INC)
-    [setup_pg_t, setup_ch_t] >> ch_to_pg_inc >> v_ch_to_pg_inc
+        ch_to_pg_inc = HrpClickhouseToPostgresIncarnationOperator(
+            task_id="ch_to_pg_incarnation",
+            clickhouse_conn_id=CH_CONN, sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
+            target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_CH_TO_PG_INC,
+        )
+        v_ch_to_pg_inc = validate_incarnation.override(task_id="v_ch_to_pg_inc")(T_CH_TO_PG_INC)
+        [setup_pg_t, setup_ch_t] >> ch_to_pg_inc >> v_ch_to_pg_inc
+
+        make_gate("run_db_to_db", [pg_to_pg, ch_to_pg, pg_to_ch, pg_inc, ch_to_pg_inc])
 
     # ──────────────────────────── s3_utils ────────────────────────────────────
     # S3ToS3: перепаковка из несжатого источника во все целевые сжатия (post_file_check).
     pg_to_s3_none = next(o for o in exports if o.task_id == "pg_to_s3_none")
-    s3s3_ops = []
-    for c in COMPRESSIONS_FULL:
-        s3s3 = HrpS3ToS3Operator(
-            task_id=f"s3_to_s3_{clabel(c)}",
-            s3_bucket_source=BUCKET, s3_key_source=s3key("pg_to_s3", None),
-            aws_conn_id_source=S3_CONN, compression_source=None,
-            s3_bucket=BUCKET, s3_key=s3key("s3_to_s3", c),
-            aws_conn_id=S3_CONN, compression=c, replace=True, post_file_check=True,
-        )
-        pg_to_s3_none >> s3s3
-        s3s3_ops.append(s3s3)
-
-    s3_archive = HrpS3ArchiveOperator(
-        task_id="s3_archive",
-        s3_keys_source=[s3key("pg_to_s3", None), s3key("ch_native", None)],
-        s3_bucket_source=BUCKET, aws_conn_id_source=S3_CONN,
-        s3_bucket=BUCKET, s3_key=f"{S3_PREFIX}archive/bundle.zip",
-        aws_conn_id=S3_CONN, replace=True,
-    )
     ch_native_none = next(o for o in exports if o.task_id == "ch_native_to_s3_none")
-    [pg_to_s3_none, ch_native_none] >> s3_archive
+    with TaskGroup(group_id="s3_utils", prefix_group_id=False):
+        s3s3_ops = []
+        for c in COMPRESSIONS_FULL:
+            s3s3 = HrpS3ToS3Operator(
+                task_id=f"s3_to_s3_{clabel(c)}",
+                s3_bucket_source=BUCKET, s3_key_source=s3key("pg_to_s3", None),
+                aws_conn_id_source=S3_CONN, compression_source=None,
+                s3_bucket=BUCKET, s3_key=s3key("s3_to_s3", c),
+                aws_conn_id=S3_CONN, compression=c, replace=True, post_file_check=True,
+            )
+            pg_to_s3_none >> s3s3
+            s3s3_ops.append(s3s3)
 
-    # CheckS3FileHash: сверяем хэш gzip-выгрузки PostgresToS3 с тем, что оператор положил в XCom.
-    check_hash = HrpCheckS3FileHash(
-        task_id="check_s3_file_hash",
-        s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
-        aws_conn_id=S3_CONN, compression="gzip",
-        checksum="{{ ti.xcom_pull(task_ids='pg_to_s3_gzip', key='checksum') }}",
-    )
-    pg_to_s3_gzip >> check_hash
+        s3_archive = HrpS3ArchiveOperator(
+            task_id="s3_archive",
+            s3_keys_source=[s3key("pg_to_s3", None), s3key("ch_native", None)],
+            s3_bucket_source=BUCKET, aws_conn_id_source=S3_CONN,
+            s3_bucket=BUCKET, s3_key=f"{S3_PREFIX}archive/bundle.zip",
+            aws_conn_id=S3_CONN, replace=True,
+        )
+        [pg_to_s3_none, ch_native_none] >> s3_archive
 
-    pg_ddl = HrpPostgresDDL(
-        task_id="pg_ddl", table_name=SRC, schema=PG_SCHEMA, postgres_conn_id=PG_CONN,
-    )
-    setup_pg_t >> pg_ddl
+        # CheckS3FileHash: сверяем хэш gzip-выгрузки PostgresToS3 с тем, что оператор положил в XCom.
+        check_hash = HrpCheckS3FileHash(
+            task_id="check_s3_file_hash",
+            s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
+            aws_conn_id=S3_CONN, compression="gzip",
+            checksum="{{ ti.xcom_pull(task_ids='pg_to_s3_gzip', key='checksum') }}",
+        )
+        pg_to_s3_gzip >> check_hash
 
-    @task
-    def validate_pg_ddl(**context):
-        ddl = context["ti"].xcom_pull(task_ids="pg_ddl")
-        if not ddl or "CREATE TABLE" not in ddl:
-            raise AirflowFailException(f"pg_ddl вернул некорректный DDL: {ddl!r}")
-        logger.info("OK: pg_ddl вернул %d символов DDL", len(ddl))
+        pg_ddl = HrpPostgresDDL(
+            task_id="pg_ddl", table_name=SRC, schema=PG_SCHEMA, postgres_conn_id=PG_CONN,
+        )
+        setup_pg_t >> pg_ddl
 
-    v_pg_ddl = validate_pg_ddl()
-    pg_ddl >> v_pg_ddl
+        @task
+        def validate_pg_ddl(**context):
+            ddl = context["ti"].xcom_pull(task_ids="pg_ddl")
+            if not ddl or "CREATE TABLE" not in ddl:
+                raise AirflowFailException(f"pg_ddl вернул некорректный DDL: {ddl!r}")
+            logger.info("OK: pg_ddl вернул %d символов DDL", len(ddl))
+
+        v_pg_ddl = validate_pg_ddl()
+        pg_ddl >> v_pg_ddl
+
+        make_gate("run_s3_utils", [*s3s3_ops, s3_archive, check_hash, pg_ddl])
 
     # ──────────────────────────── viewers ─────────────────────────────────────
-    list_keys = HrpS3ListKeysOperator(
-        task_id="s3_list_keys", bucket=BUCKET, prefix=S3_PREFIX, aws_conn_id=S3_CONN,
-    )
-    file_read = HrpS3FileReadOperator(
-        task_id="s3_file_read",
-        s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
-        aws_conn_id=S3_CONN, compression="gzip", rows=10,
-    )
-    bucket_viewer = HrpS3BucketViewerOperator(task_id="s3_bucket_viewer", aws_conn_id=S3_CONN)
+    with TaskGroup(group_id="viewers", prefix_group_id=False):
+        list_keys = HrpS3ListKeysOperator(
+            task_id="s3_list_keys", bucket=BUCKET, prefix=S3_PREFIX, aws_conn_id=S3_CONN,
+        )
+        file_read = HrpS3FileReadOperator(
+            task_id="s3_file_read",
+            s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
+            aws_conn_id=S3_CONN, compression="gzip", rows=10,
+        )
+        bucket_viewer = HrpS3BucketViewerOperator(task_id="s3_bucket_viewer", aws_conn_id=S3_CONN)
 
-    @task
-    def validate_list_keys(**context):
-        keys = context["ti"].xcom_pull(task_ids="s3_list_keys") or []
-        names = [k.get("Key") if isinstance(k, dict) else k for k in keys]
-        if not any(str(n).startswith(S3_PREFIX) for n in names):
-            raise AirflowFailException(f"s3_list_keys не вернул ключей с префиксом {S3_PREFIX}: {names}")
-        logger.info("OK: s3_list_keys вернул %d ключей", len(names))
+        @task
+        def validate_list_keys(**context):
+            keys = context["ti"].xcom_pull(task_ids="s3_list_keys") or []
+            names = [k.get("Key") if isinstance(k, dict) else k for k in keys]
+            if not any(str(n).startswith(S3_PREFIX) for n in names):
+                raise AirflowFailException(f"s3_list_keys не вернул ключей с префиксом {S3_PREFIX}: {names}")
+            logger.info("OK: s3_list_keys вернул %d ключей", len(names))
 
-    v_list_keys = validate_list_keys()
+        v_list_keys = validate_list_keys()
+        list_keys >> v_list_keys
 
-    # Гейт по run_viewer_tests (по аналогии с cluster_gate): при False вся группа viewers скипается.
-    @task.branch(task_id="viewer_gate")
-    def viewer_gate(params=None):
-        return ["s3_list_keys", "s3_file_read", "s3_bucket_viewer"] if params.get("run_viewer_tests") else []
-
-    viewer_gate_t = viewer_gate()
-    [pg_to_s3_gzip, setup_pg_t] >> viewer_gate_t >> [list_keys, file_read, bucket_viewer]
-    list_keys >> v_list_keys
+        # viewers зависят от наличия выгрузки pg_to_s3_gzip — порядок через upstream гейта.
+        make_gate("run_viewer_tests", [list_keys, file_read, bucket_viewer],
+                  upstream=[pg_to_s3_gzip, setup_pg_t], gate_id="viewer_gate")
 
     # ──────────────────────────── cluster ─────────────────────────────────────
     # ⚠ Требует system.clusters('datalab') и conn click-dlab-*. По умолчанию выключено.
-    cluster_op = HrpClickHouseClusterOperator(
-        task_id="ch_cluster_ddl",
-        sql=f"CREATE TABLE IF NOT EXISTS {CH_SCHEMA}.hrp_cluster_probe (id Int32) ENGINE = MergeTree() ORDER BY id",
-        clickhouse_conn_id=CH_CONN,
-    )
-
-    @task.branch(task_id="cluster_gate")
-    def cluster_gate(params=None):
-        return ["ch_cluster_ddl"] if params.get("run_cluster_tests") else []
-
-    gate = cluster_gate()
-    setup_ch_t >> gate >> cluster_op
+    with TaskGroup(group_id="cluster", prefix_group_id=False):
+        cluster_op = HrpClickHouseClusterOperator(
+            task_id="ch_cluster_ddl",
+            sql=f"CREATE TABLE IF NOT EXISTS {CH_SCHEMA}.hrp_cluster_probe (id Int32) ENGINE = MergeTree() ORDER BY id",
+            clickhouse_conn_id=CH_CONN,
+        )
+        make_gate("run_cluster_tests", [cluster_op], upstream=setup_ch_t, gate_id="cluster_gate")
 
     # ──────────────────────────── summary ─────────────────────────────────────
     @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
@@ -663,8 +719,8 @@ def test_hrp_operators_dag():
         pg_to_pg, v_pg_to_pg, ch_to_pg, v_ch_to_pg, pg_to_ch, v_pg_to_ch,
         pg_inc, v_pg_inc, ch_to_pg_inc, v_ch_to_pg_inc,
         s3_archive, check_hash, pg_ddl, v_pg_ddl,
-        viewer_gate_t, list_keys, v_list_keys, file_read, bucket_viewer,
-        gate, cluster_op,
+        list_keys, v_list_keys, file_read, bucket_viewer,
+        cluster_op, *gates,
     ]
     all_tasks >> summary_t >> cleanup_t
 

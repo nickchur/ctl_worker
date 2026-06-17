@@ -101,12 +101,12 @@ logger = getLogger("airflow.task")
 
 # ───────────────────────────────── Настройки ──────────────────────────────────
 DEFAULT_PG_CONN = "airflowdb"
-DEFAULT_CH_CONN = "ctl_ch"
+DEFAULT_CH_CONN = "dlab-click"
 DEFAULT_S3_CONN = "s3-archive"
-DEFAULT_S3_BUCKET = "test_operators"
+DEFAULT_S3_BUCKET = "dataplatform-monitoring"
 S3_PREFIX = "hrp_tests/"
 
-PG_SCHEMA = "public"
+PG_SCHEMA = "main"
 CH_SCHEMA = "technical"
 
 # Имена объектов (фиксированы; max_active_runs=1, cleanup гарантирует отсутствие мусора)
@@ -248,7 +248,7 @@ def _ch_insert_sql(table: str) -> str:
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
-    tags=["test", "hrp", "operators"],
+    tags=["DataLab", "tools", "operators", "AutoQA"],
     default_args={"owner": "DataLab (CI02420667)"},
     params={
         "pg_conn_id": Param(DEFAULT_PG_CONN, type="string"),

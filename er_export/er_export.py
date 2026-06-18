@@ -529,7 +529,7 @@ def _er_pack_zip(cfg, **context):
         ]
         hook_e = S3Hook(aws_conn_id=S3_CONN)
         hook_e.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
-        ts1 = base_ts.add(seconds=1).format("YYYYMMDDHHmmss")
+        ts1 = base_ts.format("YYYYMMDDHHmmss")
         summary_tkt = f"{cfg['replica']}__{ts1}.tkt".lower()
         hook_e.load_bytes(zip_n.encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
         ti.xcom_push(key="zip_name_list",    value=[zip_n])

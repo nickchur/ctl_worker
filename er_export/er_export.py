@@ -414,6 +414,12 @@ def _er_init(cfg, **context):
         if p.get(key) not in (None, '', 'None'):
             result[key] = transform(p[key])
 
+    # Фиксируем время старта DAG-рана один раз: все имена файлов в pack_zip строятся
+    # от этого значения, а не от пересчитанного now() (стабильность имён при ретраях/задержках).
+    dr = context.get('dag_run')
+    dag_start = getattr(dr, 'start_date', None) or pendulum.now('UTC')
+    result['dag_start_time'] = pendulum.instance(dag_start).in_timezone('UTC').isoformat()
+
     add_note({k: result.get(k) for k in key_map}, level='Task,DAG', context=context, title='⚙️ Delta State')
     return result
 
@@ -498,6 +504,10 @@ def _er_pack_zip(cfg, **context):
     counts  = ti.xcom_pull(task_ids="export_to_s3", key='row_count_list')
     meta_s  = ti.xcom_pull(task_ids="build_meta",   key='meta_json')
 
+    # Зафиксированное в init время старта DAG — единая точка отсчёта для имён файлов.
+    dp = ti.xcom_pull(task_ids="init")
+    base_ts = pendulum.parse(dp['dag_start_time']) if dp and dp.get('dag_start_time') else pendulum.now("UTC")
+
     if not s3_keys:
         send_empty = context['params'].get('send_empty', cfg.get('send_empty', False))
         if not send_empty:
@@ -506,12 +516,12 @@ def _er_pack_zip(cfg, **context):
 
         meta_obj = json.loads(meta_s)
         header   = "\t".join(c["column_name"] for c in meta_obj["columns"]) + "\n"
-        ts0    = pendulum.now("UTC").format("YYYYMMDDHHmmss")
+        ts0    = base_ts.format("YYYYMMDDHHmmss")
         csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts0}__0_1_0.csv".lower()
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts0}__0_1_0.meta".lower()
         tkt_n  = f"{cfg['replica']}__{ts0}.tkt".lower()
         zip_n  = f"{cfg['replica']}__{ts0}__{cfg['tbl']}__0_1_0.zip".lower()
-        mtime  = pendulum.now("UTC").naive()
+        mtime  = base_ts.naive()
         members = [
             (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{csv_n};0".encode()]),
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
@@ -519,7 +529,7 @@ def _er_pack_zip(cfg, **context):
         ]
         hook_e = S3Hook(aws_conn_id=S3_CONN)
         hook_e.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
-        ts1 = pendulum.now("UTC").format("YYYYMMDDHHmmss")
+        ts1 = base_ts.add(seconds=1).format("YYYYMMDDHHmmss")
         summary_tkt = f"{cfg['replica']}__{ts1}.tkt".lower()
         hook_e.load_bytes(zip_n.encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
         ti.xcom_push(key="zip_name_list",    value=[zip_n])
@@ -529,7 +539,7 @@ def _er_pack_zip(cfg, **context):
         return
 
     hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
-    base_ts, uploaded = pendulum.now("UTC"), []
+    uploaded = []
     ts_s = None  # type: ignore  # всегда переопределяется в цикле (s3_keys непустой)
 
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):

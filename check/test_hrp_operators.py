@@ -286,11 +286,15 @@ def _ch_insert_sql(table: str) -> str:
 )
 def test_hrp_operators_dag():
 
-    # Jinja-шаблоны conn_id/бакета; имена в верхнем регистре — это «константы» внутри DAG-фабрики.
-    PG_CONN = "{{ params.pg_conn_id }}"  # noqa: N806
-    CH_CONN = "{{ params.ch_conn_id }}"  # noqa: N806
-    S3_CONN = "{{ params.s3_conn_id }}"  # noqa: N806
-    BUCKET = "{{ params.s3_bucket }}"  # noqa: N806
+    # conn_id/бакет передаём операторам ЛИТЕРАЛАМИ, а не через {{ params }}: часть
+    # hrp_operators (PostgresToPostgres, S3ToClickhouseTable, ClickhouseToPostgres, …)
+    # не объявляет conn_id/s3_bucket в template_fields, поэтому Jinja у них не рендерится
+    # и падает с «conn_id `{{ params.* }}` isn't defined». Дефолты совпадают с params.*,
+    # @task-хелперы (setup/validate/cleanup) по-прежнему берут conn_id из params[...] в рантайме.
+    PG_CONN = DEFAULT_PG_CONN  # noqa: N806
+    CH_CONN = DEFAULT_CH_CONN  # noqa: N806
+    S3_CONN = DEFAULT_S3_CONN  # noqa: N806
+    BUCKET = DEFAULT_S3_BUCKET  # noqa: N806
 
     # ─────────────────────────────── setup ────────────────────────────────────
     @task
@@ -729,8 +733,11 @@ def test_hrp_operators_dag():
         pg_inc, v_pg_inc, ch_to_pg_inc, v_ch_to_pg_inc,
         s3_archive, check_hash, pg_ddl, v_pg_ddl,
         list_keys, v_list_keys, file_read, bucket_viewer,
-        cluster_op, *gates,
+        cluster_op,
     ]
+    # ВАЖНО: гейты (@task.branch) НЕ должны быть прямым upstream summary — branch
+    # принудительно скипает все прямые downstream вне своего списка, перебивая
+    # ALL_DONE. Их подопечные ops и так в all_tasks, поэтому summary всё дожидается.
     all_tasks >> summary_t >> cleanup_t
 
 

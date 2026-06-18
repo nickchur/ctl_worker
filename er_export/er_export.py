@@ -529,8 +529,7 @@ def _er_pack_zip(cfg, **context):
         ]
         hook_e = S3Hook(aws_conn_id=S3_CONN)
         hook_e.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
-        ts1 = base_ts.format("YYYYMMDDHHmmss")
-        summary_tkt = f"{cfg['replica']}__{ts1}.tkt".lower()
+        summary_tkt = f"{cfg['replica']}__{ts0}.tkt".lower()
         hook_e.load_bytes(zip_n.encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
         ti.xcom_push(key="zip_name_list",    value=[zip_n])
         ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
@@ -540,17 +539,17 @@ def _er_pack_zip(cfg, **context):
 
     hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
     uploaded = []
-    ts_s = None  # type: ignore  # всегда переопределяется в цикле (s3_keys непустой)
+    # Единый таймстемп пакета: ЕР требует одинаковый ts у архива (.zip) и тикета (.tkt).
+    ts    = base_ts.format("YYYYMMDDHHmmss")
+    mtime = base_ts.naive()
 
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
-        ts_s = lambda s, _i=i: base_ts.add(seconds=_i*2 + s).format("YYYYMMDDHHmmss")
-        csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.csv".lower()
-        meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts_s(0)}__{i+1}_{total}_{rows}.meta".lower()
-        tkt_n  = f"{cfg['replica']}__{ts_s(1)}.tkt".lower()
-        zip_n  = f"{cfg['replica']}__{ts_s(2)}__{cfg['tbl']}__{i+1}_{total}_{rows}.zip".lower()
+        csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.csv".lower()
+        meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.meta".lower()
+        tkt_n  = f"{cfg['replica']}__{ts}.tkt".lower()
+        zip_n  = f"{cfg['replica']}__{ts}__{cfg['tbl']}__{i+1}_{total}_{rows}.zip".lower()
 
         s3_body = hook.get_key(key=key, bucket_name=BUCKET).get()["Body"]
-        mtime = base_ts.add(seconds=i*2).naive()
         members = [
             (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{csv_n};{rows}".encode()]),
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
@@ -560,7 +559,7 @@ def _er_pack_zip(cfg, **context):
         hook.delete_objects(bucket=BUCKET, keys=[key])
         uploaded.append(zip_n)
 
-    summary_tkt = f"{cfg['replica']}__{ts_s(3)}.tkt".lower()
+    summary_tkt = f"{cfg['replica']}__{ts}.tkt".lower()
     hook.load_bytes("\n".join(uploaded).encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
 
     total_rows = sum(int(r) for r in counts)

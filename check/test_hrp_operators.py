@@ -260,11 +260,13 @@ def _ch_insert_sql(table: str) -> str:
         # Дефолт False стоит у проверок, которые пока не проходят на текущем окружении/пакете:
         #   run_pg_to_s3_list      — баг prepare_row в HrpPostgresToS3ListOperator (до пересборки пакета);
         #   run_s3_to_ch_tsv       — зависит от pg_to_s3_list;
+        #   run_ch_native_list     — JSON-путь NativeClickhouseStream не сериализует Decimal (до пересборки пакета);
         #   run_ch_table_query_s3  — требует clusterAllReplicas(datalab, system.query_log);
         #   run_cluster_tests      — требует system.clusters('datalab').
         "run_pg_to_s3": Param(default=True, type="boolean"),
         "run_pg_to_s3_list": Param(default=False, type="boolean"),
         "run_ch_native_to_s3": Param(default=True, type="boolean"),
+        "run_ch_native_list": Param(default=False, type="boolean"),
         "run_ch_table_query_s3": Param(default=False, type="boolean"),
         "run_s3_to_ch_csv": Param(default=True, type="boolean"),
         "run_s3_to_ch_tsv": Param(default=False, type="boolean"),
@@ -272,6 +274,9 @@ def _ch_insert_sql(table: str) -> str:
         "run_s3_utils": Param(default=True, type="boolean"),
         "run_viewer_tests": Param(default=True, type="boolean"),
         "run_cluster_tests": Param(default=False, type="boolean"),
+        # На время отладки: False оставляет все PG/CH таблицы и S3-ключи, чтобы можно было
+        # переразобрать/перезапустить отдельный упавший таск (иначе cleanup сносит всё).
+        "run_cleanup": Param(default=True, type="boolean"),
     },
     doc_md=__doc__,
 )
@@ -403,7 +408,8 @@ def test_hrp_operators_dag():
         return g
 
     # Группы to_s3 (раздельные флаги, чтобы изолировать пока-не-проходящие проверки).
-    pg_to_s3_ops, pg_to_s3_list_ops, ch_native_ops, ch_table_query_ops = [], [], [], []
+    pg_to_s3_ops, pg_to_s3_list_ops = [], []
+    ch_native_ops, ch_native_list_ops, ch_table_query_ops = [], [], []
 
     # ───────────────────────────── to_s3 ──────────────────────────────────────
     # Каждый to-S3 оператор с post_file_check=True сам перечитывает файл и сверяет хэш,
@@ -456,7 +462,7 @@ def test_hrp_operators_dag():
             )
             setup_ch_t >> op
             exports.append(op)
-            ch_native_ops.append(op)
+            ch_native_list_ops.append(op)
 
         # ⚠ Table/Query→S3 считают строки через clusterAllReplicas(datalab, system.query_log).
         for c in COMPRESSIONS_FULL:
@@ -485,6 +491,7 @@ def test_hrp_operators_dag():
         make_gate("run_pg_to_s3", pg_to_s3_ops)
         make_gate("run_pg_to_s3_list", pg_to_s3_list_ops)
         make_gate("run_ch_native_to_s3", ch_native_ops)
+        make_gate("run_ch_native_list", ch_native_list_ops)
         make_gate("run_ch_table_query_s3", ch_table_query_ops)
 
     # ───────────────────────── s3_to_db (end-to-end) ──────────────────────────
@@ -689,6 +696,9 @@ def test_hrp_operators_dag():
     def cleanup(params=None):
         """Удаляет все созданные PG/CH таблицы и S3-ключи (отрабатывает при любом исходе)."""
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+        if not params.get("run_cleanup", True):
+            logger.info("run_cleanup=False — пропускаем удаление (отладка: таблицы/ключи оставлены)")
+            return
         pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
         pg_objects = [SRC, T_PG_TO_PG, T_CH_TO_PG]
         drops = [f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t} CASCADE;" for t in pg_objects]

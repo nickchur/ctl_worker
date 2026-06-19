@@ -12,22 +12,24 @@
 |---|---|
 | `conn_id`  | Airflow Kafka conn_id (kafka_config_id) |
 | `topic`    | Имя топика |
-| `scenario` | ScenarioId в XML (используется только в out) |
-| `filename` | Имя файла в XML (out шлёт его как `Name`) |
-| `mode`     | Только in: `consume` (воркер, без triggerer) или `await` (deferrable-сенсор, нужен triggerer) |
+| `scenario` | Только out: ScenarioId в XML |
+| `filename` | Только out: имя файла в XML (`Name`) |
+| `mode`     | Только in: `consume` / `await` / `read_last` |
+| `timeout`  | Только in: сколько ждать сообщение, сек (poll_timeout / execution_timeout / окно read_last) |
+| `max_messages` | Только in: сколько последних сообщений читать в `read_last` |
 
 Режимы приёма (`mode`):
   • `consume` (по умолчанию) — `ConsumeFromTopicOperator`: синхронно опрашивает топик на
     воркере, triggerer не требуется. Ловит только сообщения, опубликованные ПОСЛЕ старта
-    опроса (consumer group, auto.offset.reset=latest), в пределах poll_timeout (180 c).
-  • `await` — `AwaitMessageSensor`: deferrable, ждёт сообщение через **triggerer**. Если
-    triggerer не запущен, таск зависнет в `deferred` и упадёт по execution_timeout.
+    опроса (consumer group, auto.offset.reset=latest), в пределах `timeout` секунд.
+  • `await` — `AwaitMessageSensor`: deferrable, ждёт сообщение через **triggerer** в пределах
+    `timeout` секунд. Если triggerer не запущен, таск зависнет в `deferred` и упадёт по таймауту.
   • `read_last` — читает последние `max_messages` сообщений, **уже лежащих** в топике (tail
     через seek к high_watermark−N), свежей consumer group без коммита offset. Порядок запуска
     не важен: можно сначала `test_kafka_out`, потом `test_kafka_in`.
 
 Запускать вручную (schedule=None). Для сквозной проверки `consume`/`await`: сначала trigger
-`test_kafka_in` на нужный топик, затем — пока идёт опрос (≤180 c в режиме consume) —
+`test_kafka_in` на нужный топик, затем — пока идёт ожидание (`timeout` секунд) —
 `test_kafka_out` на тот же топик. Для `read_last` порядок любой.
 """
 from __future__ import annotations
@@ -108,6 +110,16 @@ def consume_msg(msg) -> None:
     get_current_context()["ti"].xcom_push(key="message", value=text)
 
 
+def _set_poll_timeout(context):
+    """pre_execute: проставляет poll_timeout оператора из параметра timeout (poll_timeout не шаблонизируется)."""
+    context["task"].poll_timeout = int(context["params"]["timeout"])
+
+
+def _set_execution_timeout(context):
+    """pre_execute: проставляет execution_timeout оператора из параметра timeout (читается при defer)."""
+    context["task"].execution_timeout = timedelta(seconds=int(context["params"]["timeout"]))
+
+
 KAFKA_CAPTURE = f"{__name__}.capture_msg"
 ON_DELIVERY = f"{__name__}.on_delivery"
 
@@ -171,8 +183,6 @@ test_kafka_out()
     params={
         "conn_id":  Param(KAFKA_IN_CONN, type="string", title="Kafka conn_id"),
         "topic":    Param(KAFKA_IN_TOPIC, type="string", title="Topic"),
-        "scenario": Param("HRPLATFORM-4000", type="string", title="Scenario ID"),
-        "filename": Param("test.zip", type="string", title="File name"),
         "mode":     Param(
             "consume",
             type="string",
@@ -181,6 +191,11 @@ test_kafka_out()
             description="consume = ConsumeFromTopicOperator (воркер, ловит новые, без triggerer); "
                         "await = AwaitMessageSensor (deferrable, требует triggerer); "
                         "read_last = прочитать последние N сообщений, уже лежащие в топике.",
+        ),
+        "timeout":  Param(
+            180, type="integer", minimum=5, title="Timeout, sec",
+            description="Сколько ждать сообщение: poll_timeout (consume), "
+                        "execution_timeout (await), окно чтения (read_last).",
         ),
         "max_messages": Param(1, type="integer", minimum=1, title="Max messages (read_last)"),
     },
@@ -202,7 +217,7 @@ def test_kafka_in():
         commit_cadence="never",
         max_messages=1,
         max_batch_size=1,
-        poll_timeout=180,
+        pre_execute=_set_poll_timeout,  # poll_timeout из params.timeout
     )
 
     # режим await: deferrable-сенсор, ждёт сообщение через triggerer
@@ -211,7 +226,7 @@ def test_kafka_in():
         kafka_config_id="{{ params.conn_id }}",
         topics=["{{ params.topic }}"],
         apply_function=KAFKA_CAPTURE,
-        execution_timeout=timedelta(minutes=10),
+        pre_execute=_set_execution_timeout,  # execution_timeout из params.timeout
     )
 
     # общая задача отображения: берёт сообщение из той ветки, что отработала
@@ -272,7 +287,7 @@ def test_kafka_in():
                 return []
 
             consumer.assign(assignment)
-            msgs, deadline = [], time.time() + 30
+            msgs, deadline = [], time.time() + int(p.get("timeout") or 180)
             while len(msgs) < expected and time.time() < deadline:
                 m = consumer.poll(timeout=5)
                 if m is None or m.error():

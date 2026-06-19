@@ -11,19 +11,11 @@
 | **ClickHouse** | Автоматически подменяет `sqlite` на `clickhouse` для корректного отображения |
 """
 
-from collections import defaultdict
-
-import pendulum
-from airflow.configuration import get_custom_secret_backend
-from airflow.models import Connection, Variable
-from airflow.decorators import task, dag
-
-try:
-    from plugins.utils import add_note  # type: ignore
-except ImportError:
-    from CI06932748.tools.utils import add_note  # type: ignore
-
+from datetime import datetime, timezone
 from logging import getLogger
+
+from airflow.decorators import dag, task
+
 logger = getLogger("airflow.task")
 
 
@@ -33,7 +25,7 @@ logger = getLogger("airflow.task")
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
     },
-    start_date=pendulum.datetime(2026, 1, 1, tz=pendulum.UTC),
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule_interval='@once',
     tags=['DataLab', 'tools', 'conn', 'AutoQA'],
     catchup=False,
@@ -44,6 +36,16 @@ def tools_show_connections():
 
     @task
     def show_connections(**context):
+        from collections import defaultdict
+
+        from airflow.configuration import get_custom_secret_backend
+        from airflow.models import Connection, Variable
+
+        try:
+            from plugins.utils import add_note  # type: ignore
+        except ImportError:
+            from CI06932748.tools.utils import add_note  # type: ignore
+
         backend = get_custom_secret_backend()
         if not hasattr(backend, '_local_connections'):
             msg = f"{backend} has no attr `_local_connections`"

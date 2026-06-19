@@ -33,8 +33,8 @@ import yaml
 import io
 import hashlib
 import time
-import pendulum
-from datetime import timedelta
+from datetime import timedelta, datetime
+from zoneinfo import ZoneInfo
 from pprint import PrettyPrinter
 from psycopg2 import OperationalError, InterfaceError, DatabaseError
 from sqlalchemy import text
@@ -73,7 +73,7 @@ def eval_delta(dt:str, delta:str)->str:
     """
     if delta is None: return dt
         
-    new_dt = pendulum.parse(dt)
+    new_dt = datetime.fromisoformat(dt)
     # Разбиение delta на части
     for d in [d.lower().strip() for d in delta.split(',')]:
         p = [p.lower().strip() for p in d.split('=')]
@@ -107,7 +107,7 @@ def eval_delta(dt:str, delta:str)->str:
         elif p[1].lstrip('+-').isdigit():
             new_dt += timedelta(**{p[0]: int(p[1])})
             
-    return new_dt.format('YYYY-MM-DD HH:mm:ss') 
+    return new_dt.strftime('%Y-%m-%d %H:%M:%S')
 
 def logging(msg, action='info', obj='', log=None):
     """Унифицированный логгер с эмодзи-префиксами.
@@ -572,7 +572,7 @@ def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
     
     if var:
         msg ={
-            'ts': pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss'),
+            'ts': datetime.now(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S'),
             'len': len(data),
             'size': readable_size(len(str(data))),
             # 'md5': new_md5,

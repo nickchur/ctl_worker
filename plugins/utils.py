@@ -24,7 +24,6 @@ from airflow.operators.python import get_current_context
 
 from pprint import PrettyPrinter
 from datetime import timedelta, datetime
-import pendulum
 import json
 import hashlib
 
@@ -216,9 +215,7 @@ def _on_callback(context, level=None):
     Обработчик события on_callback
     """
     from airflow.utils.state import TaskInstanceState
-    import pendulum
-    import pendulum
-    
+
     ti = context.get('task_instance')
     dag_run = context.get('dag_run')
     dag_id = ti.dag_id
@@ -266,7 +263,7 @@ def _on_callback(context, level=None):
     task_msg = f'❌ FAILED' if state.lower() == 'failed' else f'✅ SUCCESS' if state.lower() == 'success' else state.upper()
     
     message = (
-        f"*{pendulum.now().format('DD.MM.YYYY HH:mm:ss zz')}*\n\n"
+        f"*{datetime.now().astimezone().strftime('%d.%m.%Y %H:%M:%S %Z')}*\n\n"
     )
     
     if level == 'DAG':
@@ -370,7 +367,7 @@ def readable(value, base=1024, indent=4, jsn=False)->str:
     elif isinstance(value, (int, float)): 
         return readable_size(value, base=base)
     elif isinstance(value, datetime):
-        return pendulum.instance(value).format("DD.MM.YYYY HH:mm:ss zz")
+        return value.strftime("%d.%m.%Y %H:%M:%S %Z").strip()
     elif isinstance(value, timedelta):
         return str(value)
     else:

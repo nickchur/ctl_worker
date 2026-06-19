@@ -18,9 +18,9 @@ from airflow.exceptions import AirflowSkipException, AirflowFailException
 from airflow.decorators import task, task_group
 from airflow.operators.python import get_current_context
 
-from datetime import timedelta
+from datetime import timedelta, datetime
+from zoneinfo import ZoneInfo
 import ast
-import pendulum
 import time
 import json
 
@@ -249,7 +249,7 @@ def ctl_chk_wait(wf, params, context):
 
 def ctl_chk_new(lid, wf_name, status, log, context):
     """Проверяет, можно ли запустить задачу (новая или TIME-WAIT истек)."""
-    now = pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
+    now = datetime.now(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S')
     # lid = params['loading_id']
     # status = params['wfp_status']
     # log = params['wfp_status_log']
@@ -444,10 +444,9 @@ def chk_any_conn(id, data=None, **context):
 
     ti = context['ti']
     try_number = ti.try_number
-    sdt = pendulum.instance(ti.start_date).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss zz')
+    sdt = ti.start_date.astimezone(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S %Z')
     ts = time.time()
     try:
-    # if True:
         if data['type'] == 'Postgres':
             if data.get('default'):
                 from airflow.utils.session import create_session
@@ -643,8 +642,7 @@ def ctl_events_mon(sdt, wf, now):
         last_dt = last_item.get('published_dttm', '')
         chk[event] = last_dt[:19]
         
-        # if last_dt and now - datetime.strptime(last_dt[:19], "%Y-%m-%d %H:%M:%S") < timedelta(minutes=30):
-        if last_dt and now - pendulum.parse(last_dt[:19], tz=get_config()['tz']) < timedelta(minutes=30):
+        if last_dt and now - datetime.strptime(last_dt[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=now.tzinfo) < timedelta(minutes=30):
             return {**last_item, 'chk': True, 'icon': '🔁'}
 
         if is_and:

@@ -90,20 +90,22 @@ def on_delivery(err: Exception | None, msg) -> None:
 def capture_msg(msg) -> str:
     """apply_function для AwaitMessageSensor (режим await): принимает любое сообщение, возвращает текст.
 
-    Truthy-возврат останавливает сенсор; значение уходит в XCom для отображения в задаче show_await.
+    Truthy-возврат останавливает сенсор; значение уходит в XCom для отображения в общей задаче show.
     """
     return msg.value().decode("utf-8", errors="replace")
 
 
-def consume_msg(msg) -> str:
-    """apply_function для ConsumeFromTopicOperator (режим consume): логирует и постит ноту.
+def consume_msg(msg) -> None:
+    """apply_function для ConsumeFromTopicOperator (режим consume): логирует и кладёт текст в XCom.
 
-    Выполняется на воркере, поэтому add_note сам берёт контекст через get_current_context.
+    Выполняется на воркере; get_current_context даёт доступ к ti для xcom_push.
+    Отображение — в общей задаче show.
     """
+    from airflow.operators.python import get_current_context
+
     text = msg.value().decode("utf-8", errors="replace")
     logger.info("Received Kafka message: %s", text)
-    add_note(f"```\n{text}\n```", level="DAG", title="📨 Kafka message received")
-    return text
+    get_current_context()["ti"].xcom_push(key="message", value=text)
 
 
 KAFKA_CAPTURE = f"{__name__}.capture_msg"
@@ -212,11 +214,23 @@ def test_kafka_in():
         execution_timeout=timedelta(minutes=10),
     )
 
-    @task(task_id="show_await")
-    def show_await(**context):
-        msg = context["ti"].xcom_pull(task_ids="wait_await")
-        add_note(f"```\n{msg}\n```", context, level="DAG", title="📨 Kafka message received")
-        logger.info("Received Kafka message: %s", msg)
+    # общая задача отображения: берёт сообщение из той ветки, что отработала
+    @task(task_id="show", trigger_rule="none_failed_min_one_success")
+    def show(**context):
+        ti = context["ti"]
+        msg = (
+            ti.xcom_pull(task_ids="wait_await")                      # await: return capture_msg
+            or ti.xcom_pull(task_ids="read_last")                   # read_last: return list
+            or ti.xcom_pull(task_ids="wait_consume", key="message")  # consume: xcom_push
+        )
+        if not msg:
+            logger.info("No Kafka message received")
+            add_note("Сообщение не получено", context, level="DAG", title="📭 Kafka: no message")
+            return
+        items = msg if isinstance(msg, list) else [msg]
+        for text in items:
+            add_note(f"```\n{text}\n```", context, level="DAG", title="📨 Kafka message received")
+        logger.info("Received %d Kafka message(s)", len(items))
 
     # режим read_last: читает последние N сообщений, уже лежащих в топике (tail),
     # через свежую consumer group + seek к high_watermark-N. Backlog не реплеит, offset не двигает.
@@ -255,7 +269,6 @@ def test_kafka_in():
 
             if expected == 0:
                 logger.info("Топик %s пуст", topic)
-                add_note(f"Топик `{topic}` пуст — нет сообщений", context, level="DAG", title="📭 Kafka empty")
                 return []
 
             consumer.assign(assignment)
@@ -268,16 +281,14 @@ def test_kafka_in():
                 msgs.append(text)
                 logger.info("Read existing message: %s", text)
 
-            for text in msgs[-n:]:
-                add_note(f"```\n{text}\n```", context, level="DAG", title="📨 Kafka message (existing)")
             return msgs[-n:]
         finally:
             consumer.close()
 
     p = pick()
-    p >> wait_consume
-    p >> read_last()
-    p >> wait_await >> show_await()
+    targets = [wait_consume, wait_await, read_last()]
+    p >> targets
+    targets >> show()
 
 
 test_kafka_in()

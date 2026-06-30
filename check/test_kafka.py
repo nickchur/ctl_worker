@@ -67,8 +67,8 @@ def produce_test_msg(scenario_id: str, file_names: list[str], throttle_delay: in
     for file_name in file_names:
         time.sleep(throttle_delay)
         rq_uuid = str(uuid.uuid4()).replace("-", "")
-        now = datetime.now().astimezone()
-        rq_tm = f"{now:%Y-%m-%dT%H:%M:%S}.{now.microsecond // 1000:03d}{now:%z}"
+        # isoformat(ms) даёт формат TFS 'YYYY-MM-DDTHH:mm:ss.SSSZ' (смещение с двоеточием, +03:00)
+        rq_tm = datetime.now().astimezone().isoformat(timespec="milliseconds")
         message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <TransferFileCephRq>
     <RqUID>{rq_uuid}</RqUID>

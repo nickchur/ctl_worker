@@ -15,12 +15,9 @@ from __future__ import annotations
 import ast
 import json
 import logging
-import time
-import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import pendulum
 from airflow import DAG
 from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
@@ -245,13 +242,18 @@ def produce_msg(scenario_id: str, file_names: list[str], throttle_delay: int = 1
     throttle_delay — пауза перед каждой отправкой (сек), защита от перегрузки брокера.
     Функция — генератор (yield key, value), как того требует ProduceToTopicOperator.
     """
+    import time
+    import uuid
+
     for file_name in file_names:
         time.sleep(throttle_delay)
         rq_uuid = str(uuid.uuid4()).replace('-', '')
+        # isoformat(ms) воспроизводит формат pendulum 'YYYY-MM-DDTHH:mm:ss.SSSZ' (смещение с двоеточием)
+        rq_tm = datetime.now().astimezone().isoformat(timespec='milliseconds')
         message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <TransferFileCephRq>
     <RqUID>{rq_uuid}</RqUID>
-    <RqTm>{pendulum.now().format('YYYY-MM-DDTHH:mm:ss.SSSZ')}</RqTm>
+    <RqTm>{rq_tm}</RqTm>
     <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
     <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
 </TransferFileCephRq>"""
@@ -375,17 +377,18 @@ def _er_init(cfg, **context):
             result = {**reg, **(cur if 'condition' in cur else _format_cur_state(cur))}
     else:
         ri  = int(cfg.get('recent_interval', 60))
-        now = pendulum.now('UTC').replace(microsecond=0)
-        t0  = now.subtract(minutes=ri)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        t0  = now - timedelta(minutes=ri)
+        now_s, t0_s = now.isoformat(), t0.isoformat()
         reg.update({
-            'extract_time':    f"'{now}'",
+            'extract_time':    f"'{now_s}'",
             'extract_count':   'null',
             'loaded':          'null',
             'sent':            'null',
             'confirmed':       'null',
-            'time_from':       f"'{t0}'",
-            'time_to':         f"'{now}'",
-            'condition':       f"'{t0}' < {tf} and {tf} <= '{now}'",
+            'time_from':       f"'{t0_s}'",
+            'time_to':         f"'{now_s}'",
+            'condition':       f"'{t0_s}' < {tf} and {tf} <= '{now_s}'",
             'is_current':      'True',
             'recent_interval': str(ri),
             'num_state':       '0',
@@ -417,8 +420,8 @@ def _er_init(cfg, **context):
     # Фиксируем время старта DAG-рана один раз: все имена файлов в pack_zip строятся
     # от этого значения, а не от пересчитанного now() (стабильность имён при ретраях/задержках).
     dr = context.get('dag_run')
-    dag_start = getattr(dr, 'start_date', None) or pendulum.now('UTC')
-    result['dag_start_time'] = pendulum.instance(dag_start).in_timezone('UTC').isoformat()
+    dag_start = getattr(dr, 'start_date', None) or datetime.now(timezone.utc)
+    result['dag_start_time'] = dag_start.astimezone(timezone.utc).isoformat()
 
     add_note({k: result.get(k) for k in key_map}, level='Task,DAG', context=context, title='⚙️ Delta State')
     return result
@@ -506,7 +509,7 @@ def _er_pack_zip(cfg, **context):
 
     # Зафиксированное в init время старта DAG — единая точка отсчёта для имён файлов.
     dp = ti.xcom_pull(task_ids="init")
-    base_ts = pendulum.parse(dp['dag_start_time']) if dp and dp.get('dag_start_time') else pendulum.now("UTC")
+    base_ts = datetime.fromisoformat(dp['dag_start_time']) if dp and dp.get('dag_start_time') else datetime.now(timezone.utc)
 
     if not s3_keys:
         send_empty = context['params'].get('send_empty', cfg.get('send_empty', False))
@@ -516,12 +519,12 @@ def _er_pack_zip(cfg, **context):
 
         meta_obj = json.loads(meta_s)
         header   = "\t".join(c["column_name"] for c in meta_obj["columns"]) + "\n"
-        ts0    = base_ts.format("YYYYMMDDHHmmss")
+        ts0    = base_ts.strftime("%Y%m%d%H%M%S")
         csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts0}__0_1_0.csv".lower()
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts0}__0_1_0.meta".lower()
         tkt_n  = f"{cfg['replica']}__{ts0}.tkt".lower()
         zip_n  = f"{cfg['replica']}__{ts0}__{cfg['tbl']}__0_1_0.zip".lower()
-        mtime  = base_ts.naive()
+        mtime  = base_ts.replace(tzinfo=None)
         members = [
             (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{csv_n};0".encode()]),
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
@@ -540,8 +543,8 @@ def _er_pack_zip(cfg, **context):
     hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
     uploaded = []
     # Единый таймстемп пакета: ЕР требует одинаковый ts у архива (.zip) и тикета (.tkt).
-    ts    = base_ts.format("YYYYMMDDHHmmss")
-    mtime = base_ts.naive()
+    ts    = base_ts.strftime("%Y%m%d%H%M%S")
+    mtime = base_ts.replace(tzinfo=None)
 
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
         csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.csv".lower()
@@ -614,9 +617,9 @@ def _er_schedule_next(cfg, **context):
         add_note("✅ delta is current — next run not scheduled", level='task,dag', context=context)
         return
 
-    next_run = pendulum.now('UTC').add(minutes=int(dp['selfrun_timeout']))
+    next_run = datetime.now(timezone.utc) + timedelta(minutes=int(dp['selfrun_timeout']))
     trigger_dag(dag_id=cfg['dag_id'], execution_date=next_run, conf={}, replace_microseconds=False)
-    add_note(f"⏭️ next run scheduled at {next_run.format('YYYY-MM-DD HH:mm:ss')} UTC", level='task,dag', context=context)
+    add_note(f"⏭️ next run scheduled at {next_run.strftime('%Y-%m-%d %H:%M:%S')} UTC", level='task,dag', context=context)
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────
 
@@ -702,7 +705,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     dag = DAG(
         dag_id=cfg['dag_id'], description=params.get('description', f"ER: {table_key}"),
         doc_md=f"```json\n{json.dumps(p, indent=2, default=str)}\n```",
-        default_args=DEF_ARGS, start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone('UTC')),
+        default_args=DEF_ARGS, start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
         schedule_interval=params.get('schedule', '55 0 * * *'), max_active_tasks=1, max_active_runs=1, catchup=False,
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema.replace(' ', '_').lower()],
         render_template_as_native_obj=True, is_paused_upon_creation=True,

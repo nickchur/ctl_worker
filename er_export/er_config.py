@@ -65,7 +65,7 @@ logger = logging.getLogger("airflow.task")
 def _on_callback(context, level=None):
     """Обработчик on_failure_callback/on_success_callback — формирует заметку о статусе таска/DAG в Airflow UI."""
     from airflow.utils.state import TaskInstanceState
-    import pendulum
+    from datetime import datetime
 
     ti = context.get('task_instance')
     dag_run = context.get('dag_run')
@@ -99,7 +99,7 @@ def _on_callback(context, level=None):
 
     task_msg = '❌ FAILED' if state.lower() == 'failed' else '✅ SUCCESS' if state.lower() == 'success' else state.upper()
 
-    message = f"*{pendulum.now().format('DD.MM.YYYY HH:mm:ss zz')}*\n\n"
+    message = f"*{datetime.now().astimezone().strftime('%d.%m.%Y %H:%M:%S %Z')}*\n\n"
 
     if level == 'DAG':
         dag_msg = '❌ FAILED' if dag_state.lower() == 'failed' else '✅ SUCCESS'
@@ -192,7 +192,7 @@ def obj_save(key: str, data: Any) -> None:
     Обновляет description переменной метаданными: {'ts': ..., 'len': ..., 'size': ...}.
     """
     from airflow.models import Variable
-    import pendulum
+    from datetime import datetime
 
     # Сравниваем с текущим значением — пропускаем лишнюю запись в БД
     try:
@@ -215,7 +215,7 @@ def obj_save(key: str, data: Any) -> None:
 
     size_str = f"{size_val:.1f} {unit}"
     length   = len(data) if isinstance(data, (dict, list)) else 1
-    ts       = pendulum.now().format('YYYY-MM-DD HH:mm:ss')
+    ts       = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     desc     = f"{{'ts': '{ts}', 'len': {length}, 'size': '{size_str}'}}"
 
     Variable.set(key, data, description=desc, serialize_json=True)

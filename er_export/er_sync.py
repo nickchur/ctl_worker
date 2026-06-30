@@ -31,10 +31,10 @@
 from __future__ import annotations
 
 import json
-
-import pendulum
-from airflow.decorators import dag, task
 import logging
+from datetime import datetime, timezone
+
+from airflow.decorators import dag, task
 
 try:
     from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_save, add_note  # type: ignore
@@ -96,7 +96,7 @@ def _ensure_pool() -> None:
     dag_id="export_er_sync",
     description="🔄 Синхронизация export.er_wf_meta → Airflow Variable datalab_er_wfs (каждые 5 мин)",
     default_args=DEF_ARGS,
-    start_date=pendulum.datetime(2024, 12, 18, tz=pendulum.timezone("UTC")),
+    start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
     schedule_interval="*/5 * * * *",
     max_active_runs=1,
     catchup=False,

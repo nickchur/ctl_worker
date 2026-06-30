@@ -25,8 +25,8 @@
     }
   }
 
-⏱️ Расписание: каждые 5 минут. При пустой таблице на не-DEV стенде падает,
-чтобы не затереть Variable пустым значением.
+⏱️ Расписание: @once (одноразовый прогон при включении DAG). При пустой таблице
+на не-DEV стенде падает, чтобы не затереть Variable пустым значением.
 """
 from __future__ import annotations
 
@@ -94,14 +94,14 @@ def _ensure_pool() -> None:
 
 @dag(
     dag_id="export_er_sync",
-    description="🔄 Синхронизация export.er_wf_meta → Airflow Variable datalab_er_wfs (каждые 5 мин)",
+    description="🔄 Синхронизация export.er_wf_meta → Airflow Variable datalab_er_wfs",
     default_args=DEF_ARGS,
     start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
-    schedule_interval="*/5 * * * *",
+    schedule_interval="@once",
     max_active_runs=1,
     catchup=False,
     tags=["DataLab", "CI02420667", "ER", "sync"],
-    is_paused_upon_creation=True,
+    is_paused_upon_creation=False,
     doc_md="```\n" + json.dumps(_doc_cfg, indent=4, default=str) + "\n```",
 )
 def er_sync_dag():

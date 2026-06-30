@@ -1,14 +1,11 @@
 """⚙️ Конфигурация и константы фреймворка ER-выгрузок.
 
-CH-коннект и S3 определяются переменной ENV_SPACE:
-  🔑 ALPHA → dlab-click-test + s3-archive, секреты из Vault.
-  🏭 иначе → dlab-click + s3-tfs-hrplt.
+CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
 Поведение на стенде управляется ENVIRONMENT (PROM / UAT / QA / IFT / DEV).
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -17,33 +14,11 @@ from datetime import timedelta
 from typing import Any
 
 ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
-ENV_SPACE = os.getenv("ENV_SPACE", "").strip().upper()
 
 VAR_NAME = "datalab_er_wfs"
 
-if ENV_SPACE == "ALPHA":
-    CH_ID = 'dlab-click-test'
-    with open('/vault/secrets/application') as f:
-        secrets = json.load(f)
-
-    def _b64(s: str) -> str:
-        """Декодирует base64-строку из vault в UTF-8."""
-        return base64.b64decode(s).decode()
-
-    conn_json = {
-        "conn_type": "clickhouse",
-        "host":      "tvlds-hrplt0429.cloud.delta.sbrf.ru",
-        "port":      9440,
-        "login":     _b64(secrets['SCSP_CLICKHOUSE_USERNAME']),
-        "password":  _b64(secrets['SCSP_CLICKHOUSE_PASSWORD']),
-        "schema":    'export',
-        "extra":     {"verify": False, "secure": True},
-    }
-    os.environ[f'AIRFLOW_CONN_{CH_ID.upper()}'] = json.dumps(conn_json)
-    S3_CONN = 's3-archive'
-else:
-    CH_ID   = 'dlab-click'
-    S3_CONN = 's3-tfs-hrplt'
+CH_ID   = 'dlab-click'
+S3_CONN = 's3-tfs-hrplt'
 
 BUCKET          = 'tfshrplt'
 KAFKA_OUT_TOPIC = 'TFS.HRPLT.IN'
@@ -329,7 +304,6 @@ def get_config() -> dict:
         'TYPE_MAP':        TYPE_MAP,
         'DEF_ARGS':        DEF_ARGS,
         'ENV_STAND':       ENV_STAND,
-        'ENV_SPACE':       ENV_SPACE,       # TODO: удалить после удаления ALPHA-блока
         'EXTRA_PRE':       EXTRA_PRE,
         'EXTRA_SUF':       EXTRA_SUF,
         'LIMITS':          LIMITS,

@@ -139,6 +139,84 @@ def _safe_id(conn_id: str, seen: set[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Локальная копия plugins.ctl_core.chk_any_conn (Postgres / S3 / KerberosHttp)
+# ---------------------------------------------------------------------------
+
+def _chk_any_conn(conn_id: str, conn_type: str, context: dict) -> None:
+    """Проверяет доступность соединения (Postgres / S3 / KerberosHttp).
+
+    Самодостаточная копия `plugins.ctl_core.chk_any_conn` — чтобы тест не зависел от
+    импорта ctl_core. Логика pool_slots / get_config из оригинала здесь не нужна: тест
+    всегда проверяет одно соединение без пулов. При успехе пишет ноту, при ошибке —
+    пробрасывает AirflowFailException.
+    """
+    import time
+
+    from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+    try:
+        from plugins.utils import add_note  # type: ignore
+    except ImportError:
+        from CI06932748.tools.utils import add_note  # type: ignore
+
+    ti = context["ti"]
+    try_number = ti.try_number
+    sdt = ti.start_date.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    ts = time.time()
+    try:
+        if conn_type == "Postgres":
+            from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+            hook = PostgresHook(postgres_conn_id=conn_id)
+            result = hook.get_first("SELECT current_user, current_database(), inet_server_addr()")
+
+        elif conn_type == "S3":
+            from airflow.providers.amazon.aws.hooks.s3 import S3Hook  # type: ignore
+            from botocore.config import Config  # type: ignore
+
+            verify = S3Hook(aws_conn_id=conn_id).get_connection(conn_id).extra_dejson.get("verify", True)
+            if isinstance(verify, str):
+                verify = verify.lower() == "true"
+            hook = S3Hook(aws_conn_id=conn_id, verify=verify, config=Config(connect_timeout=15, read_timeout=15))
+            result = hook.get_conn().list_buckets()["Buckets"]
+
+        elif conn_type == "KerberosHttp":
+            from hrp_operators.utils.kerberos_http import KerberosHttpHook  # type: ignore
+
+            hook = KerberosHttpHook(method="GET", http_conn_id=conn_id)
+            verify = hook.get_connection(conn_id).extra_dejson.get("verify", True)
+            if isinstance(verify, str):
+                verify = verify.lower() == "true"
+            response = hook.run(
+                "/v5/api/info",
+                headers={"Accept": "application/json"},
+                extra_options={"timeout": 15, "verify": verify},
+            )
+            response.raise_for_status()
+            result = response.json()
+        else:
+            result = None
+
+        logger.info("🔍 %s", result)
+        add_note({"try": try_number, "sdt": sdt}, context, title=f"✅ {time.time() - ts:.2f} sec chk_{conn_id}_conn")
+
+    except AirflowSkipException:
+        raise
+
+    except ImportError as err:
+        msg = f"☮️ {conn_id}: провайдер не установлен — {err}"
+        add_note(msg, context, level="task", title=f"☮️ {conn_id}")
+        logger.warning(msg)
+        raise AirflowSkipException(msg) from err
+
+    except Exception as err:
+        response = getattr(err, "response", None)
+        logger.error(response)
+        msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {try_number} {sdt}"
+        add_note(err, context, level="Task,DAG", title=msg)
+        raise AirflowFailException(f"{msg}: {err}") from err
+
+
+# ---------------------------------------------------------------------------
 # Объединенная функция проверки соединений
 # ---------------------------------------------------------------------------
 
@@ -153,10 +231,9 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     from airflow.exceptions import AirflowFailException, AirflowSkipException
 
     try:
-        from plugins.ctl_core import chk_any_conn  # type: ignore
         from plugins.utils import add_note  # type: ignore
     except ImportError:
-        from CI06932748.tools.utils import add_note, chk_any_conn  # type: ignore
+        from CI06932748.tools.utils import add_note  # type: ignore
 
     ti = context["ti"]
     ts = time.time()
@@ -176,8 +253,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     try:
         # 2. Выполнение проверки
         if chk_type in ("Postgres", "S3", "KerberosHttp"):
-            data = {"type": chk_type, "conn_id": conn_id}
-            chk_any_conn(id=conn_id, data=data, **context)
+            _chk_any_conn(conn_id, chk_type, context)
             result = "Success via chk_any_conn"
 
         elif chk_type == "ClickHouse":

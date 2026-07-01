@@ -821,9 +821,15 @@ def test_hrp_operators_dag():
                     icon, ok = "✅", ok + 1
                 elif state in ("skipped", "upstream_failed", "removed"):
                     icon, skip = "☮️", skip + 1
+                    # on_skipped_callback ловит только явный AirflowSkipException; скипы по
+                    # гейту/upstream он НЕ триггерит — до-записываем заметку здесь (ti в сессии,
+                    # note закоммитит create_session). Заметки setup_* с причиной не перетираем.
+                    if not ti.note:
+                        ti.note = f"☮️ SKIPPED — {state} (отключено флагом системы или зависимостью)"
                 else:
                     icon, fail = "❌", fail + 1
                 rows.append(f"| {icon} | `{ti.task_id}` | {state} |")
+            session.commit()  # фиксируем до-записанные заметки скипнутых тасков
 
         # Статус систем: отключена флагом / недоступна (setup пропущен по ошибке) / активна.
         params = context["params"]

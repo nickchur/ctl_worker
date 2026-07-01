@@ -155,8 +155,20 @@ def _s3_purge_prefix(s3_hook, bucket: str) -> int:
     """Удаляет все ключи под S3_PREFIX в бакете; возвращает их число. Общий для setup_s3/cleanup."""
     keys = s3_hook.list_keys(bucket_name=bucket, prefix=S3_PREFIX)
     if keys:
-        s3_hook.delete_objects(bucket_name=bucket, keys=keys)
+        # ВНИМАНИЕ: у S3Hook delete_objects принимает `bucket`, а не `bucket_name` (в отличие
+        # от list_keys/load_string/check_for_bucket) — непоследовательность API провайдера.
+        s3_hook.delete_objects(bucket=bucket, keys=keys)
     return len(keys or [])
+
+
+def _skip_setup(system: str, reason: str, context):
+    """Пишет причину недоступности/нехватки прав в заметку таска (add_note) и скипает систему.
+
+    Флаг test_* гаснет через AirflowSkipException (setup → ☮️, зависимые проверки → ☮️),
+    но причина остаётся видимой в UI таска, а не только в логах.
+    """
+    add_note(reason, context, level="task", title=f"⚠️ {system}: setup пропущен")
+    raise AirflowSkipException(reason)
 
 
 # ───────────────────────── Единый источник данных ─────────────────────────────
@@ -320,12 +332,13 @@ def test_hrp_operators_dag():
 
     # ─────────────────────────────── setup ────────────────────────────────────
     @task
-    def setup_pg(params=None):
+    def setup_pg(params=None, **context):
         """Создаёт PG-источник и все PG-таргеты (с комментами) + наполняет источник.
 
         Скипается при test_pg=False, либо если PG недоступен / нет прав на create/write (проба
-        гасит test_pg: проверки уходят в ☮️ вместо каскада падений). Ошибка настоящего DDL/insert
-        стенда ПОСЛЕ успешной пробы — реальный fail (сигнал регрессии не маскируется).
+        гасит test_pg, причина пишется в заметку таска через add_note; проверки уходят в ☮️
+        вместо каскада падений). Ошибка настоящего DDL/insert стенда ПОСЛЕ успешной пробы —
+        реальный fail (сигнал регрессии не маскируется).
         """
         if not params.get("test_pg"):
             raise AirflowSkipException("test_pg=False — PG-проверки отключены, setup_pg пропущен")
@@ -341,9 +354,8 @@ def test_hrp_operators_dag():
                 f"DROP TABLE {probe}",
             ])
         except Exception as e:
-            raise AirflowSkipException(
-                f"PG недоступен / нет прав на create/write ({params['pg_conn_id']!r}): {e}"
-                " — PG-проверки пропущены") from e
+            _skip_setup("PG", f"PG недоступен / нет прав на create/write "
+                        f"({params['pg_conn_id']!r}): {e} — PG-проверки пропущены", context)
         ddl = "\n".join([
             _pg_create_sql(SRC),
             _pg_create_sql(T_PG_TO_PG),
@@ -366,12 +378,13 @@ def test_hrp_operators_dag():
         logger.info("Postgres setup complete: %d rows in %s.%s", EXPECTED_ROWS, PG_SCHEMA, SRC)
 
     @task
-    def setup_ch(params=None):
+    def setup_ch(params=None, **context):
         """Создаёт CH-источник (typed) и landing-таблицы (all-String) + наполняет источник.
 
         Скипается при test_ch=False, либо если CH недоступен / нет прав на create/write (проба
-        гасит test_ch: проверки уходят в ☮️ вместо каскада падений). Ошибка настоящего DDL/insert
-        стенда ПОСЛЕ успешной пробы — реальный fail (сигнал регрессии не маскируется).
+        гасит test_ch, причина пишется в заметку таска через add_note; проверки уходят в ☮️
+        вместо каскада падений). Ошибка настоящего DDL/insert стенда ПОСЛЕ успешной пробы —
+        реальный fail (сигнал регрессии не маскируется).
         """
         if not params.get("test_ch"):
             raise AirflowSkipException("test_ch=False — CH-проверки отключены, setup_ch пропущен")
@@ -385,9 +398,8 @@ def test_hrp_operators_dag():
             ch.execute(f"INSERT INTO {probe} VALUES (1)")
             ch.execute(f"DROP TABLE {probe}")
         except Exception as e:
-            raise AirflowSkipException(
-                f"CH недоступен / нет прав на create/write ({params['ch_conn_id']!r}): {e}"
-                " — CH-проверки пропущены") from e
+            _skip_setup("CH", f"CH недоступен / нет прав на create/write "
+                        f"({params['ch_conn_id']!r}): {e} — CH-проверки пропущены", context)
         for stmt in _ch_create_sql(SRC, typed=True).split(";"):
             if stmt.strip():
                 ch.execute(stmt)
@@ -399,13 +411,14 @@ def test_hrp_operators_dag():
         logger.info("ClickHouse setup complete: %d rows in %s.%s", EXPECTED_ROWS, CH_SCHEMA, SRC)
 
     @task
-    def setup_s3(params=None):
+    def setup_s3(params=None, **context):
         """Проверяет S3-соединение и существование бакета + чистит префикс от прошлых прогонов.
 
         Аналог DROP→CREATE у setup_pg/setup_ch: делает S3 идемпотентным, чтобы стейл-ключи
         (например после прогона с run_cleanup=False) не искажали s3_list_keys/bucket_viewer.
         Скипается при test_s3=False, либо если S3 недоступен / нет бакета / нет прав на запись
-        (проба гасит test_s3: проверки уходят в ☮️ вместо каскада падений).
+        (проба гасит test_s3, причина пишется в заметку таска через add_note; проверки уходят
+        в ☮️ вместо каскада падений).
         """
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         if not params.get("test_s3"):
@@ -419,14 +432,13 @@ def test_hrp_operators_dag():
             available = s3.check_for_bucket(bucket)
             if available:
                 s3.load_string("probe", key=probe_key, bucket_name=bucket, replace=True)
-                s3.delete_objects(bucket_name=bucket, keys=[probe_key])
+                s3.delete_objects(bucket=bucket, keys=[probe_key])
         except Exception as e:
-            raise AirflowSkipException(
-                f"S3 недоступен / нет прав на запись ({params['s3_conn_id']!r}): {e}"
-                " — S3-проверки пропущены") from e
+            _skip_setup("S3", f"S3 недоступен / нет прав на запись "
+                        f"({params['s3_conn_id']!r}): {e} — S3-проверки пропущены", context)
         if not available:
-            raise AirflowSkipException(
-                f"S3 бакет {bucket!r} недоступен (conn={params['s3_conn_id']!r}) — S3-проверки пропущены")
+            _skip_setup("S3", f"S3 бакет {bucket!r} недоступен "
+                        f"(conn={params['s3_conn_id']!r}) — S3-проверки пропущены", context)
         removed = _s3_purge_prefix(s3, bucket)
         logger.info("S3 setup complete: бакет %s доступен, удалено %d стейл-ключей под %s",
                     bucket, removed, S3_PREFIX)

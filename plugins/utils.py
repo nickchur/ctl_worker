@@ -260,7 +260,7 @@ def _on_callback(context, level=None):
     try_str = f"   *Try number*: **{try_number}**" if try_number > 1 else ""
     msg_str = f"```\n{str(msg)[:1000]}\n```\n" if msg else ""
     
-    task_msg = f'❌ FAILED' if state.lower() == 'failed' else f'✅ SUCCESS' if state.lower() == 'success' else state.upper()
+    task_msg = f'❌ FAILED' if state.lower() == 'failed' else f'✅ SUCCESS' if state.lower() == 'success' else f'☮️ SKIPPED' if state.lower() == 'skipped' else state.upper()
     
     message = (
         f"*{datetime.now().astimezone().strftime('%d.%m.%Y %H:%M:%S %Z')}*\n\n"

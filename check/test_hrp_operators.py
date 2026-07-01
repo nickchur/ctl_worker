@@ -171,6 +171,19 @@ def _skip_setup(system: str, reason: str, context):
     raise AirflowSkipException(reason)
 
 
+def _skip_or_retry(system: str, reason: str, exc: Exception, context):
+    """Ошибка пробы: пока есть ретраи — пробрасываем (transient «Connection reset by peer»
+    переживаем через retries), когда исчерпаны — трактуем как недоступность и скипаем флаг.
+
+    Так транзиентный сетевой сбой не гасит систему преждевременно, а устойчивая
+    недоступность/нехватка прав всё равно уводит проверки в ☮️ (а не в ❌ каскадом).
+    """
+    ti = context["ti"]
+    if ti.is_eligible_to_retry():
+        raise exc
+    _skip_setup(system, reason, context)
+
+
 # ───────────────────────── Единый источник данных ─────────────────────────────
 # (name, pg_type, ch_type_typed, ch_type_string, comment) — комменты обязательны для QG.
 COLUMNS = [
@@ -361,8 +374,8 @@ def test_hrp_operators_dag():
                 f"DROP TABLE {probe}",
             ])
         except Exception as e:
-            _skip_setup("PG", f"PG недоступен / нет прав на create/write "
-                        f"({params['pg_conn_id']!r}): {e} — PG-проверки пропущены", context)
+            _skip_or_retry("PG", f"PG недоступен / нет прав на create/write "
+                           f"({params['pg_conn_id']!r}): {e} — PG-проверки пропущены", e, context)
         ddl = "\n".join([
             _pg_create_sql(SRC),
             _pg_create_sql(T_PG_TO_PG),
@@ -405,8 +418,8 @@ def test_hrp_operators_dag():
             ch.execute(f"INSERT INTO {probe} VALUES (1)")
             ch.execute(f"DROP TABLE {probe}")
         except Exception as e:
-            _skip_setup("CH", f"CH недоступен / нет прав на create/write "
-                        f"({params['ch_conn_id']!r}): {e} — CH-проверки пропущены", context)
+            _skip_or_retry("CH", f"CH недоступен / нет прав на create/write "
+                           f"({params['ch_conn_id']!r}): {e} — CH-проверки пропущены", e, context)
         for stmt in _ch_create_sql(SRC, typed=True).split(";"):
             if stmt.strip():
                 ch.execute(stmt)
@@ -441,8 +454,8 @@ def test_hrp_operators_dag():
                 s3.load_string("probe", key=probe_key, bucket_name=bucket, replace=True)
                 s3.delete_objects(bucket=bucket, keys=[probe_key])
         except Exception as e:
-            _skip_setup("S3", f"S3 недоступен / нет прав на запись "
-                        f"({params['s3_conn_id']!r}): {e} — S3-проверки пропущены", context)
+            _skip_or_retry("S3", f"S3 недоступен / нет прав на запись "
+                           f"({params['s3_conn_id']!r}): {e} — S3-проверки пропущены", e, context)
         if not available:
             _skip_setup("S3", f"S3 бакет {bucket!r} недоступен "
                         f"(conn={params['s3_conn_id']!r}) — S3-проверки пропущены", context)

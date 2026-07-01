@@ -108,9 +108,9 @@ from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import (
 )
 
 try:
-    from plugins.utils import add_note  # type: ignore
+    from plugins.utils import add_note, on_callback  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import add_note  # type: ignore
+    from CI06932748.tools.utils import add_note, on_callback  # type: ignore
 
 logger = getLogger("airflow.task")
 
@@ -290,6 +290,13 @@ def _ch_insert_sql(table: str) -> str:
         "owner": "DataLab (CI02420667)",
         "retries": 2,
         "retry_delay": dt.timedelta(seconds=30),
+        # Единый вывод исхода в заметку КАЖДОГО таска (успех/скип-причина/ошибка-причина).
+        # on_callback пишет add_note со state (✅/❌/SKIPPED) и текстом context['exception'].
+        # on_skipped_callback (Airflow ≥2.9) срабатывает на AirflowSkipException — так причина
+        # скипа setup_* (флаг/недоступность) попадает в заметку и без явного add_note.
+        "on_success_callback": on_callback,
+        "on_failure_callback": on_callback,
+        "on_skipped_callback": on_callback,
     },
     params={
         "pg_conn_id": Param(DEFAULT_PG_CONN, type="string"),

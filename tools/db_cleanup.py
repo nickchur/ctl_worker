@@ -112,12 +112,13 @@ _CUSTOM_TABLES = {
 def _log_sql(sql, bind, msg="SQL"):
     """Логирует SQL с подставленными параметрами (упрощённо)."""
     try:
-        from sqlalchemy.dialects import postgresql
         from sqlalchemy.sql import text as sa_text
         if isinstance(sql, str):
             sql = sa_text(sql)
-        compiled = sql.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
-        q = str(compiled)
+        # Берём сырой SQL с плейсхолдерами :cutoff/:b_s/:b_e/:lim.
+        # Компиляция с literal_binds=True рендерит несвязанный :cutoff как NULL
+        # ещё до подстановки ниже, поэтому её не используем.
+        q = str(sql)
         # Подставляем значения
         for k, v in bind.items():
             if isinstance(v, (pendulum.DateTime, pendulum.Date)):

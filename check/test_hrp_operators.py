@@ -124,6 +124,12 @@ S3_PREFIX = "hrp_tests/"
 PG_SCHEMA = "main"
 CH_SCHEMA = "technical"
 
+# Стенд из env ENVIRONMENT. Только на DEV стенд владеет схемой и управляет DDL
+# (DROP+CREATE в setup, DROP в cleanup). На прочих стендах таблицы предсозданы
+# вручную — setup лишь TRUNCATE+наполняет, cleanup лишь TRUNCATE (не удаляет).
+ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
+IS_DEV = ENV_STAND == "DEV"
+
 # Имена объектов (фиксированы; max_active_runs=1, cleanup гарантирует отсутствие мусора)
 SRC = "hrp_src"                  # источник истины
 T_PG_TO_PG = "hrp_pg_to_pg"      # таргет PostgresToPostgres
@@ -152,8 +158,18 @@ def s3key(name, c, ext=".csv"):
 
 
 def _s3_purge_prefix(s3_hook, bucket: str) -> int:
-    """Удаляет все ключи под S3_PREFIX в бакете; возвращает их число. Общий для setup_s3/cleanup."""
-    keys = s3_hook.list_keys(bucket_name=bucket, prefix=S3_PREFIX)
+    """Best-effort очистка ключей под S3_PREFIX; возвращает их число (−1 если листинг недоступен).
+
+    Требует s3:ListBucket. Если листинг запрещён (AccessDenied) или падает — НЕ роняем таск:
+    purge не критичен (идемпотентность setup_s3 / уборка cleanup с trigger_rule=ALL_DONE),
+    объектные проверки стенда всё равно валидируют реальный доступ. Общий для setup_s3/cleanup.
+    """
+    try:
+        keys = s3_hook.list_keys(bucket_name=bucket, prefix=S3_PREFIX)
+    except Exception as e:
+        logger.warning("S3 purge пропущен: листинг под %s недоступен (нужен s3:ListBucket?): %s",
+                       S3_PREFIX, e)
+        return -1
     if keys:
         # ВНИМАНИЕ: у S3Hook delete_objects принимает `bucket`, а не `bucket_name` (в отличие
         # от list_keys/load_string/check_for_bucket) — непоследовательность API провайдера.
@@ -243,6 +259,11 @@ def _pg_create_sql(table: str, incarnation: bool = False) -> str:
     incarnation=True добавляет ведущую колонку incarnation и создаёт _0/_1 + последовательность.
     """
     full = f"{PG_SCHEMA}.{table}"
+    if not IS_DEV:
+        # Не-DEV: таблицы предсозданы — DDL не трогаем, только очищаем.
+        if incarnation:
+            return f"TRUNCATE TABLE {full}_0;\nTRUNCATE TABLE {full}_1;"
+        return f"TRUNCATE TABLE {full};"
     cols = []
     comments = []
     if incarnation:
@@ -277,6 +298,9 @@ def _pg_create_sql(table: str, incarnation: bool = False) -> str:
 def _ch_create_sql(table: str, typed: bool) -> str:
     """CREATE TABLE для ClickHouse. typed=True — реальные типы (Array/Nullable), иначе all-String."""
     full = f"{CH_SCHEMA}.{table}"
+    if not IS_DEV:
+        # Не-DEV: таблица предсоздана — только очищаем.
+        return f"TRUNCATE TABLE {full};"
     idx = 1 if typed else 2  # позиция типа в COLUMNS
     cols = ",\n    ".join(f"{c[0]} {c[idx + 1]}" for c in COLUMNS)
     order = "id" if typed else "tuple()"
@@ -367,14 +391,19 @@ def test_hrp_operators_dag():
         # может пройти, но не быть прав на создание/запись; тогда это «недоступность», а не fail.
         probe = f"{PG_SCHEMA}.{PROBE}"
         try:
-            pg.run([
-                f"DROP TABLE IF EXISTS {probe}",
-                f"CREATE TABLE {probe} (x integer)",
-                f"INSERT INTO {probe} VALUES (1)",
-                f"DROP TABLE {probe}",
-            ])
+            if IS_DEV:
+                pg.run([
+                    f"DROP TABLE IF EXISTS {probe}",
+                    f"CREATE TABLE {probe} (x integer)",
+                    f"INSERT INTO {probe} VALUES (1)",
+                    f"DROP TABLE {probe}",
+                ])
+            else:
+                # Не-DEV: DDL-прав может не быть — проверяем лишь доступность коннекта.
+                pg.get_first("SELECT 1")
         except Exception as e:
-            _skip_or_retry("PG", f"PG недоступен / нет прав на create/write "
+            reason = "PG недоступен / нет прав на create/write" if IS_DEV else "PG недоступен"
+            _skip_or_retry("PG", f"{reason} "
                            f"({params['pg_conn_id']!r}): {e} — PG-проверки пропущены", e, context)
         ddl = "\n".join([
             _pg_create_sql(SRC),
@@ -413,12 +442,17 @@ def test_hrp_operators_dag():
         # может пройти, но не быть прав на создание/запись; тогда это «недоступность», а не fail.
         probe = f"{CH_SCHEMA}.{PROBE}"
         try:
-            ch.execute(f"DROP TABLE IF EXISTS {probe}")
-            ch.execute(f"CREATE TABLE {probe} (x Int32) ENGINE = MergeTree() ORDER BY x")
-            ch.execute(f"INSERT INTO {probe} VALUES (1)")
-            ch.execute(f"DROP TABLE {probe}")
+            if IS_DEV:
+                ch.execute(f"DROP TABLE IF EXISTS {probe}")
+                ch.execute(f"CREATE TABLE {probe} (x Int32) ENGINE = MergeTree() ORDER BY x")
+                ch.execute(f"INSERT INTO {probe} VALUES (1)")
+                ch.execute(f"DROP TABLE {probe}")
+            else:
+                # Не-DEV: DDL-прав может не быть — проверяем лишь доступность коннекта.
+                ch.execute("SELECT 1")
         except Exception as e:
-            _skip_or_retry("CH", f"CH недоступен / нет прав на create/write "
+            reason = "CH недоступен / нет прав на create/write" if IS_DEV else "CH недоступен"
+            _skip_or_retry("CH", f"{reason} "
                            f"({params['ch_conn_id']!r}): {e} — CH-проверки пропущены", e, context)
         for stmt in _ch_create_sql(SRC, typed=True).split(";"):
             if stmt.strip():
@@ -460,8 +494,8 @@ def test_hrp_operators_dag():
             _skip_setup("S3", f"S3 бакет {bucket!r} недоступен "
                         f"(conn={params['s3_conn_id']!r}) — S3-проверки пропущены", context)
         removed = _s3_purge_prefix(s3, bucket)
-        logger.info("S3 setup complete: бакет %s доступен, удалено %d стейл-ключей под %s",
-                    bucket, removed, S3_PREFIX)
+        purged = "листинг недоступен" if removed < 0 else f"удалено {removed} стейл-ключей"
+        logger.info("S3 setup complete: бакет %s доступен, %s под %s", bucket, purged, S3_PREFIX)
 
     # ───────────────────────── validation helpers ─────────────────────────────
     @task
@@ -798,9 +832,16 @@ def test_hrp_operators_dag():
     # ──────────────────────────── cluster ─────────────────────────────────────
     # ⚠ Требует system.clusters('datalab') и conn click-dlab-*. По умолчанию выключено.
     with TaskGroup(group_id="cluster", prefix_group_id=False):
+        # DEV создаёт probe-таблицу; на прочих стендах она предсоздана — оператор
+        # прогоняем на TRUNCATE (тоже cluster-DDL), не создавая объектов.
+        cluster_sql = (
+            f"CREATE TABLE IF NOT EXISTS {CH_SCHEMA}.hrp_cluster_probe (id Int32) ENGINE = MergeTree() ORDER BY id"
+            if IS_DEV else
+            f"TRUNCATE TABLE IF EXISTS {CH_SCHEMA}.hrp_cluster_probe"
+        )
         cluster_op = HrpClickHouseClusterOperator(
             task_id="ch_cluster_ddl",
-            sql=f"CREATE TABLE IF NOT EXISTS {CH_SCHEMA}.hrp_cluster_probe (id Int32) ENGINE = MergeTree() ORDER BY id",
+            sql=cluster_sql,
             clickhouse_conn_id=CH_CONN,
         )
         make_gate(gate_cond("run_known_broken", "test_ch"), [cluster_op],
@@ -869,23 +910,38 @@ def test_hrp_operators_dag():
     # ──────────────────────────── cleanup ─────────────────────────────────────
     @task(task_id="cleanup", trigger_rule=TriggerRule.ALL_DONE)
     def cleanup(params=None):
-        """Удаляет все созданные PG/CH таблицы и S3-ключи (отрабатывает при любом исходе)."""
+        """Очищает PG/CH таблицы и S3-ключи (отрабатывает при любом исходе).
+
+        DEV — DROP таблиц/последовательностей (стенд владеет схемой);
+        прочие стенды — только TRUNCATE (таблицы предсозданы, не удаляем).
+        """
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         if not params.get("run_cleanup", True):
             logger.info("run_cleanup=False — пропускаем удаление (отладка: таблицы/ключи оставлены)")
             return
         pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
         pg_objects = [SRC, T_PG_TO_PG, T_CH_TO_PG]
-        drops = [f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t} CASCADE;" for t in pg_objects]
-        for t in (T_PG_INC, T_CH_TO_PG_INC):
-            drops += [f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t}_0 CASCADE;",
-                      f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t}_1 CASCADE;",
-                      f"DROP SEQUENCE IF EXISTS {PG_SCHEMA}.{t}_inc_seq;"]
-        pg.run("\n".join(drops))
+        if IS_DEV:
+            drops = [f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t} CASCADE;" for t in pg_objects]
+            for t in (T_PG_INC, T_CH_TO_PG_INC):
+                drops += [f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t}_0 CASCADE;",
+                          f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t}_1 CASCADE;",
+                          f"DROP SEQUENCE IF EXISTS {PG_SCHEMA}.{t}_inc_seq;"]
+            pg.run("\n".join(drops))
+        else:
+            # Не-DEV: таблицы предсозданы — не удаляем, только очищаем (последовательности инкарнаций оставляем).
+            truncs = [f"TRUNCATE TABLE {PG_SCHEMA}.{t};" for t in pg_objects]
+            for t in (T_PG_INC, T_CH_TO_PG_INC):
+                truncs += [f"TRUNCATE TABLE {PG_SCHEMA}.{t}_0;",
+                           f"TRUNCATE TABLE {PG_SCHEMA}.{t}_1;"]
+            pg.run("\n".join(truncs))
 
         ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
         for t in (SRC, T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST, "hrp_cluster_probe"):
-            ch.execute(f"DROP TABLE IF EXISTS {CH_SCHEMA}.{t}")
+            if IS_DEV:
+                ch.execute(f"DROP TABLE IF EXISTS {CH_SCHEMA}.{t}")
+            else:
+                ch.execute(f"TRUNCATE TABLE IF EXISTS {CH_SCHEMA}.{t}")
 
         s3 = S3Hook(aws_conn_id=params["s3_conn_id"])
         _s3_purge_prefix(s3, params["s3_bucket"])

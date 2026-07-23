@@ -9,13 +9,13 @@
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
-| 🔁 `reindex`        | `True` — REINDEX TABLE CONCURRENTLY после вакуума *(default)*, `False` — пропустить       |
+| 🔁 `reindex`        | `True` — REINDEX SCHEMA CONCURRENTLY после вакуума *(default)*, `False` — пропустить      |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
 
 **Таски:**
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
-- **reindex** — REINDEX TABLE CONCURRENTLY по очищенным таблицам (админский коннект из Vault)
+- **reindex** — REINDEX SCHEMA CONCURRENTLY main одной командой (админский коннект из Vault)
 - **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
 
 > `dry_run=False` по умолчанию — реальное удаление. Для проверки установите `dry_run=True`.
@@ -328,15 +328,18 @@ def get_af_conn():
     return AF_ID
 
 
-def db_reindex(table, conn_id, timeout=3600):
-    """REINDEX TABLE CONCURRENTLY по таблице схемы main под коннектом conn_id.
+def db_reindex(conn_id, schema='main', timeout=3600):
+    """REINDEX SCHEMA CONCURRENTLY по схеме целиком под коннектом conn_id.
 
     CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
+    Таблицы, которыми пользователь не владеет, PostgreSQL пропускает с warning'ом
+    ("skipping ..."), не прерывая команду — возвращаем сообщения сервера, чтобы
+    было видно, что реально переиндексировано.
     """
     from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
     ts = time.time()
-    sql = f"REINDEX TABLE CONCURRENTLY main.{table}"
+    sql = f"REINDEX SCHEMA CONCURRENTLY {schema}"
     logger.info(f"🔧 REINDEX: {sql} (conn={conn_id})")
 
     conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
@@ -344,11 +347,16 @@ def db_reindex(table, conn_id, timeout=3600):
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = '{timeout}s'")
+            del conn.notices[:]
             cur.execute(sql)
+            notices = list(conn.notices)
     finally:
         conn.close()
 
+    for n in notices:
+        logger.info(f"📣 {n.strip()}")
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
+    return notices
 
 
 def _fmt_ts(ts):
@@ -393,7 +401,7 @@ params = {
     'reindex': Param(
         True,
         type='boolean',
-        description='True — REINDEX TABLE CONCURRENTLY после вакуума, False — пропустить',
+        description='True — REINDEX SCHEMA CONCURRENTLY main после вакуума, False — пропустить',
     ),
     'custom': Param(
         False,
@@ -726,36 +734,31 @@ def tools_db_cleanup():
         if not p.get('reindex', True):
             raise AirflowSkipException('reindex=False — пропущено')
 
-        timeout = 15 * 60
-        tables = context['ti'].xcom_pull(task_ids='clean') or []
-        if not tables:
-            raise AirflowSkipException('нет таблиц из clean')
-
+        timeout = 60 * 60  # схема целиком одной командой — запас по времени
         # REINDEX требует прав владельца таблиц — идём админским коннектом из Vault.
         conn_id = get_af_conn()
-        results = []
-        for tbl in tables:
-            _ts = time.time()
-            try:
-                db_reindex(tbl, conn_id, timeout=timeout)
-            except Exception as e:
-                # Прерванный REINDEX CONCURRENTLY оставляет невалидный индекс
-                # (pg_index.indisvalid = false) — его нужно удалить вручную.
-                logger.warning(f"⚠️ {tbl}: {e} — возможен невалидный индекс, проверьте pg_index")
-                results.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                                'status': f'❌ {str(e)[:60]}'})
-                continue
-            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': '✅'})
 
-        lines = [
-            '| Таблица | Время, с | Статус |',
-            '|---------|---------|--------|',
-        ] + [f"| `{r['table']}` | {r['duration']} | {r['status']} |" for r in results]
-        total = round(sum(r['duration'] for r in results), 2)
-        ok = sum(1 for r in results if r['status'] == '✅')
-        lines.append(f"| **Итого** | **{total} с** | **{ok}/{len(results)}** |")
+        _ts = time.time()
+        try:
+            notices = db_reindex(conn_id, schema='main', timeout=timeout)
+        except Exception as e:
+            # Прерванный REINDEX CONCURRENTLY оставляет невалидные индексы
+            # (pg_index.indisvalid = false) — их нужно удалить вручную.
+            logger.warning(f"⚠️ {e} — возможны невалидные индексы, проверьте pg_index")
+            add_note(f'❌ {str(e)[:400]}', context=context, level='DAG,Task',
+                     title='🔁 reindex', duration=round(time.time() - _ts, 2))
+            raise
+
+        duration = round(time.time() - _ts, 2)
+        skipped = [n for n in notices if 'skipping' in n.lower()]
+        lines = [f'`REINDEX SCHEMA CONCURRENTLY main` за {duration} с',
+                 f'сообщений сервера: {len(notices)}, пропущено: {len(skipped)}']
+        if notices:
+            lines += ['', '```'] + [n.strip() for n in notices[:20]] + ['```']
         add_note('\n'.join(lines), context=context, level='Task', title='🔁 reindex')
-        add_note(f'{ok}/{len(results)} таблиц за {total} с', context=context, level='DAG', title='🔁 reindex')
+        add_note(f'схема main за {duration} с'
+                 + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''),
+                 context=context, level='DAG', title='🔁 reindex')
 
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):

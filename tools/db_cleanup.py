@@ -257,7 +257,9 @@ def get_af_conn():
         "port":      int(port or 5433),
         "login":     _b64(secrets['DB_ADM_USER_1_1']),
         "password":  _b64(secrets['DB_ADM_PASS_1_1']),
-        "schema":    'main',
+        # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;
+        # 'main' — схема внутри airflowdb, и в SQL она указана явно (main.<table>).
+        "schema":    _b64(secrets['DB_NAME_1']),
         # Дефолты как в платформенном hrp_secret_backend.vault_secret_backend
         # (parse_self_pg_connections). gssencmode=disable — в контейнере есть
         # Kerberos-кэш для CTL, и libpq пробует GSS-шифрование раньше пароля,

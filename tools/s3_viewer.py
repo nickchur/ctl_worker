@@ -12,7 +12,7 @@
 | `rows` | Количество строк для вывода (1–1000, default: `300`) |
 """
 
-import pendulum
+from datetime import datetime, timedelta, timezone
 from airflow.models import Param
 from airflow.decorators import task, dag
 
@@ -32,12 +32,12 @@ logger = getLogger("airflow.task")
     default_args={
         'owner': 'DataLab (CI02420667)',
         'retries': 0,
-        'retry_delay': pendulum.duration(seconds=30),
+        'retry_delay': timedelta(seconds=30),
         'on_failure_callback': on_callback,
         'on_success_callback': on_callback,
         'on_retry_callback': on_callback,
     },
-    start_date=pendulum.datetime(2026, 1, 21, tz=pendulum.UTC),
+    start_date=datetime(2026, 1, 21, tzinfo=timezone.utc),
     schedule_interval=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,

@@ -23,7 +23,7 @@ import os
 import zipfile
 from io import BytesIO
 
-import pendulum
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("airflow.task")
 from airflow.decorators import dag, task
@@ -49,7 +49,7 @@ else:
     doc_md=__doc__,
     default_args={"owner": "DataLab (CI02420667)", "retries": 0},
     owner_links={"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"},
-    start_date=pendulum.datetime(2025, 8, 7, tz=pendulum.UTC),
+    start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
     tags=["DataLab", "tools", "ER", "test"],
     catchup=False,
     is_paused_upon_creation=True,
@@ -116,7 +116,7 @@ def tools_test_package():
             parts.append(cur)
         total = len(parts)
 
-        base_ts = pendulum.now("UTC")
+        base_ts = datetime.now(timezone.utc)
         hook = S3Hook(aws_conn_id=p["conn_id"])
         meta_bytes = p["meta"].encode()
         uploaded = []
@@ -128,9 +128,9 @@ def tools_test_package():
             csv_content = "\n".join(part_lines) + "\n"
             csv_bytes = csv_content.encode()
 
-            inner_ts = base_ts.add(seconds=i * 2).format("YYYYMMDDHHmmss")
-            tkt_ts   = base_ts.add(seconds=i * 2 + 1).format("YYYYMMDDHHmmss")
-            outer_ts = base_ts.add(seconds=i * 2 + 2).format("YYYYMMDDHHmmss")
+            inner_ts = (base_ts + timedelta(seconds=i * 2)).strftime("%Y%m%d%H%M%S")
+            tkt_ts   = (base_ts + timedelta(seconds=i * 2 + 1)).strftime("%Y%m%d%H%M%S")
+            outer_ts = (base_ts + timedelta(seconds=i * 2 + 2)).strftime("%Y%m%d%H%M%S")
 
             csv_name  = f"{schema}__{table_name}__{inner_ts}__{part}_{total}_{rows}.csv"
             meta_name = f"{schema}__{table_name}__{inner_ts}__{part}_{total}_{rows}.meta"
@@ -150,7 +150,7 @@ def tools_test_package():
             uploaded.append(zip_name)
 
         # итоговый .tkt: список всех zip-файлов, ts = last_outer_ts + 1s
-        summary_ts = base_ts.add(seconds=(total - 1) * 2 + 3).format("YYYYMMDDHHmmss")
+        summary_ts = (base_ts + timedelta(seconds=(total - 1) * 2 + 3)).strftime("%Y%m%d%H%M%S")
         summary_tkt_name = f"{prefix}__{summary_ts}.tkt"
         summary_tkt_bytes = "\n".join(uploaded).encode()
         hook.load_bytes(

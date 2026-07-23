@@ -14,7 +14,7 @@
 | `max_items` | Макс. кол-во объектов при сканировании (default: `10000`) |
 """
 
-import pendulum
+from datetime import datetime, timedelta, timezone
 from airflow.models import Param
 from airflow.decorators import task, dag
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -45,10 +45,10 @@ def _split_mask(full_path):
     default_args={
         'owner': 'DataLab (CI02420667)',
         'retries': 0,
-        'retry_delay': pendulum.duration(seconds=30),
+        'retry_delay': timedelta(seconds=30),
         'on_failure_callback': on_callback,
     },
-    start_date=pendulum.datetime(2026, 1, 22, tz=pendulum.UTC),
+    start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule_interval=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,

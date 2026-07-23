@@ -34,7 +34,7 @@ from airflow.configuration import get_custom_secret_backend
 
 import os
 import base64
-import pendulum
+from datetime import datetime, timedelta, timezone
 
 from logging import getLogger
 logger = getLogger("airflow.task")
@@ -67,9 +67,9 @@ s3_conns=get_conns_by_type(conn_type='aws')
     default_args = {
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
-        'retry_delay': pendulum.duration(seconds=30),
+        'retry_delay': timedelta(seconds=30),
     },
-    start_date=pendulum.datetime(2025, 8, 7, tz=pendulum.UTC),
+    start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
     tags=['DataLab', 'tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,

@@ -8,9 +8,8 @@
 | `days` | Возраст объектов для удаления (дни, default: `0`) |
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-import pendulum
 from airflow.models import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task, dag
@@ -42,9 +41,9 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):
     default_args={
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
-        'retry_delay': pendulum.duration(seconds=30),
+        'retry_delay': timedelta(seconds=30),
     },
-    start_date=pendulum.datetime(2026, 1, 22, tz=pendulum.UTC),
+    start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule_interval='17 5 * * *',
     tags=['EDP_ETL', 'tools', 'maintenance'],
     catchup=False,

@@ -29,7 +29,7 @@
 ```
 """
 
-import pendulum
+from datetime import datetime, timezone
 from airflow.operators.empty import EmptyOperator
 from airflow.decorators import dag
 
@@ -41,7 +41,7 @@ from plugins.utils import on_callback, default_args  # type: ignore
     tags=['HR_Data', 'tools', 'dummy'],
     owner_links={'HR_Data (CI02750757)': 'https://confluence.delta.sbrf.ru/pages/viewpage.action?pageId=1774392110'},
     default_args=default_args,
-    start_date=pendulum.datetime(2026, 1, 22, tz=pendulum.UTC),
+    start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule=None,
     catchup=False,
     is_paused_upon_creation=True,

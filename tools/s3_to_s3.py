@@ -15,7 +15,7 @@
 > Если расширение `src_key` совпадает с `dst_compression` — повторное сжатие не применяется.
 """
 
-import pendulum
+from datetime import datetime, timedelta, timezone
 from airflow.models import Param, Connection
 from airflow.configuration import get_custom_secret_backend
 from airflow.decorators import dag
@@ -50,9 +50,9 @@ s3_conns = get_conns_by_type(conn_type='aws')
     default_args={
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
-        'retry_delay': pendulum.duration(seconds=30),
+        'retry_delay': timedelta(seconds=30),
     },
-    start_date=pendulum.datetime(2026, 1, 22, tz=pendulum.UTC),
+    start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule_interval=None,
     tags=['tools', 's3'],
     catchup=False,

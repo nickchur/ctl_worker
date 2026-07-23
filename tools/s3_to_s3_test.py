@@ -16,7 +16,7 @@
 | `reverse` | Сортировка от новых к старым |
 """
 
-import pendulum
+from datetime import datetime, timedelta, timezone
 from airflow.models import Param
 from airflow.decorators import task, dag
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -47,11 +47,11 @@ for conn in get_conns_by_type(conn_type='aws'):
     default_args={
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
-        'retry_delay': pendulum.duration(minutes=1),
+        'retry_delay': timedelta(minutes=1),
         'on_failure_callback': on_callback,
         'priority_weight': 999,
     },
-    start_date=pendulum.datetime(2026, 1, 22, tz=pendulum.UTC),
+    start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule_interval=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,
@@ -123,7 +123,7 @@ def tools_s3_to_s3_test():
 
         src_hook = S3Hook(aws_conn_id=src['conn_id'], verify=False)
         src_obj = src_hook.get_key(src['key'], src['bucket'])
-        sdt = pendulum.instance(src_obj.last_modified).format('YYYY-MM-DD HH:mm:ss')
+        sdt = src_obj.last_modified.strftime('%Y-%m-%d %H:%M:%S')
 
         dst_path = p.get('dst_path', '')
         dst_path += '/' if dst_path and not dst_path.endswith('/') else ''

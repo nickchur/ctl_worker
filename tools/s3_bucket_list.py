@@ -3,7 +3,7 @@
 Перечисляет все бакеты по всем S3-подключениям с размером, количеством объектов и TTL.
 """
 
-import pendulum
+from datetime import datetime, timedelta, timezone
 from airflow.decorators import task, dag
 
 from plugins.utils import get_conns_by_type, add_note, on_callback, readable_size
@@ -22,10 +22,10 @@ logger = getLogger("airflow.task")
     default_args={
         'owner': 'DataLab (CI02420667)',
         'retries': 0,
-        'retry_delay': pendulum.duration(seconds=30),
+        'retry_delay': timedelta(seconds=30),
         'on_failure_callback': on_callback,
     },
-    start_date=pendulum.datetime(2026, 1, 22, tz=pendulum.UTC),
+    start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule_interval=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,

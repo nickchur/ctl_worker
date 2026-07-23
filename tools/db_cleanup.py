@@ -210,34 +210,62 @@ def db_stats(tables):
     return {r[0]: (r[1], r[2]) for r in rows}
 
 
-def db_vacuum(table, full=False, timeout=3600, set_role=None):
+def db_vacuum(table, conn_params=None, full=False, timeout=3600, set_role=None):
     """VACUUM [FULL] ANALYZE по таблице схемы main.
 
     VACUUM без FULL не уменьшает файл таблицы (страницы уходят в free space map),
     поэтому судить о его работе по размеру нельзя — ориентир n_dead_tup и last_vacuum.
-    set_role — роль-владелец, без неё VACUUM без прав молча пропускает таблицу.
+    conn_params (см. get_af_conn) — админский коннект psycopg2; без них идём
+    штатным коннектом Airflow. set_role — роль-владелец: без прав владельца
+    VACUUM не падает, а молча пропускает таблицу с warning'ом.
     """
-    from airflow import settings
     from airflow.exceptions import AirflowSkipException
 
     ts = time.time()
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
     sql = f"VACUUM {mode} main.{table}"
-    with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
-        pool_proxy = conn.connection
-        psy = getattr(pool_proxy, 'dbapi_connection', None) or getattr(pool_proxy, 'connection', None) or pool_proxy
-        # Соединение берётся из пула и уже может нести чужие сообщения — чистим,
-        # иначе пропуск по правам ("skipping ... only table or database owner can
-        # vacuum it") теряется и таблица считается успешно обработанной.
-        notices = getattr(psy, 'notices', None)
-        if notices is not None:
-            del notices[:]
-        conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
-        if set_role:
-            conn.execute(text('SET ROLE "{}"'.format(set_role.replace('"', '""'))))
-        logger.info(f"🔧 VACUUM: {sql}" + (f" (SET ROLE {set_role})" if set_role else ""))
-        conn.execute(text(sql))
-        notices = list(notices or [])
+    # Роль приходит из pg_get_userbyid — существующее имя, но кавычим на случай
+    # спецсимволов (учётки вида CI05456832-pg-airflowadm).
+    role_sql = 'SET ROLE "{}"'.format(set_role.replace('"', '""')) if set_role else None
+    suffix = (f" (user={conn_params['user']})" if conn_params else "") \
+             + (f" (SET ROLE {set_role})" if set_role else "")
+
+    if conn_params:
+        import psycopg2
+
+        conn = psycopg2.connect(**conn_params)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = '{timeout}s'")
+                if role_sql:
+                    cur.execute(role_sql)
+                logger.info(f"🔧 VACUUM: {sql}{suffix}")
+                del conn.notices[:]
+                cur.execute(sql)
+                notices = list(conn.notices)
+        finally:
+            conn.close()
+    else:
+        from airflow import settings
+
+        with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+            pool_proxy = conn.connection
+            psy = (getattr(pool_proxy, 'dbapi_connection', None)
+                   or getattr(pool_proxy, 'connection', None) or pool_proxy)
+            # Соединение берётся из пула и уже может нести чужие сообщения — чистим,
+            # иначе пропуск по правам ("skipping ... only table or database owner can
+            # vacuum it") теряется и таблица считается успешно обработанной.
+            notices = getattr(psy, 'notices', None)
+            if notices is not None:
+                del notices[:]
+            conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
+            if role_sql:
+                conn.execute(text(role_sql))
+            logger.info(f"🔧 VACUUM: {sql}{suffix}")
+            conn.execute(text(sql))
+            notices = list(notices or [])
+
     for n in notices:
         logger.info(f"📣 {table}: {n.strip()}")
     skipped = next((n for n in notices if 'skipping' in n.lower()), None)
@@ -708,17 +736,32 @@ def tools_db_cleanup():
             raise AirflowSkipException('нет таблиц из clean')
         before = db_stats(tables)
         owners = db_owners(tables)
+
+        # Штатный пользователь Airflow не владеет таблицами main, поэтому VACUUM
+        # молча их пропускает — идём админским коннектом из Vault; если он
+        # недоступен, откатываемся на штатный (там сработает SET ROLE, если есть).
+        try:
+            conn_params = get_af_conn()
+        except Exception as e:
+            logger.warning(f"⚠️ админский коннект недоступен ({e}) — идём штатным")
+            conn_params = None
+
         results, skipped = [], []
         for tbl in tables:
             _ts = time.time()
             owner, can_set_role = owners.get(tbl, (None, False))
             try:
-                db_vacuum(tbl, full=False, timeout=timeout,
+                db_vacuum(tbl, conn_params, full=False, timeout=timeout,
                           set_role=owner if can_set_role else None)
             except AirflowSkipException as e:
                 logger.warning(f"☮️ {tbl}: {e}")
                 skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
                                 'status': f'☮️ {str(e)[:60]}'})
+                continue
+            except Exception as e:
+                logger.warning(f"⚠️ {tbl}: {e}")
+                skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
+                                'status': f'❌ {str(e)[:60]}'})
                 continue
             results.append({'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': '✅'})
 

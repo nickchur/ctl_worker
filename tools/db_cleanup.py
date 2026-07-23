@@ -210,11 +210,12 @@ def db_stats(tables):
     return {r[0]: (r[1], r[2]) for r in rows}
 
 
-def db_vacuum(table, full=False, timeout=3600):
+def db_vacuum(table, full=False, timeout=3600, set_role=None):
     """VACUUM [FULL] ANALYZE по таблице схемы main.
 
     VACUUM без FULL не уменьшает файл таблицы (страницы уходят в free space map),
     поэтому судить о его работе по размеру нельзя — ориентир n_dead_tup и last_vacuum.
+    set_role — роль-владелец, без неё VACUUM без прав молча пропускает таблицу.
     """
     from airflow import settings
     from airflow.exceptions import AirflowSkipException
@@ -232,7 +233,9 @@ def db_vacuum(table, full=False, timeout=3600):
         if notices is not None:
             del notices[:]
         conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
-        logger.info(f"🔧 VACUUM: {sql}")
+        if set_role:
+            conn.execute(text('SET ROLE "{}"'.format(set_role.replace('"', '""'))))
+        logger.info(f"🔧 VACUUM: {sql}" + (f" (SET ROLE {set_role})" if set_role else ""))
         conn.execute(text(sql))
         notices = list(notices or [])
     for n in notices:
@@ -318,17 +321,51 @@ def get_af_conn():
     return params
 
 
-def db_reindex(table, conn_params=None, timeout=3600):
+def db_owners(tables):
+    """Владельцы таблиц main и признак членства текущего пользователя в роли-владельце.
+
+    {table: (owner, can_set_role)}. Если членство есть, но роль NOINHERIT, права
+    владельца не действуют автоматически — их нужно взять явным SET ROLE.
+    """
+    from airflow import settings
+
+    sql = text("""
+        SELECT c.relname,
+               pg_get_userbyid(c.relowner)                  AS owner,
+               pg_has_role(current_user, c.relowner, 'USAGE') AS can_set_role,
+               current_user
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND c.relname = ANY(:tbls)
+    """)
+    with settings.engine.connect() as conn:
+        rows = conn.execute(sql, {'tbls': list(tables)}).fetchall()
+    if rows:
+        logger.info(f"👤 current_user={rows[0][3]}")
+        for r in rows:
+            logger.info(f"👤 {r[0]}: owner={r[1]} | SET ROLE доступен: {r[2]}")
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def db_reindex(table, conn_params=None, timeout=3600, set_role=None):
     """REINDEX TABLE CONCURRENTLY по таблице схемы main.
 
     CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
     По умолчанию идём тем же коннектом, что и db_vacuum (прав владельца хватает —
-    VACUUM требует тех же). conn_params (см. get_af_conn) задаются только при
-    ошибке прав: тогда подключаемся psycopg2 напрямую, мимо Airflow-коннектов.
+    VACUUM требует тех же). set_role — роль-владелец, которую берём перед REINDEX,
+    если членство в ней есть (см. db_owners). conn_params (см. get_af_conn)
+    задаются только при ошибке прав: тогда подключаемся psycopg2 напрямую.
     """
     ts = time.time()
     sql = f"REINDEX TABLE CONCURRENTLY main.{table}"
-    logger.info(f"🔧 REINDEX: {sql}" + (f" (user={conn_params['user']})" if conn_params else ""))
+    logger.info(
+        f"🔧 REINDEX: {sql}"
+        + (f" (user={conn_params['user']})" if conn_params else "")
+        + (f" (SET ROLE {set_role})" if set_role else "")
+    )
+    # Роль приходит из pg_get_userbyid — существующее имя, но кавычим на случай
+    # спецсимволов в имени роли (учётки вида CI05456832-pg-airflowadm).
+    role_sql = 'SET ROLE "{}"'.format(set_role.replace('"', '""')) if set_role else None
 
     if conn_params:
         import psycopg2
@@ -338,6 +375,8 @@ def db_reindex(table, conn_params=None, timeout=3600):
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute(f"SET statement_timeout = '{timeout}s'")
+                if role_sql:
+                    cur.execute(role_sql)
                 cur.execute(sql)
         finally:
             conn.close()
@@ -346,6 +385,8 @@ def db_reindex(table, conn_params=None, timeout=3600):
 
         with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
             conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
+            if role_sql:
+                conn.execute(text(role_sql))
             conn.execute(text(sql))
 
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
@@ -666,11 +707,14 @@ def tools_db_cleanup():
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
         before = db_stats(tables)
+        owners = db_owners(tables)
         results, skipped = [], []
         for tbl in tables:
             _ts = time.time()
+            owner, can_set_role = owners.get(tbl, (None, False))
             try:
-                db_vacuum(tbl, full=False, timeout=timeout)
+                db_vacuum(tbl, full=False, timeout=timeout,
+                          set_role=owner if can_set_role else None)
             except AirflowSkipException as e:
                 logger.warning(f"☮️ {tbl}: {e}")
                 skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
@@ -722,13 +766,18 @@ def tools_db_cleanup():
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
 
+        owners = db_owners(tables)
         conn_params = None  # штатный коннект Airflow; админский — только если не хватит прав
         results = []
         for tbl in tables:
             _ts = time.time()
+            owner, can_set_role = owners.get(tbl, (None, False))
+            # Членство в роли-владельце есть, но при NOINHERIT права не действуют
+            # автоматически — берём роль явно.
+            set_role = owner if can_set_role else None
             try:
                 try:
-                    db_reindex(tbl, conn_params, timeout=timeout)
+                    db_reindex(tbl, conn_params, timeout=timeout, set_role=set_role)
                 except Exception as e:
                     if conn_params or not any(s in str(e).lower() for s in ('must be owner', 'permission denied')):
                         raise

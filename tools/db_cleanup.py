@@ -225,15 +225,21 @@ def get_af_conn():
 
     VAULT_PATH = '/vault/secrets/application'
     AF_ID = 'af_adm'
+    # Перечитываем Vault каждый раз: процесс celery-воркера переиспользуется,
+    # и закэшированный в env коннект пережил бы правку параметров подключения.
     env_key = f'AIRFLOW_CONN_{AF_ID.upper()}'
-    if os.environ.get(env_key):
-        return AF_ID
 
     with open(VAULT_PATH) as f:
         secrets = json.load(f)
 
     def _b64(s: str) -> str:
         return base64.b64decode(s).decode()
+
+    raw_extra = _b64(secrets['DB_EXTRA_1']) if secrets.get('DB_EXTRA_1') else ''
+    try:
+        extra = json.loads(raw_extra) if raw_extra else {}
+    except ValueError:
+        extra = ast.literal_eval(raw_extra) if raw_extra else {}
 
     host, _, port = _b64(secrets['DB_HOST_1']).partition(':')
     conn_json = {
@@ -243,7 +249,17 @@ def get_af_conn():
         "login":     _b64(secrets['DB_ADM_USER_1_1']),
         "password":  _b64(secrets['DB_ADM_PASS_1_1']),
         "schema":    'main',
-        "extra":     ast.literal_eval(_b64(secrets['DB_EXTRA_1'])) or {"verify": False, "secure": True},
+        # Дефолты как в платформенном hrp_secret_backend.vault_secret_backend
+        # (parse_self_pg_connections). gssencmode=disable — в контейнере есть
+        # Kerberos-кэш для CTL, и libpq пробует GSS-шифрование раньше пароля,
+        # падая с "could not initiate GSSAPI security context".
+        "extra": {
+            "sslmode":              "prefer",
+            "gssencmode":           "disable",
+            "target_session_attrs": "read-write",
+            "connect_timeout":      5,
+            **extra,
+        },
     }
     os.environ[env_key] = json.dumps(conn_json)
     logger.info(f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}")

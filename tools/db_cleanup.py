@@ -9,29 +9,28 @@
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
+| 🔁 `reindex`        | `True` — REINDEX TABLE CONCURRENTLY после вакуума *(default)*, `False` — пропустить       |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
 
 **Таски:**
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
+- **reindex** — REINDEX TABLE CONCURRENTLY по очищенным таблицам (админский коннект из Vault)
 - **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
 
 > `dry_run=False` по умолчанию — реальное удаление. Для проверки установите `dry_run=True`.
 """
 
-from airflow.decorators import task, dag
-from airflow.models import Param, DagRun, XCom
-from airflow.exceptions import AirflowFailException, AirflowSkipException
+# Только то, что нужно на парсинге DAG (scheduler/dag-processor): декораторы,
+# Param/TriggerRule для сигнатуры, datetime для start_date, cheap-stdlib.
+# Всё runtime-only (модели, exceptions, session, settings, config_dict, pprint,
+# unicodedata) импортируется внутри тасков/хелперов — грузится на воркере.
+from airflow.decorators import dag, task
+from airflow.models import Param
 from airflow.utils.trigger_rule import TriggerRule
-from airflow.utils.session import create_session
-from airflow.operators.python import get_current_context
-from airflow import settings
-from airflow.utils.db_cleanup import config_dict as _cleanup_config
 from sqlalchemy import text
 
-from pprint import PrettyPrinter
-import unicodedata
-import pendulum
+from datetime import date, datetime, timedelta, timezone
 import time
 import logging
 
@@ -121,7 +120,7 @@ def _log_sql(sql, bind, msg="SQL"):
         q = str(sql)
         # Подставляем значения
         for k, v in bind.items():
-            if isinstance(v, (pendulum.DateTime, pendulum.Date)):
+            if isinstance(v, (datetime, date)):
                 v = f"'{v.isoformat()}'"
             elif isinstance(v, str):
                 v = f"'{v}'"
@@ -136,6 +135,12 @@ def _log_sql(sql, bind, msg="SQL"):
 
 
 def add_note(msg, context=None, level='task', add=True, title='', compact=False, duration=None):
+    from pprint import PrettyPrinter
+    import unicodedata
+
+    from airflow.operators.python import get_current_context
+    from airflow.utils.session import create_session
+
     if not context:
         context = get_current_context()
 
@@ -188,6 +193,9 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False,
 
 
 def db_vacuum(table, full=False, timeout=3600):
+    from airflow import settings
+    from airflow.exceptions import AirflowSkipException
+
     ts = time.time()
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
     sql = f"VACUUM {mode} main.{table}"
@@ -201,6 +209,66 @@ def db_vacuum(table, full=False, timeout=3600):
     skipped = next((n for n in notices if 'skipping' in n.lower()), None)
     if skipped:
         raise AirflowSkipException(skipped.strip())
+    logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
+
+
+def get_af_conn():
+    """Регистрирует админский коннект к метабазе Airflow из Vault и возвращает его conn_id.
+
+    Нужен для REINDEX TABLE CONCURRENTLY: требуются права владельца таблиц,
+    которых нет у сессионного пользователя Airflow.
+    """
+    import ast
+    import base64
+    import json
+    import os
+
+    VAULT_PATH = '/vault/secrets/application'
+    AF_ID = 'af_adm'
+    env_key = f'AIRFLOW_CONN_{AF_ID.upper()}'
+    if os.environ.get(env_key):
+        return AF_ID
+
+    with open(VAULT_PATH) as f:
+        secrets = json.load(f)
+
+    def _b64(s: str) -> str:
+        return base64.b64decode(s).decode()
+
+    host, _, port = _b64(secrets['DB_HOST_1']).partition(':')
+    conn_json = {
+        "conn_type": "postgres",
+        "host":      host,
+        "port":      int(port or 5433),
+        "login":     _b64(secrets['DB_ADM_USER_1_1']),
+        "password":  _b64(secrets['DB_ADM_PASS_1_1']),
+        "schema":    'main',
+        "extra":     ast.literal_eval(_b64(secrets['DB_EXTRA_1'])) or {"verify": False, "secure": True},
+    }
+    os.environ[env_key] = json.dumps(conn_json)
+    logger.info(f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}")
+
+    return AF_ID
+
+
+def db_reindex(table, conn_id, timeout=3600):
+    """REINDEX TABLE CONCURRENTLY по таблице схемы main под админским коннектом.
+
+    CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
+    """
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+    ts = time.time()
+    sql = f"REINDEX TABLE CONCURRENTLY main.{table}"
+    conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = '{timeout}s'")
+            logger.info(f"🔧 REINDEX: {sql}")
+            cur.execute(sql)
+    finally:
+        conn.close()
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 
@@ -238,6 +306,11 @@ params = {
         type='boolean',
         description='True — VACUUM ANALYZE, False — пропустить',
     ),
+    'reindex': Param(
+        True,
+        type='boolean',
+        description='True — REINDEX TABLE CONCURRENTLY после вакуума, False — пропустить',
+    ),
     'custom': Param(
         False,
         type='boolean',
@@ -264,7 +337,7 @@ params = {
         'owner': 'DataLab (CI02420667)',
         'retries': 0,
     },
-    start_date=pendulum.datetime(2025, 8, 7, tz=pendulum.UTC),
+    start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
     tags=['DataLab', 'tools', 'maintenance'],
     catchup=False,
     is_paused_upon_creation=True,
@@ -276,6 +349,10 @@ def tools_db_cleanup():
 
     @task(task_id='clean')
     def clean(**context):
+        from airflow.exceptions import AirflowFailException
+        from airflow.utils.db_cleanup import config_dict as _cleanup_config
+        from airflow.utils.session import create_session
+
         p = context['params']
         retention_days = p['retention_days']
         if retention_days < 30:
@@ -284,7 +361,7 @@ def tools_db_cleanup():
         dry_run = p['dry_run']
         batch_size = p.get('batch_size', BATCH_SIZE)
         lock_timeout = p.get('lock_timeout', '10min')
-        cutoff = pendulum.now('UTC').subtract(days=retention_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
         def _fmt_date(d):
             return str(d)[:10] if d else '—'
@@ -388,12 +465,14 @@ def tools_db_cleanup():
                         if on_batch:
                             on_batch(batches, n_batches, count, min_date, idx)
                 elif n_batches > 1 and min_date is not None:
-                    start = pendulum.instance(min_date)
+                    # min_date из БД (timestamptz → aware). Приводим к aware UTC на
+                    # случай timestamp-without-tz, чтобы вычитание с cutoff не падало.
+                    start = min_date if min_date.tzinfo else min_date.replace(tzinfo=timezone.utc)
                     diff = (cutoff - start).total_seconds()
                     step = diff / n_batches
                     for j in range(n_batches):
-                        b_s = start.add(seconds=step * j)
-                        b_e = cutoff if j == n_batches - 1 else start.add(seconds=step * (j + 1))
+                        b_s = start + timedelta(seconds=step * j)
+                        b_e = cutoff if j == n_batches - 1 else start + timedelta(seconds=step * (j + 1))
                         batch_extra = f"{p}{col} >= :b_s AND {p}{col} < :b_e"
                         _log_sql(make_delete(batch_extra), {**bind, 'b_s': b_s, 'b_e': b_e}, f"🗑️ DELETE {tbl}")
                         session.execute(make_delete(batch_extra), {**bind, 'b_s': b_s, 'b_e': b_e})
@@ -479,12 +558,12 @@ def tools_db_cleanup():
             add_note('\n'.join(lines), context=context, level='Task',
                      title=f'🗑️ clean ({mode}, {retention_days}d)', duration=duration, add=False)
             add_note(
-                f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.format("YYYY-MM-DD")}',
+                f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.strftime("%Y-%m-%d")}',
                 context=context, level='DAG', title='🗑️ clean', duration=duration,
             )
         else:
             add_note(
-                f'{mode} | cutoff: {cutoff.format("YYYY-MM-DD")}',
+                f'{mode} | cutoff: {cutoff.strftime("%Y-%m-%d")}',
                 context=context, level='DAG,Task', title='🗑️ clean', duration=duration,
             )
 
@@ -492,6 +571,8 @@ def tools_db_cleanup():
 
     @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
     def vacuum(**context):
+        from airflow.exceptions import AirflowSkipException
+
         p = context['params']
         if not p.get('vacuum', True):
             raise AirflowSkipException('vacuum=False — пропущено')
@@ -522,8 +603,49 @@ def tools_db_cleanup():
         add_note('\n'.join(lines), context=context, level='Task', title='🧹 vacuum')
         add_note(f'{len(results)} таблиц за {total} с', context=context, level='DAG', title='🧹 vacuum')
 
+    @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
+    def reindex(**context):
+        from airflow.exceptions import AirflowSkipException
+
+        p = context['params']
+        if not p.get('reindex', True):
+            raise AirflowSkipException('reindex=False — пропущено')
+
+        timeout = 15 * 60
+        tables = context['ti'].xcom_pull(task_ids='clean') or []
+        if not tables:
+            raise AirflowSkipException('нет таблиц из clean')
+
+        conn_id = get_af_conn()
+        results = []
+        for tbl in tables:
+            _ts = time.time()
+            try:
+                db_reindex(tbl, conn_id, timeout=timeout)
+            except Exception as e:
+                # Прерванный REINDEX CONCURRENTLY оставляет невалидный индекс
+                # (pg_index.indisvalid = false) — его нужно удалить вручную.
+                logger.warning(f"⚠️ {tbl}: {e} — возможен невалидный индекс, проверьте pg_index")
+                results.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
+                                'status': f'❌ {str(e)[:60]}'})
+                continue
+            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': '✅'})
+
+        lines = [
+            '| Таблица | Время, с | Статус |',
+            '|---------|---------|--------|',
+        ] + [f"| `{r['table']}` | {r['duration']} | {r['status']} |" for r in results]
+        total = round(sum(r['duration'] for r in results), 2)
+        ok = sum(1 for r in results if r['status'] == '✅')
+        lines.append(f"| **Итого** | **{total} с** | **{ok}/{len(results)}** |")
+        add_note('\n'.join(lines), context=context, level='Task', title='🔁 reindex')
+        add_note(f'{ok}/{len(results)} таблиц за {total} с', context=context, level='DAG', title='🔁 reindex')
+
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
+        from airflow.models import DagRun, XCom
+        from airflow.utils.session import create_session
+
         dag_id = context['dag_run'].dag_id
         run_id = context['dag_run'].run_id
 
@@ -607,6 +729,6 @@ def tools_db_cleanup():
 
         return data
 
-    clean() >> vacuum() >> report()
+    clean() >> vacuum() >> reindex() >> report()
 
 tools_db_cleanup()

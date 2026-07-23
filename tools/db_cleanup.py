@@ -233,7 +233,16 @@ def get_af_conn():
         secrets = json.load(f)
 
     def _b64(s: str) -> str:
-        return base64.b64decode(s).decode()
+        """base64 → текст; если значение не base64 — возвращаем как есть.
+
+        В /vault/secrets/application часть значений лежит в открытом виде, а
+        b64decode без validate=True молча выбрасывает символы вне алфавита
+        base64 ('-', '_', '#', скобки) и портит пароль вместо явной ошибки.
+        """
+        try:
+            return base64.b64decode(s, validate=True).decode()
+        except (ValueError, UnicodeDecodeError):
+            return s
 
     raw_extra = _b64(secrets['DB_EXTRA_1']) if secrets.get('DB_EXTRA_1') else ''
     try:

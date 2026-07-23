@@ -243,22 +243,28 @@ def db_vacuum(table, full=False, timeout=3600):
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 
-def get_af_conn():
-    """Регистрирует админский коннект к метабазе Airflow из Vault и возвращает его conn_id.
+# Опции libpq, которые имеет смысл пропускать из DB_EXTRA_1 в psycopg2.connect;
+# всё остальное (ключи в стиле S3/ClickHouse и т.п.) вызвало бы
+# "invalid connection option".
+_LIBPQ_OPTS = {
+    'connect_timeout', 'application_name', 'options', 'target_session_attrs',
+    'sslmode', 'sslrootcert', 'sslcert', 'sslkey', 'gssencmode', 'krbsrvname',
+}
 
-    Нужен для REINDEX TABLE CONCURRENTLY: требуются права владельца таблиц,
-    которых нет у сессионного пользователя Airflow.
+
+def get_af_conn():
+    """Параметры psycopg2 для админского подключения к метабазе Airflow из Vault.
+
+    Нужны для REINDEX TABLE CONCURRENTLY: требуются права владельца таблиц,
+    которых нет у сессионного пользователя Airflow. Собираем kwargs напрямую,
+    без Airflow Connection и AIRFLOW_CONN_* — так подключение не зависит от
+    secret backend, парсинга JSON-коннекта и платформенного do_connect-хука.
     """
     import ast
     import base64
     import json
-    import os
 
     VAULT_PATH = '/vault/secrets/application'
-    AF_ID = 'af_adm'
-    # Перечитываем Vault каждый раз: процесс celery-воркера переиспользуется,
-    # и закэшированный в env коннект пережил бы правку параметров подключения.
-    env_key = f'AIRFLOW_CONN_{AF_ID.upper()}'
 
     with open(VAULT_PATH) as f:
         secrets = json.load(f)
@@ -282,57 +288,52 @@ def get_af_conn():
         extra = ast.literal_eval(raw_extra) if raw_extra else {}
 
     host, _, port = _b64(secrets['DB_HOST_1']).partition(':')
-    conn_json = {
-        "conn_type": "postgres",
-        "host":      host,
-        "port":      int(port or 5433),
-        "login":     _b64(secrets['DB_ADM_USER_1_1']),
-        "password":  _b64(secrets['DB_ADM_PASS_1_1']),
-        # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;
-        # 'main' — схема внутри airflowdb, и в SQL она указана явно (main.<table>).
-        "schema":    _b64(secrets['DB_NAME_1']),
-        # Дефолты как в платформенном hrp_secret_backend.vault_secret_backend
-        # (parse_self_pg_connections), поверх — DB_EXTRA_1, но sslmode и
-        # gssencmode задаём жёстко:
+    params = {
+        'host':     host,
+        'port':     int(port or 5433),
+        'user':     _b64(secrets['DB_ADM_USER_1_1']),
+        'password': _b64(secrets['DB_ADM_PASS_1_1']),
+        # 'main' — SQL-схема внутри airflowdb, в запросах она указана явно
+        'dbname':   _b64(secrets['DB_NAME_1']),
+        'application_name': 'airflow_db_cleanup',
+        'connect_timeout': 5,
+        'target_session_attrs': 'read-write',
+        # DB_EXTRA_1 поверх дефолтов, но sslmode и gssencmode задаём жёстко:
         #   sslmode=prefer — DB_EXTRA_1 приносит disable, и тогда SSL даже не
-        #     пробуется; под этой учёткой сервер пускает только по SSL (в DBeaver
-        #     подключение идёт с prefer);
+        #     пробуется; в DBeaver подключение под этой учёткой идёт с prefer;
         #   gssencmode=disable — в контейнере есть Kerberos-кэш для CTL, и libpq
         #     пробует GSS-шифрование раньше пароля, падая с "Unspecified GSS failure".
-        "extra": {
-            "target_session_attrs": "read-write",
-            "connect_timeout":      5,
-            **extra,
-            "sslmode":              "prefer",
-            "gssencmode":           "disable",
-        },
+        **{k: v for k, v in extra.items() if k in _LIBPQ_OPTS},
+        'sslmode':    'prefer',
+        'gssencmode': 'disable',
     }
-    os.environ[env_key] = json.dumps(conn_json)
-    pwd = conn_json['password']
+    pwd = params['password']
     logger.info(
-        f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}"
-        f"/{conn_json['schema']} | пароль: {len(pwd)} симв."
-        f" {pwd[:2]}…{pwd[-2:]} (b64-декодирован: {pwd != secrets['DB_ADM_PASS_1_1']})"
+        f"🔑 Админский коннект: {params['user']}@{host}:{params['port']}/{params['dbname']}"
+        f" | пароль: {len(pwd)} симв. {pwd[:2]}…{pwd[-2:]}"
+        f" (b64-декодирован: {pwd != secrets['DB_ADM_PASS_1_1']})"
+        f" | {', '.join(f'{k}={params[k]}' for k in sorted(_LIBPQ_OPTS & params.keys()))}"
     )
 
-    return AF_ID
+    return params
 
 
-def db_reindex(table, conn_id=None, timeout=3600):
+def db_reindex(table, conn_params=None, timeout=3600):
     """REINDEX TABLE CONCURRENTLY по таблице схемы main.
 
     CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
     По умолчанию идём тем же коннектом, что и db_vacuum (прав владельца хватает —
-    VACUUM требует тех же). conn_id задаётся только при ошибке прав, см. get_af_conn.
+    VACUUM требует тех же). conn_params (см. get_af_conn) задаются только при
+    ошибке прав: тогда подключаемся psycopg2 напрямую, мимо Airflow-коннектов.
     """
     ts = time.time()
     sql = f"REINDEX TABLE CONCURRENTLY main.{table}"
-    logger.info(f"🔧 REINDEX: {sql}" + (f" (conn={conn_id})" if conn_id else ""))
+    logger.info(f"🔧 REINDEX: {sql}" + (f" (user={conn_params['user']})" if conn_params else ""))
 
-    if conn_id:
-        from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+    if conn_params:
+        import psycopg2
 
-        conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
+        conn = psycopg2.connect(**conn_params)
         try:
             conn.autocommit = True
             with conn.cursor() as cur:
@@ -721,19 +722,19 @@ def tools_db_cleanup():
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
 
-        conn_id = None  # штатный коннект Airflow; af_adm — только если не хватит прав
+        conn_params = None  # штатный коннект Airflow; админский — только если не хватит прав
         results = []
         for tbl in tables:
             _ts = time.time()
             try:
                 try:
-                    db_reindex(tbl, conn_id, timeout=timeout)
+                    db_reindex(tbl, conn_params, timeout=timeout)
                 except Exception as e:
-                    if conn_id or not any(s in str(e).lower() for s in ('must be owner', 'permission denied')):
+                    if conn_params or not any(s in str(e).lower() for s in ('must be owner', 'permission denied')):
                         raise
                     logger.warning(f"⚠️ {tbl}: {e} — пробуем админский коннект из Vault")
-                    conn_id = get_af_conn()
-                    db_reindex(tbl, conn_id, timeout=timeout)
+                    conn_params = get_af_conn()
+                    db_reindex(tbl, conn_params, timeout=timeout)
             except Exception as e:
                 # Прерванный REINDEX CONCURRENTLY оставляет невалидный индекс
                 # (pg_index.indisvalid = false) — его нужно удалить вручную.

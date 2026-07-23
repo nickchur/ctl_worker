@@ -192,18 +192,29 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False,
                 obj.note = new_note[:MAX_NOTE_LEN]
 
 
-_STAT_SQL = """
-    SELECT n_dead_tup, n_live_tup, last_vacuum, last_autovacuum
-    FROM pg_stat_user_tables WHERE schemaname = 'main' AND relname = :tbl
-"""
+def db_stats(tables):
+    """Снимок pg_stat_user_tables по таблицам схемы main: {table: (dead, last_vacuum)}.
+
+    Статистика наполняется коллектором асинхронно (~500 мс), поэтому читать её
+    сразу после VACUUM бессмысленно — снимок «после» снимаем с паузой.
+    """
+    from airflow import settings
+
+    sql = text("""
+        SELECT relname, n_dead_tup, GREATEST(last_vacuum, last_autovacuum)
+        FROM pg_stat_user_tables
+        WHERE schemaname = 'main' AND relname = ANY(:tbls)
+    """)
+    with settings.engine.connect() as conn:
+        rows = conn.execute(sql, {'tbls': list(tables)}).fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows}
 
 
 def db_vacuum(table, full=False, timeout=3600):
     """VACUUM [FULL] ANALYZE по таблице схемы main.
 
-    Возвращает (dead_до, dead_после, last_vacuum) — VACUUM без FULL не уменьшает
-    файл таблицы (страницы уходят в free space map), поэтому судить о его работе
-    по размеру в отчёте нельзя, ориентир — n_dead_tup и last_vacuum.
+    VACUUM без FULL не уменьшает файл таблицы (страницы уходят в free space map),
+    поэтому судить о его работе по размеру нельзя — ориентир n_dead_tup и last_vacuum.
     """
     from airflow import settings
     from airflow.exceptions import AirflowSkipException
@@ -212,24 +223,24 @@ def db_vacuum(table, full=False, timeout=3600):
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
     sql = f"VACUUM {mode} main.{table}"
     with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
-        conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
-        before = conn.execute(text(_STAT_SQL), {'tbl': table}).fetchone()
-        logger.info(f"🔧 VACUUM: {sql}")
-        conn.execute(text(sql))
         pool_proxy = conn.connection
         psy = getattr(pool_proxy, 'dbapi_connection', None) or getattr(pool_proxy, 'connection', None) or pool_proxy
-        notices = list(getattr(psy, 'notices', []))
-        after = conn.execute(text(_STAT_SQL), {'tbl': table}).fetchone()
+        # Соединение берётся из пула и уже может нести чужие сообщения — чистим,
+        # иначе пропуск по правам ("skipping ... only table or database owner can
+        # vacuum it") теряется и таблица считается успешно обработанной.
+        notices = getattr(psy, 'notices', None)
+        if notices is not None:
+            del notices[:]
+        conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
+        logger.info(f"🔧 VACUUM: {sql}")
+        conn.execute(text(sql))
+        notices = list(notices or [])
+    for n in notices:
+        logger.info(f"📣 {table}: {n.strip()}")
     skipped = next((n for n in notices if 'skipping' in n.lower()), None)
     if skipped:
         raise AirflowSkipException(skipped.strip())
-    dead_before = before[0] if before else None
-    dead_after, last_vac = (after[0], after[2]) if after else (None, None)
-    logger.info(
-        f"✅ {sql} за {time.time() - ts:.2f}s | мёртвых {dead_before} → {dead_after}"
-        f" | last_vacuum={last_vac}"
-    )
-    return dead_before, dead_after, last_vac
+    logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 
 def get_af_conn():
@@ -281,15 +292,19 @@ def get_af_conn():
         # 'main' — схема внутри airflowdb, и в SQL она указана явно (main.<table>).
         "schema":    _b64(secrets['DB_NAME_1']),
         # Дефолты как в платформенном hrp_secret_backend.vault_secret_backend
-        # (parse_self_pg_connections). gssencmode=disable — в контейнере есть
-        # Kerberos-кэш для CTL, и libpq пробует GSS-шифрование раньше пароля,
-        # падая с "could not initiate GSSAPI security context".
+        # (parse_self_pg_connections), поверх — DB_EXTRA_1, но sslmode и
+        # gssencmode задаём жёстко:
+        #   sslmode=prefer — DB_EXTRA_1 приносит disable, и тогда SSL даже не
+        #     пробуется; под этой учёткой сервер пускает только по SSL (в DBeaver
+        #     подключение идёт с prefer);
+        #   gssencmode=disable — в контейнере есть Kerberos-кэш для CTL, и libpq
+        #     пробует GSS-шифрование раньше пароля, падая с "Unspecified GSS failure".
         "extra": {
-            "sslmode":              "prefer",
-            "gssencmode":           "disable",
             "target_session_attrs": "read-write",
             "connect_timeout":      5,
             **extra,
+            "sslmode":              "prefer",
+            "gssencmode":           "disable",
         },
     }
     os.environ[env_key] = json.dumps(conn_json)
@@ -333,6 +348,11 @@ def db_reindex(table, conn_id=None, timeout=3600):
             conn.execute(text(sql))
 
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
+
+
+def _fmt_ts(ts):
+    """'HH:MM:SS' для отметок вакуума; '—' если статистики по таблице нет."""
+    return ts.strftime('%H:%M:%S') if ts else '—'
 
 
 def readable_size(size_bytes, base=1024):
@@ -644,28 +664,49 @@ def tools_db_cleanup():
         tables = context['ti'].xcom_pull(task_ids='clean') or []
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
-        results = []
+        before = db_stats(tables)
+        results, skipped = [], []
         for tbl in tables:
             _ts = time.time()
             try:
-                dead_before, dead_after, _ = db_vacuum(tbl, full=False, timeout=timeout)
+                db_vacuum(tbl, full=False, timeout=timeout)
             except AirflowSkipException as e:
-                logger.warning(f"⚠️ {tbl}: {e}")
+                logger.warning(f"☮️ {tbl}: {e}")
+                skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
+                                'status': f'☮️ {str(e)[:60]}'})
                 continue
-            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                            'dead': f"{dead_before} → {dead_after}"})
+            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': '✅'})
 
-        if not results:
+        if not results and not skipped:
             add_note('нет таблиц для вакуума', context=context, level='DAG,Task', title='🧹 vacuum')
             return
+
+        # Даём коллектору статистики дописать результаты вакуума (PGSTAT_STAT_INTERVAL = 500 мс)
+        if results:
+            time.sleep(2)
+        after = db_stats(tables) if results else {}
+        for r in results:
+            r['ok'] = True
+        for r in results + skipped:
+            dead_b = before.get(r['table'], (None, None))[0]
+            dead_a, last_vac = after.get(r['table'], (None, None))
+            r['dead'] = f"{dead_b} → {dead_a}" if r.get('ok') else str(dead_b)
+            r['last_vacuum'] = _fmt_ts(last_vac)
+            logger.info(f"🔎 {r['table']}: мёртвых {r['dead']} | last_vacuum={last_vac}")
+
         lines = [
-            '| Таблица | Время, с | Мёртвых |',
-            '|---------|---------|---------|',
-        ] + [f"| `{r['table']}` | {r['duration']} | {r['dead']} |" for r in results]
-        total = round(sum(r['duration'] for r in results), 2)
-        lines.append(f"| **Итого** | **{total} с** | |")
+            '| Таблица | Время, с | Мёртвых | last_vacuum | Статус |',
+            '|---------|---------|---------|-------------|--------|',
+        ] + [
+            f"| `{r['table']}` | {r['duration']} | {r['dead']} | {r['last_vacuum']} | {r['status']} |"
+            for r in results + skipped
+        ]
+        total = round(sum(r['duration'] for r in results + skipped), 2)
+        lines.append(f"| **Итого** | **{total} с** | | | **{len(results)}/{len(tables)}** |")
         add_note('\n'.join(lines), context=context, level='Task', title='🧹 vacuum')
-        add_note(f'{len(results)} таблиц за {total} с', context=context, level='DAG', title='🧹 vacuum')
+        add_note(f'{len(results)}/{len(tables)} таблиц за {total} с'
+                 + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''),
+                 context=context, level='DAG', title='🧹 vacuum')
 
     @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
     def reindex(**context):

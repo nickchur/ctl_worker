@@ -210,61 +210,32 @@ def db_stats(tables):
     return {r[0]: (r[1], r[2]) for r in rows}
 
 
-def db_vacuum(table, conn_params=None, full=False, timeout=3600, set_role=None):
-    """VACUUM [FULL] ANALYZE по таблице схемы main.
+def db_vacuum(table, conn_id, full=False, timeout=3600):
+    """VACUUM [FULL] ANALYZE по таблице схемы main под коннектом conn_id.
 
     VACUUM без FULL не уменьшает файл таблицы (страницы уходят в free space map),
     поэтому судить о его работе по размеру нельзя — ориентир n_dead_tup и last_vacuum.
-    conn_params (см. get_af_conn) — админский коннект psycopg2; без них идём
-    штатным коннектом Airflow. set_role — роль-владелец: без прав владельца
-    VACUUM не падает, а молча пропускает таблицу с warning'ом.
+    Без прав владельца VACUUM не падает, а молча пропускает таблицу с warning'ом —
+    его и ловим, чтобы пропуск был виден.
     """
     from airflow.exceptions import AirflowSkipException
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
     ts = time.time()
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
     sql = f"VACUUM {mode} main.{table}"
-    # Роль приходит из pg_get_userbyid — существующее имя, но кавычим на случай
-    # спецсимволов (учётки вида CI05456832-pg-airflowadm).
-    role_sql = 'SET ROLE "{}"'.format(set_role.replace('"', '""')) if set_role else None
-    suffix = (f" (user={conn_params['user']})" if conn_params else "") \
-             + (f" (SET ROLE {set_role})" if set_role else "")
 
-    if conn_params:
-        import psycopg2
-
-        conn = psycopg2.connect(**conn_params)
-        try:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute(f"SET statement_timeout = '{timeout}s'")
-                if role_sql:
-                    cur.execute(role_sql)
-                logger.info(f"🔧 VACUUM: {sql}{suffix}")
-                del conn.notices[:]
-                cur.execute(sql)
-                notices = list(conn.notices)
-        finally:
-            conn.close()
-    else:
-        from airflow import settings
-
-        with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
-            pool_proxy = conn.connection
-            psy = (getattr(pool_proxy, 'dbapi_connection', None)
-                   or getattr(pool_proxy, 'connection', None) or pool_proxy)
-            # Соединение берётся из пула и уже может нести чужие сообщения — чистим,
-            # иначе пропуск по правам ("skipping ... only table or database owner can
-            # vacuum it") теряется и таблица считается успешно обработанной.
-            notices = getattr(psy, 'notices', None)
-            if notices is not None:
-                del notices[:]
-            conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
-            if role_sql:
-                conn.execute(text(role_sql))
-            logger.info(f"🔧 VACUUM: {sql}{suffix}")
-            conn.execute(text(sql))
-            notices = list(notices or [])
+    conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = '{timeout}s'")
+            logger.info(f"🔧 VACUUM: {sql} (conn={conn_id})")
+            del conn.notices[:]
+            cur.execute(sql)
+            notices = list(conn.notices)
+    finally:
+        conn.close()
 
     for n in notices:
         logger.info(f"📣 {table}: {n.strip()}")
@@ -274,8 +245,8 @@ def db_vacuum(table, conn_params=None, full=False, timeout=3600, set_role=None):
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 
-# Опции libpq, которые имеет смысл пропускать из DB_EXTRA_1 в psycopg2.connect;
-# всё остальное (ключи в стиле S3/ClickHouse и т.п.) вызвало бы
+# Опции libpq, которые имеет смысл пропускать из DB_EXTRA_1 в extra коннекта;
+# всё остальное (ключи в стиле S3/ClickHouse и т.п.) psycopg2 отверг бы с
 # "invalid connection option".
 _LIBPQ_OPTS = {
     'connect_timeout', 'application_name', 'options', 'target_session_attrs',
@@ -284,18 +255,21 @@ _LIBPQ_OPTS = {
 
 
 def get_af_conn():
-    """Параметры psycopg2 для админского подключения к метабазе Airflow из Vault.
+    """Регистрирует админский коннект к метабазе Airflow из Vault, возвращает conn_id.
 
-    Нужны для REINDEX TABLE CONCURRENTLY: требуются права владельца таблиц,
-    которых нет у сессионного пользователя Airflow. Собираем kwargs напрямую,
-    без Airflow Connection и AIRFLOW_CONN_* — так подключение не зависит от
-    secret backend, парсинга JSON-коннекта и платформенного do_connect-хука.
+    Нужен для VACUUM и REINDEX: требуются права владельца таблиц, которых нет у
+    сессионного пользователя Airflow.
     """
     import ast
     import base64
     import json
+    import os
 
     VAULT_PATH = '/vault/secrets/application'
+    AF_ID = 'af_adm'
+    # Перечитываем Vault каждый раз: процесс celery-воркера переиспользуется,
+    # и закэшированный в env коннект пережил бы правку параметров подключения.
+    env_key = f'AIRFLOW_CONN_{AF_ID.upper()}'
 
     with open(VAULT_PATH) as f:
         secrets = json.load(f)
@@ -319,103 +293,60 @@ def get_af_conn():
         extra = ast.literal_eval(raw_extra) if raw_extra else {}
 
     host, _, port = _b64(secrets['DB_HOST_1']).partition(':')
-    params = {
-        'host':     host,
-        'port':     int(port or 5433),
-        'user':     _b64(secrets['DB_ADM_USER_1_1']),
-        'password': _b64(secrets['DB_ADM_PASS_1_1']),
-        # 'main' — SQL-схема внутри airflowdb, в запросах она указана явно
-        'dbname':   _b64(secrets['DB_NAME_1']),
-        'application_name': 'airflow_db_cleanup',
-        'connect_timeout': 5,
-        'target_session_attrs': 'read-write',
+    conn_json = {
+        'conn_type': 'postgres',
+        'host':      host,
+        'port':      int(port or 5433),
+        'login':     _b64(secrets['DB_ADM_USER_1_1']),
+        'password':  _b64(secrets['DB_ADM_PASS_1_1']),
+        # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;
+        # 'main' — схема внутри airflowdb, и в SQL она указана явно (main.<table>).
+        'schema':    _b64(secrets['DB_NAME_1']),
         # DB_EXTRA_1 поверх дефолтов, но sslmode и gssencmode задаём жёстко:
         #   sslmode=prefer — DB_EXTRA_1 приносит disable, и тогда SSL даже не
         #     пробуется; в DBeaver подключение под этой учёткой идёт с prefer;
         #   gssencmode=disable — в контейнере есть Kerberos-кэш для CTL, и libpq
         #     пробует GSS-шифрование раньше пароля, падая с "Unspecified GSS failure".
-        **{k: v for k, v in extra.items() if k in _LIBPQ_OPTS},
-        'sslmode':    'prefer',
-        'gssencmode': 'disable',
+        'extra': {
+            'application_name':     'airflow_db_cleanup',
+            'connect_timeout':      5,
+            'target_session_attrs': 'read-write',
+            **{k: v for k, v in extra.items() if k in _LIBPQ_OPTS},
+            'sslmode':    'prefer',
+            'gssencmode': 'disable',
+        },
     }
-    pwd = params['password']
+    os.environ[env_key] = json.dumps(conn_json)
+    pwd = conn_json['password']
     logger.info(
-        f"🔑 Админский коннект: {params['user']}@{host}:{params['port']}/{params['dbname']}"
-        f" | пароль: {len(pwd)} симв. {pwd[:2]}…{pwd[-2:]}"
+        f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}"
+        f"/{conn_json['schema']} | пароль: {len(pwd)} симв. {pwd[:2]}…{pwd[-2:]}"
         f" (b64-декодирован: {pwd != secrets['DB_ADM_PASS_1_1']})"
-        f" | {', '.join(f'{k}={params[k]}' for k in sorted(_LIBPQ_OPTS & params.keys()))}"
+        f" | {', '.join(f'{k}={v}' for k, v in sorted(conn_json['extra'].items()))}"
     )
 
-    return params
+    return AF_ID
 
 
-def db_owners(tables):
-    """Владельцы таблиц main и признак членства текущего пользователя в роли-владельце.
-
-    {table: (owner, can_set_role)}. Если членство есть, но роль NOINHERIT, права
-    владельца не действуют автоматически — их нужно взять явным SET ROLE.
-    """
-    from airflow import settings
-
-    sql = text("""
-        SELECT c.relname,
-               pg_get_userbyid(c.relowner)                  AS owner,
-               pg_has_role(current_user, c.relowner, 'USAGE') AS can_set_role,
-               current_user
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'main' AND c.relname = ANY(:tbls)
-    """)
-    with settings.engine.connect() as conn:
-        rows = conn.execute(sql, {'tbls': list(tables)}).fetchall()
-    if rows:
-        logger.info(f"👤 current_user={rows[0][3]}")
-        for r in rows:
-            logger.info(f"👤 {r[0]}: owner={r[1]} | SET ROLE доступен: {r[2]}")
-    return {r[0]: (r[1], r[2]) for r in rows}
-
-
-def db_reindex(table, conn_params=None, timeout=3600, set_role=None):
-    """REINDEX TABLE CONCURRENTLY по таблице схемы main.
+def db_reindex(table, conn_id, timeout=3600):
+    """REINDEX TABLE CONCURRENTLY по таблице схемы main под коннектом conn_id.
 
     CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
-    По умолчанию идём тем же коннектом, что и db_vacuum (прав владельца хватает —
-    VACUUM требует тех же). set_role — роль-владелец, которую берём перед REINDEX,
-    если членство в ней есть (см. db_owners). conn_params (см. get_af_conn)
-    задаются только при ошибке прав: тогда подключаемся psycopg2 напрямую.
     """
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
     ts = time.time()
     sql = f"REINDEX TABLE CONCURRENTLY main.{table}"
-    logger.info(
-        f"🔧 REINDEX: {sql}"
-        + (f" (user={conn_params['user']})" if conn_params else "")
-        + (f" (SET ROLE {set_role})" if set_role else "")
-    )
-    # Роль приходит из pg_get_userbyid — существующее имя, но кавычим на случай
-    # спецсимволов в имени роли (учётки вида CI05456832-pg-airflowadm).
-    role_sql = 'SET ROLE "{}"'.format(set_role.replace('"', '""')) if set_role else None
+    logger.info(f"🔧 REINDEX: {sql} (conn={conn_id})")
 
-    if conn_params:
-        import psycopg2
-
-        conn = psycopg2.connect(**conn_params)
-        try:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute(f"SET statement_timeout = '{timeout}s'")
-                if role_sql:
-                    cur.execute(role_sql)
-                cur.execute(sql)
-        finally:
-            conn.close()
-    else:
-        from airflow import settings
-
-        with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
-            conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
-            if role_sql:
-                conn.execute(text(role_sql))
-            conn.execute(text(sql))
+    conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = '{timeout}s'")
+            cur.execute(sql)
+    finally:
+        conn.close()
 
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
@@ -735,24 +666,15 @@ def tools_db_cleanup():
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
         before = db_stats(tables)
-        owners = db_owners(tables)
-
-        # Штатный пользователь Airflow не владеет таблицами main, поэтому VACUUM
-        # молча их пропускает — идём админским коннектом из Vault; если он
-        # недоступен, откатываемся на штатный (там сработает SET ROLE, если есть).
-        try:
-            conn_params = get_af_conn()
-        except Exception as e:
-            logger.warning(f"⚠️ админский коннект недоступен ({e}) — идём штатным")
-            conn_params = None
+        # Штатный пользователь Airflow не владеет таблицами main и VACUUM их молча
+        # пропускает — идём админским коннектом из Vault.
+        conn_id = get_af_conn()
 
         results, skipped = [], []
         for tbl in tables:
             _ts = time.time()
-            owner, can_set_role = owners.get(tbl, (None, False))
             try:
-                db_vacuum(tbl, conn_params, full=False, timeout=timeout,
-                          set_role=owner if can_set_role else None)
+                db_vacuum(tbl, conn_id, full=False, timeout=timeout)
             except AirflowSkipException as e:
                 logger.warning(f"☮️ {tbl}: {e}")
                 skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
@@ -809,24 +731,13 @@ def tools_db_cleanup():
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
 
-        owners = db_owners(tables)
-        conn_params = None  # штатный коннект Airflow; админский — только если не хватит прав
+        # REINDEX требует прав владельца таблиц — идём админским коннектом из Vault.
+        conn_id = get_af_conn()
         results = []
         for tbl in tables:
             _ts = time.time()
-            owner, can_set_role = owners.get(tbl, (None, False))
-            # Членство в роли-владельце есть, но при NOINHERIT права не действуют
-            # автоматически — берём роль явно.
-            set_role = owner if can_set_role else None
             try:
-                try:
-                    db_reindex(tbl, conn_params, timeout=timeout, set_role=set_role)
-                except Exception as e:
-                    if conn_params or not any(s in str(e).lower() for s in ('must be owner', 'permission denied')):
-                        raise
-                    logger.warning(f"⚠️ {tbl}: {e} — пробуем админский коннект из Vault")
-                    conn_params = get_af_conn()
-                    db_reindex(tbl, conn_params, timeout=timeout)
+                db_reindex(tbl, conn_id, timeout=timeout)
             except Exception as e:
                 # Прерванный REINDEX CONCURRENTLY оставляет невалидный индекс
                 # (pg_index.indisvalid = false) — его нужно удалить вручную.

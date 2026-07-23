@@ -192,7 +192,19 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False,
                 obj.note = new_note[:MAX_NOTE_LEN]
 
 
+_STAT_SQL = """
+    SELECT n_dead_tup, n_live_tup, last_vacuum, last_autovacuum
+    FROM pg_stat_user_tables WHERE schemaname = 'main' AND relname = :tbl
+"""
+
+
 def db_vacuum(table, full=False, timeout=3600):
+    """VACUUM [FULL] ANALYZE по таблице схемы main.
+
+    Возвращает (dead_до, dead_после, last_vacuum) — VACUUM без FULL не уменьшает
+    файл таблицы (страницы уходят в free space map), поэтому судить о его работе
+    по размеру в отчёте нельзя, ориентир — n_dead_tup и last_vacuum.
+    """
     from airflow import settings
     from airflow.exceptions import AirflowSkipException
 
@@ -201,15 +213,23 @@ def db_vacuum(table, full=False, timeout=3600):
     sql = f"VACUUM {mode} main.{table}"
     with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
         conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
+        before = conn.execute(text(_STAT_SQL), {'tbl': table}).fetchone()
         logger.info(f"🔧 VACUUM: {sql}")
         conn.execute(text(sql))
         pool_proxy = conn.connection
         psy = getattr(pool_proxy, 'dbapi_connection', None) or getattr(pool_proxy, 'connection', None) or pool_proxy
         notices = list(getattr(psy, 'notices', []))
+        after = conn.execute(text(_STAT_SQL), {'tbl': table}).fetchone()
     skipped = next((n for n in notices if 'skipping' in n.lower()), None)
     if skipped:
         raise AirflowSkipException(skipped.strip())
-    logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
+    dead_before = before[0] if before else None
+    dead_after, last_vac = (after[0], after[2]) if after else (None, None)
+    logger.info(
+        f"✅ {sql} за {time.time() - ts:.2f}s | мёртвых {dead_before} → {dead_after}"
+        f" | last_vacuum={last_vac}"
+    )
+    return dead_before, dead_after, last_vac
 
 
 def get_af_conn():
@@ -273,29 +293,45 @@ def get_af_conn():
         },
     }
     os.environ[env_key] = json.dumps(conn_json)
-    logger.info(f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}")
+    pwd = conn_json['password']
+    logger.info(
+        f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}"
+        f"/{conn_json['schema']} | пароль: {len(pwd)} симв."
+        f" {pwd[:2]}…{pwd[-2:]} (b64-декодирован: {pwd != secrets['DB_ADM_PASS_1_1']})"
+    )
 
     return AF_ID
 
 
-def db_reindex(table, conn_id, timeout=3600):
-    """REINDEX TABLE CONCURRENTLY по таблице схемы main под админским коннектом.
+def db_reindex(table, conn_id=None, timeout=3600):
+    """REINDEX TABLE CONCURRENTLY по таблице схемы main.
 
     CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
+    По умолчанию идём тем же коннектом, что и db_vacuum (прав владельца хватает —
+    VACUUM требует тех же). conn_id задаётся только при ошибке прав, см. get_af_conn.
     """
-    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
-
     ts = time.time()
     sql = f"REINDEX TABLE CONCURRENTLY main.{table}"
-    conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(f"SET statement_timeout = '{timeout}s'")
-            logger.info(f"🔧 REINDEX: {sql}")
-            cur.execute(sql)
-    finally:
-        conn.close()
+    logger.info(f"🔧 REINDEX: {sql}" + (f" (conn={conn_id})" if conn_id else ""))
+
+    if conn_id:
+        from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+        conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = '{timeout}s'")
+                cur.execute(sql)
+        finally:
+            conn.close()
+    else:
+        from airflow import settings
+
+        with settings.engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+            conn.execute(text(f"SET statement_timeout = '{timeout}s'"))
+            conn.execute(text(sql))
+
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 
@@ -612,21 +648,22 @@ def tools_db_cleanup():
         for tbl in tables:
             _ts = time.time()
             try:
-                db_vacuum(tbl, full=False, timeout=timeout)
+                dead_before, dead_after, _ = db_vacuum(tbl, full=False, timeout=timeout)
             except AirflowSkipException as e:
                 logger.warning(f"⚠️ {tbl}: {e}")
                 continue
-            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2)})
+            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
+                            'dead': f"{dead_before} → {dead_after}"})
 
         if not results:
             add_note('нет таблиц для вакуума', context=context, level='DAG,Task', title='🧹 vacuum')
             return
         lines = [
-            '| Таблица | Время, с |',
-            '|---------|---------|',
-        ] + [f"| `{r['table']}` | {r['duration']} |" for r in results]
+            '| Таблица | Время, с | Мёртвых |',
+            '|---------|---------|---------|',
+        ] + [f"| `{r['table']}` | {r['duration']} | {r['dead']} |" for r in results]
         total = round(sum(r['duration'] for r in results), 2)
-        lines.append(f"| **Итого** | **{total} с** |")
+        lines.append(f"| **Итого** | **{total} с** | |")
         add_note('\n'.join(lines), context=context, level='Task', title='🧹 vacuum')
         add_note(f'{len(results)} таблиц за {total} с', context=context, level='DAG', title='🧹 vacuum')
 
@@ -643,12 +680,19 @@ def tools_db_cleanup():
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
 
-        conn_id = get_af_conn()
+        conn_id = None  # штатный коннект Airflow; af_adm — только если не хватит прав
         results = []
         for tbl in tables:
             _ts = time.time()
             try:
-                db_reindex(tbl, conn_id, timeout=timeout)
+                try:
+                    db_reindex(tbl, conn_id, timeout=timeout)
+                except Exception as e:
+                    if conn_id or not any(s in str(e).lower() for s in ('must be owner', 'permission denied')):
+                        raise
+                    logger.warning(f"⚠️ {tbl}: {e} — пробуем админский коннект из Vault")
+                    conn_id = get_af_conn()
+                    db_reindex(tbl, conn_id, timeout=timeout)
             except Exception as e:
                 # Прерванный REINDEX CONCURRENTLY оставляет невалидный индекс
                 # (pg_index.indisvalid = false) — его нужно удалить вручную.

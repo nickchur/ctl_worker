@@ -35,9 +35,9 @@ import time
 import logging
 
 try:
-    from plugins.utils import add_note, get_af_conn, on_callback  # type: ignore
-except ImportError:
     from CI06932748.analytics.datalab.tools.utils import add_note, get_af_conn, on_callback  # type: ignore
+except ImportError:
+    from plugins.utils import add_note, get_af_conn, on_callback  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 

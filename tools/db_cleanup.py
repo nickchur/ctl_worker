@@ -34,10 +34,14 @@ from datetime import date, datetime, timedelta, timezone
 import time
 import logging
 
+try:
+    from plugins.utils import add_note, get_af_conn, on_callback  # type: ignore
+except ImportError:
+    from CI06932748.analytics.datalab.tools.utils import add_note, get_af_conn, on_callback  # type: ignore
+
 logger = logging.getLogger("airflow.task")
 
 
-MAX_NOTE_LEN = 1000
 BATCH_SIZE = 50_000
 
 # Дополнительные условия для использования существующих индексов без создания новых.
@@ -134,64 +138,6 @@ def _log_sql(sql, bind, msg="SQL"):
         logger.warning(f"⚠️ Не удалось развернуть SQL: {sql} | Параметры: {bind}")
 
 
-def add_note(msg, context=None, level='task', add=True, title='', compact=False, duration=None):
-    from pprint import PrettyPrinter
-    import unicodedata
-
-    from airflow.operators.python import get_current_context
-    from airflow.utils.session import create_session
-
-    if not context:
-        context = get_current_context()
-
-    if isinstance(msg, dict) and len(msg) == 1:
-        t, msg = next(iter(msg.items()))
-        title += str(t) + (f' ({len(msg)})' if isinstance(msg, (dict, list, tuple, set)) else '')
-
-    if duration is not None:
-        msg = f"{msg} ⏱ {duration:.2f}s"
-
-    if type(msg) is not str:
-        msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
-        msg = '```\n' + msg + '\n```'
-
-    logger.info(f"📝 Note added to {level} {title}:\n{msg}")
-
-    with create_session() as session:
-        for l in list(set(level.upper().split(',')))[:2]:
-            new_note = msg.strip()
-
-            if title:
-                if not unicodedata.category(title[0]) == 'So':
-                    title = "📝 " + title
-                new_note = f"{title}\n---\n{new_note}"
-
-            if l == 'DAG':
-                dag_run_id = context['dag_run'].id
-                existing = session.execute(
-                    text("SELECT content FROM main.dag_run_note WHERE dag_run_id = :id"),
-                    {'id': dag_run_id}
-                ).scalar()
-                if existing and existing.startswith(new_note[:MAX_NOTE_LEN]):
-                    continue
-                if add and existing:
-                    new_note = f"{new_note}\n\n---\n{existing}"
-                session.execute(text("""
-                    INSERT INTO main.dag_run_note (dag_run_id, user_id, content, created_at, updated_at)
-                    VALUES (:id, NULL, :content, NOW(), NOW())
-                    ON CONFLICT (dag_run_id) DO UPDATE
-                    SET content = EXCLUDED.content, updated_at = NOW()
-                """), {'id': dag_run_id, 'content': new_note[:MAX_NOTE_LEN]})
-            else:
-                obj = session.merge(context['task_instance'])
-                session.expire(obj)
-                if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
-                    continue
-                if add:
-                    new_note = f"{new_note}\n\n---\n{obj.note if obj.note else ''}"
-                obj.note = new_note[:MAX_NOTE_LEN]
-
-
 def db_stats(tables):
     """Снимок pg_stat_user_tables по таблицам схемы main: {table: (dead, last_vacuum)}.
 
@@ -243,89 +189,6 @@ def db_vacuum(table, conn_id, full=False, timeout=3600):
     if skipped:
         raise AirflowSkipException(skipped.strip())
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
-
-
-# Опции libpq, которые имеет смысл пропускать из DB_EXTRA_1 в extra коннекта;
-# всё остальное (ключи в стиле S3/ClickHouse и т.п.) psycopg2 отверг бы с
-# "invalid connection option".
-_LIBPQ_OPTS = {
-    'connect_timeout', 'application_name', 'options', 'target_session_attrs',
-    'sslmode', 'sslrootcert', 'sslcert', 'sslkey', 'gssencmode', 'krbsrvname',
-}
-
-
-def get_af_conn():
-    """Регистрирует админский коннект к метабазе Airflow из Vault, возвращает conn_id.
-
-    Нужен для VACUUM и REINDEX: требуются права владельца таблиц, которых нет у
-    сессионного пользователя Airflow.
-    """
-    import ast
-    import base64
-    import json
-    import os
-
-    VAULT_PATH = '/vault/secrets/application'
-    AF_ID = 'af_adm'
-    # Перечитываем Vault каждый раз: процесс celery-воркера переиспользуется,
-    # и закэшированный в env коннект пережил бы правку параметров подключения.
-    env_key = f'AIRFLOW_CONN_{AF_ID.upper()}'
-
-    with open(VAULT_PATH) as f:
-        secrets = json.load(f)
-
-    def _b64(s: str) -> str:
-        """base64 → текст; если значение не base64 — возвращаем как есть.
-
-        В /vault/secrets/application часть значений лежит в открытом виде, а
-        b64decode без validate=True молча выбрасывает символы вне алфавита
-        base64 ('-', '_', '#', скобки) и портит пароль вместо явной ошибки.
-        """
-        try:
-            return base64.b64decode(s, validate=True).decode()
-        except (ValueError, UnicodeDecodeError):
-            return s
-
-    raw_extra = _b64(secrets['DB_EXTRA_1']) if secrets.get('DB_EXTRA_1') else ''
-    try:
-        extra = json.loads(raw_extra) if raw_extra else {}
-    except ValueError:
-        extra = ast.literal_eval(raw_extra) if raw_extra else {}
-
-    host, _, port = _b64(secrets['DB_HOST_1']).partition(':')
-    conn_json = {
-        'conn_type': 'postgres',
-        'host':      host,
-        'port':      int(port or 5433),
-        'login':     _b64(secrets['DB_ADM_USER_1_1']),
-        'password':  _b64(secrets['DB_ADM_PASS_1_1']),
-        # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;
-        # 'main' — схема внутри airflowdb, и в SQL она указана явно (main.<table>).
-        'schema':    _b64(secrets['DB_NAME_1']),
-        # DB_EXTRA_1 поверх дефолтов, но sslmode и gssencmode задаём жёстко:
-        #   sslmode=prefer — DB_EXTRA_1 приносит disable, и тогда SSL даже не
-        #     пробуется; в DBeaver подключение под этой учёткой идёт с prefer;
-        #   gssencmode=disable — в контейнере есть Kerberos-кэш для CTL, и libpq
-        #     пробует GSS-шифрование раньше пароля, падая с "Unspecified GSS failure".
-        'extra': {
-            'application_name':     'airflow_db_cleanup',
-            'connect_timeout':      5,
-            'target_session_attrs': 'read-write',
-            **{k: v for k, v in extra.items() if k in _LIBPQ_OPTS},
-            'sslmode':    'prefer',
-            'gssencmode': 'disable',
-        },
-    }
-    os.environ[env_key] = json.dumps(conn_json)
-    pwd = conn_json['password']
-    logger.info(
-        f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}"
-        f"/{conn_json['schema']} | пароль: {len(pwd)} симв. {pwd[:2]}…{pwd[-2:]}"
-        f" (b64-декодирован: {pwd != secrets['DB_ADM_PASS_1_1']})"
-        f" | {', '.join(f'{k}={v}' for k, v in sorted(conn_json['extra'].items()))}"
-    )
-
-    return AF_ID
 
 
 def db_reindex(conn_id, schema='main', timeout=3600):
@@ -428,6 +291,7 @@ params = {
     default_args={
         'owner': 'DataLab (CI02420667)',
         'retries': 0,
+        'on_failure_callback': on_callback,
     },
     start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
     tags=['DataLab', 'tools', 'maintenance'],
@@ -435,6 +299,7 @@ params = {
     is_paused_upon_creation=True,
     max_active_runs=1,
     schedule_interval='0 2 * * *',
+    on_failure_callback=on_callback,
     params=params,
 )
 def tools_db_cleanup():
@@ -648,15 +513,16 @@ def tools_db_cleanup():
             footer = f"|**Итого**|**{readable_size(total, base=1000)}**|||**{duration}**|"
             lines = HDR + _note_rows(results) + [footer]
             add_note('\n'.join(lines), context=context, level='Task',
-                     title=f'🗑️ clean ({mode}, {retention_days}d)', duration=duration, add=False)
+                     title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
             add_note(
-                f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.strftime("%Y-%m-%d")}',
-                context=context, level='DAG', title='🗑️ clean', duration=duration,
+                f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.strftime("%Y-%m-%d")}'
+                f' ⏱ {duration}s',
+                context=context, level='DAG', title='🗑️ clean',
             )
         else:
             add_note(
-                f'{mode} | cutoff: {cutoff.strftime("%Y-%m-%d")}',
-                context=context, level='DAG,Task', title='🗑️ clean', duration=duration,
+                f'{mode} | cutoff: {cutoff.strftime("%Y-%m-%d")} ⏱ {duration}s',
+                context=context, level='DAG,Task', title='🗑️ clean',
             )
 
         return list(results.keys())
@@ -745,8 +611,8 @@ def tools_db_cleanup():
             # Прерванный REINDEX CONCURRENTLY оставляет невалидные индексы
             # (pg_index.indisvalid = false) — их нужно удалить вручную.
             logger.warning(f"⚠️ {e} — возможны невалидные индексы, проверьте pg_index")
-            add_note(f'❌ {str(e)[:400]}', context=context, level='DAG,Task',
-                     title='🔁 reindex', duration=round(time.time() - _ts, 2))
+            add_note(f'❌ {str(e)[:400]} ⏱ {round(time.time() - _ts, 2)}s',
+                     context=context, level='DAG,Task', title='🔁 reindex')
             raise
 
         duration = round(time.time() - _ts, 2)

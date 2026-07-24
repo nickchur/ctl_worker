@@ -450,5 +450,88 @@ def safe_eval(expr):
             return op_map[type(node.op)](_eval(node.operand))
         else:
             raise ValueError(f"Недопустимое выражение: {ast.dump(node)}")
-    
+
     return _eval(tree.body)
+
+
+# Опции libpq, которые имеет смысл пропускать из DB_EXTRA_1 в extra коннекта;
+# всё остальное (ключи в стиле S3/ClickHouse и т.п.) psycopg2 отверг бы с
+# "invalid connection option".
+_LIBPQ_OPTS = {
+    'connect_timeout', 'application_name', 'options', 'target_session_attrs',
+    'sslmode', 'sslrootcert', 'sslcert', 'sslkey', 'gssencmode', 'krbsrvname',
+}
+
+
+def get_af_conn():
+    """Регистрирует коннект к метабазе Airflow из Vault, возвращает conn_id.
+
+    Нужен для VACUUM и REINDEX: требуются права владельца таблиц, которых нет у
+    сессионного пользователя Airflow.
+    """
+    import ast
+    import base64
+    import json
+    import os
+
+    VAULT_PATH = '/vault/secrets/application'
+    AF_ID = 'af_adm'
+    # Перечитываем Vault каждый раз: процесс celery-воркера переиспользуется,
+    # и закэшированный в env коннект пережил бы правку параметров подключения.
+    env_key = f'AIRFLOW_CONN_{AF_ID.upper()}'
+
+    with open(VAULT_PATH) as f:
+        secrets = json.load(f)
+
+    def _b64(s: str) -> str:
+        """base64 → текст; если значение не base64 — возвращаем как есть.
+
+        В /vault/secrets/application часть значений лежит в открытом виде, а
+        b64decode без validate=True молча выбрасывает символы вне алфавита
+        base64 ('-', '_', '#', скобки) и портит пароль вместо явной ошибки.
+        """
+        try:
+            return base64.b64decode(s, validate=True).decode()
+        except (ValueError, UnicodeDecodeError):
+            return s
+
+    raw_extra = _b64(secrets['DB_EXTRA_1']) if secrets.get('DB_EXTRA_1') else ''
+    try:
+        extra = json.loads(raw_extra) if raw_extra else {}
+    except ValueError:
+        extra = ast.literal_eval(raw_extra) if raw_extra else {}
+
+    host, _, port = _b64(secrets['DB_HOST_1']).partition(':')
+    conn_json = {
+        'conn_type': 'postgres',
+        'host':      host,
+        'port':      int(port or 5433),
+        'login':     _b64(secrets['DB_ADM_USER_1_1']),
+        'password':  _b64(secrets['DB_ADM_PASS_1_1']),
+        # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;
+        # 'main' — схема внутри airflowdb, и в SQL она указана явно (main.<table>).
+        'schema':    _b64(secrets['DB_NAME_1']),
+        # DB_EXTRA_1 поверх дефолтов, но sslmode и gssencmode задаём жёстко:
+        #   sslmode=prefer — DB_EXTRA_1 приносит disable, и тогда SSL даже не
+        #     пробуется; в DBeaver подключение под этой учёткой идёт с prefer;
+        #   gssencmode=disable — в контейнере есть Kerberos-кэш для CTL, и libpq
+        #     пробует GSS-шифрование раньше пароля, падая с "Unspecified GSS failure".
+        'extra': {
+            'application_name':     'airflow_db_cleanup',
+            'connect_timeout':      5,
+            'target_session_attrs': 'read-write',
+            **{k: v for k, v in extra.items() if k in _LIBPQ_OPTS},
+            'sslmode':    'prefer',
+            'gssencmode': 'disable',
+        },
+    }
+    os.environ[env_key] = json.dumps(conn_json)
+    pwd = conn_json['password']
+    logger.info(
+        f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}"
+        f"/{conn_json['schema']} | пароль: {len(pwd)} симв. {pwd[:2]}…{pwd[-2:]}"
+        f" (b64-декодирован: {pwd != secrets['DB_ADM_PASS_1_1']})"
+        f" | {', '.join(f'{k}={v}' for k, v in sorted(conn_json['extra'].items()))}"
+    )
+
+    return AF_ID

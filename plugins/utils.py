@@ -501,11 +501,17 @@ def get_af_conn():
     except ValueError:
         extra = ast.literal_eval(raw_extra) if raw_extra else {}
 
-    host, _, port = _b64(secrets['DB_HOST_1']).partition(':')
+    # DB_HOST_1 — failover-список "h1:port,h2:port": libpq перебирает хосты и по
+    # target_session_attrs=read-write выбирает primary. В коннекте host — имена
+    # через запятую без портов, port — порт первой пары (общий для всех хостов).
+    conn_str = _b64(secrets['DB_HOST_1'])
+    host = ','.join(h.split(':')[0] for h in conn_str.split(','))
+    first = conn_str.split(',')[0]
+    port = int(first.split(':')[1]) if ':' in first else 5433
     conn_json = {
         'conn_type': 'postgres',
         'host':      host,
-        'port':      int(port or 5433),
+        'port':      port,
         'login':     _b64(secrets['DB_ADM_USER_1_1']),
         'password':  _b64(secrets['DB_ADM_PASS_1_1']),
         # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;

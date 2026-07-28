@@ -434,7 +434,7 @@ def _er_build_meta(cfg, **context):
     Порядок колонок: export_time (PRE) + data_cols + ctl_action, ctl_validfrom (SUF).
     Типы: DESCRIBE TABLE → parse_ch_type → TYPE_MAP; для FixedString/Decimal
     извлекаются length/precision/scale. Если fields=['*'] — все колонки таблицы.
-    UK оборачивается в массив массивов: ['id'] → [['id']] (стандарт ЕР).
+    UK передаётся плоским массивом: ['id'] (стандарт ЕР).
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = context['ti'].xcom_pull(task_ids="init")
@@ -477,7 +477,7 @@ def _er_build_meta(cfg, **context):
         "description": cfg.get('description') or None,
         "strategy":    dp.get('strategy', cfg['strategy']),
         "PK":          cfg['PK'],
-        "UK":          [cfg['UK']] if cfg['UK'] else [],
+        "UK":          cfg['UK'] or [],
         "params":      {"separation": "\t"},
         "columns":     [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_PRE] + data_cols + [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_SUF],
     }

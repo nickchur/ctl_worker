@@ -19,7 +19,7 @@ ClickHouse → S3 (CSV → ZIP) → Kafka (XML-уведомление) → TFS
 | Файл | Описание |
 | :--- | :--- |
 | `er_export.py` | Фабрика DAG-ов. Динамически создаёт DAG для каждой активной выгрузки. Содержит бизнес-логику: SQL-билдеры, таски, Kafka-хелперы. |
-| `er_sync.py` | DAG синхронизации `export_er_sync`. Синхронизирует `export.er_wf_meta` → Airflow Variable `datalab_er_wfs`. Создаёт пулы. |
+| `er_sync.py` | DAG синхронизации `export_er_sync` (расписание `@once`, стартует автоматически при появлении DAG). Синхронизирует `export.er_wf_meta` → Airflow Variable `datalab_er_wfs`. Создаёт пулы. |
 | `er_config.py` | Конфигурация и утилиты. Константы, маппинг типов, `DEFAULT_PARAMS`, хелперы `obj_load`, `obj_save`, `add_note`, `get_params`, `on_callback`. |
 | `er_wf_meta.sql` | DDL управляющей таблицы `export.er_wf_meta`. |
 | `er_meta.json` | Пример формата Airflow Variable `datalab_er_wfs` (delta + recent). Поле `params` — JSON-строка внутри JSON: хранится в CH как `String`, десериализуется при чтении через `get_params`. |
@@ -100,7 +100,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
   "description": "Описание или null",
   "strategy":    "FULL_UK",
   "PK":          ["id"],
-  "UK":          [["id"]],
+  "UK":          ["id"],
   "params":      {"separation": "\t"},
   "columns": [
     {
@@ -116,7 +116,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 }
 ```
 
-> `UK` — массив массивов: `er_wf_meta.uk` (плоский список) оборачивается в `[uk]`.  
+> `UK` — плоский массив: `er_wf_meta.uk` передаётся как есть.  
 > `params.separation` указывается всегда (отклонение от дефолта `;`).  
 > Для `FixedString(N)` → `length=N`; для `Decimal(P,S)` → `precision=P, scale=S, length=P`.
 
@@ -291,6 +291,7 @@ VALUES (
 
 - 🔤 **Hive reserved words**: `build_meta` автоматически добавляет суффикс `_` к именам колонок, совпадающим с зарезервированными словами Hive (все версии 1.2–4.0). Изменение отражается в `.meta`-файле и гарантирует корректную загрузку в KAP.
 - 📭 **send_empty**: при `send_empty=1` и нулевой дельте `pack_zip` создаёт ZIP с пустым CSV (только строка заголовка) + TKT + META и отправляет Kafka-уведомление. Соответствует требованию TFS: "пустой пакет выгружается по расписанию даже при отсутствии изменений".
+- 🔄 **Синхронизация**: `export_er_sync` запускается `@once` — один проход при появлении DAG (деплое), без паузы. Повторный сайнк метаданных — ручным Trigger DAG.
 - 🏊 **Pool**: пул `datalab_export_er` (20 слотов) создаётся автоматически DAG-ом `export_er_sync`.
 - 💧 **Стриминг**: ZIP-архивация потребляет минимум памяти — `stream_zip` + multipart-загрузка в S3 без буферизации всего файла.
 - 🔒 **Изоляция**: фреймворк не зависит от общих `plugins`, используя собственные хелперы в `er_config.py`.

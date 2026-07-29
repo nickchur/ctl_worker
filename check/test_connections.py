@@ -395,23 +395,24 @@ def tools_test_connections():  # noqa: PLR0915
         from sqlalchemy import text
 
         try:
-            from plugins.utils import add_note  # type: ignore
+            from plugins.utils import add_note, add_xcom  # type: ignore
         except ImportError:
-            from CI06932748.tools.utils import add_note  # type: ignore
+            from CI06932748.tools.utils import add_note, add_xcom  # type: ignore
 
         count_sql = """
             SELECT COUNT(dag_id)
             FROM main.serialized_dag
             WHERE last_updated > now() - interval '30 minutes'
         """
-        # Список нужен только для заметки — какие именно DAG'и переразбираются
+        # Полный список уходит в XCom, в заметку попадают только первые note_rows
         list_sql = """
             SELECT last_updated, dag_id, fileloc, dag_hash
             FROM main.serialized_dag
             WHERE last_updated > now() - interval '30 minutes'
             ORDER BY last_updated DESC
-            LIMIT 25
+            LIMIT 500
         """
+        note_rows = 25  # заметка режется по MAX_NOTE_LEN, таблица на 500 строк туда не влезет
 
         ts = time.time()
         with create_session() as session:
@@ -431,12 +432,19 @@ def tools_test_connections():  # noqa: PLR0915
             return {"status": "ok", "updated": 0}
 
         msg = f"main.serialized_dag: {count} DAG'ов пересериализовано за последние 30 минут"
-        table = "| last_updated | dag_id | fileloc | dag_hash |\n|---|---|---|---|\n" + "\n".join(
-            f"| {last_updated} | `{dag_id}` | `{fileloc}` | `{dag_hash}` |"
+        data = [
+            {"last_updated": str(last_updated), "dag_id": dag_id, "fileloc": fileloc, "dag_hash": dag_hash}
             for last_updated, dag_id, fileloc, dag_hash in rows
+        ]
+        add_xcom("serialized_dag", data, context)
+
+        table = "| last_updated | dag_id | fileloc | dag_hash |\n|---|---|---|---|\n" + "\n".join(
+            f"| {r['last_updated']} | `{r['dag_id']}` | `{r['fileloc']}` | `{r['dag_hash']}` |"
+            for r in data[:note_rows]
         )
-        if count > len(rows):
-            table += f"\n\nПоказаны первые {len(rows)} из {count}."
+        if count > note_rows:
+            table += (f"\n\nПоказаны первые {min(note_rows, len(data))} из {count}, "
+                      f"полный список — в XCom `serialized_dag`.")
         add_note(f"{msg}\n\n{table}", context, level="task",
                  title=f"❌ {elapsed:.2f} sec check_serialized_dag")
         add_note(f"{msg}", context, level="DAG",

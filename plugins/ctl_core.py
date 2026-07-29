@@ -223,7 +223,7 @@ def ctl_get_retry(params=None, wf=None, logs=None, retry=None):
         retry.update({
             'try': 1,
             'left': int(ft['numAttempts']) - 1,
-            'delay': f"seconds=+{int(ft.get('retryDelayMs', 0) // 1000)}" if ft.get('retryDelayMs') else None
+            'delay': f"seconds=+{int(ft.get('retryDelayMs', 0)) // 1000}" if ft.get('retryDelayMs') else None
         })
 
     return {k: v for k, v in retry.items() if v is not None} if retry.get('try') else {}
@@ -423,7 +423,7 @@ def ctl_loading_load(prm, save=True):
 
     wfs_dict = ctl_obj_load('ctl_workflows')
     lids = []
-    for j in sorted(data, key=lambda x: x['id']):
+    for j in sorted(data, key=lambda x: int(x['id'])):
         wf_name = wfs_dict.get(str(j['wf_id']), {}).get('name', '')
         j = ctl_loading_norm(wf_name, j)
         lids.append(j)

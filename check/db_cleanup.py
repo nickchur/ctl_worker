@@ -279,7 +279,7 @@ params = {
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
-    tags=['DataLab', 'tools', 'maintenance'],
+    tags=['DataLab', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

@@ -4,7 +4,7 @@
 
 | Параметр | Описание |
 |---|---|
-| `months` | Возраст объектов для удаления (месяцы, default: `1`) |
+| `months` | Возраст объектов для удаления (месяцы по 30 дней, default: `1`) |
 | `days` | Возраст объектов для удаления (дни, default: `0`) |
 """
 
@@ -13,7 +13,6 @@ from datetime import datetime, timedelta, timezone
 from airflow.models import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task, dag
-from dateutil.relativedelta import relativedelta
 
 try:
     from CI06932748.analytics.datalab.tools.utils import add_note, on_callback, readable_size  # type: ignore
@@ -41,14 +40,14 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule_interval='17 5 * * *',
-    tags=['EDP_ETL', 'tools', 'maintenance'],
+    tags=['DataLab', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
     max_active_tasks=1,
     on_failure_callback=on_callback,
     params={
-        'months': Param(1, type='integer', description='Возраст объектов для удаления (месяцы)'),
+        'months': Param(1, type='integer', description='Возраст объектов для удаления (месяцы по 30 дней)'),
         'days': Param(0, type='integer', description='Возраст объектов для удаления (дни)'),
     },
 )
@@ -66,7 +65,8 @@ def s3_cleanup():
     @task
     def clean_logs(**context):
         params = context['params']
-        cutoff = datetime.now(timezone.utc) - relativedelta(months=params['months'], days=params['days'])
+        # Месяц считаем как 30 дней: для порога удаления логов календарная точность не нужна
+        cutoff = datetime.now(timezone.utc) - timedelta(days=params['months'] * 30 + params['days'])
         s3_hook, paginator = _get_paginator()
         total = 0
         for page in paginator:

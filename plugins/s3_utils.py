@@ -25,7 +25,6 @@ from stream_unzip import stream_unzip # type: ignore
 
 from  plugins.utils import readable_size, get_conns_by_type
 
-import pendulum
 from fnmatch import fnmatch
 import time
 import io
@@ -468,8 +467,9 @@ def s3_keys(path) -> dict:
                 
                 # Фильтруем по wildcard (аналог wildcard_match)
                 if fnmatch(key, s3['key']):
-                    dt = pendulum.instance(obj['LastModified'])
-                    objects[key] = dt.format('YYYY-MM-DD HH:mm:ss zz') + f" / {readable_size(obj['Size'])}"
+                    # LastModified boto3 отдаёт уже как aware datetime — оборачивать не надо
+                    dt = obj['LastModified'].strftime('%Y-%m-%d %H:%M:%S %Z')
+                    objects[key] = dt + f" / {readable_size(obj['Size'])}"
                     logger.info(f"✅ {key}: {objects[key]}")
     
     return objects

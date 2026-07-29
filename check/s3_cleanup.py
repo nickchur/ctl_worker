@@ -4,8 +4,7 @@
 
 | Параметр | Описание |
 |---|---|
-| `months` | Возраст объектов для удаления (месяцы по 30 дней, default: `1`) |
-| `days` | Возраст объектов для удаления (дни, default: `0`) |
+| `days` | Возраст объектов для удаления (дни, default: `30`) |
 """
 
 from datetime import datetime, timedelta, timezone
@@ -47,8 +46,7 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):
     max_active_tasks=1,
     on_failure_callback=on_callback,
     params={
-        'months': Param(1, type='integer', description='Возраст объектов для удаления (месяцы по 30 дней)'),
-        'days': Param(0, type='integer', description='Возраст объектов для удаления (дни)'),
+        'days': Param(30, type='integer', minimum=1, description='Возраст объектов для удаления (дни)'),
     },
 )
 def s3_cleanup():
@@ -65,8 +63,7 @@ def s3_cleanup():
     @task
     def clean_logs(**context):
         params = context['params']
-        # Месяц считаем как 30 дней: для порога удаления логов календарная точность не нужна
-        cutoff = datetime.now(timezone.utc) - timedelta(days=params['months'] * 30 + params['days'])
+        cutoff = datetime.now(timezone.utc) - timedelta(days=params['days'])
         s3_hook, paginator = _get_paginator()
         total = 0
         for page in paginator:
@@ -75,7 +72,7 @@ def s3_cleanup():
                 if keys:
                     total += len(keys)
                     s3_hook.delete_objects(bucket=BUCKET_NAME, keys=keys)
-        msg = f"Удалено {total} объектов старше {params['months']}м {params['days']}д"
+        msg = f"Удалено {total} объектов старше {params['days']}д"
         add_note(msg, context)
         return msg
 

@@ -19,6 +19,9 @@
 - **Оптимизация**: Использует Airflow Variable `local_connections` (создаваемую в `show_connections`) для ускорения получения списка соединений.
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
 - **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
+- **`check_serialized_dag`**: отдельная проверка метабазы — падает, если в `main.serialized_dag`
+  есть записи с `last_updated` за последние 30 минут (признак того, что DAG'и переразбираются
+  и пересериализуются на ходу).
 """
 
 import re
@@ -377,6 +380,68 @@ def tools_test_connections():  # noqa: PLR0915
                 check_task()
         groups.append(tg)
 
+    # --- Serialized DAG check ---
+    @task(
+        task_id="check_serialized_dag",
+        doc_md="Проверка `main.serialized_dag`: не пересериализовывались ли DAG'и за последние 30 минут",
+        retries=0,  # окно проверки — 30 минут, ретрай через 5 минут смотрел бы почти на то же самое
+    )
+    def check_serialized_dag(**context) -> dict:
+        """Падает, если в метабазе есть DAG'и, пересериализованные за последние 30 минут."""
+        import time
+
+        from airflow.exceptions import AirflowFailException
+        from airflow.utils.session import create_session
+        from sqlalchemy import text
+
+        try:
+            from plugins.utils import add_note  # type: ignore
+        except ImportError:
+            from CI06932748.tools.utils import add_note  # type: ignore
+
+        count_sql = """
+            SELECT COUNT(dag_id)
+            FROM main.serialized_dag
+            WHERE dag_id IN (
+                SELECT dag_id FROM main.serialized_dag
+                WHERE last_updated > now() - interval '30 minutes' ORDER BY dag_id)
+        """
+        # Список нужен только для заметки — какие именно DAG'и переразбираются
+        list_sql = """
+            SELECT last_updated, dag_id, fileloc, dag_hash
+            FROM main.serialized_dag
+            WHERE last_updated > now() - interval '30 minutes'
+            ORDER BY last_updated DESC
+            LIMIT 25
+        """
+
+        ts = time.time()
+        with create_session() as session:
+            count = session.execute(text(count_sql)).scalar() or 0
+            rows = session.execute(text(list_sql)).fetchall() if count else []
+
+        elapsed = time.time() - ts
+        logger.info("🔍 serialized_dag: %d записей обновлено за последние 30 минут", count)
+
+        if not count:
+            add_note(
+                "Записей с last_updated за последние 30 минут нет",
+                context,
+                title=f"✅ {elapsed:.2f} sec check_serialized_dag",
+            )
+            return {"status": "ok", "updated": 0}
+
+        msg = f"main.serialized_dag: {count} DAG'ов пересериализовано за последние 30 минут"
+        table = "| last_updated | dag_id | fileloc | dag_hash |\n|---|---|---|---|\n" + "\n".join(
+            f"| {last_updated} | `{dag_id}` | `{fileloc}` | `{dag_hash}` |"
+            for last_updated, dag_id, fileloc, dag_hash in rows
+        )
+        if count > len(rows):
+            table += f"\n\nПоказаны первые {len(rows)} из {count}."
+        add_note(f"{msg}\n\n{table}", context, level="task",
+                 title=f"❌ {elapsed:.2f} sec check_serialized_dag")
+        raise AirflowFailException(msg)
+
     # --- Summary ---
     @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
     def summary(**context):  # noqa: PLR0915
@@ -474,6 +539,7 @@ def tools_test_connections():  # noqa: PLR0915
         return {"ok": ok, "fail": fail, "skip": skip, "none": none_count, "avg_time": avg_time}
 
     summary_task = summary()
+    check_serialized_dag() >> summary_task
 
     if groups:
         groups >> summary_task

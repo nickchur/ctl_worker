@@ -368,10 +368,11 @@ def readable_size(size_bytes, base=1024):
     if base == 1024:
         units = ["B", "KB", "MB", "GB", "TB", "PB"]
     else:
-        units = ["ед", "тыс", "млн", "млрд", "трлн", "птлн"]
+        # Единицы без суффикса: "500", а не "500 ед" — счётчики читаются как числа
+        units = ["", "тыс", "млн", "млрд", "трлн", "птлн"]
 
     if not size_bytes or size_bytes == 0:
-        return f"0 {units[0]}"
+        return f"0 {units[0]}".rstrip()
 
     import math
     
@@ -386,7 +387,7 @@ def readable_size(size_bytes, base=1024):
 
     size_value = round(size_bytes / (base ** i), 2)
     
-    return f"{sign}{size_value} {units[i]}"
+    return f"{sign}{size_value} {units[i]}".rstrip()
 
 def readable(value, base=1024, indent=4, jsn=False)->str:
     if isinstance(value, str):

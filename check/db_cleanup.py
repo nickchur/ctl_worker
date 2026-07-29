@@ -35,9 +35,11 @@ import time
 import logging
 
 try:
-    from CI06932748.analytics.datalab.tools.utils import add_note, get_af_conn, on_callback  # type: ignore
+    from CI06932748.analytics.datalab.tools.utils import (  # type: ignore
+        add_note, get_af_conn, on_callback, readable_size,
+    )
 except ImportError:
-    from plugins.utils import add_note, get_af_conn, on_callback  # type: ignore
+    from plugins.utils import add_note, get_af_conn, on_callback, readable_size  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 
@@ -225,23 +227,6 @@ def db_reindex(conn_id, schema='main', timeout=3600):
 def _fmt_ts(ts):
     """'HH:MM:SS' для отметок вакуума; '—' если статистики по таблице нет."""
     return ts.strftime('%H:%M:%S') if ts else '—'
-
-
-def readable_size(size_bytes, base=1024):
-    if base == 1024:
-        units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    else:
-        units = ["", "тыс", "млн", "млрд", "трлн", "птлн"]
-    if not size_bytes or size_bytes == 0:
-        return f"0{' ' + units[0] if units[0] else ''}"
-    import math
-    sign = "-" if size_bytes < 0 else ""
-    size_bytes = abs(size_bytes)
-    i = int(math.floor(math.log(size_bytes, base)))
-    if i >= len(units): i = len(units) - 1
-    if i < 0: i = 0
-    suffix = units[i]
-    return f"{sign}{round(size_bytes / (base ** i), 2)}" + (f" {suffix}" if suffix else "")
 
 
 params = {

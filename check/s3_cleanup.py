@@ -16,20 +16,12 @@ from airflow.decorators import task, dag
 from dateutil.relativedelta import relativedelta
 
 try:
-    from CI06932748.analytics.datalab.tools.utils import add_note, on_callback  # type: ignore
+    from CI06932748.analytics.datalab.tools.utils import add_note, on_callback, readable_size  # type: ignore
 except ImportError:
-    from plugins.utils import add_note, on_callback  # type: ignore
+    from plugins.utils import add_note, on_callback, readable_size  # type: ignore
 
 BUCKET_NAME = 'edpetl-monitoring'
 AWS_CONN_ID = 's3-archive'
-
-
-def _format_size(size_bytes):
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.2f} PB"
 
 
 def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):
@@ -96,7 +88,7 @@ def s3_cleanup():
                 for obj in contents:
                     total_size += obj.get("Size", 0)
                     total_objs += 1
-        msg = f"Объём бакета: {_format_size(total_size)} ({total_objs} объектов)"
+        msg = f"Объём бакета: {readable_size(total_size)} ({total_objs} объектов)"
         add_note(msg, context)
         return msg
 

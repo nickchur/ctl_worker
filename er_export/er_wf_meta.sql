@@ -43,14 +43,20 @@ ORDER BY (db_name, extract_name);
 -- В params указываются только отличия от DEFAULT_PARAMS (er_config.py); остальные берутся по умолчанию.
 -- Повторный INSERT той же (db_name, extract_name) не заменяет строку мгновенно —
 -- дедупликация происходит при фоновом MERGE; для немедленного чтения актуальной версии использовать FINAL.
+--
+-- ВАЖНО: при непустом sql_join поле fields обязательно, иначе '*' развернётся в колонки
+-- обеих таблиц — дубли справа ClickHouse назовёт 't2.col' и они попадут в CSV-заголовок
+-- (TSVWithNames), тогда как .meta строится по DESCRIBE TABLE источника и их не содержит.
+-- 't1.*' даёт все колонки левой таблицы и соответствует .meta.
 INSERT INTO export.er_wf_meta
-    (extract_name, db_name, replica, schema_name, uk, sql_from, sql_join, sql_where, params)
+    (extract_name, db_name, replica, schema_name, uk, fields, sql_from, sql_join, sql_where, params)
 VALUES (
     'lc_items_opened',
     'evolution',
     'hrplatform_datalab',
     'learning',
     ['person_uuid', 'item_id'],
+    ['t1.*'],
     'evolution.lc_items_opened t1',
     'LEFT JOIN evolution_export.lc_items_opened_exp t2 ON t1.person_uuid = t2.person_uuid AND t1.item_id = t2.item_id',
     '{condition}',

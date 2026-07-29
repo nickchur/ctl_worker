@@ -457,12 +457,18 @@ def _er_build_meta(cfg, **context):
         return name + '_' if name.lower() in HIVE_RESERVED else name
 
     fields = cfg.get('fields', ['*'])
-    if not fields or fields in (['*'], '*'):
+    # 't1.*' — тот же «все колонки таблицы», что и '*', но с явным алиасом:
+    # при JOIN без алиаса ClickHouse подмешивает в SELECT * колонки правой таблицы
+    # (дубли получают имена вида 't2.col'), и CSV перестаёт соответствовать .meta.
+    if not fields or fields in (['*'], '*') or all(str(f).strip().endswith('.*') for f in fields):
         data_cols = [{**ch_cols[r[0]], "column_name": _safe(r[0])} for r in rows]
     else:
         data_cols = []
         for f in fields:
             name = f.split()[-1] if ' as ' in f.lower() else f
+            # 't1.col' → 'col': алиас таблицы нужен в SQL при JOIN, но не в .meta —
+            # ClickHouse в TSVWithNames тоже отдаёт такие колонки без квалификатора
+            name = name.rsplit('.', 1)[-1]
             base = ch_cols.get(name, {
                 "column_name": name, "source_type": "STRING", "length": None,
                 "notnull": False, "precision": None, "scale": None,

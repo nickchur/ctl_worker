@@ -402,9 +402,7 @@ def tools_test_connections():  # noqa: PLR0915
         count_sql = """
             SELECT COUNT(dag_id)
             FROM main.serialized_dag
-            WHERE dag_id IN (
-                SELECT dag_id FROM main.serialized_dag
-                WHERE last_updated > now() - interval '30 minutes' ORDER BY dag_id)
+            WHERE last_updated > now() - interval '30 minutes'
         """
         # Список нужен только для заметки — какие именно DAG'и переразбираются
         list_sql = """
@@ -427,6 +425,7 @@ def tools_test_connections():  # noqa: PLR0915
             add_note(
                 "Записей с last_updated за последние 30 минут нет",
                 context,
+                level="task,DAG",
                 title=f"✅ {elapsed:.2f} sec check_serialized_dag",
             )
             return {"status": "ok", "updated": 0}
@@ -439,6 +438,8 @@ def tools_test_connections():  # noqa: PLR0915
         if count > len(rows):
             table += f"\n\nПоказаны первые {len(rows)} из {count}."
         add_note(f"{msg}\n\n{table}", context, level="task",
+                 title=f"❌ {elapsed:.2f} sec check_serialized_dag")
+        add_note(f"{msg}", context, level="DAG",
                  title=f"❌ {elapsed:.2f} sec check_serialized_dag")
         raise AirflowFailException(msg)
 

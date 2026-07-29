@@ -212,8 +212,12 @@ def _chk_any_conn(conn_id: str, conn_type: str, context: dict) -> None:
         raise AirflowSkipException(msg) from err
 
     except Exception as err:
+        logger.error("❌ %s: %s", conn_id, err, exc_info=True)
+        # is not None обязательно: у requests.Response __bool__ == False на 4xx/5xx,
+        # то есть проверка на истинность отбросила бы ровно те ответы, ради которых всё и логируется
         response = getattr(err, "response", None)
-        logger.error(response)
+        if response is not None:
+            logger.error("HTTP %s: %s", getattr(response, "status_code", "?"), str(getattr(response, "text", ""))[:500])
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {try_number} {sdt}"
         add_note(err, context, level="Task,DAG", title=msg)
         raise AirflowFailException(f"{msg}: {err}") from err

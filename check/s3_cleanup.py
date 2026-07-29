@@ -15,7 +15,10 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task, dag
 from dateutil.relativedelta import relativedelta
 
-from plugins.utils import add_note
+try:
+    from CI06932748.analytics.datalab.tools.utils import add_note, on_callback  # type: ignore
+except ImportError:
+    from plugins.utils import add_note, on_callback  # type: ignore
 
 BUCKET_NAME = 'edpetl-monitoring'
 AWS_CONN_ID = 's3-archive'
@@ -42,6 +45,7 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
         'retry_delay': timedelta(seconds=30),
+        'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule_interval='17 5 * * *',
@@ -50,6 +54,7 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):
     is_paused_upon_creation=True,
     max_active_runs=1,
     max_active_tasks=1,
+    on_failure_callback=on_callback,
     params={
         'months': Param(1, type='integer', description='Возраст объектов для удаления (месяцы)'),
         'days': Param(0, type='integer', description='Возраст объектов для удаления (дни)'),

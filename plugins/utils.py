@@ -5,6 +5,7 @@
 | Функция | Описание |
 |---|---|
 | `add_note()` | Структурированные заметки в Airflow UI (DAG/Task) |
+| `add_xcom()` | Запись в XCom с обрезкой коллекций до `MAX_XCOM` элементов |
 | `on_callback()` | Обработчик событий success/failure/retry |
 | `pool_slots()` / `get_current_load()` | Управление слотами пула |
 | `md5_hash()` | Хеш JSON-совместимых структур |
@@ -24,6 +25,7 @@ from airflow.operators.python import get_current_context
 
 from pprint import PrettyPrinter
 from datetime import timedelta, datetime
+from itertools import islice
 import json
 import hashlib
 
@@ -31,6 +33,7 @@ from logging import getLogger, Handler
 logger = getLogger("airflow.task")
 
 MAX_NOTE_LEN = 1000
+MAX_XCOM = 500
 
 
 class LogCapture(Handler):
@@ -189,6 +192,30 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
             session.commit() # Явный коммит внутри контекста
     except Exception as e:
         logger.warning(f"Failed to update note: {e}")
+
+def add_xcom(key, value, context=None):
+    """Кладёт значение в XCom, обрезая коллекции до MAX_XCOM элементов.
+
+    XCom лежит в метабазе Airflow, поэтому длинные списки/словари режем — иначе
+    таблица xcom пухнет, а UI на больших значениях подвисает.
+    """
+    if not context:
+        context = get_current_context()
+
+    ti = context['ti']
+    if isinstance(value, (dict, list, tuple, set)):
+        if len(value) > MAX_XCOM:
+            logger.warning(f"XCom '{key}': {len(value)} элементов, обрезано до {MAX_XCOM}")
+        # dict и set срезы не поддерживают — режем через islice
+        if isinstance(value, dict):
+            value = dict(islice(value.items(), MAX_XCOM))
+        elif isinstance(value, set):
+            value = list(islice(value, MAX_XCOM))
+        else:
+            value = value[:MAX_XCOM]
+        ti.xcom_push(key=key, value=json.dumps(value, default=str))
+    else:
+        ti.xcom_push(key=key, value=value)
 
 def on_callback(context, level=None): return _on_callback(context, level)
 

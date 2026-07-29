@@ -49,7 +49,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | Таск | Описание |
 | :--- | :--- |
 | `init` | ⚙️ Delta: читает состояние из `export.extract_current_vw`; при первом запуске — bootstrap от `lower_bound`. Recent: вычисляет окно `[now() - recent_interval, now()]` без обращения к CH. Применяет переопределения из DAG Params. |
-| `build_meta` | 🗂️ Генерирует `.meta` JSON (`DESCRIBE TABLE`). Имена колонок, совпадающие с зарезервированными словами Hive, получают суффикс `_`. |
+| `build_meta` | 🗂️ Генерирует `.meta` JSON. Имена и типы — `DESCRIBE (<итоговый запрос>)`, то есть ровно заголовок CSV (учитывает JOIN, алиасы, выражения); `description` — `DESCRIBE TABLE` источника по имени колонки. Имена колонок, совпадающие с зарезервированными словами Hive, получают суффикс `_`. |
 | `export_to_s3` | 📤 Нативная выгрузка ClickHouse → S3 (`HrpClickNativeToS3ListOperator`). |
 | `pack_zip` | 📦 Потоковая упаковка CSV + `.meta` + `.tkt` в ZIP (`stream_zip`). При `send_empty=True` и нулевой дельте — пустой CSV с заголовком. |
 | `notify_tfs` | 📨 Отправка XML-уведомления в Kafka → TFS. Пропускается при `notify_kafka=False` или если нет данных (и `send_empty=False`). |
@@ -132,7 +132,7 @@ init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm
 | `schema_name` | String | — | Целевая схема в `.meta`-файле для TFS |
 | `pk` | Array(String) | `[]` | Первичный ключ |
 | `uk` | Array(String) | `[]` | Уникальный ключ |
-| `fields` | Array(String) | `[]` | SELECT-выражения; `[]` = все колонки (`DESCRIBE TABLE`) |
+| `fields` | Array(String) | `[]` | SELECT-выражения; `[]` = все колонки (`DESCRIBE TABLE`). При непустом `sql_join` задавать обязательно (`['t1.*']`), иначе `*` развернётся в колонки обеих таблиц |
 | `sql_from` | String | `''` | FROM-часть: `"db.table"` или псевдоним CTE |
 | `sql_where` | String | `''` | WHERE-условие; `{condition}` подставляется рантаймом |
 | `sql_join` | String | `''` | JOIN-clause (полное выражение, включая ключевое слово) |

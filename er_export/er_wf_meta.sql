@@ -45,9 +45,9 @@ ORDER BY (db_name, extract_name);
 -- дедупликация происходит при фоновом MERGE; для немедленного чтения актуальной версии использовать FINAL.
 --
 -- ВАЖНО: при непустом sql_join поле fields обязательно, иначе '*' развернётся в колонки
--- обеих таблиц — дубли справа ClickHouse назовёт 't2.col' и они попадут в CSV-заголовок
--- (TSVWithNames), тогда как .meta строится по DESCRIBE TABLE источника и их не содержит.
--- 't1.*' даёт все колонки левой таблицы и соответствует .meta.
+-- обеих таблиц — дубли справа ClickHouse назовёт 't2.col', и они уедут в выгрузку
+-- (в CSV-заголовок и в .meta) как лишние колонки с пустыми значениями.
+-- 't1.*' даёт только колонки левой таблицы.
 INSERT INTO export.er_wf_meta
     (extract_name, db_name, replica, schema_name, uk, fields, sql_from, sql_join, sql_where, params)
 VALUES (

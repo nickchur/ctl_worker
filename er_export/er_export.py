@@ -432,9 +432,17 @@ def _er_build_meta(cfg, **context):
     """🗂️ Строит .meta JSON с описанием структуры таблицы для ЕР/TFS.
 
     Порядок колонок: export_time (PRE) + data_cols + ctl_action, ctl_validfrom (SUF).
-    Типы: DESCRIBE TABLE → parse_ch_type → TYPE_MAP; для FixedString/Decimal
-    извлекаются length/precision/scale. Если fields=['*'] — все колонки таблицы.
-    UK передаётся плоским массивом: ['id'] (стандарт ЕР).
+
+    Состав data_cols — два DESCRIBE:
+      • имена и типы — `DESCRIBE (<итоговый запрос>)`, ровно то, что TSVWithNames
+        пишет в заголовок CSV (учитывает JOIN, алиасы, вычисляемые выражения);
+      • description — `DESCRIBE TABLE <источник>`, подмешивается по имени колонки,
+        так как у результата подзапроса комментариев нет.
+    Если запрос задан строкой или со своим списком fields, cfg['sql_meta'] пуст —
+    состав берётся только по DESCRIBE TABLE источника.
+
+    Типы: parse_ch_type → TYPE_MAP; для FixedString/Decimal извлекаются
+    length/precision/scale. UK передаётся плоским массивом: ['id'] (стандарт ЕР).
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = context['ti'].xcom_pull(task_ids="init")
@@ -456,25 +464,58 @@ def _er_build_meta(cfg, **context):
     def _safe(name: str) -> str:
         return name + '_' if name.lower() in HIVE_RESERVED else name
 
-    fields = cfg.get('fields', ['*'])
-    # 't1.*' — тот же «все колонки таблицы», что и '*', но с явным алиасом:
-    # при JOIN без алиаса ClickHouse подмешивает в SELECT * колонки правой таблицы
-    # (дубли получают имена вида 't2.col'), и CSV перестаёт соответствовать .meta.
-    if not fields or fields in (['*'], '*') or all(str(f).strip().endswith('.*') for f in fields):
-        data_cols = [{**ch_cols[r[0]], "column_name": _safe(r[0])} for r in rows]
-    else:
-        data_cols = []
+    def _cols_from_query(sql: str) -> list[dict]:
+        """Колонки по DESCRIBE итогового запроса — так же, как их видит TSVWithNames.
+
+        Единственный способ получить состав, совпадающий с заголовком CSV при JOIN,
+        алиасах и вычисляемых выражениях. Комментариев у результата подзапроса нет,
+        поэтому description подмешивается из DESCRIBE TABLE источника по имени колонки.
+        {condition} подставляем заведомо ложным: DESCRIBE запрос не выполняет, но разобрать
+        его обязан.
+        """
+        q = sql.format(export_time='now64(6)', condition='1=0')
+        qrows, _ = hook.execute(f"DESCRIBE ({q})", with_column_types=True)
+        out = []
+        for r in qrows:
+            stype, notnull, length, precision, scale = parse_ch_type(r[1], TYPE_MAP)
+            out.append({
+                "column_name": _safe(r[0]), "source_type": stype, "length": length,
+                "notnull": notnull, "precision": precision, "scale": scale,
+                "description": ch_cols.get(r[0], {}).get("description"),
+            })
+        return out
+
+    def _cols_from_table() -> list[dict]:
+        """Запасной путь: колонки по DESCRIBE TABLE источника, без учёта JOIN и выражений."""
+        fields = cfg.get('fields', ['*'])
+        # 't1.*' — тот же «все колонки таблицы», что и '*', но с явным алиасом
+        if not fields or fields in (['*'], '*') or all(str(f).strip().endswith('.*') for f in fields):
+            return [{**ch_cols[r[0]], "column_name": _safe(r[0])} for r in rows]
+        out = []
         for f in fields:
             name = f.split()[-1] if ' as ' in f.lower() else f
-            # 't1.col' → 'col': алиас таблицы нужен в SQL при JOIN, но не в .meta —
-            # ClickHouse в TSVWithNames тоже отдаёт такие колонки без квалификатора
+            # 't1.col' → 'col': алиас таблицы нужен в SQL при JOIN, но не в .meta
             name = name.rsplit('.', 1)[-1]
             base = ch_cols.get(name, {
                 "column_name": name, "source_type": "STRING", "length": None,
                 "notnull": False, "precision": None, "scale": None,
                 "description": f"Calculated: {f}",
             })
-            data_cols.append({**base, "column_name": _safe(base["column_name"])})
+            out.append({**base, "column_name": _safe(base["column_name"])})
+        return out
+
+    sql_meta = cfg.get('sql_meta')
+    if sql_meta:
+        try:
+            data_cols = _cols_from_query(sql_meta)
+        except Exception as err:
+            # Схема из DESCRIBE TABLE лучше, чем упавший DAG, но она может разойтись с CSV
+            logger.warning("DESCRIBE по запросу не удался, откат на DESCRIBE TABLE: %s", err)
+            add_note(f"DESCRIBE по запросу не удался, схема взята по DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}\n\n{err}",
+                     level='task,dag', context=context, title='⚠️ build_meta fallback')
+            data_cols = _cols_from_table()
+    else:
+        data_cols = _cols_from_table()
 
     meta = {
         "mask_file":   None,
@@ -661,6 +702,15 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
             m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + fields + [c['sql'] for c in EXTRA_SUF]}
         return build_sql(m)
 
+    def _prep_sql_data(key):
+        """Тот же запрос, но только с data-колонками — build_meta делает по нему DESCRIBE.
+
+        Пусто, если SQL задан строкой или со своим списком fields: тогда состав колонок
+        мы не контролируем, и build_meta откатывается на DESCRIBE TABLE источника.
+        """
+        m = params.get(key)
+        return build_sql({**m, "fields": fields}) if isinstance(m, dict) and "fields" not in m else ""
+
     sql_delta, sql_recent = _prep_sql('sql_stmt_export_delta'), _prep_sql('sql_stmt_export_recent')
     if not (sql_delta or sql_recent) or (sql_delta and sql_recent):
         raise AirflowFailException("Must specify exactly one of delta or recent SQL statements.")
@@ -680,6 +730,7 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         's3_prefix':       prefix,
         # ── SQL ──────────────────────────────────────────────────────────────
         'sql_get_current': sql_cur_delta(tbl) if sql_delta else None,  # None → recent-режим
+        'sql_meta':        _prep_sql_data('sql_stmt_export_delta') or _prep_sql_data('sql_stmt_export_recent'),
         # ── Схема ────────────────────────────────────────────────────────────
         'fields':          fields,
         'PK':              params.get('PK', []),

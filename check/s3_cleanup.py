@@ -68,7 +68,10 @@ def s3_cleanup():
         total = 0
         for page in paginator:
             if contents := page.get("Contents"):
-                keys = s3_hook._list_key_object_filter(keys=contents, to_datetime=cutoff)
+                # Было s3_hook._list_key_object_filter(keys=contents, to_datetime=cutoff) —
+                # приватный метод провайдера, который следующий мажор унесёт молча.
+                # Граница включающая, как в оригинале: он отбрасывал только LastModified > cutoff
+                keys = [o["Key"] for o in contents if o["LastModified"] <= cutoff]
                 if keys:
                     total += len(keys)
                     s3_hook.delete_objects(bucket=BUCKET_NAME, keys=keys)

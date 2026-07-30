@@ -465,11 +465,18 @@ def chk_any_conn(id, data=None, **context):
             from botocore.config import Config # type: ignore
             
             # Явно извлекаем verify из экстра для надежности
-            hook = S3Hook(aws_conn_id=data['conn_id'])
-            verify = hook.get_connection(data['conn_id']).extra_dejson.get('verify', True)
+            extra = S3Hook.get_connection(data['conn_id']).extra_dejson
+            verify = extra.get('verify', True)
             if isinstance(verify, str): verify = verify.lower() == 'true'
 
-            hook = S3Hook(aws_conn_id=data['conn_id'], verify=verify, config=Config(connect_timeout=15, read_timeout=15))
+            # config_kwargs соединения нельзя терять: явно переданный config подменяет их
+            # целиком (connection_wrapper.py: `if not self.botocore_config and config_kwargs`),
+            # а секрет-бэкенд кладёт туда signature_version, payload_signing_enabled и
+            # request_checksum_calculation — без них шлюз отвергает запросы.
+            # merge накладывает таймауты поверх, не затирая остального.
+            config = Config(**extra.get('config_kwargs', {})).merge(Config(connect_timeout=15, read_timeout=15))
+
+            hook = S3Hook(aws_conn_id=data['conn_id'], verify=verify, config=config)
             result = hook.get_conn().list_buckets()['Buckets']
             
         elif data['type'] == 'KerberosHttp':

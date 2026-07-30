@@ -25,8 +25,11 @@ logger = getLogger("airflow.task")
 
 MAX_XCOM = 500
 
+# get_config() — ленивый синглтон, один запрос на процесс парсинга, и убрать его нельзя:
+# от него зависят dag_id, schedule_interval и tags, а они нужны в момент разбора файла.
+# А вот ctl_obj_load кэша не имеет: каждый вызов это Variable.get, при промахе ещё и поход
+# в S3. Раньше ctl_enames грузились здесь же, хотя нужны единственному месту — set_events
 profile =  get_config()['profile']
-enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 
 
 with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
@@ -144,8 +147,10 @@ with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
         max_active_tis_per_dag=15, 
         map_index_template="{{ event }}"
     )
-    def set_events(event, **context): 
-        
+    def set_events(event, **context):
+
+        enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
+
         prf, eid, sid = event.split('/')
         ds = Dataset(f'CTL/{prf}/{eid}/{enames[int(eid)]}')
         extra = { f"0/{event}": pendulum.now().format('YYYY-MM-DD HH:mm:ss') }

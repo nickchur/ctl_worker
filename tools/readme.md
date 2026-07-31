@@ -18,7 +18,7 @@
 | `s3_to_s3_test.py` | `tools_s3_to_s3_test` | Находит файлы по маске и копирует/перемещает их S3→S3 |
 | `dummy.py` | `dummy_dag` | Шаблон DAG для проверки отображения Markdown в Airflow UI |
 
-> `db_cleanup.py`, `show_connections.py` и `maintenance.py` (теперь `s3_cleanup.py`)
+> `db_cleanup.py`, `show_connections.py` и `maintenance.py` (теперь `log_cleanup.py`)
 > переехали в [`check/`](../check/readme.md).
 
 ---

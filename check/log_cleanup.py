@@ -1,4 +1,4 @@
-"""###🛠️ Обслуживание S3-бакета мониторинга
+"""###🛠️ Обслуживание бакета логов задач
 
 Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
 Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
@@ -63,7 +63,7 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
         'days': Param(30, type='integer', minimum=1, description='Возраст объектов для удаления (дни)'),
     },
 )
-def s3_cleanup():
+def log_cleanup():
 
     @task
     def create_bucket(**context):
@@ -109,4 +109,4 @@ def s3_cleanup():
     create_bucket() >> clean_logs() >> show_bucket_size()
 
 
-s3_cleanup()
+log_cleanup()

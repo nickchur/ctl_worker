@@ -9,6 +9,7 @@
 
 from datetime import datetime, timedelta, timezone
 
+from airflow.configuration import conf
 from airflow.models import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task, dag
@@ -18,8 +19,12 @@ try:
 except ImportError:
     from plugins.utils import add_note, on_callback, readable_size  # type: ignore
 
-BUCKET_NAME = 'edpetl-monitoring'
-AWS_CONN_ID = 's3-archive'
+# Берём из настроек логирования, а не прописываем именем: бакет и соединение
+# зависят от контура, а conf читается из файла и переменных окружения — в базу
+# на уровне модуля этот вызов не ходит
+AWS_CONN_ID = conf.get("logging", "REMOTE_LOG_CONN_ID")
+# s3://dataplatform-monitoring/dataplatform-etl
+BUCKET_NAME = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].split("/")[0]
 
 
 def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):

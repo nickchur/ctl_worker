@@ -14,7 +14,6 @@
 """
 
 from airflow import DAG
-from airflow.utils.dates import days_ago
 from airflow.decorators import task, task_group
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.sensors.base import PokeReturnValue # type: ignore
@@ -26,7 +25,7 @@ from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_w
 import ast
 import sys
 from functools import partial
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 import pendulum
 
 from logging import  getLogger
@@ -52,13 +51,13 @@ timeout = timedelta(hours=24)
 
 with DAG(f'CTL.{get_config()["profile"]}.monitor',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'logger'],
-    start_date=days_ago(1),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=monitor_interval,
     catchup=False,
     default_args={
         'owner': 'EDP.ETL',
         'depends_on_past': False,
-        'start_date': days_ago(1),
+        'start_date': datetime(2025, 1, 1, tzinfo=timezone.utc),
         'email': ['p1080@sber.ru'],
         'email_on_failure': False,
         'email_on_retry': False,
@@ -124,7 +123,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             }
             tsk = ctl_loading_load(data, save=False)
             
-            for ld in sorted(tsk, key=lambda x: x['id']):
+            for ld in sorted(tsk, key=lambda x: int(x['id'])):
                 
                 if ld['alive'] != 'ACTIVE': continue
                     

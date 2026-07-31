@@ -10,7 +10,6 @@
 
 from airflow import DAG
 from airflow.operators.python import task
-from airflow.utils.dates import days_ago
 
 from plugins.utils import add_note, default_args # type: ignore
 from plugins.ctl_utils import get_config, ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
@@ -19,6 +18,7 @@ import json
 import pendulum
 
 from  logging import getLogger
+from datetime import datetime, timezone
 logger = getLogger("airflow.task")
 
 wfs = [
@@ -31,7 +31,7 @@ profiles = {
     "IFT_SDP_UE": "CTL_SDPUE_PROFILE",
     "atdisdpcap": "CTL_SDPUE_PROFILE",
     "arnsdpue": "CTL_SDPUE_PROFILE",
-    "HR_Data": "CTL_PROFILE_NAME"
+    # "HR_Data": "CTL_PROFILE_NAME"
 }
 
 
@@ -39,7 +39,7 @@ profiles = {
 with DAG(f"CTL_{get_config()['profile']}.yml", 
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'tools'],
     description='CTL',
-    start_date=days_ago(1), 
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc), 
     schedule=None, 
     catchup=False, 
     default_args=default_args,
@@ -52,25 +52,22 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
 ) as dag:
 
 
-    def req(url, method='get', data={}, log=True, logs=None):
+    def req(url, method='get', data=None, log=True, logs=None):
+        if data is None:
+            data = {}
         if log:
             logger.info(dict(url=url, method=method, data=data))
-        
+
         if type(logs) == dict:
             ind = len(logs)
             logs[ind] = str(data)
         elif type(logs) == list:
             logs.append(str(data))
-        
+
         if not url.startswith('/v'):
-            url = '/v5/api' + url 
-            ret = ctl_api(url, method, json=data)
-        elif url.startswith('/v4'):
-            ret = ctl_api(url, method, json=data)
-        else:
-            ret = ctl_api(url, method, json=data)
-        
-        return ret
+            url = '/v5/api' + url
+
+        return ctl_api(url, method, json=data)
 
     def save_category(cats):
         yaml_data = dict()
@@ -80,8 +77,8 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         for j,v in cats.items():
             ed = dict()
             ed['category'] = {
-                'name': cats[j]['name'],
-                'deleted':  cats[j]['deleted']
+                'name': cats[j].get('name'),
+                'deleted':  cats[j].get('deleted')
             }
 
             if cats[j].get('parent_name'):
@@ -98,10 +95,10 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         for eid in e_ids:
             ed = dict()
             ed['entity'] = {
-                'id': e_ids[eid]['id'],
-                'name': e_ids[eid]['name'],
-                'storage': e_ids[eid]['storage'],
-                'parent-id': e_ids[eid]['parentId']
+                'id': e_ids[eid].get('id'),
+                'name': e_ids[eid].get('name'),
+                'storage': e_ids[eid].get('storage'),
+                'parent-id': e_ids[eid].get('parentId')
             }
             if e_ids[eid].get('path'):
                 ed['entity']['path'] = e_ids[eid]['path']
@@ -211,6 +208,7 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         safe = context['params']['safe']
         
         wfs = context['params']['wfs']
+        wfs = [wf.strip().split(" ")[0] for wf in wfs if wf.strip()]
         add_note(wfs, context, level='DAG,Task', title='Workflows')
         
         cats = ctl_obj_load('ctl_categories')
@@ -218,7 +216,7 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         save_category(cats)
         
         e_ids = ctl_obj_load('ctl_entities')
-        e_ids = {int(k): v for k, v in e_ids.items() if str(k) >= get_config()['root_entity']}
+        e_ids = {int(k): v for k, v in e_ids.items() if int(k) >= int(get_config()['root_entity'])}
         add_note(f'Entities:{len(e_ids)}', context, level='DAG,Task')
         save_entity(e_ids)
         
@@ -232,7 +230,7 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         # used = dict()
         # used_eids = dict()
         find = list()
-        for i, data in enumerate(sorted(res, key=lambda x: x['wf']['id'])):
+        for i, data in enumerate(sorted(res, key=lambda x: int(x['wf']['id']))):
             # print(data['wf']['id'])
             if int(data['wf']['id']) > 999999 or int(data['wf']['id']) in [0, ] or data['wf']['name'] in wfs:
                 # for eid in data['connectedEntities']:

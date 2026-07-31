@@ -11,7 +11,6 @@
 
 from airflow import DAG, Dataset
 from airflow.datasets import DatasetAlias
-from airflow.utils.dates import days_ago
 from airflow.decorators import task, task_group
 from airflow.api.common.trigger_dag import trigger_dag           
 from airflow.exceptions import DagRunAlreadyExists
@@ -26,7 +25,7 @@ from plugins.ctl_core import chk_any_conn, ctl_loading_load, ctl_chk_new, ctl_ch
 from psycopg2 import errors
 import pendulum
 import json
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 from logging import getLogger
 logger = getLogger("airflow.task")
@@ -43,7 +42,7 @@ profile = profile['name']
 default_args = {
     'owner': 'EDP.ETL',
     'depends_on_past': False,
-    'start_date': days_ago(1),
+    'start_date': datetime(2025, 1, 1, tzinfo=timezone.utc),
     'email': ['p1080@sber.ru'],
     'email_on_failure': False,
     'email_on_retry': False,
@@ -58,7 +57,7 @@ default_args = {
     # 'on_execute_callback': None,
 }
 
-# with DAG('_test_dag', start_date=days_ago(1), catchup=False, tags=['tools']) as dag:
+# with DAG('_test_dag', start_date=datetime(2025, 1, 1, tzinfo=timezone.utc), catchup=False, tags=['tools']) as dag:
 #     @task
 #     def test_task(): 
 #         print("Hello")
@@ -66,7 +65,7 @@ default_args = {
 
 
 with DAG(f'CTL.{get_config()["profile"]}.sensor',
-    start_date=days_ago(1),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=str2timedelta(get_config().get('sensor_interval','minutes=1')),
     default_args={ 
     'owner': 'EDP.ETL',
@@ -185,7 +184,7 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         lid_to_chk = {}
         wf_adding = []
 
-        for jsn in sorted(tsk, key=lambda x: x['id']):
+        for jsn in sorted(tsk, key=lambda x: int(x['id'])):
             # lid = jsn['id']
             # ctl_obj_save(f"ctl_working/{lid}", jsn, var=False)
             if jsn.get('loading_status') is not None: del jsn['loading_status']

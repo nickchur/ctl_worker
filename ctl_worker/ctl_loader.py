@@ -14,7 +14,6 @@
 """
 
 from airflow import DAG
-from airflow.utils.dates import days_ago
 from airflow.decorators import task, task_group
 from airflow.exceptions import AirflowFailException, AirflowSkipException, AirflowRescheduleException
 
@@ -45,13 +44,13 @@ def load_obj_save(obj, data, var=False, skip=False, **context):
 
 with DAG(f'CTL.{get_config()["profile"]}.loader',
     tags=['CTL', 'CTL_agent', 'logger'],
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
     schedule_interval=str2timedelta(get_config().get('loader_interval','minutes=5')),
     catchup=False,
     default_args={
         'owner': 'EDP.ETL',
         'depends_on_past': False,
-        'start_date': days_ago(1),
+        'start_date': pendulum.datetime(2025, 1, 1, tz='UTC'),
         'email': ['p1080@sber.ru'],
         'email_on_failure': False,
         'email_on_retry': False,

@@ -6,7 +6,6 @@
 
 from datetime import timedelta 
 from airflow import DAG
-from airflow.utils.dates import days_ago
 from airflow.decorators import task, task_group
 from airflow.sensors.base import PokeReturnValue # type: ignore
 
@@ -15,6 +14,7 @@ from plugins.ctl_utils import get_config, add_note # type: ignore
 from plugins.ctl_core import chk_any_conn # type: ignore
 
 import logging
+import pendulum
 logger = logging.getLogger("airflow.task")
 
 profile =  get_config()['profile']
@@ -43,7 +43,7 @@ with DAG(
         # 'on_retry_callback': on_callback,
         # 'on_execute_callback': None,
     },
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
     schedule_interval=test_interval,
     # schedule_interval=None,
     catchup=False,

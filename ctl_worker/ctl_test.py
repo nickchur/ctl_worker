@@ -7,7 +7,6 @@
 from airflow import DAG, Dataset
 from airflow.datasets import DatasetAlias
 from airflow.api.common.trigger_dag import trigger_dag           
-from airflow.utils.dates import days_ago
 from airflow.decorators import task
 
 from airflow.exceptions import AirflowFailException, AirflowSkipException, AirflowRescheduleException
@@ -33,7 +32,7 @@ profile =  get_config()['profile']
 
 
 with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
     schedule_interval=str2timedelta(get_config().get('simulator_interval','minutes=5')),
     default_args={ 
     'owner': 'EDP.ETL',

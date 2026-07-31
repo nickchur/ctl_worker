@@ -20,7 +20,6 @@
 from airflow.models import DagModel, TaskInstance, Pool
 from airflow.utils.session import provide_session, create_session
 from airflow.utils.state import State
-from airflow.utils.dates import days_ago
 from airflow.operators.python import get_current_context
 
 from pprint import PrettyPrinter
@@ -30,6 +29,7 @@ import json
 import hashlib
 
 from logging import getLogger, Handler
+import pendulum
 logger = getLogger("airflow.task")
 
 MAX_NOTE_LEN = 1000
@@ -222,7 +222,7 @@ def on_callback(context, level=None): return _on_callback(context, level)
 default_args = {
     'owner': 'EDP.ETL',
     'depends_on_past': False,
-    'start_date': days_ago(1),
+    'start_date': pendulum.datetime(2025, 1, 1, tz='UTC'),
     'email': ['p1080@sber.ru'],
     'email_on_failure': False,
     'email_on_retry': False,

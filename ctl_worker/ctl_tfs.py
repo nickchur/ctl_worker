@@ -44,7 +44,6 @@ from airflow.decorators import task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 # from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor 
 from airflow.exceptions import AirflowFailException
-from airflow.utils.dates import days_ago
 from airflow.sensors.base import PokeReturnValue
 from airflow.datasets import DatasetAlias, Dataset
 
@@ -206,7 +205,7 @@ def tfs_copy(path: str, **context):
 # Основная логика DAG
 with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'tfs_sensor'],
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
     schedule_interval=tfs_interval,
     default_args={ 
         'owner': 'EDP.ETL',
@@ -302,7 +301,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
 # ── Kafka-triggered DAG ──────────────────────────────────────────────────────
 with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'tfs_kafka'],
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
     schedule=None,
     default_args={
         'owner': 'EDP.ETL',

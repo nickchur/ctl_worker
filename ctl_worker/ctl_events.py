@@ -11,7 +11,6 @@
 
 from airflow import DAG, Dataset
 from airflow.datasets import DatasetAlias
-from airflow.utils.dates import days_ago
 from airflow.decorators import task
 # from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.sensors.base import PokeReturnValue
@@ -36,7 +35,7 @@ enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 events_interval = str2timedelta(get_config().get('events_interval','minutes=1'))
 
 with DAG(f'CTL.{get_config()["profile"]}.events',
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
     schedule_interval=events_interval,
     default_args={ 
     'owner': 'EDP.ETL',

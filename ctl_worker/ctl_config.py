@@ -14,7 +14,6 @@
 """
 
 from airflow import DAG
-from airflow.utils.dates import days_ago
 from airflow.decorators import task
 from airflow.models import Variable, Param
 
@@ -110,7 +109,7 @@ if not conf:
 
 with DAG(f'CTL.{config["profile"]}.config',
     tags=['CTL', 'CTL_agent', 'tools'],
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
     schedule='@once',
     catchup=False,
     default_args={ **default_args,

@@ -14,7 +14,6 @@
 """
 
 from airflow import DAG
-from airflow.utils.dates import days_ago
 from airflow.models import Param
 from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
@@ -23,6 +22,7 @@ from plugins.utils import  on_callback # type: ignore
 from plugins.ctl_utils import ctl_obj_load, ctl_api # type: ignore
 
 from  logging import getLogger
+import pendulum
 logger = getLogger("airflow.task")
 
 ent_dict = ctl_obj_load('ctl_entities')
@@ -99,7 +99,7 @@ with DAG(
         "on_success_callback": on_callback,
     },
     tags=["EDP_ETL", 'CTL_agent', "tools", "CTL"],
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
     schedule_interval=None,
     # schedule_interval=timedelta(minutes=11),
     catchup=False,

@@ -19,9 +19,10 @@
 - **Оптимизация**: Использует Airflow Variable `local_connections` (создаваемую в `show_connections`) для ускорения получения списка соединений.
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
 - **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
-- **`check_serialized_dag`**: отдельная проверка метабазы — падает, если в `main.serialized_dag`
-  есть записи с `last_updated` за последние 30 минут (признак того, что DAG'и переразбираются
-  и пересериализуются на ходу).
+- **`check_serialized_dag`**: отдельная проверка метабазы. Строит таблицу — сколько всего DAG'ов
+  и у скольких менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час. Падает, если
+  изменения есть за последний час: значит DAG'и пересериализуются на ходу, а разбор файла даёт
+  каждый раз новый результат.
 """
 
 import re
@@ -394,13 +395,32 @@ def tools_test_connections():  # noqa: PLR0915
         groups.append(tg)
 
     # --- Serialized DAG check ---
+    # Периоды от большего к меньшему, накопительно: каждый следующий — подмножество
+    # предыдущего. Так по таблице сразу видно, стенд «устаканился» или переразбирается
+    # прямо сейчас: у здорового стенда числа падают до нуля уже на неделе
+    SERIALIZED_PERIODS = [
+        ("за год", "1 year"),
+        ("за 3 месяца", "3 months"),
+        ("за месяц", "1 month"),
+        ("за неделю", "7 days"),
+        ("за сутки", "1 day"),
+        ("за час", "1 hour"),
+    ]
+
     @task(
         task_id="check_serialized_dag",
-        doc_md="Проверка `main.serialized_dag`: не пересериализовывались ли DAG'и за последние 30 минут",
-        retries=0,  # окно проверки — 30 минут, ретрай через 5 минут смотрел бы почти на то же самое
+        doc_md="Статистика `main.serialized_dag`: как давно менялась сериализация DAG'ов. Падает на изменениях за час",
+        retries=0,  # окно проверки — час, ретрай через 5 минут смотрел бы почти на то же самое
     )
     def check_serialized_dag(**context) -> dict:
-        """Падает, если в метабазе есть DAG'и, пересериализованные за последние 30 минут."""
+        """Считает, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час.
+
+        Строка в serialized_dag переписывается только когда меняется dag_hash, то есть
+        содержимое DAG'а после разбора файла (serialized_dag.py:170). На стабильном стенде
+        за последний час изменений быть не должно — они означают, что разбор файла даёт
+        каждый раз новый результат: значение из БД или API на уровне модуля, текущее время,
+        плавающий порядок списка. Поэтому ненулевой час — ошибка.
+        """
         import time
 
         from airflow.exceptions import AirflowFailException
@@ -412,55 +432,64 @@ def tools_test_connections():  # noqa: PLR0915
         except ImportError:
             from CI06932748.tools.utils import add_note, add_xcom  # type: ignore
 
-        count_sql = """
-            SELECT COUNT(dag_id)
-            FROM main.serialized_dag
-            WHERE last_updated > now() - interval '30 minutes'
-        """
+        # интервалы — константы из SERIALIZED_PERIODS, в запрос не приходит ничего извне
+        stats_sql = (
+            "SELECT COUNT(*) AS total, "
+            + ", ".join(
+                f"COUNT(*) FILTER (WHERE last_updated > now() - interval '{iv}') AS p{i}"
+                for i, (_, iv) in enumerate(SERIALIZED_PERIODS)
+            )
+            + " FROM main.serialized_dag"
+        )
         # Полный список уходит в XCom, в заметку попадают только первые note_rows
         list_sql = """
             SELECT last_updated, dag_id, fileloc, dag_hash
             FROM main.serialized_dag
-            WHERE last_updated > now() - interval '30 minutes'
+            WHERE last_updated > now() - interval '1 hour'
             ORDER BY last_updated DESC
             LIMIT 500
         """
-        note_rows = 25  # заметка режется по MAX_NOTE_LEN, таблица на 500 строк туда не влезет
+        note_rows = 10  # заметка режется по MAX_NOTE_LEN, а таблица со статистикой важнее списка
 
         ts = time.time()
         with create_session() as session:
-            count = session.execute(text(count_sql)).scalar() or 0
-            rows = session.execute(text(list_sql)).fetchall() if count else []
+            row = session.execute(text(stats_sql)).one()
+            total, counts = row[0], dict(zip([name for name, _ in SERIALIZED_PERIODS], row[1:]))
+            rows = session.execute(text(list_sql)).fetchall() if counts["за час"] else []
 
         elapsed = time.time() - ts
-        logger.info("🔍 serialized_dag: %d записей обновлено за последние 30 минут", count)
+        logger.info("🔍 serialized_dag: всего %d, %s", total,
+                    ", ".join(f"{name} {cnt}" for name, cnt in counts.items()))
 
-        if not count:
-            add_note(
-                "Записей с last_updated за последние 30 минут нет",
-                context,
-                level="task,DAG",
-                title=f"✅ {elapsed:.2f} sec check_serialized_dag",
-            )
-            return {"status": "ok", "updated": 0}
+        def share(cnt: int) -> str:
+            return f"{cnt * 100 / total:.0f}%" if total else "—"
 
-        msg = f"main.serialized_dag: {count} DAG'ов пересериализовано за последние 30 минут"
+        stats = "\n".join(
+            ["| Изменялись | DAG'ов | Доля |", "|---|---:|---:|", f"| **всего** | **{total}** | 100% |"]
+            + [f"| {name} | {counts[name]} | {share(counts[name])} |" for name, _ in SERIALIZED_PERIODS]
+        )
+        result = {"total": total, **{name: counts[name] for name, _ in SERIALIZED_PERIODS}}
+
+        if not counts["за час"]:
+            add_note(stats, context, level="task,DAG", title=f"✅ {elapsed:.2f} sec check_serialized_dag")
+            return {"status": "ok", **result}
+
+        msg = f"main.serialized_dag: {counts['за час']} из {total} DAG'ов пересериализовано за последний час"
         data = [
             {"last_updated": str(last_updated), "dag_id": dag_id, "fileloc": fileloc, "dag_hash": dag_hash}
             for last_updated, dag_id, fileloc, dag_hash in rows
         ]
         add_xcom("serialized_dag", data, context)
 
-        table = "| last_updated | dag_id | fileloc | dag_hash |\n|---|---|---|---|\n" + "\n".join(
-            f"| {r['last_updated']} | `{r['dag_id']}` | `{r['fileloc']}` | `{r['dag_hash']}` |"
-            for r in data[:note_rows]
+        table = "| last_updated | dag_id | dag_hash |\n|---|---|---|\n" + "\n".join(
+            f"| {r['last_updated']} | `{r['dag_id']}` | `{r['dag_hash']}` |" for r in data[:note_rows]
         )
-        if count > note_rows:
-            table += (f"\n\nПоказаны первые {min(note_rows, len(data))} из {count}, "
+        if counts["за час"] > note_rows:
+            table += (f"\n\nПоказаны первые {min(note_rows, len(data))} из {counts['за час']}, "
                       f"полный список — в XCom `serialized_dag`.")
-        add_note(f"{msg}\n\n{table}", context, level="task",
+        add_note(f"{msg}\n\n{stats}\n\n{table}", context, level="task",
                  title=f"❌ {elapsed:.2f} sec check_serialized_dag")
-        add_note(f"{msg}", context, level="DAG",
+        add_note(f"{msg}\n\n{stats}", context, level="DAG",
                  title=f"❌ {elapsed:.2f} sec check_serialized_dag")
         raise AirflowFailException(msg)
 

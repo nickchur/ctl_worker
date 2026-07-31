@@ -1,6 +1,8 @@
 """###🛠️ Обслуживание S3-бакета мониторинга
 
 Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
+Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
+логи задач, а не весь бакет.
 
 | Параметр | Описание |
 |---|---|
@@ -24,13 +26,20 @@ except ImportError:
 # на уровне модуля этот вызов не ходит
 AWS_CONN_ID = conf.get("logging", "REMOTE_LOG_CONN_ID")
 # s3://dataplatform-monitoring/dataplatform-etl
-BUCKET_NAME = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].split("/")[0]
+_LOG_BASE = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1]
+BUCKET_NAME = _LOG_BASE.split("/")[0]
+# Всё, что после имени бакета. Без префикса удаление шло бы по всему бакету, а он
+# общий: кроме логов задач там лежит чужое, и чистить его этот DAG не должен
+PREFIX = _LOG_BASE[len(BUCKET_NAME):].strip("/")
+PREFIX = f"{PREFIX}/" if PREFIX else ""
 
 
-def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000):
+def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
     s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
     paginator = s3_hook.get_bucket(bucket_name).meta.client.get_paginator("list_objects_v2")
-    return s3_hook, paginator.paginate(Bucket=bucket_name, PaginationConfig={'PageSize': page_size})
+    return s3_hook, paginator.paginate(
+        Bucket=bucket_name, Prefix=prefix, PaginationConfig={'PageSize': page_size}
+    )
 
 
 @dag(
@@ -80,7 +89,7 @@ def s3_cleanup():
                 if keys:
                     total += len(keys)
                     s3_hook.delete_objects(bucket=BUCKET_NAME, keys=keys)
-        msg = f"Удалено {total} объектов старше {params['days']}д"
+        msg = f"Удалено {total} объектов старше {params['days']}д из `{BUCKET_NAME}/{PREFIX}`"
         add_note(msg, context)
         return msg
 
@@ -93,7 +102,7 @@ def s3_cleanup():
                 for obj in contents:
                     total_size += obj.get("Size", 0)
                     total_objs += 1
-        msg = f"Объём бакета: {readable_size(total_size)} ({total_objs} объектов)"
+        msg = f"Объём `{BUCKET_NAME}/{PREFIX}`: {readable_size(total_size)} ({total_objs} объектов)"
         add_note(msg, context)
         return msg
 

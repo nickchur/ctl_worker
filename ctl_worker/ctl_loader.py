@@ -25,7 +25,7 @@ from plugins.ctl_core import ctl_loading_load, ctl_wf_norm, chk_any_conn # type:
 
 from functools import partial
 import pendulum
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 from logging import  getLogger
 logger = getLogger('airflow.task')
@@ -44,13 +44,13 @@ def load_obj_save(obj, data, var=False, skip=False, **context):
 
 with DAG(f'CTL.{get_config()["profile"]}.loader',
     tags=['CTL', 'CTL_agent', 'logger'],
-    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=str2timedelta(get_config().get('loader_interval','minutes=5')),
     catchup=False,
     default_args={
         'owner': 'EDP.ETL',
         'depends_on_past': False,
-        'start_date': pendulum.datetime(2025, 1, 1, tz='UTC'),
+        'start_date': datetime(2025, 1, 1, tzinfo=timezone.utc),
         'email': ['p1080@sber.ru'],
         'email_on_failure': False,
         'email_on_retry': False,

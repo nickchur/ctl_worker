@@ -23,13 +23,12 @@ from airflow.utils.state import State
 from airflow.operators.python import get_current_context
 
 from pprint import PrettyPrinter
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from itertools import islice
 import json
 import hashlib
 
 from logging import getLogger, Handler
-import pendulum
 logger = getLogger("airflow.task")
 
 MAX_NOTE_LEN = 1000
@@ -222,7 +221,7 @@ def on_callback(context, level=None): return _on_callback(context, level)
 default_args = {
     'owner': 'EDP.ETL',
     'depends_on_past': False,
-    'start_date': pendulum.datetime(2025, 1, 1, tz='UTC'),
+    'start_date': datetime(2025, 1, 1, tzinfo=timezone.utc),
     'email': ['p1080@sber.ru'],
     'email_on_failure': False,
     'email_on_retry': False,

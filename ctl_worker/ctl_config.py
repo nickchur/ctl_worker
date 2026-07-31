@@ -25,6 +25,7 @@ import json
 import pendulum
 
 from logging import  getLogger
+from datetime import datetime, timezone
 logger = getLogger('airflow.task')
 
 def get_scrt(s: str) -> str:
@@ -109,7 +110,7 @@ if not conf:
 
 with DAG(f'CTL.{config["profile"]}.config',
     tags=['CTL', 'CTL_agent', 'tools'],
-    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule='@once',
     catchup=False,
     default_args={ **default_args,

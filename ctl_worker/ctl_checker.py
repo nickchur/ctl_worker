@@ -22,7 +22,7 @@ from plugins.utils import  on_callback # type: ignore
 from plugins.ctl_utils import ctl_obj_load, ctl_api # type: ignore
 
 from  logging import getLogger
-import pendulum
+from datetime import datetime, timezone
 logger = getLogger("airflow.task")
 
 ent_dict = ctl_obj_load('ctl_entities')
@@ -99,7 +99,7 @@ with DAG(
         "on_success_callback": on_callback,
     },
     tags=["EDP_ETL", 'CTL_agent', "tools", "CTL"],
-    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=None,
     # schedule_interval=timedelta(minutes=11),
     catchup=False,

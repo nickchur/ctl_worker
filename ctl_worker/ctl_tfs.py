@@ -60,7 +60,7 @@ from plugins.ctl_utils import get_config   # type: ignore
 import xml.etree.ElementTree as ET
 import pendulum
 from fnmatch import fnmatch
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from logging import getLogger
 
 logger = getLogger("airflow.task")
@@ -205,7 +205,7 @@ def tfs_copy(path: str, **context):
 # Основная логика DAG
 with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'tfs_sensor'],
-    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=tfs_interval,
     default_args={ 
         'owner': 'EDP.ETL',
@@ -301,7 +301,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
 # ── Kafka-triggered DAG ──────────────────────────────────────────────────────
 with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'tfs_kafka'],
-    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule=None,
     default_args={
         'owner': 'EDP.ETL',

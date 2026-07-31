@@ -17,7 +17,7 @@ from plugins.ctl_core import chk_any_conn
 
 import random
 import pendulum
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 from logging import getLogger
 logger = getLogger("airflow.task")
@@ -32,7 +32,7 @@ profile =  get_config()['profile']
 
 
 with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
-    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=str2timedelta(get_config().get('simulator_interval','minutes=5')),
     default_args={ 
     'owner': 'EDP.ETL',

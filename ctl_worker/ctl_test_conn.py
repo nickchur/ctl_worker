@@ -4,7 +4,7 @@
 Поддерживает типы: `Postgres`, `S3`, `KerberosHttp`. При сбое — экспоненциальный retry (до 1000 попыток).
 """
 
-from datetime import timedelta 
+from datetime import timedelta, datetime, timezone
 from airflow import DAG
 from airflow.decorators import task, task_group
 from airflow.sensors.base import PokeReturnValue # type: ignore
@@ -14,7 +14,6 @@ from plugins.ctl_utils import get_config, add_note # type: ignore
 from plugins.ctl_core import chk_any_conn # type: ignore
 
 import logging
-import pendulum
 logger = logging.getLogger("airflow.task")
 
 profile =  get_config()['profile']
@@ -43,7 +42,7 @@ with DAG(
         # 'on_retry_callback': on_callback,
         # 'on_execute_callback': None,
     },
-    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=test_interval,
     # schedule_interval=None,
     catchup=False,

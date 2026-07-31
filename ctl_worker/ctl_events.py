@@ -19,7 +19,7 @@ from plugins.utils import add_note, on_callback, str2timedelta  # type: ignore
 from plugins.ctl_utils import get_config, ctl_api, pg_exe, ctl_obj_load # type: ignore 
 from plugins.ctl_core import chk_any_conn  # type: ignore
 
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 import json
 import pendulum
 import ast
@@ -35,7 +35,7 @@ enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 events_interval = str2timedelta(get_config().get('events_interval','minutes=1'))
 
 with DAG(f'CTL.{get_config()["profile"]}.events',
-    start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=events_interval,
     default_args={ 
     'owner': 'EDP.ETL',

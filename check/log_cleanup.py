@@ -63,7 +63,7 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
         'days': Param(30, type='integer', minimum=1, description='Возраст объектов для удаления (дни)'),
     },
 )
-def log_cleanup():
+def tools_log_cleanup():
 
     @task
     def create_bucket(**context):
@@ -109,4 +109,4 @@ def log_cleanup():
     create_bucket() >> clean_logs() >> show_bucket_size()
 
 
-log_cleanup()
+tools_log_cleanup()

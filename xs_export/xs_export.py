@@ -1,6 +1,6 @@
 import json
 import os
-import pendulum
+from datetime import datetime, timezone
 import logging
 import re
 from airflow import DAG
@@ -131,7 +131,7 @@ def create_dynamic_dags():
             description=desc,
             default_args=DEFAULT_ARGS,
             schedule_interval=schedule,
-            start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
+            start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
             catchup=False,
             tags=common_tags,
             is_paused_upon_creation=True,

@@ -35,7 +35,7 @@ import json
 import pendulum
 import random
 
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from functools import reduce
 from operator import and_, or_
 from pprint import PrettyPrinter
@@ -399,8 +399,7 @@ def build_worker_dag(w):
             # 'on_retry_callback': on_callback,
             # 'on_execute_callback': None,
         },
-        # start_date=days_ago(1),
-        start_date=pendulum.datetime(2025, 1, 1, tz='UTC'),
+        start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
         catchup=False,
         on_failure_callback=on_callback,
         # on_success_callback=on_callback,

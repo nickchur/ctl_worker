@@ -6,7 +6,7 @@
 | Функция | Описание |
 |---|---|
 | **Группировка** | Все соединения распределяются по `conn_type` |
-| **Отчёт** | В заметку DAG'а — сводка **по типам** (соединений, уникальных хостов, перечень ID); полная таблица с `host`, `port`, `schema` и `description` — в заметке таска |
+| **Отчёт** | В заметку DAG'а — сводка **по типам** (сколько соединений каждого); полная таблица с `conn_id`, `host`, `port`, `schema` и `description` — в заметке таска |
 | **Кэширование** | Сохраняет результат в Airflow Variable `local_connections` для ускорения работы `test_connections` |
 | **ClickHouse** | Автоматически подменяет `sqlite` на `clickhouse` для корректного отображения |
 """
@@ -83,19 +83,10 @@ def tools_show_connections():
 
         # В заметку DAG'а идёт сводка по типам: соединений под сотню, и поимённая таблица
         # там всё равно резалась по MAX_NOTE_LEN. Полная таблица остаётся в заметке таска.
-        max_ids = 10  # сколько conn_id показывать в строке типа
-        summary_lines = ["| Тип | Соединений | Хостов | conn_id |", "|---|---:|---:|---|"]
+        summary_lines = ["| Тип | Соединений |", "|---|---:|"]
         for conn_type in sorted(by_type):
-            conns = by_type[conn_type]
-            ids = sorted(c['conn_id'] for c in conns)
-            shown = ", ".join(f"`{i}`" for i in ids[:max_ids])
-            if len(ids) > max_ids:
-                shown += f" … +{len(ids) - max_ids}"
-            hosts = {c['host'] for c in conns if c['host']}
-            summary_lines.append(f"| **{conn_type}** | {len(conns)} | {len(hosts)} | {shown} |")
-
-        all_hosts = {c['host'] for conns in by_type.values() for c in conns if c['host']}
-        summary_lines.append(f"| **итого** | **{len(rows)}** | **{len(all_hosts)}** | |")
+            summary_lines.append(f"| **{conn_type}** | {len(by_type[conn_type])} |")
+        summary_lines.append(f"| **итого** | **{len(rows)}** |")
 
         title = f"Connections: {len(rows)} в {len(by_type)} типах"
         add_note("\n".join(summary_lines), context, level='DAG', title=title)

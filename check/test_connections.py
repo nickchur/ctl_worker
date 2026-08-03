@@ -336,7 +336,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     except Exception as err:
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
         add_note(str(err), context, level="task,DAG", title=msg)
-        raise  # re-raise оригинальное исключение, чтобы сработал retries: 1
+        raise  # re-raise оригинальное исключение, а не AirflowFailException — в логе видна причина
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +347,9 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     doc_md=__doc__,
     default_args={
         "owner": "DataLab (CI02420667)",
-        "retries": 1,
+        # без ретраев: тест снимает срез доступности здесь и сейчас, повтор только
+        # растягивает прогон и маскирует моргнувшее соединение
+        "retries": 0,
     },
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule="@once",
@@ -410,7 +412,6 @@ def tools_test_connections():  # noqa: PLR0915
     @task(
         task_id="check_serialized_dag",
         doc_md="Статистика `main.serialized_dag`: как давно менялась сериализация DAG'ов. Падает на изменениях за час",
-        retries=0,  # окно проверки — час, ретрай через 5 минут смотрел бы почти на то же самое
     )
     def check_serialized_dag(**context) -> dict:
         """Считает, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час.

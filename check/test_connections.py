@@ -18,7 +18,9 @@
 **Особенности:**
 - **Оптимизация**: Использует Airflow Variable `local_connections` (создаваемую в `show_connections`) для ускорения получения списка соединений.
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
-- **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
+- **Отчетность**: Финальный таск `summary` пишет в заметку DAG'а сводку **по группам** соединений
+  (сколько всего, ✅/❌/☮️/🔘, среднее время, поимённо — только проблемные). Полная расшифровка
+  по каждому упавшему соединению остаётся в заметке самого таска `summary`.
 - **`check_serialized_dag`**: отдельная проверка метабазы. Строит таблицу — сколько всего DAG'ов
   и у скольких менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час. Падает, если
   изменения есть за последний час: значит DAG'и пересериализуются на ходу, а разбор файла даёт
@@ -62,6 +64,9 @@ _GROUP_TOOLTIP: dict[str, str] = {
     "redis":      "Redis",
     "other":      "Прочие соединения",
 }
+
+# Порядок групп: и в графе DAG'а, и в итоговом отчёте
+_GROUP_ORDER = ("tfs", "postgres", "s3", "ctl", "clickhouse", "kafka", "trino", "redis", "other")
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +381,7 @@ def tools_test_connections():  # noqa: PLR0915
         groups.append(tg_tfs)
 
     # --- Type groups ---
-    for group_name in ("postgres", "s3", "ctl", "clickhouse", "kafka", "trino", "redis", "other"):
+    for group_name in (g for g in _GROUP_ORDER if g != "tfs"):  # tfs собран выше отдельно
         conns = _type_groups.get(group_name, {})
         if not conns:
             continue
@@ -532,14 +537,25 @@ def tools_test_connections():  # noqa: PLR0915
             except Exception as e:
                 logger.warning("Could not load task notes: %s", e)
 
-        ok = fail = skip = none_count = 0
-        all_rows = []
-        durations = []
-        icons = []
+        # Отчёт агрегируется по группам: у задачи внутри TaskGroup task_id имеет вид
+        # "<группа>.<conn_id>". Соединений в стенде под сотню, поимённая таблица в заметке
+        # DAG'а всё равно резалась по MAX_NOTE_LEN — по группам сразу видно, где именно
+        # порвалось. Поимённый список проблемных остаётся в заметке самого summary.
+        max_bad = 8  # сколько проблемных conn_id показывать в строке группы
+
+        def _new_group() -> dict:
+            return {"ok": 0, "fail": 0, "skip": 0, "none": 0, "dur": [], "icons": [], "bad": []}
+
+        stats: dict[str, dict] = defaultdict(_new_group)
+        detail_rows = []
 
         for ti in tis:
             if ti.task_id == "summary":
                 continue
+
+            # partition, а не split: conn_id сам может содержать точку (_safe_id её сохраняет)
+            group, _, conn_name = ti.task_id.partition(".")
+            conn_name = conn_name or group  # задачи вне групп (check_serialized_dag) сами себе группа
 
             state = ti.state
             raw_note = notes_map.get(ti.task_id, "")
@@ -548,40 +564,67 @@ def tools_test_connections():  # noqa: PLR0915
             reason = first_line[:120].replace("|", "\\|") or "—"
 
             if state == "success":
-                icon = "✅"
-                ok += 1
-                reason = "—"
+                icon, key, reason = "✅", "ok", "—"
             elif state in ("failed", "upstream_failed"):
-                icon = "❌"
-                fail += 1
-            elif state == "skipped":
-                icon = "☮️"
-                skip += 1
+                icon, key = "❌", "fail"
             elif state is None:
-                icon = "🔘"
-                none_count += 1
-                reason = "Не запущен"
+                icon, key, reason = "🔘", "none", "Не запущен"
             else:
-                icon = "☮️"
-                skip += 1
+                icon, key = "☮️", "skip"
 
-            icons.append(icon)
+            g = stats[group]
+            g[key] += 1
+            g["icons"].append(icon)
             if ti.duration:
-                durations.append(ti.duration)
+                g["dur"].append(ti.duration)
 
             # Выводим только ошибки и скипы
             if state != "success":
-                all_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} | {reason} |")
+                g["bad"].append(f"{icon} `{conn_name}`")
+                detail_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} | {reason} |")
+
+        ok = sum(g["ok"] for g in stats.values())
+        fail = sum(g["fail"] for g in stats.values())
+        skip = sum(g["skip"] for g in stats.values())
+        none_count = sum(g["none"] for g in stats.values())
+        durations = [d for g in stats.values() for d in g["dur"]]
 
         avg_time = sum(durations) / len(durations) if durations else 0
-        graph = "".join(icons)
+        # Иконки разбиты по группам пробелом: провал целой группы виден одним взглядом
+        ordered = sorted(
+            stats,
+            key=lambda name: (_GROUP_ORDER.index(name) if name in _GROUP_ORDER else len(_GROUP_ORDER), name),
+        )
+        graph = " ".join("".join(stats[name]["icons"]) for name in ordered)
         counts = f"✅ {ok} / ❌ {fail} / ☮️ {skip}"
         if none_count:
             counts += f" / 🔘 {none_count}"
         headline = f"{graph}\n\n{counts} | 🕒 Avg: {avg_time:.2f}s"
 
-        table = "| Соединение | Статус | Причина |\n|---|---|---|\n" + "\n".join(all_rows)
+        def group_row(name: str, g: dict) -> str:
+            total = g["ok"] + g["fail"] + g["skip"] + g["none"]
+            avg = sum(g["dur"]) / len(g["dur"]) if g["dur"] else 0
+            bad = ", ".join(g["bad"][:max_bad]) or "—"
+            if len(g["bad"]) > max_bad:
+                bad += f" … +{len(g['bad']) - max_bad}"
+            title = _GROUP_TOOLTIP.get(name)
+            label = f"**{name}** — {title}" if title else f"**{name}**"
+            return (f"| {label} | {total} | {g['ok']} | {g['fail']} | {g['skip']} | {g['none']} "
+                    f"| {avg:.2f}s | {bad} |")
+
+        table = "\n".join(
+            ["| Группа | Всего | ✅ | ❌ | ☮️ | 🔘 | 🕒 сред. | Проблемные |",
+             "|---|---:|---:|---:|---:|---:|---:|---|"]
+            + [group_row(name, stats[name]) for name in ordered]
+            + [f"| **итого** | **{ok + fail + skip + none_count}** | {ok} | {fail} | {skip} | {none_count} "
+               f"| {avg_time:.2f}s | |"]
+        )
         add_note(table, context, level="DAG", title=headline)
+
+        # Поимённая расшифровка — в заметке самого summary, чтобы не раздувать заметку DAG'а
+        detail = ("| Соединение | Статус | Причина |\n|---|---|---|\n" + "\n".join(detail_rows)
+                  if detail_rows else "Все соединения прошли проверку")
+        add_note(detail, context, level="task", title=headline)
         logger.info("summary: %s", headline)
 
         if fail > 0:

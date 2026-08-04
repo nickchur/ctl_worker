@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-08-04 17:20 MSK · v2.11 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 18:05 MSK · v2.12 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -497,9 +497,17 @@ def tools_test_dags():
                     dag_id, parsed0, timeout)
 
         hash1, data1, parsed1, loc1 = hash0, data0, parsed0, loc0
+        poll = 0
         while time.time() < deadline:
             time.sleep(poke)
             hash1, data1, parsed1, loc1 = snapshot()
+            poll += 1
+            # Пишем на каждом опросе, а не только по факту: промежуточная выгрузка лога
+            # в S3 (hrp_adapter/logging/handlers.py) дёргается из emit, то есть по записи,
+            # а не по таймеру. Без этой строки лог молчащего таска не обновлялся бы все
+            # 20 минут ожидания, и со стороны это неотличимо от зависшего воркера
+            logger.info("⏳ %s: опрос %d, ждём %.0fс из %d, last_parsed_time=%s",
+                        dag_id, poll, time.time() - ts, timeout, parsed1)
             if parsed1 and parsed1 > parsed0:
                 break
         else:

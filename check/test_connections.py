@@ -20,9 +20,10 @@
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
 - **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
 - **`check_serialized_dag`**: отдельная проверка метабазы. Строит таблицу — сколько всего DAG'ов
-  и у скольких менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час. Падает, если
-  изменения есть за последний час: значит DAG'и пересериализуются на ходу, а разбор файла даёт
-  каждый раз новый результат.
+  и у скольких менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка
+  «на последнем парсинге» (`serialized_dag.last_updated` попадает в окно последнего
+  парсинга файла — `dag.last_parsed_time`). Падает именно на этой строке: значит парсинг даёт
+  каждый раз новый результат и DAG'и пересериализуются на ходу.
 """
 
 import re
@@ -421,21 +422,29 @@ def tools_test_connections():  # noqa: PLR0915
         ("за час", "1 hour"),
     ]
 
+    # Читается вместе с заголовком колонки: «Изменялись на последнем парсинге».
+    # Это продолжение ряда периодов — самый узкий «интервал», уже не время, а одно событие
+    LAST_PARSE_ROW = "на последнем парсинге"
+
     @task(
         task_id="check_serialized_dag",
-        doc_md="Статистика `main.serialized_dag`: как давно менялась сериализация DAG'ов. Падает на изменениях за час",
+        doc_md=("Статистика `main.serialized_dag`: как давно менялась сериализация DAG'ов. "
+                "Падает, если сериализация переписана на последнем парсинге файла"),
     )
     def check_serialized_dag(**context) -> dict:
         """Считает, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час.
 
         Строка в serialized_dag переписывается только когда меняется dag_hash, то есть
-        содержимое DAG'а после разбора файла (serialized_dag.py:170). На стабильном стенде
-        за последний час изменений быть не должно — они означают, что разбор файла даёт
-        каждый раз новый результат: значение из БД или API на уровне модуля, текущее время,
-        плавающий порядок списка. Поэтому ненулевой час — ошибка.
+        содержимое DAG'а после парсинга файла (serialized_dag.py:170). На стабильном стенде
+        последний парсинг файла не должен был ничего переписать — если переписал, значит
+        парсинг даёт каждый раз новый результат: значение из БД или API на уровне модуля,
+        текущее время, плавающий порядок списка. Поэтому ошибка — не «изменения за час»
+        (час зависит от min_file_process_interval и ловит обычный деплой), а именно
+        совпадение записи сериализации с последним парсингом.
         """
         import time
 
+        from airflow.configuration import conf
         from airflow.exceptions import AirflowFailException
         from airflow.utils.session import create_session
         from sqlalchemy import text
@@ -445,21 +454,33 @@ def tools_test_connections():  # noqa: PLR0915
         except ImportError:
             from CI06932748.tools.utils import add_note, add_xcom  # type: ignore
 
-        # интервалы — константы из SERIALIZED_PERIODS, в запрос не приходит ничего извне
+        # Окно одного парсинга: write_dag пишет last_updated раньше, чем bulk_write_to_db —
+        # last_parsed_time (dagbag.py:716-723, одна транзакция), поэтому сериализация,
+        # сделанная на последнем парсинге, отстаёт от last_parsed_time не больше, чем длится
+        # сам парсинг. Верхняя граница — dag_file_processor_timeout, и она заведомо меньше
+        # min_file_process_interval, то есть окно не дотянется до прошлого парсинга.
+        parse_window = conf.getint("core", "dag_file_processor_timeout", fallback=600)
+        at_parse_cond = (f"d.last_parsed_time IS NOT NULL AND "
+                         f"sd.last_updated >= d.last_parsed_time - interval '{parse_window} seconds'")
+
+        # интервалы — константы из SERIALIZED_PERIODS, parse_window — int из conf:
+        # в запрос не приходит ничего извне
         stats_sql = (
             "SELECT COUNT(*) AS total, "
             + ", ".join(
-                f"COUNT(*) FILTER (WHERE last_updated > now() - interval '{iv}') AS p{i}"
+                f"COUNT(*) FILTER (WHERE sd.last_updated > now() - interval '{iv}') AS p{i}"
                 for i, (_, iv) in enumerate(SERIALIZED_PERIODS)
             )
-            + " FROM main.serialized_dag"
+            + f", COUNT(*) FILTER (WHERE {at_parse_cond}) AS at_parse"
+            + " FROM main.serialized_dag sd LEFT JOIN main.dag d USING (dag_id)"
         )
         # Полный список уходит в XCom, в заметку попадают только первые note_rows
-        list_sql = """
-            SELECT last_updated, dag_id, fileloc, dag_hash
-            FROM main.serialized_dag
-            WHERE last_updated > now() - interval '1 hour'
-            ORDER BY last_updated DESC
+        list_sql = f"""
+            SELECT sd.last_updated, sd.dag_id, sd.fileloc, sd.dag_hash, d.last_parsed_time
+            FROM main.serialized_dag sd
+            JOIN main.dag d USING (dag_id)
+            WHERE {at_parse_cond}
+            ORDER BY sd.last_updated DESC
             LIMIT 500
         """
         note_rows = 10  # заметка режется по MAX_NOTE_LEN, а таблица со статистикой важнее списка
@@ -467,12 +488,15 @@ def tools_test_connections():  # noqa: PLR0915
         ts = time.time()
         with create_session() as session:
             row = session.execute(text(stats_sql)).one()
-            total, counts = row[0], dict(zip([name for name, _ in SERIALIZED_PERIODS], row[1:]))
-            rows = session.execute(text(list_sql)).fetchall() if counts["за час"] else []
+            names = [name for name, _ in SERIALIZED_PERIODS]
+            total, counts = row[0], dict(zip(names, row[1:1 + len(names)]))
+            at_parse = row[1 + len(names)]
+            rows = session.execute(text(list_sql)).fetchall() if at_parse else []
 
         elapsed = time.time() - ts
-        logger.info("🔍 serialized_dag: всего %d, %s", total,
-                    ", ".join(f"{name} {cnt}" for name, cnt in counts.items()))
+        logger.info("🔍 serialized_dag: всего %d, %s, %s %d", total,
+                    ", ".join(f"{name} {cnt}" for name, cnt in counts.items()),
+                    LAST_PARSE_ROW, at_parse)
 
         def share(cnt: int) -> str:
             return f"{cnt * 100 / total:.0f}%" if total else "—"
@@ -480,25 +504,30 @@ def tools_test_connections():  # noqa: PLR0915
         stats = "\n".join(
             ["| Изменялись | DAG'ов | Доля |", "|---|---:|---:|", f"| **всего** | **{total}** | 100% |"]
             + [f"| {name} | {counts[name]} | {share(counts[name])} |" for name, _ in SERIALIZED_PERIODS]
+            + [f"| **{LAST_PARSE_ROW}** | **{at_parse}** | {share(at_parse)} |"]
         )
-        result = {"total": total, **{name: counts[name] for name, _ in SERIALIZED_PERIODS}}
+        result = {"total": total, **{name: counts[name] for name, _ in SERIALIZED_PERIODS},
+                  LAST_PARSE_ROW: at_parse}
 
-        if not counts["за час"]:
+        if not at_parse:
             add_note(stats, context, level="task,DAG", title=f"✅ {elapsed:.2f} sec check_serialized_dag")
             return {"status": "ok", **result}
 
-        msg = f"main.serialized_dag: {counts['за час']} из {total} DAG'ов пересериализовано за последний час"
+        msg = (f"main.serialized_dag: {at_parse} из {total} DAG'ов пересериализовано "
+               f"на последнем парсинге файла")
         data = [
-            {"last_updated": str(last_updated), "dag_id": dag_id, "fileloc": fileloc, "dag_hash": dag_hash}
-            for last_updated, dag_id, fileloc, dag_hash in rows
+            {"last_updated": str(last_updated), "dag_id": dag_id, "fileloc": fileloc,
+             "dag_hash": dag_hash, "last_parsed_time": str(last_parsed_time)}
+            for last_updated, dag_id, fileloc, dag_hash, last_parsed_time in rows
         ]
         add_xcom("serialized_dag", data, context)
 
-        table = "| last_updated | dag_id | dag_hash |\n|---|---|---|\n" + "\n".join(
-            f"| {r['last_updated']} | `{r['dag_id']}` | `{r['dag_hash']}` |" for r in data[:note_rows]
+        table = "| last_updated | last_parsed_time | dag_id | dag_hash |\n|---|---|---|---|\n" + "\n".join(
+            f"| {r['last_updated']} | {r['last_parsed_time']} | `{r['dag_id']}` | `{r['dag_hash']}` |"
+            for r in data[:note_rows]
         )
-        if counts["за час"] > note_rows:
-            table += (f"\n\nПоказаны первые {min(note_rows, len(data))} из {counts['за час']}, "
+        if at_parse > note_rows:
+            table += (f"\n\nПоказаны первые {min(note_rows, len(data))} из {at_parse}, "
                       f"полный список — в XCom `serialized_dag`.")
         add_note(f"{msg}\n\n{stats}\n\n{table}", context, level="task",
                  title=f"❌ {elapsed:.2f} sec check_serialized_dag")

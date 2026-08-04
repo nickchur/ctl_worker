@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-08-04 16:10 MSK · v2.9 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 17:00 MSK · v2.10 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -101,12 +101,47 @@ def _short(value, limit: int = 60) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def _diff_pair(before, after, limit: int = 60) -> tuple[str, str]:
+    """Пара ячеек для таблицы: у длинных строк показывает место расхождения, а не начало.
+
+    Обрезка с начала бесполезна там, где строки различаются в середине или в конце:
+    у `doc_md` первые полсотни символов совпадают, и в отчёт попадали два одинаковых
+    огрызка. Поэтому отбрасываем общий префикс и общий суффикс, оставляя вокруг
+    расхождения немного контекста.
+    """
+    if not (isinstance(before, str) and isinstance(after, str)):
+        return _short(before, limit), _short(after, limit)
+    if len(before) <= limit and len(after) <= limit:
+        return _short(before, limit), _short(after, limit)
+
+    ctx = 12
+    n = min(len(before), len(after))
+    head = 0
+    while head < n and before[head] == after[head]:
+        head += 1
+    tail = 0
+    # tail < n - head: хвост не должен налезть на уже отброшенный префикс
+    while tail < n - head and before[-1 - tail] == after[-1 - tail]:
+        tail += 1
+
+    start = max(0, head - ctx)
+
+    def cut(s: str) -> str:
+        end = min(len(s), len(s) - tail + ctx)
+        return ("…" if start else "") + s[start:end] + ("…" if end < len(s) else "")
+
+    return _short(cut(before), limit), _short(cut(after), limit)
+
+
 def _json_diff(before, after, limit: int = 20) -> list[tuple[str, str, str]]:
     """Рекурсивно сравнивает две сериализации DAG'а: [(путь, было, стало), ...].
 
     Списки сравниваются поэлементно, а не как множества: для dag_hash порядок значим,
     и плавающий порядок списка — самая частая причина дрожания сериализации. Поэтому
     разная длина списка и расхождение по индексу — разные строки отчёта.
+
+    Значения в ячейки кладёт `_diff_pair`: у длинных строк он показывает окрестность
+    расхождения, а не начало, — иначе в отчёт попадают два одинаковых огрызка.
     """
     out: list[tuple[str, str, str]] = []
 
@@ -136,7 +171,7 @@ def _json_diff(before, after, limit: int = 20) -> list[tuple[str, str, str]]:
                     return
                 walk(x[i], y[i], f"{path}[{i}]")
         elif x != y:
-            out.append((path or ".", _short(x), _short(y)))
+            out.append((path or ".", *_diff_pair(x, y)))
 
     walk(before, after, "")
     return out[:limit]

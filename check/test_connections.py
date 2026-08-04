@@ -11,7 +11,7 @@
 | **ctl** | тип `http` или `ctl*` | Вызов `GET /v5/api/info` (Kerberos Auth) |
 | **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
 | **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
-| **trino** | тип `trino` | Валидация сессии через `TrinoHook` |
+| **trino** | тип `trino` | Валидация сессии через `TrinoHook`; нерезолвящийся хост → `☮️` |
 | **redis** | тип `redis` | Проверка доступности через `redis.Redis(...).ping()` |
 | **other** | прочие | Помечаются символом `☮️` (пропуск) |
 
@@ -295,7 +295,19 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         elif chk_type == "Trino":
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
             hook = TrinoHook(trino_conn_id=conn_id)
-            result = hook.get_first("SELECT current_user, current_catalog, current_schema")
+            try:
+                result = hook.get_first("SELECT current_user, current_catalog, current_schema")
+            except Exception as err:
+                # Хост не резолвится: соединение заведено под контур, где Trino нет.
+                # Это не деградация связности, а отсутствие сервиса — скип, а не падение.
+                # Сообщение приезжает из urllib3 внутрь requests.ConnectionError, поэтому
+                # ищем по всей строке, а не сравниваем тип исключения.
+                if "Name or service not known" not in str(err):
+                    raise
+                msg = f"☮️ {conn_id}: хост не резолвится — {err}"
+                add_note(msg, context, level="task", title=f"☮️ {conn_id}")
+                logger.warning(msg)
+                raise AirflowSkipException(msg) from err
 
         elif chk_type == "Redis":
             import redis

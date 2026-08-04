@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-08-04 11:05 MSK · v1.2 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 11:30 MSK · v1.3 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend. 
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -21,18 +21,20 @@
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
 - **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
 - **Группа `check_dags`**: проверки, которые смотрят не на соединения, а на сами DAG'и —
-  `check_serialized_dag`, `recheck_targets` и mapped-таск `recheck_serialized_dag`.
-- **`check_serialized_dag`**: отдельная проверка метабазы. Строит таблицу — сколько всего DAG'ов
-  и у скольких менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка
-  «на последнем парсинге» (`serialized_dag.last_updated` попадает в окно последнего
-  парсинга файла — `dag.last_parsed_time`). Падает именно на этой строке: значит парсинг даёт
-  каждый раз новый результат и DAG'и пересериализуются на ходу.
-- **`recheck_serialized_dag`**: mapped-таск поверх находок `check_serialized_dag`. На каждый
-  DAG из XCom `serialized_dag` ждёт следующего парсинга (сдвига `dag.last_parsed_time`) и
-  сравнивает сериализацию до и после, показывая расхождения по путям вида
-  `.dag.params[0][1].schema.examples[0]`. Совпавший `dag_hash` — значит прошлое изменение было
-  разовым (деплой), разошедшийся — вот конкретное поле, которое дрожит. Сам не падает.
-  В списке mapped-тасков вместо `Map Index` `0,1,2…` показывается `dag_id`.
+  `check_serialized_dag` и mapped-таск `recheck_serialized_dag` поверх его результата.
+- **`check_serialized_dag`**: строит таблицу — сколько всего DAG'ов и у скольких менялась
+  сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка «на последнем
+  парсинге» (`serialized_dag.last_updated` попадает в окно последнего парсинга файла —
+  `dag.last_parsed_time`). **Никогда не падает**: одного замера мало, чтобы отличить
+  дрожание от деплоя. Возвращает список подозрительных DAG'ов, статистика — в XCom
+  `serialized_stats`.
+- **`recheck_serialized_dag`**: mapped-таск, по одному экземпляру на DAG из списка. Ждёт
+  следующего парсинга (сдвига `dag.last_parsed_time`) и сравнивает сериализацию до и после,
+  показывая расхождения по путям вида `.dag.params[0][1].schema.examples[0]`. **Здесь
+  и выносится вердикт**: `stable` (совпал `dag_hash` — прошлое изменение было деплоем) и
+  `no_parse` (парсинга не дождались) — успех, `unstable` — падение. Итог всегда уходит
+  в XCom `recheck`, откуда его собирает `summary`. В списке mapped-тасков вместо
+  `Map Index` `0,1,2…` показывается `dag_id`.
 """
 
 import re
@@ -486,26 +488,33 @@ def tools_test_connections():  # noqa: PLR0915
     # Это продолжение ряда периодов — самый узкий «интервал», уже не время, а одно событие
     LAST_PARSE_ROW = "на последнем парсинге"
 
+    # Сколько DAG'ов отдаём на перепроверку. Каждый ждёт своего следующего парсинга, то есть
+    # до min_file_process_interval, а параллельность ограничена max_active_tasks_per_dag
+    # (в проме 4) — отсюда и небольшой лимит
+    RECHECK_LIMIT = 5
+
     @task(
         task_id="check_serialized_dag",
         doc_md=("Статистика `main.serialized_dag`: как давно менялась сериализация DAG'ов. "
-                "Падает, если сериализация переписана на последнем парсинге файла"),
+                "Не падает — отдаёт подозрительные DAG'и на перепроверку"),
     )
-    def check_serialized_dag(**context) -> dict:
+    def check_serialized_dag(**context) -> list[dict]:
         """Считает, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час.
 
         Строка в serialized_dag переписывается только когда меняется dag_hash, то есть
         содержимое DAG'а после парсинга файла (serialized_dag.py:170). На стабильном стенде
         последний парсинг файла не должен был ничего переписать — если переписал, значит
-        парсинг даёт каждый раз новый результат: значение из БД или API на уровне модуля,
-        текущее время, плавающий порядок списка. Поэтому ошибка — не «изменения за час»
-        (час зависит от min_file_process_interval и ловит обычный деплой), а именно
-        совпадение записи сериализации с последним парсингом.
+        парсинг либо даёт каждый раз новый результат (значение из БД или API на уровне
+        модуля, текущее время, плавающий порядок списка), либо только что был деплой.
+
+        Различить эти два случая по одному замеру нельзя, поэтому таск не падает никогда:
+        он только считает статистику и возвращает список подозрительных DAG'ов, а вердикт
+        выносит recheck_serialized_dag, дождавшись следующего парсинга. Возврат — список
+        для expand, статистика уходит в XCom `serialized_stats` и в заметку.
         """
         import time
 
         from airflow.configuration import conf
-        from airflow.exceptions import AirflowFailException
         from airflow.utils.session import create_session
         from sqlalchemy import text
 
@@ -569,9 +578,11 @@ def tools_test_connections():  # noqa: PLR0915
         result = {"total": total, **{name: counts[name] for name, _ in SERIALIZED_PERIODS},
                   LAST_PARSE_ROW: at_parse}
 
+        add_xcom("serialized_stats", result, context)
+
         if not at_parse:
             add_note(stats, context, level="task,DAG", title=f"✅ {elapsed:.2f} sec check_serialized_dag")
-            return {"status": "ok", **result}
+            return []
 
         msg = (f"main.serialized_dag: {at_parse} из {total} DAG'ов пересериализовано "
                f"на последнем парсинге файла")
@@ -591,47 +602,13 @@ def tools_test_connections():  # noqa: PLR0915
         if at_parse > note_rows:
             table += (f"\n\nПоказаны первые {min(note_rows, len(data))} из {at_parse}, "
                       f"полный список — в XCom `serialized_dag`.")
-        add_note(f"{msg}\n\n{stats}\n\n{table}", context, level="task",
-                 title=f"❌ {elapsed:.2f} sec check_serialized_dag")
-        add_note(f"{msg}\n\n{stats}", context, level="DAG",
-                 title=f"❌ {elapsed:.2f} sec check_serialized_dag")
-        raise AirflowFailException(msg)
 
-    # --- Перепроверка дёргающихся DAG'ов ---
-    # Сколько DAG'ов из списка check_serialized_dag берём в перепроверку. Каждый ждёт
-    # своего следующего парсинга, то есть до min_file_process_interval, а параллельность
-    # ограничена max_active_tasks_per_dag (в проме 4) — отсюда и небольшой лимит
-    RECHECK_LIMIT = 5
-
-    @task(task_id="recheck_targets", trigger_rule=TriggerRule.ALL_DONE)
-    def recheck_targets(**context) -> list[dict]:
-        """Раздаёт mapped-таску список DAG'ов из XCom `serialized_dag`.
-
-        Отдельный таск, а не expand прямо от check_serialized_dag: тот падает, когда
-        список непустой, и раскрытие mapped-таска по XCom упавшего апстрима — лишний
-        риск. Здесь же trigger_rule=ALL_DONE и обычный список на выходе.
-        """
-        import json
-
-        try:
-            from plugins.utils import add_note  # type: ignore
-        except ImportError:
-            from CI06932748.tools.utils import add_note  # type: ignore
-
-        raw = context["ti"].xcom_pull(task_ids=f"{CHECK_DAGS_GROUP}.check_serialized_dag",
-                                      key="serialized_dag")
-        if not raw:
-            logger.info("check_serialized_dag не оставил списка — перепроверять нечего")
-            return []
-
-        # add_xcom кладёт коллекции json.dumps'ом, поэтому строка
-        data = json.loads(raw) if isinstance(raw, str) else raw
         targets = [{"dag_id": r["dag_id"], "dag_hash": r["dag_hash"]} for r in data[:RECHECK_LIMIT]]
-        tail = f" (из {len(data)})" if len(data) > RECHECK_LIMIT else ""
-        add_note(", ".join(f"`{t['dag_id']}`" for t in targets), context, level="task",
-                 title=f"🔁 На перепроверку: {len(targets)}{tail}")
-        logger.info("На перепроверку %d DAG'ов%s: %s", len(targets), tail,
-                    ", ".join(t["dag_id"] for t in targets))
+        tail = f" (из {at_parse})" if at_parse > RECHECK_LIMIT else ""
+        add_note(f"{msg}\n\n{stats}\n\n{table}", context, level="task",
+                 title=f"⚠️ {elapsed:.2f} sec check_serialized_dag: на перепроверку {len(targets)}{tail}")
+        logger.warning("%s; на перепроверку %d%s: %s", msg, len(targets), tail,
+                       ", ".join(t["dag_id"] for t in targets))
         return targets
 
     @task(task_id="recheck_serialized_dag", map_index_template="{{ target_dag_id }}")
@@ -644,22 +621,26 @@ def tools_test_connections():  # noqa: PLR0915
         показывает расхождения по путям. Одинаковый dag_hash после нового парсинга
         означает, что прошлое изменение было разовым (деплой), а не дрожанием.
 
-        Не падает: это диагностика поверх уже упавшего check_serialized_dag, и своим
-        падением она только зашумила бы summary. Вердикт — в заметке и в логе.
+        Здесь и выносится вердикт, поэтому таск падает — но только на `unstable`, то есть
+        когда второй парсинг снова переписал сериализацию. `no_parse` не падение: за окно
+        ожидания парсинга могло не случиться из-за очереди в dag-processor'е.
+
+        Итог всегда уходит в XCom `recheck` (до возможного падения — иначе при падении
+        return-значения бы не осталось), оттуда его собирает summary.
         """
         import time
 
         from airflow.configuration import conf
-        from airflow.exceptions import AirflowSkipException
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
         from airflow.models.dag import DagModel
         from airflow.models.serialized_dag import SerializedDagModel
         from airflow.operators.python import get_current_context
         from airflow.utils.session import create_session
 
         try:
-            from plugins.utils import add_note  # type: ignore
+            from plugins.utils import add_note, add_xcom  # type: ignore
         except ImportError:
-            from CI06932748.tools.utils import add_note  # type: ignore
+            from CI06932748.tools.utils import add_note, add_xcom  # type: ignore
 
         dag_id = target["dag_id"]
         # В UI вместо «Map Index 0,1,2…» показываем dag_id. map_index_template рендерится
@@ -706,7 +687,9 @@ def tools_test_connections():  # noqa: PLR0915
                    f"(last_parsed_time всё ещё {parsed0}) — файл не разбирается")
             add_note(msg, context, level="task", title=f"⏱️ {dag_id}")
             logger.warning(msg)
-            return {"dag_id": dag_id, "status": "no_parse", "waited": round(waited)}
+            result = {"dag_id": dag_id, "status": "no_parse", "waited": round(waited), "diffs": 0}
+            add_xcom("recheck", result, context)
+            return result
 
         waited = time.time() - ts
         if hash1 == hash0:
@@ -714,7 +697,9 @@ def tools_test_connections():  # noqa: PLR0915
                    f"сериализация не изменилась (dag_hash `{hash0}`) — разовое изменение")
             add_note(msg, context, level="task", title=f"✅ {dag_id}")
             logger.info(msg)
-            return {"dag_id": dag_id, "status": "stable", "waited": round(waited), "diffs": 0}
+            result = {"dag_id": dag_id, "status": "stable", "waited": round(waited), "diffs": 0}
+            add_xcom("recheck", result, context)
+            return result
 
         diffs = _json_diff(data0 or {}, data1 or {})
         head = (f"❌ {dag_id}: сериализация переписана снова через {waited:.0f}с "
@@ -731,12 +716,15 @@ def tools_test_connections():  # noqa: PLR0915
             table += f"\n\nПоказаны 5 из {len(diffs)}, остальные — в логе."
         add_note(f"{head}\n\n{table}", context, level="task", title=f"❌ {dag_id}")
         logger.error(head)
-        return {"dag_id": dag_id, "status": "unstable", "waited": round(waited),
-                "diffs": len(diffs), "paths": [p for p, _, _ in diffs]}
+        add_xcom("recheck", {"dag_id": dag_id, "status": "unstable", "waited": round(waited),
+                             "diffs": len(diffs), "paths": [p for p, _, _ in diffs]}, context)
+        raise AirflowFailException(head)
 
     # --- Summary ---
     @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
     def summary(**context):  # noqa: PLR0915
+        import json
+
         from airflow.exceptions import AirflowFailException
         from airflow.models import TaskInstance
         from airflow.utils.session import create_session
@@ -822,24 +810,41 @@ def tools_test_connections():  # noqa: PLR0915
         headline = f"{graph}\n\n{counts} | 🕒 Avg: {avg_time:.2f}s"
 
         table = "| Соединение | Статус | Причина |\n|---|---|---|\n" + "\n".join(all_rows)
+
+        # Итоги перепроверки DAG'ов. XCom берём, а не состояния тасков: у упавшего
+        # recheck состояние скажет только «failed», а здесь есть вердикт и число
+        # расхождений. Для mapped-таска xcom_pull отдаёт итератор по map-индексам
+        # (taskinstance.py:3711-3715), поэтому list()
+        icon_by_status = {"stable": "✅", "unstable": "❌", "no_parse": "⏱️"}
+        rechecks = context["ti"].xcom_pull(
+            task_ids=f"{CHECK_DAGS_GROUP}.recheck_serialized_dag", key="recheck")
+        rechecks = [json.loads(r) if isinstance(r, str) else r for r in (list(rechecks or []))]
+        if rechecks:
+            table += "\n\n| DAG | Перепроверка | Ждали | Расхождений |\n|---|---|---:|---:|\n"
+            table += "\n".join(
+                f"| `{r['dag_id']}` | {icon_by_status.get(r['status'], '❔')} {r['status']} "
+                f"| {r.get('waited', 0)}s | {r.get('diffs', 0)} |"
+                for r in rechecks
+            )
+            logger.info("recheck: %s", ", ".join(f"{r['dag_id']}={r['status']}" for r in rechecks))
+
         add_note(table, context, level="DAG", title=headline)
         logger.info("summary: %s", headline)
 
         if fail > 0:
             raise AirflowFailException(f"Connections check failed: {headline}")
 
-        return {"ok": ok, "fail": fail, "skip": skip, "none": none_count, "avg_time": avg_time}
+        return {"ok": ok, "fail": fail, "skip": skip, "none": none_count, "avg_time": avg_time,
+                "recheck": rechecks}
 
     summary_task = summary()
 
     # Таски объявлены выше, а в группу попадают в момент вызова — оператор создаётся
-    # именно здесь, TaskGroupContext читается тогда же. check_serialized_dag падает
-    # при находках, поэтому цепочка держится на ALL_DONE у recheck_targets;
+    # именно здесь, TaskGroupContext читается тогда же. check_serialized_dag не падает
+    # и возвращает список подозрительных DAG'ов, поэтому expand цепляется прямо к нему;
     # пустой список схлопывает mapped-таск в skipped
     with TaskGroup(group_id=CHECK_DAGS_GROUP, tooltip="Проверки метабазы DAG'ов") as tg_dags:
-        targets = recheck_targets()
-        check_serialized_dag() >> targets
-        recheck_serialized_dag.expand(target=targets)
+        recheck_serialized_dag.expand(target=check_serialized_dag())
 
     tg_dags >> summary_task
 

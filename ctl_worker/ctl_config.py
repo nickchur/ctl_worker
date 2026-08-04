@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай*
+*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 

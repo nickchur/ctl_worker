@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай*
+*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Config-driven регрессионный стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`.
 Предназначен для прогона на **каждом релизе/хотфиксе** и при обновлении версии

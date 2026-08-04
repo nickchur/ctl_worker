@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай*
+*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.

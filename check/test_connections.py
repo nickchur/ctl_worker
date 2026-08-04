@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 11:05 MSK · v1.2 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend. 
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -20,6 +20,8 @@
 - **Оптимизация**: Использует Airflow Variable `local_connections` (создаваемую в `show_connections`) для ускорения получения списка соединений.
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
 - **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
+- **Группа `check_dags`**: проверки, которые смотрят не на соединения, а на сами DAG'и —
+  `check_serialized_dag`, `recheck_targets` и mapped-таск `recheck_serialized_dag`.
 - **`check_serialized_dag`**: отдельная проверка метабазы. Строит таблицу — сколько всего DAG'ов
   и у скольких менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка
   «на последнем парсинге» (`serialized_dag.last_updated` попадает в окно последнего
@@ -30,6 +32,7 @@
   сравнивает сериализацию до и после, показывая расхождения по путям вида
   `.dag.params[0][1].schema.examples[0]`. Совпавший `dag_hash` — значит прошлое изменение было
   разовым (деплой), разошедшийся — вот конкретное поле, которое дрожит. Сам не падает.
+  В списке mapped-тасков вместо `Map Index` `0,1,2…` показывается `dag_id`.
 """
 
 import re
@@ -462,7 +465,11 @@ def tools_test_connections():  # noqa: PLR0915
                 check_task()
         groups.append(tg)
 
-    # --- Serialized DAG check ---
+    # --- Проверки метабазы DAG'ов (группа check_dags) ---
+    # Группа собирает всё, что смотрит не на соединения, а на сами DAG'и. Имя нужно и
+    # в коде: внутри группы task_id получает префикс, и xcom_pull ищет по полному имени
+    CHECK_DAGS_GROUP = "check_dags"
+
     # Периоды от большего к меньшему, накопительно: каждый следующий — подмножество
     # предыдущего. Так по таблице сразу видно, стенд «устаканился» или переразбирается
     # прямо сейчас: у здорового стенда числа падают до нуля уже на неделе
@@ -611,7 +618,8 @@ def tools_test_connections():  # noqa: PLR0915
         except ImportError:
             from CI06932748.tools.utils import add_note  # type: ignore
 
-        raw = context["ti"].xcom_pull(task_ids="check_serialized_dag", key="serialized_dag")
+        raw = context["ti"].xcom_pull(task_ids=f"{CHECK_DAGS_GROUP}.check_serialized_dag",
+                                      key="serialized_dag")
         if not raw:
             logger.info("check_serialized_dag не оставил списка — перепроверять нечего")
             return []
@@ -626,7 +634,7 @@ def tools_test_connections():  # noqa: PLR0915
                     ", ".join(t["dag_id"] for t in targets))
         return targets
 
-    @task(task_id="recheck_serialized_dag")
+    @task(task_id="recheck_serialized_dag", map_index_template="{{ target_dag_id }}")
     def recheck_serialized_dag(target: dict, **context) -> dict:
         """Ждёт следующего парсинга DAG'а и сравнивает сериализацию до и после.
 
@@ -645,6 +653,7 @@ def tools_test_connections():  # noqa: PLR0915
         from airflow.exceptions import AirflowSkipException
         from airflow.models.dag import DagModel
         from airflow.models.serialized_dag import SerializedDagModel
+        from airflow.operators.python import get_current_context
         from airflow.utils.session import create_session
 
         try:
@@ -653,6 +662,12 @@ def tools_test_connections():  # noqa: PLR0915
             from CI06932748.tools.utils import add_note  # type: ignore
 
         dag_id = target["dag_id"]
+        # В UI вместо «Map Index 0,1,2…» показываем dag_id. map_index_template рендерится
+        # по контексту уже ПОСЛЕ execute (taskinstance.py:3174-3192), поэтому ключ кладём
+        # в объект из get_current_context(): наш **context — отдельная копия kwargs,
+        # её правка до шаблона не доедет. При скипе имя тоже проставится — рендер идёт
+        # и в except-ветке
+        get_current_context()["target_dag_id"] = dag_id
         poke = 30
         # Худший случай — начали ждать сразу после парсинга: полный интервал плюс сам
         # разбор файла. Ждать дольше смысла нет: если за это время парсинга не случилось,
@@ -817,11 +832,16 @@ def tools_test_connections():  # noqa: PLR0915
 
     summary_task = summary()
 
-    # check_serialized_dag падает при находках, поэтому цепочка держится на ALL_DONE
-    # у recheck_targets; пустой список схлопывает mapped-таск в skipped
-    targets = recheck_targets()
-    check_serialized_dag() >> targets
-    recheck_serialized_dag.expand(target=targets) >> summary_task
+    # Таски объявлены выше, а в группу попадают в момент вызова — оператор создаётся
+    # именно здесь, TaskGroupContext читается тогда же. check_serialized_dag падает
+    # при находках, поэтому цепочка держится на ALL_DONE у recheck_targets;
+    # пустой список схлопывает mapped-таск в skipped
+    with TaskGroup(group_id=CHECK_DAGS_GROUP, tooltip="Проверки метабазы DAG'ов") as tg_dags:
+        targets = recheck_targets()
+        check_serialized_dag() >> targets
+        recheck_serialized_dag.expand(target=targets)
+
+    tg_dags >> summary_task
 
     if groups:
         groups >> summary_task

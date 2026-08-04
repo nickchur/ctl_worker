@@ -1,4 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
+*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend. 
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -24,6 +25,11 @@
   «на последнем парсинге» (`serialized_dag.last_updated` попадает в окно последнего
   парсинга файла — `dag.last_parsed_time`). Падает именно на этой строке: значит парсинг даёт
   каждый раз новый результат и DAG'и пересериализуются на ходу.
+- **`recheck_serialized_dag`**: mapped-таск поверх находок `check_serialized_dag`. На каждый
+  DAG из XCom `serialized_dag` ждёт следующего парсинга (сдвига `dag.last_parsed_time`) и
+  сравнивает сериализацию до и после, показывая расхождения по путям вида
+  `.dag.params[0][1].schema.examples[0]`. Совпавший `dag_hash` — значит прошлое изменение было
+  разовым (деплой), разошедшийся — вот конкретное поле, которое дрожит. Сам не падает.
 """
 
 import re
@@ -141,6 +147,53 @@ def _safe_id(conn_id: str, seen: set[str]) -> str:
         i += 1
     seen.add(safe)
     return safe
+
+
+def _short(value, limit: int = 60) -> str:
+    """Однострочное представление значения для ячейки таблицы diff'а."""
+    text = str(value).replace("|", "\\|").replace("\n", " ")
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _json_diff(before, after, limit: int = 20) -> list[tuple[str, str, str]]:
+    """Рекурсивно сравнивает две сериализации DAG'а: [(путь, было, стало), ...].
+
+    Списки сравниваются поэлементно, а не как множества: для dag_hash порядок значим,
+    и плавающий порядок списка — самая частая причина дрожания сериализации. Поэтому
+    разная длина списка и расхождение по индексу — разные строки отчёта.
+    """
+    out: list[tuple[str, str, str]] = []
+
+    def walk(x, y, path: str) -> None:
+        if len(out) >= limit:
+            return
+        if type(x) is not type(y):
+            # тип показываем явно: '1' и 1 в таблице выглядели бы одинаково
+            out.append((path or ".", f"{_short(x)} ({type(x).__name__})",
+                        f"{_short(y)} ({type(y).__name__})"))
+        elif isinstance(x, dict):
+            for key in dict.fromkeys(list(x) + list(y)):
+                if len(out) >= limit:
+                    return
+                sub = f"{path}.{key}"
+                if key not in x:
+                    out.append((sub, "—", _short(y[key])))
+                elif key not in y:
+                    out.append((sub, _short(x[key]), "—"))
+                else:
+                    walk(x[key], y[key], sub)
+        elif isinstance(x, list):
+            if len(x) != len(y):
+                out.append((f"{path}[]", f"{len(x)} элем.", f"{len(y)} элем."))
+            for i in range(min(len(x), len(y))):
+                if len(out) >= limit:
+                    return
+                walk(x[i], y[i], f"{path}[{i}]")
+        elif x != y:
+            out.append((path or ".", _short(x), _short(y)))
+
+    walk(before, after, "")
+    return out[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +590,135 @@ def tools_test_connections():  # noqa: PLR0915
                  title=f"❌ {elapsed:.2f} sec check_serialized_dag")
         raise AirflowFailException(msg)
 
+    # --- Перепроверка дёргающихся DAG'ов ---
+    # Сколько DAG'ов из списка check_serialized_dag берём в перепроверку. Каждый ждёт
+    # своего следующего парсинга, то есть до min_file_process_interval, а параллельность
+    # ограничена max_active_tasks_per_dag (в проме 4) — отсюда и небольшой лимит
+    RECHECK_LIMIT = 5
+
+    @task(task_id="recheck_targets", trigger_rule=TriggerRule.ALL_DONE)
+    def recheck_targets(**context) -> list[dict]:
+        """Раздаёт mapped-таску список DAG'ов из XCom `serialized_dag`.
+
+        Отдельный таск, а не expand прямо от check_serialized_dag: тот падает, когда
+        список непустой, и раскрытие mapped-таска по XCom упавшего апстрима — лишний
+        риск. Здесь же trigger_rule=ALL_DONE и обычный список на выходе.
+        """
+        import json
+
+        try:
+            from plugins.utils import add_note  # type: ignore
+        except ImportError:
+            from CI06932748.tools.utils import add_note  # type: ignore
+
+        raw = context["ti"].xcom_pull(task_ids="check_serialized_dag", key="serialized_dag")
+        if not raw:
+            logger.info("check_serialized_dag не оставил списка — перепроверять нечего")
+            return []
+
+        # add_xcom кладёт коллекции json.dumps'ом, поэтому строка
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        targets = [{"dag_id": r["dag_id"], "dag_hash": r["dag_hash"]} for r in data[:RECHECK_LIMIT]]
+        tail = f" (из {len(data)})" if len(data) > RECHECK_LIMIT else ""
+        add_note(", ".join(f"`{t['dag_id']}`" for t in targets), context, level="task",
+                 title=f"🔁 На перепроверку: {len(targets)}{tail}")
+        logger.info("На перепроверку %d DAG'ов%s: %s", len(targets), tail,
+                    ", ".join(t["dag_id"] for t in targets))
+        return targets
+
+    @task(task_id="recheck_serialized_dag")
+    def recheck_serialized_dag(target: dict, **context) -> dict:
+        """Ждёт следующего парсинга DAG'а и сравнивает сериализацию до и после.
+
+        check_serialized_dag говорит только «сериализация переписана на последнем
+        парсинге». Этот таск отвечает на следующий вопрос — что именно в ней меняется:
+        снимает JSON, дожидается сдвига `dag.last_parsed_time`, снимает второй и
+        показывает расхождения по путям. Одинаковый dag_hash после нового парсинга
+        означает, что прошлое изменение было разовым (деплой), а не дрожанием.
+
+        Не падает: это диагностика поверх уже упавшего check_serialized_dag, и своим
+        падением она только зашумила бы summary. Вердикт — в заметке и в логе.
+        """
+        import time
+
+        from airflow.configuration import conf
+        from airflow.exceptions import AirflowSkipException
+        from airflow.models.dag import DagModel
+        from airflow.models.serialized_dag import SerializedDagModel
+        from airflow.utils.session import create_session
+
+        try:
+            from plugins.utils import add_note  # type: ignore
+        except ImportError:
+            from CI06932748.tools.utils import add_note  # type: ignore
+
+        dag_id = target["dag_id"]
+        poke = 30
+        # Худший случай — начали ждать сразу после парсинга: полный интервал плюс сам
+        # разбор файла. Ждать дольше смысла нет: если за это время парсинга не случилось,
+        # проблема не в дрожании, а в том, что файл вообще перестали разбирать
+        timeout = (conf.getint("scheduler", "min_file_process_interval", fallback=30)
+                   + conf.getint("core", "dag_file_processor_timeout", fallback=600))
+
+        def snapshot() -> tuple:
+            """(dag_hash, data, last_parsed_time); data берём через ORM — она распакует zlib."""
+            with create_session() as session:
+                sdm = session.query(SerializedDagModel).filter(SerializedDagModel.dag_id == dag_id).one_or_none()
+                parsed = session.query(DagModel.last_parsed_time).filter(DagModel.dag_id == dag_id).scalar()
+                return (sdm.dag_hash, sdm.data, parsed) if sdm else (None, None, parsed)
+
+        hash0, data0, parsed0 = snapshot()
+        if hash0 is None or parsed0 is None:
+            msg = f"☮️ {dag_id}: нет в serialized_dag или в dag — сравнивать не с чем"
+            add_note(msg, context, level="task", title=f"☮️ {dag_id}")
+            logger.warning(msg)
+            raise AirflowSkipException(msg)
+
+        ts = time.time()
+        deadline = ts + timeout
+        logger.info("⏳ %s: ждём следующего парсинга, last_parsed_time=%s, таймаут %dс",
+                    dag_id, parsed0, timeout)
+
+        hash1, data1, parsed1 = hash0, data0, parsed0
+        while time.time() < deadline:
+            time.sleep(poke)
+            hash1, data1, parsed1 = snapshot()
+            if parsed1 and parsed1 > parsed0:
+                break
+        else:
+            waited = time.time() - ts
+            msg = (f"⏱️ {dag_id}: за {waited:.0f}с парсинга не было "
+                   f"(last_parsed_time всё ещё {parsed0}) — файл не разбирается")
+            add_note(msg, context, level="task", title=f"⏱️ {dag_id}")
+            logger.warning(msg)
+            return {"dag_id": dag_id, "status": "no_parse", "waited": round(waited)}
+
+        waited = time.time() - ts
+        if hash1 == hash0:
+            msg = (f"✅ {dag_id}: парсинг прошёл через {waited:.0f}с, "
+                   f"сериализация не изменилась (dag_hash `{hash0}`) — разовое изменение")
+            add_note(msg, context, level="task", title=f"✅ {dag_id}")
+            logger.info(msg)
+            return {"dag_id": dag_id, "status": "stable", "waited": round(waited), "diffs": 0}
+
+        diffs = _json_diff(data0 or {}, data1 or {})
+        head = (f"❌ {dag_id}: сериализация переписана снова через {waited:.0f}с "
+                f"(`{hash0}` → `{hash1}`) — разбор файла недетерминирован")
+        for path, was, became in diffs:
+            logger.warning("  %s: %s → %s", path, was, became)
+        if diffs:
+            table = ("| Путь | Было | Стало |\n|---|---|---|\n"
+                     + "\n".join(f"| `{p}` | {a} | {b} |" for p, a, b in diffs[:5]))
+        else:
+            # data пустая при compress_serialized_dags, либо расхождение вне JSON
+            table = "Расхождений в JSON не нашлось, хотя dag_hash разный"
+        if len(diffs) > 5:
+            table += f"\n\nПоказаны 5 из {len(diffs)}, остальные — в логе."
+        add_note(f"{head}\n\n{table}", context, level="task", title=f"❌ {dag_id}")
+        logger.error(head)
+        return {"dag_id": dag_id, "status": "unstable", "waited": round(waited),
+                "diffs": len(diffs), "paths": [p for p, _, _ in diffs]}
+
     # --- Summary ---
     @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
     def summary(**context):  # noqa: PLR0915
@@ -634,7 +816,12 @@ def tools_test_connections():  # noqa: PLR0915
         return {"ok": ok, "fail": fail, "skip": skip, "none": none_count, "avg_time": avg_time}
 
     summary_task = summary()
-    check_serialized_dag() >> summary_task
+
+    # check_serialized_dag падает при находках, поэтому цепочка держится на ALL_DONE
+    # у recheck_targets; пустой список схлопывает mapped-таск в skipped
+    targets = recheck_targets()
+    check_serialized_dag() >> targets
+    recheck_serialized_dag.expand(target=targets) >> summary_task
 
     if groups:
         groups >> summary_task

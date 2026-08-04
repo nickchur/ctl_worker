@@ -522,9 +522,11 @@ def tools_test_connections():  # noqa: PLR0915
         ]
         add_xcom("serialized_dag", data, context)
 
-        table = "| last_updated | last_parsed_time | dag_id | dag_hash |\n|---|---|---|---|\n" + "\n".join(
-            f"| {r['last_updated']} | {r['last_parsed_time']} | `{r['dag_id']}` | `{r['dag_hash']}` |"
-            for r in data[:note_rows]
+        # last_parsed_time и dag_hash в заметке не нужны: первый по условию отбора и так
+        # совпадает с last_updated с точностью до парсинга, второй ни с чем не сравнить.
+        # Оба остаются в XCom `serialized_dag` — там их можно смотреть построчно
+        table = "| last_updated | dag_id |\n|---|---|\n" + "\n".join(
+            f"| {r['last_updated']} | `{r['dag_id']}` |" for r in data[:note_rows]
         )
         if at_parse > note_rows:
             table += (f"\n\nПоказаны первые {min(note_rows, len(data))} из {at_parse}, "

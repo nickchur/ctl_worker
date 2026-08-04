@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 17:40 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -35,6 +35,7 @@ import time
 import json
 import pendulum
 import random
+import re
 
 from datetime import timedelta, datetime, timezone
 from functools import reduce
@@ -50,6 +51,19 @@ from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_
 
 from logging import  getLogger
 logger = getLogger('airflow.task')
+
+# repr по умолчанию печатает адрес объекта — <...DatasetOrTimeSchedule object at 0x7f40…>,
+# и он в каждом процессе разбора свой. Через doc_md адрес попадает в сериализацию, dag_hash
+# меняется на каждом парсинге, и serialized_dag переписывается вхолостую раз в
+# min_file_process_interval. default=str не помогает: str() у такого объекта — тот же repr.
+# (?=>) обязателен: адрес должен закрывать repr, иначе вычистили бы и текст в данных,
+# где встретилось " at 0x…"
+_ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+(?=>)")
+
+
+def pformat(obj) -> str:
+    """PrettyPrinter без адресов объектов: тип виден, id() отброшен."""
+    return _ADDR_RE.sub("", PrettyPrinter(indent=4, width=200, compact=True).pformat(obj))
 
 # Справочники
 profile = get_config()['profile']
@@ -377,9 +391,9 @@ def build_worker_dag(w):
     doc_md = (
         f"###🔗 [CTL/{profile}/{wf_name}]({ctl_url})  TimeOut: {exe_timeout}\n\n"
         # f"```json\n{json.dumps(w, indent=4)}\n```"
-        f"```\n{PrettyPrinter(indent=4, width=200, compact=True).pformat(w)}\n```\n"
-        f"```\n{PrettyPrinter(indent=4, width=200, compact=True).pformat(conf)}\n```\n"
-        f"```\n{PrettyPrinter(indent=4, width=200, compact=True).pformat(w_eids)}\n```\n"
+        f"```\n{pformat(w)}\n```\n"
+        f"```\n{pformat(conf)}\n```\n"
+        f"```\n{pformat(w_eids)}\n```\n"
     )
     
     with DAG(f'CTL.{wf_name}', 

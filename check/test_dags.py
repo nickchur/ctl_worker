@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-08-04 17:00 MSK · v2.10 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 17:20 MSK · v2.11 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -94,6 +94,11 @@ SNAP_BUCKET = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].spli
 SNAP_PREFIX = "dag_snapshots/"
 SNAP_EXT = ".json.gz"
 
+# Сколько расхождений показывать в заметке. Ячейка — 110 символов (_diff_pair), строка
+# таблицы с двумя ячейками и путём выходит под 270, а заметка режется по MAX_NOTE_LEN
+# (1000): три строки влезают даже в худшем случае. Остальное — в логе, там лимита нет
+NOTE_DIFFS = 3
+
 
 def _short(value, limit: int = 60) -> str:
     """Однострочное представление значения для ячейки таблицы diff'а."""
@@ -101,7 +106,7 @@ def _short(value, limit: int = 60) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def _diff_pair(before, after, limit: int = 60) -> tuple[str, str]:
+def _diff_pair(before, after, limit: int = 110) -> tuple[str, str]:
     """Пара ячеек для таблицы: у длинных строк показывает место расхождения, а не начало.
 
     Обрезка с начала бесполезна там, где строки различаются в середине или в конце:
@@ -114,7 +119,7 @@ def _diff_pair(before, after, limit: int = 60) -> tuple[str, str]:
     if len(before) <= limit and len(after) <= limit:
         return _short(before, limit), _short(after, limit)
 
-    ctx = 12
+    ctx = 24
     n = min(len(before), len(after))
     head = 0
     while head < n and before[head] == after[head]:
@@ -133,7 +138,7 @@ def _diff_pair(before, after, limit: int = 60) -> tuple[str, str]:
     return _short(cut(before), limit), _short(cut(after), limit)
 
 
-def _json_diff(before, after, limit: int = 20) -> list[tuple[str, str, str]]:
+def _json_diff(before, after, limit: int = 20, cell: int = 110) -> list[tuple[str, str, str]]:
     """Рекурсивно сравнивает две сериализации DAG'а: [(путь, было, стало), ...].
 
     Списки сравниваются поэлементно, а не как множества: для dag_hash порядок значим,
@@ -150,17 +155,17 @@ def _json_diff(before, after, limit: int = 20) -> list[tuple[str, str, str]]:
             return
         if type(x) is not type(y):
             # тип показываем явно: '1' и 1 в таблице выглядели бы одинаково
-            out.append((path or ".", f"{_short(x)} ({type(x).__name__})",
-                        f"{_short(y)} ({type(y).__name__})"))
+            out.append((path or ".", f"{_short(x, cell)} ({type(x).__name__})",
+                        f"{_short(y, cell)} ({type(y).__name__})"))
         elif isinstance(x, dict):
             for key in dict.fromkeys(list(x) + list(y)):
                 if len(out) >= limit:
                     return
                 sub = f"{path}.{key}"
                 if key not in x:
-                    out.append((sub, "—", _short(y[key])))
+                    out.append((sub, "—", _short(y[key], cell)))
                 elif key not in y:
-                    out.append((sub, _short(x[key]), "—"))
+                    out.append((sub, _short(x[key], cell), "—"))
                 else:
                     walk(x[key], y[key], sub)
         elif isinstance(x, list):
@@ -171,7 +176,7 @@ def _json_diff(before, after, limit: int = 20) -> list[tuple[str, str, str]]:
                     return
                 walk(x[i], y[i], f"{path}[{i}]")
         elif x != y:
-            out.append((path or ".", *_diff_pair(x, y)))
+            out.append((path or ".", *_diff_pair(x, y, cell)))
 
     walk(before, after, "")
     return out[:limit]
@@ -538,12 +543,12 @@ def tools_test_dags():
             logger.warning("  %s: %s → %s", path, was, became)
         if diffs:
             table = ("| Путь | Было | Стало |\n|---|---|---|\n"
-                     + "\n".join(f"| `{p}` | {a} | {b} |" for p, a, b in diffs[:5]))
+                     + "\n".join(f"| `{p}` | {a} | {b} |" for p, a, b in diffs[:NOTE_DIFFS]))
         else:
             # data пустая при compress_serialized_dags, либо расхождение вне JSON
             table = "Расхождений в JSON не нашлось, хотя dag_hash разный"
-        if len(diffs) > 5:
-            table += f"\n\nПоказаны 5 из {len(diffs)}, остальные — в логе."
+        if len(diffs) > NOTE_DIFFS:
+            table += f"\n\nПоказаны {NOTE_DIFFS} из {len(diffs)}, остальные — в логе."
         add_note(f"{head}\n\n{table}", context, level="task", title=f"❌ {dag_id}")
         logger.error(head)
         add_xcom("recheck", {"dag_id": dag_id, "status": status, "waited": round(waited),
@@ -838,9 +843,9 @@ def tools_test_dags():
             logger.info("  %s: %s → %s", path, was, became)
         if diffs:
             table = ("| Путь | Было | Стало |\n|---|---|---|\n"
-                     + "\n".join(f"| `{p}` | {a} | {b} |" for p, a, b in diffs[:5]))
-            if len(diffs) > 5:
-                table += f"\n\nПоказаны 5 из {len(diffs)}, остальные — в логе."
+                     + "\n".join(f"| `{p}` | {a} | {b} |" for p, a, b in diffs[:NOTE_DIFFS]))
+            if len(diffs) > NOTE_DIFFS:
+                table += f"\n\nПоказаны {NOTE_DIFFS} из {len(diffs)}, остальные — в логе."
         else:
             table = "Расхождений в JSON нет"
 

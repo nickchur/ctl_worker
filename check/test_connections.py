@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-08-04 11:30 MSK · v1.3 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 11:58 MSK · v1.6 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend. 
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -424,6 +424,10 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     },
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule="@once",
+    # Дефолт из airflow.cfg — max_active_tasks_per_dag = 4, а recheck при RECHECK_LIMIT=25
+    # растянулся бы на семь волн ожидания (до пары часов). Таски почти всё время спят
+    # в ожидании парсинга, так что нагрузки это не добавляет — только занятые слоты
+    max_active_tasks=12,
     tags=["DataLab", "tools", "conn", "AutoQA"],
     catchup=False,
     is_paused_upon_creation=False,
@@ -490,8 +494,8 @@ def tools_test_connections():  # noqa: PLR0915
 
     # Сколько DAG'ов отдаём на перепроверку. Каждый ждёт своего следующего парсинга, то есть
     # до min_file_process_interval, а параллельность ограничена max_active_tasks_per_dag
-    # (в проме 4) — отсюда и небольшой лимит
-    RECHECK_LIMIT = 5
+    # (в проме 4): при 25 целях прогон растянется на ~7 волн ожидания
+    RECHECK_LIMIT = 25
 
     @task(
         task_id="check_serialized_dag",
@@ -735,7 +739,11 @@ def tools_test_connections():  # noqa: PLR0915
             from CI06932748.tools.utils import add_note  # type: ignore
 
         dag_run = context["dag_run"]
-        notes_map: dict[str, str] = {}
+        # Ключ — (task_id, map_index), а не один task_id: у mapped-таска экземпляров
+        # много, task_id у них общий, и словарь по одному task_id оставлял заметку
+        # случайного индекса — в строке падения показывалась причина от соседнего,
+        # успешного экземпляра
+        notes_map: dict[tuple[str, int], str] = {}
 
         with create_session() as session:
             tis = (
@@ -744,7 +752,7 @@ def tools_test_connections():  # noqa: PLR0915
                     TaskInstance.dag_id == dag_run.dag_id,
                     TaskInstance.run_id == dag_run.run_id,
                 )
-                .order_by(TaskInstance.task_id)
+                .order_by(TaskInstance.task_id, TaskInstance.map_index)
                 .all()
             )
             try:
@@ -757,7 +765,7 @@ def tools_test_connections():  # noqa: PLR0915
                     )
                     .all()
                 )
-                notes_map = {n.task_id: (n.content or "") for n in note_rows}
+                notes_map = {(n.task_id, n.map_index): (n.content or "") for n in note_rows}
             except Exception as e:
                 logger.warning("Could not load task notes: %s", e)
 
@@ -771,7 +779,7 @@ def tools_test_connections():  # noqa: PLR0915
                 continue
 
             state = ti.state
-            raw_note = notes_map.get(ti.task_id, "")
+            raw_note = notes_map.get((ti.task_id, ti.map_index), "")
             non_empty_lines = [ln.strip() for ln in raw_note.splitlines() if ln.strip()] if raw_note else []
             first_line = non_empty_lines[2] if len(non_empty_lines) > 2 else ""
             reason = first_line[:120].replace("|", "\\|") or "—"
@@ -798,9 +806,14 @@ def tools_test_connections():  # noqa: PLR0915
             if ti.duration:
                 durations.append(ti.duration)
 
-            # Выводим только ошибки и скипы
+            # Выводим только ошибки и скипы. У mapped-таска к имени добавляем индекс —
+            # иначе несколько строк выглядят одинаково; rendered_map_index у recheck
+            # содержит dag_id, у остальных его нет, поэтому фолбэк на номер
+            name = ti.task_id
+            if ti.map_index >= 0:
+                name += f"[{ti.rendered_map_index or ti.map_index}]"
             if state != "success":
-                all_rows.append(f"| `{ti.task_id}` | {icon} {state or 'not_started'} | {reason} |")
+                all_rows.append(f"| `{name}` | {icon} {state or 'not_started'} | {reason} |")
 
         avg_time = sum(durations) / len(durations) if durations else 0
         graph = "".join(icons)

@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-08-04 15:25 MSK · v2.7 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 16:10 MSK · v2.9 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -15,9 +15,10 @@
 | **`check_serialized.check_serialized_dag`** | Считает по `main.serialized_dag`, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка «на последнем парсинге» (`last_updated` попал в окно последнего разбора файла — `dag.last_parsed_time`). **Никогда не падает**: одного замера мало, чтобы отличить дрожание от деплоя. Возвращает список подозрительных DAG'ов, статистика — в XCom `serialized_stats` |
 | **`check_serialized.recheck_serialized_dag`** | Mapped-таск, по экземпляру на DAG из списка. Ждёт следующего парсинга (сдвига `dag.last_parsed_time`) и сравнивает сериализацию до и после, показывая расхождения по путям вида `.dag.params[0][1].schema.examples[0]` |
 | **`compare.find_changed`** | Находит DAG'и, у которых `dag_hash` разошёлся с последней сохранённой версией, то есть изменившиеся с прошлого прогона. Ничего не скачивает: хэш виден в имени объекта |
-| **`compare.snapshot_dags`** | Пишет новые версии в S3 и раздаёт пары «прошлая версия → новая» (XCom `pairs`) |
+| **`compare.snapshot_dags`** | Пишет новые версии в S3 и возвращает пары «прошлая версия → новая» для `expand`; статистика — в XCom `snapshot_stats` |
 | **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
-| **`summary`** | Сводка обеих веток: вердикты, время ожидания, расхождения, покрытие копиями |
+| **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** |
+| **`summary`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга |
 
 **Параметры:**
 
@@ -600,11 +601,13 @@ def tools_test_dags():
         doc_md=("Складывает копии сериализаций в S3. `snapshot_limit=0` — все DAG'и, иначе "
                 "ротация: изменившиеся → без копии → с самой старой копией"),
     )
-    def snapshot_dags(changed: list, **context) -> dict:
-        """Пишет новые версии и раздаёт mapped-таску пары «прошлая версия → новая».
+    def snapshot_dags(changed: list, **context) -> list[dict]:
+        """Пишет новые версии и возвращает пары «прошлая версия → новая» для expand.
 
-        Пары уходят отдельным XCom `pairs`, а не return-значением: return занят
-        статистикой для summary, а expand умеет цепляться к произвольному ключу.
+        Пары идут именно return-значением: expand умеет раскрываться только по
+        `return_value` и на кастомном XCom-ключе падает ещё при разборе файла
+        (`mappedoperator.py:132`, «cannot map over XCom with custom key»). Поэтому
+        статистика для summary уезжает в ключ `snapshot_stats`, а не наоборот.
         """
         import gzip
         import json
@@ -614,9 +617,9 @@ def tools_test_dags():
         from airflow.utils.session import create_session
 
         try:
-            from plugins.utils import add_note, readable_size  # type: ignore
+            from plugins.utils import add_note, add_xcom, readable_size  # type: ignore
         except ImportError:
-            from CI06932748.tools.utils import add_note, readable_size  # type: ignore
+            from CI06932748.tools.utils import add_note, add_xcom, readable_size  # type: ignore
 
         limit = int(context["params"]["snapshot_limit"])
         cleanup = bool(context["params"]["cleanup_deleted"])
@@ -718,12 +721,12 @@ def tools_test_dags():
         logger.info("📦 новых версий %d (%s), без изменений %d, покрытие %d/%d, на сравнение %d",
                     written, readable_size(total_bytes), unchanged, covered, len(all_dags), len(pairs))
 
-        # Пары кладём напрямую, а не через add_xcom: тот сериализует коллекции в строку,
-        # а expand ждёт список. Список короткий — только dag_id, ключи и номера версий
-        context["ti"].xcom_push(key="pairs", value=pairs)
-        return {"written": written, "first": first, "unchanged": unchanged, "bytes": total_bytes,
-                "covered": covered, "total": len(all_dags), "versions": versions,
-                "pairs": len(pairs), "deleted": len(deleted), "cleaned": bool(deleted and cleanup)}
+        add_xcom("snapshot_stats",
+                 {"written": written, "first": first, "unchanged": unchanged,
+                  "bytes": total_bytes, "covered": covered, "total": len(all_dags),
+                  "versions": versions, "pairs": len(pairs), "deleted": len(deleted),
+                  "cleaned": bool(deleted and cleanup)}, context)
+        return pairs
 
     @task(task_id="compare_changed", map_index_template="{{ target_dag_id }}")
     def compare_changed(target: dict, **context) -> dict:
@@ -812,6 +815,118 @@ def tools_test_dags():
         add_xcom("compare", result, context)
         return result
 
+    # --- Время парсинга (вне групп: это про файлы, а не про сериализацию) ---
+    @task(
+        task_id="parse_time",
+        doc_md=("Разбирает все файлы DAG'ов и ищет выбросы по времени: медленнее "
+                "`среднее + 3σ`. Не падает — только отчёт"),
+    )
+    def parse_time(**context) -> dict:
+        """Ищет файлы, которые парсятся аномально долго.
+
+        Длительности разбора в метабазе нет: `dag.last_parsed_time` — это момент, а не
+        сколько заняло. Поэтому меряем сами, тем же способом, что и `airflow dags report`:
+        `DagBag` при обходе папки складывает в `dagbag_stats` по `FileLoadStat` на файл
+        (`models/dagbag.py:600-618`).
+
+        Порог — среднее плюс три сигмы по всем файлам. Три сигмы имеют смысл только на
+        достаточной выборке, поэтому при `MIN_FILES` файлах и меньше отчёт ограничивается
+        самыми медленными без вердикта «выброс».
+
+        Свойство метода, о котором стоит помнить: несколько тормозов сразу раздувают σ и
+        могут замаскировать друг друга — два файла по 30с среди десяти по полсекунды
+        поднимают порог до 40с и в выбросы не попадают. Поэтому таблица самых медленных
+        печатается всегда, а не только когда выброс нашёлся.
+
+        Разбор идёт в воркере и импортирует все файлы разом, то есть выполняет их код
+        верхнего уровня. У DAG'ов ctl там обращения к метабазе и секрет-бэкенду — на
+        чтение, но время прогона от этого зависит и растёт вместе с числом файлов.
+
+        Таск вне групп: он про то, как разбираются файлы, а не про то, что получается
+        в serialized_dag.
+        """
+        import statistics
+        import time
+
+        from airflow.configuration import conf as af_conf
+        from airflow.models.dagbag import DagBag
+
+        try:
+            from plugins.utils import add_note, add_xcom  # type: ignore
+        except ImportError:
+            from CI06932748.tools.utils import add_note, add_xcom  # type: ignore
+
+        MIN_FILES = 5  # noqa: N806 — меньше выборки: сигма бессмысленна
+        SIGMAS = 3  # noqa: N806
+        note_rows = 10
+
+        folder = af_conf.get("core", "dags_folder")
+        timeout = af_conf.getint("core", "dag_file_processor_timeout", fallback=600)
+
+        ts = time.time()
+        # include_examples=False: примеры в папке не лежат, но дефолт берётся из конфига,
+        # и полагаться на него незачем. read_dags_from_db не трогаем — нам нужен разбор
+        # файлов, а не чтение готовой сериализации
+        bag = DagBag(dag_folder=folder, include_examples=False)
+        elapsed = time.time() - ts
+
+        rows = [{"file": s.file, "sec": s.duration.total_seconds(),
+                 "dags": s.dag_num, "tasks": s.task_num, "warnings": s.warning_num}
+                for s in bag.dagbag_stats]
+        if not rows:
+            msg = f"В {folder} не нашлось ни одного файла с DAG'ами"
+            add_note(msg, context, level="task", title="🔘 parse_time")
+            logger.warning(msg)
+            return {"files": 0, "outliers": 0}
+
+        secs = [r["sec"] for r in rows]
+        mean = statistics.fmean(secs)
+        # stdev требует минимум двух значений и считает выборочное отклонение
+        sigma = statistics.stdev(secs) if len(secs) > 1 else 0.0
+        threshold = mean + SIGMAS * sigma
+        enough = len(rows) > MIN_FILES
+
+        outliers = [r for r in rows if enough and sigma > 0 and r["sec"] > threshold]
+        for r in outliers:
+            logger.warning("🐢 %s: %.2fс при пороге %.2fс (dags %d, tasks %d)",
+                           r["file"], r["sec"], threshold, r["dags"], r["tasks"])
+
+        # Отдельно — те, кто подобрался к таймауту процессора: такой файл dag-processor
+        # бросит на полпути, и DAG'и из него исчезнут из serialized_dag
+        near_timeout = [r for r in rows if r["sec"] > timeout / 2]
+
+        shown = outliers or rows[:note_rows]  # dagbag_stats уже отсортирован по убыванию
+        table = "| Файл | Сек | DAG'ов | Тасков |\n|---|---:|---:|---:|\n" + "\n".join(
+            f"| `{_short(r['file'], 70)}` | {r['sec']:.2f} | {r['dags']} | {r['tasks']} |"
+            for r in shown[:note_rows])
+        stats_block = "\n".join([
+            "| | |", "|---|---:|",
+            f"| файлов | {len(rows)} |",
+            f"| суммарно | {sum(secs):.1f}с |",
+            f"| среднее | {mean:.2f}с |",
+            f"| σ | {sigma:.2f}с |",
+            f"| порог (среднее + {SIGMAS}σ) | {threshold:.2f}с |",
+            f"| выбросов | {len(outliers) if enough else '—'} |",
+        ])
+        head = (f"🐢 Медленнее порога: {len(outliers)}" if outliers else
+                "Выбросов нет" if enough else
+                f"Файлов {len(rows)} — для {SIGMAS}σ мало, показаны самые медленные")
+        if near_timeout:
+            head += (f". ⚠️ {len(near_timeout)} файлов уже за половиной "
+                     f"dag_file_processor_timeout ({timeout}с)")
+
+        add_xcom("parse_time", {"stats": {"files": len(rows), "mean": round(mean, 2),
+                                          "sigma": round(sigma, 2),
+                                          "threshold": round(threshold, 2)},
+                                "outliers": outliers}, context)
+        add_note(f"{head}\n\n{stats_block}\n\n{table}", context, level="task",
+                 title=f"🕐 {elapsed:.1f} sec parse_time: {len(rows)} файлов")
+        logger.info("🕐 разобрано %d файлов за %.1fс, среднее %.2fс, σ %.2fс, порог %.2fс, "
+                    "выбросов %d", len(rows), elapsed, mean, sigma, threshold, len(outliers))
+        return {"files": len(rows), "outliers": len(outliers), "mean": round(mean, 2),
+                "sigma": round(sigma, 2), "threshold": round(threshold, 2),
+                "near_timeout": len(near_timeout)}
+
     # --- Summary ---
     @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
     def summary(**context) -> dict:
@@ -877,7 +992,10 @@ def tools_test_dags():
         # изменение сериализации после деплоя это норма
         found = ti.xcom_pull(task_ids=f"{COMPARE_GROUP}.find_changed", key="find_stats") or {}
         found = json.loads(found) if isinstance(found, str) else found
-        snapshot = ti.xcom_pull(task_ids=f"{COMPARE_GROUP}.snapshot_dags") or {}
+        snapshot = ti.xcom_pull(task_ids=f"{COMPARE_GROUP}.snapshot_dags",
+                                key="snapshot_stats") or {}
+        snapshot = json.loads(snapshot) if isinstance(snapshot, str) else snapshot
+        parsed = ti.xcom_pull(task_ids="parse_time") or {}
         raw_cmp = ti.xcom_pull(task_ids=f"{COMPARE_GROUP}.compare_changed", key="compare")
         compares = [json.loads(r) if isinstance(r, str) else r for r in list(raw_cmp or [])]
         cmp_counts: dict[str, int] = {}
@@ -920,6 +1038,13 @@ def tools_test_dags():
                          f"поэтому следующий прогон эти DAG'и не переоткроет — очистите "
                          f"упавшие экземпляры `{compare_id}`, они перечитают те же объекты "
                          f"из S3 и дадут тот же вердикт.")
+        if parsed.get("files"):
+            line = (f"Парсинг: {parsed['files']} файлов, среднее {parsed.get('mean')}с, "
+                    f"σ {parsed.get('sigma')}с, порог {parsed.get('threshold')}с, "
+                    f"выбросов **{parsed.get('outliers')}**")
+            if parsed.get("near_timeout"):
+                line += f", у {parsed['near_timeout']} файлов больше половины таймаута"
+            parts.append(line)
         if snapshot:
             total = snapshot.get("total") or 1
             parts.append(f"Версии: покрыто **{snapshot.get('covered')}** из {snapshot.get('total')} "
@@ -935,7 +1060,8 @@ def tools_test_dags():
             raise AirflowFailException(f"Сериализация дрожит у {bad} DAG'ов: {headline}")
 
         return {"stats": stats, "recheck": rechecks, "counts": counts, "found": found,
-                "compare": cmp_counts, "compare_silent": cmp_silent, "snapshot": snapshot}
+                "compare": cmp_counts, "compare_silent": cmp_silent, "snapshot": snapshot,
+                "parse_time": parsed}
 
     summary_task = summary()
 
@@ -948,12 +1074,14 @@ def tools_test_dags():
         recheck_serialized_dag.expand(target=check_serialized_dag())
 
     with TaskGroup(group_id=COMPARE_GROUP, tooltip="Версии в S3 и что изменилось") as tg_compare:
-        snap = snapshot_dags(find_changed())
-        # expand цепляется к XCom-ключу pairs — snapshot_dags кладёт туда пары
-        # «прошлая версия → новая», а return оставляет под статистику для summary
-        compare_changed.expand(target=snap["pairs"])
+        # expand раскрывается только по return_value: на кастомном ключе Airflow
+        # падает при разборе файла. Поэтому snapshot_dags возвращает пары,
+        # а статистику кладёт в XCom snapshot_stats
+        compare_changed.expand(target=snapshot_dags(find_changed()))
 
-    [tg_check, tg_compare] >> summary_task
+    # parse_time вне групп и ни от кого не зависит: он про разбор файлов, а не про
+    # содержимое serialized_dag
+    [tg_check, tg_compare, parse_time()] >> summary_task
 
 
 tools_test_dags()

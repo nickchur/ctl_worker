@@ -1,17 +1,21 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-08-04 14:15 MSK · v2.3 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-04 14:35 MSK · v2.4 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
 
 Запускается ежедневно в 23:00 MSK.
 
+Две независимые группы: **`check_serialized`** ловит дрожание сериализации на парсинге
+(может ждать часами), **`compare`** ведёт версии в S3 и показывает, что изменилось
+(минуты). Итог обеих собирает `summary`.
+
 | Таск | Что делает |
 |---|---|
-| **`check_serialized_dag`** | Считает по `main.serialized_dag`, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка «на последнем парсинге» (`last_updated` попал в окно последнего разбора файла — `dag.last_parsed_time`). **Никогда не падает**: одного замера мало, чтобы отличить дрожание от деплоя. Возвращает список подозрительных DAG'ов, статистика — в XCom `serialized_stats` |
-| **`recheck_serialized_dag`** | Mapped-таск, по экземпляру на DAG из списка. Ждёт следующего парсинга (сдвига `dag.last_parsed_time`) и сравнивает сериализацию до и после, показывая расхождения по путям вида `.dag.params[0][1].schema.examples[0]` |
-| **`compare_changed`** | Сравнивает DAG'и, у которых `dag_hash` разошёлся с последней сохранённой версией, то есть изменившиеся с прошлого прогона, и показывает, что именно поменялось. **Никогда не падает**, полный список в XCom `changed_dags` |
-| **`snapshot_dags`** | Складывает версии сериализаций в S3, чтобы завтра было с чем сравнивать. Идёт строго после `compare_changed` |
+| **`check_serialized.check_serialized_dag`** | Считает по `main.serialized_dag`, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка «на последнем парсинге» (`last_updated` попал в окно последнего разбора файла — `dag.last_parsed_time`). **Никогда не падает**: одного замера мало, чтобы отличить дрожание от деплоя. Возвращает список подозрительных DAG'ов, статистика — в XCom `serialized_stats` |
+| **`check_serialized.recheck_serialized_dag`** | Mapped-таск, по экземпляру на DAG из списка. Ждёт следующего парсинга (сдвига `dag.last_parsed_time`) и сравнивает сериализацию до и после, показывая расхождения по путям вида `.dag.params[0][1].schema.examples[0]` |
+| **`compare.compare_changed`** | Сравнивает DAG'и, у которых `dag_hash` разошёлся с последней сохранённой версией, то есть изменившиеся с прошлого прогона, и показывает, что именно поменялось. **Никогда не падает**, полный список в XCom `changed_dags` |
+| **`compare.snapshot_dags`** | Складывает версии сериализаций в S3, чтобы завтра было с чем сравнивать. Идёт строго после `compare_changed` |
 | **`summary`** | Сводка обеих веток: вердикты, время ожидания, расхождения, покрытие копиями |
 
 **Параметры:**
@@ -64,6 +68,7 @@ import pendulum
 from airflow.configuration import conf
 from airflow.decorators import dag, task
 from airflow.models import Param
+from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
 from logging import getLogger
@@ -232,6 +237,11 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
     },
 )
 def tools_test_dags():
+
+    # Имена групп нужны и в коде: внутри группы task_id получает префикс, а xcom_pull
+    # и запрос состояний в summary ищут по полному имени
+    CHECK_GROUP = "check_serialized"
+    COMPARE_GROUP = "compare"
 
     # Периоды от большего к меньшему, накопительно: каждый следующий — подмножество
     # предыдущего. Так по таблице сразу видно, стенд «устаканился» или переразбирается
@@ -760,10 +770,11 @@ def tools_test_dags():
         # Вердикты берём из XCom, а не из состояний тасков: состояние скажет только
         # «failed», а здесь есть причина, время ожидания и число расхождений. Для
         # mapped-таска xcom_pull отдаёт итератор по map-индексам (taskinstance.py:3711-3715)
-        raw = ti.xcom_pull(task_ids="recheck_serialized_dag", key="recheck")
+        raw = ti.xcom_pull(task_ids=f"{CHECK_GROUP}.recheck_serialized_dag", key="recheck")
         rechecks = [json.loads(r) if isinstance(r, str) else r for r in list(raw or [])]
 
-        stats_raw = ti.xcom_pull(task_ids="check_serialized_dag", key="serialized_stats")
+        stats_raw = ti.xcom_pull(task_ids=f"{CHECK_GROUP}.check_serialized_dag",
+                                 key="serialized_stats")
         stats = json.loads(stats_raw) if isinstance(stats_raw, str) else (stats_raw or {})
 
         # Состояния нужны только чтобы поймать экземпляры, не оставившие XCom вовсе:
@@ -774,7 +785,7 @@ def tools_test_dags():
                 .filter(
                     TaskInstance.dag_id == dag_run.dag_id,
                     TaskInstance.run_id == dag_run.run_id,
-                    TaskInstance.task_id == "recheck_serialized_dag",
+                    TaskInstance.task_id == f"{CHECK_GROUP}.recheck_serialized_dag",
                 )
                 .all()
             )
@@ -793,8 +804,8 @@ def tools_test_dags():
 
         # Ветка версий: у неё свои вердикты, на падение summary они не влияют —
         # изменение сериализации после деплоя это норма
-        compared = ti.xcom_pull(task_ids="compare_changed") or {}
-        snapshot = ti.xcom_pull(task_ids="snapshot_dags") or {}
+        compared = ti.xcom_pull(task_ids=f"{COMPARE_GROUP}.compare_changed") or {}
+        snapshot = ti.xcom_pull(task_ids=f"{COMPARE_GROUP}.snapshot_dags") or {}
 
         parts = []
         if stats:
@@ -832,11 +843,18 @@ def tools_test_dags():
 
     summary_task = summary()
 
-    # Две независимые ветки: recheck ждёт парсинг часами, compare/snapshot отрабатывают
-    # за минуты. snapshot строго после compare — иначе свежая копия затрёт ту, с которой
-    # сравниваем
-    recheck_serialized_dag.expand(target=check_serialized_dag()) >> summary_task
-    snapshot_dags(compare_changed()) >> summary_task
+    # Таски объявлены выше, а в группы попадают в момент вызова: оператор создаётся
+    # именно здесь, TaskGroupContext читается тогда же.
+    # Две независимые ветки: check_serialized ждёт парсинг часами, compare отрабатывает
+    # за минуты. Внутри compare snapshot строго после сравнения — иначе свежая версия
+    # затрёт ту, с которой сравниваем
+    with TaskGroup(group_id=CHECK_GROUP, tooltip="Дрожание сериализации на парсинге") as tg_check:
+        recheck_serialized_dag.expand(target=check_serialized_dag())
+
+    with TaskGroup(group_id=COMPARE_GROUP, tooltip="Версии в S3 и что изменилось") as tg_compare:
+        snapshot_dags(compare_changed())
+
+    [tg_check, tg_compare] >> summary_task
 
 
 tools_test_dags()

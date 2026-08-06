@@ -21,10 +21,12 @@ CH_ID   = 'dlab-click'
 S3_CONN = 's3-tfs-hrplt'
 
 BUCKET          = 'tfshrplt'
-KAFKA_OUT_TOPIC = 'TFS.HRPLT.IN'
-KAFKA_OUT_CONN  = 'tfs-kafka-out'
-KAFKA_IN_CONN   = 'tfs-kafka-in'
-KAFKA_IN_TOPIC  = 'TFS.HRPLT.OUT'
+# IN/OUT в conn_id и топиках — сторона TFS, и у соединения, и у топика: пишем мы в его
+# вход, читаем из его выхода. Префиксы констант — наше действие, чтобы не путаться
+KAFKA_SND_CONN  = 'tfs-kafka-in'    # notify_tfs: шлём уведомление
+KAFKA_SND_TOPIC = 'TFS.HRPLT.IN'
+KAFKA_RCV_CONN  = 'tfs-kafka-out'   # wait_confirm: ждём квитанцию
+KAFKA_RCV_TOPIC = 'TFS.HRPLT.OUT'
 
 # 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
@@ -308,10 +310,10 @@ def get_config() -> dict:
         'EXTRA_SUF':       EXTRA_SUF,
         'LIMITS':          LIMITS,
         'BUCKET':          BUCKET,
-        'KAFKA_OUT_TOPIC': KAFKA_OUT_TOPIC,
-        'KAFKA_OUT_CONN':  KAFKA_OUT_CONN,
-        'KAFKA_IN_CONN':   KAFKA_IN_CONN,
-        'KAFKA_IN_TOPIC':  KAFKA_IN_TOPIC,
+        'KAFKA_SND_CONN':  KAFKA_SND_CONN,
+        'KAFKA_SND_TOPIC': KAFKA_SND_TOPIC,
+        'KAFKA_RCV_CONN':   KAFKA_RCV_CONN,
+        'KAFKA_RCV_TOPIC':  KAFKA_RCV_TOPIC,
         'TFS_MAP':         TFS_MAP,
         'S3_CONN':         S3_CONN,
         'VAR_NAME':        VAR_NAME,

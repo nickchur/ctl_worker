@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-06 19:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Жизненный цикл одного запуска:
   init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm → save_status → schedule_next
@@ -42,10 +42,10 @@ EXTRA_PRE      = _cfg['EXTRA_PRE']
 EXTRA_SUF      = _cfg['EXTRA_SUF']
 LIMITS         = _cfg['LIMITS']
 BUCKET         = _cfg['BUCKET']
-KAFKA_OUT_TOPIC = _cfg['KAFKA_OUT_TOPIC']
-KAFKA_OUT_CONN  = _cfg['KAFKA_OUT_CONN']
-KAFKA_IN_CONN   = _cfg['KAFKA_IN_CONN']
-KAFKA_IN_TOPIC  = _cfg['KAFKA_IN_TOPIC']
+KAFKA_SND_CONN  = _cfg['KAFKA_SND_CONN']
+KAFKA_SND_TOPIC = _cfg['KAFKA_SND_TOPIC']
+KAFKA_RCV_CONN  = _cfg['KAFKA_RCV_CONN']
+KAFKA_RCV_TOPIC = _cfg['KAFKA_RCV_TOPIC']
 TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
 VAR_NAME        = _cfg['VAR_NAME']
@@ -115,7 +115,6 @@ HIVE_RESERVED: frozenset = frozenset({
 })
 
 ON_DELIVERY      = f'{__name__}.on_delivery'        # dot-notation для delivery_callback
-KAFKA_ACCEPT_ANY = f'{__name__}._kafka_accept_any'  # dot-notation для apply_function
 
 # ── SQL Builders ──────────────────────────────────────────────────────────────
 
@@ -268,9 +267,38 @@ def on_delivery(err: Exception | None, msg) -> None:
     logger.info("Message delivered to %s [%s]", msg.topic(), msg.partition())
 
 
-def _kafka_accept_any(msg) -> bool:
-    """apply_function для AwaitMessageSensor: принимает любое сообщение из топика."""
-    return True
+def _kafka_wait_any(conn_id: str, topic: str, timeout_min: int) -> str | None:
+    """Ждёт любое сообщение из топика опросом на воркере, не дольше timeout_min минут.
+
+    Возвращает текст сообщения или None, если за отведённое время ничего не пришло.
+    Группу берём из коннекта (как раньше брал сенсор) и коммитим offset полученного
+    сообщения, чтобы подтверждение не пришло повторно на следующем запуске.
+    """
+    import time
+
+    from airflow.hooks.base import BaseHook
+    from confluent_kafka import Consumer
+
+    conn = BaseHook.get_connection(conn_id)
+    config = dict(conn.extra_dejson)  # extra_dejson = librdkafka config (контракт Kafka-провайдера)
+    config.setdefault("bootstrap.servers", conn.host)
+    config["enable.auto.commit"] = False
+
+    consumer = Consumer(config)
+    try:
+        consumer.subscribe([topic])
+        deadline = time.time() + timeout_min * 60
+        while time.time() < deadline:
+            msg = consumer.poll(timeout=5)
+            if msg is None or msg.error():
+                continue
+            text = msg.value().decode("utf-8", errors="replace")
+            consumer.commit(message=msg, asynchronous=False)
+            logger.info("Kafka confirmation received from %s [%s]: %s", msg.topic(), msg.partition(), text)
+            return text
+    finally:
+        consumer.close()
+    return None
 
 
 def _pre_kafka(scenario: str):
@@ -291,10 +319,10 @@ def _pre_kafka(scenario: str):
 
 
 def _pre_await(context):
-    """pre_execute для AwaitMessageSensor.
+    """Пропускает ожидание подтверждения: auto_confirm=True, notify_kafka=False или данных не было.
 
-    Пропускает ожидание если: auto_confirm=True, notify_kafka=False, или данных не было.
-    Позволяет использовать один оператор вместо EmptyOperator/AwaitMessageSensor switch.
+    Вызывается первым делом в wait_confirm — так один таск заменяет
+    EmptyOperator/ожидание switch.
     """
     p = context['params']
     if p.get('auto_confirm', False):
@@ -620,6 +648,26 @@ def _er_pack_zip(cfg, **context):
     add_note({"📦 pack_zip": uploaded}, title=f"rows={total_rows} files={total}", level='task,dag', context=context)
 
 
+@task(task_id='wait_confirm', trigger_rule='none_failed')
+def _er_wait_confirm(cfg, **context):
+    """⏳ Ждёт квитанцию TFS в Kafka — опросом на воркере.
+
+    Раньше здесь стоял AwaitMessageSensor, но он deferrable: без живого Triggerer
+    таск уходит в deferred и висит там со статусом unknown, пока его не снимут руками.
+    Читаем сами, с тем же поведением: подойдёт любое сообщение из топика, ждём не
+    дольше confirm_timeout минут, по истечении — падаем.
+    """
+    _pre_await(context)  # auto_confirm / notify_kafka / нет данных → skip
+
+    text = _kafka_wait_any(KAFKA_RCV_CONN, KAFKA_RCV_TOPIC, cfg['confirm_timeout'])
+    if text is None:
+        raise AirflowFailException(
+            f"Подтверждение TFS не пришло в {KAFKA_RCV_TOPIC} за {cfg['confirm_timeout']} мин"
+        )
+    add_note(f"```\n{text}\n```", context=context, level='task', title='📨 TFS confirm')
+    return text
+
+
 @task(task_id='save_status', trigger_rule='none_failed')
 def _er_save_status(cfg, **context):
     """💾 Записывает результат выгрузки в export.extract_history.
@@ -683,7 +731,6 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
     """
     from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
     from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
-    from airflow.providers.apache.kafka.sensors.kafka import AwaitMessageSensor
 
     p = get_params(params)
 
@@ -875,17 +922,17 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         )
         t_zip = _er_pack_zip(cfg=cfg)
         t_msg = ProduceToTopicOperator(
-            task_id='notify_tfs', kafka_config_id=KAFKA_OUT_CONN, topic=KAFKA_OUT_TOPIC,
+            task_id='notify_tfs', kafka_config_id=KAFKA_SND_CONN, topic=KAFKA_SND_TOPIC,
             pool=f"tfs_{cfg['scenario']}",
             producer_function=produce_msg, producer_function_args=[cfg['scenario'], []],
             delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(cfg['scenario']),
             execution_timeout=timedelta(minutes=cfg['notify_timeout']),
         )
-        t_wait = AwaitMessageSensor(
-            task_id='wait_confirm', kafka_config_id=KAFKA_IN_CONN, topics=[KAFKA_IN_TOPIC],
-            apply_function=KAFKA_ACCEPT_ANY, trigger_rule='none_failed',
-            execution_timeout=timedelta(minutes=cfg['confirm_timeout']), pre_execute=_pre_await
-        )
+        # execution_timeout с запасом к собственному дедлайну таска: снимать его должен
+        # он сам, с внятной ошибкой, а не Airflow по таймауту
+        t_wait = _er_wait_confirm.override(
+            execution_timeout=timedelta(minutes=cfg['confirm_timeout'] + 5),
+        )(cfg=cfg)
 
         t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)
 

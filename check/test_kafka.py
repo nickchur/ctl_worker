@@ -1,35 +1,48 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-06 19:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
 
-  📤 test_kafka_out — шлёт одно XML-сообщение `TransferFileCephRq` в топик.
-  📥 test_kafka_in  — принимает первое любое сообщение из топика и показывает его.
+  📤 tools_test_kafka_snd — шлёт одно XML-сообщение `TransferFileCephRq` в топик.
+  📥 tools_test_kafka_rcv — показывает сообщения из топика.
+
+Имена топиков TFS даны с его стороны, поэтому наши направления зеркальны:
+
+| Действие | conn_id | Топик |
+|---|---|---|
+| пишем | `tfs-kafka-in` | `TFS.HRPLT.IN` |
+| читаем | `tfs-kafka-out` | `TFS.HRPLT.OUT` |
+
+Дефолты параметров расставлены по этой таблице; на запуске переопределяются.
 
 Оба DAG-а параметризуются на запуске:
 
 | Параметр   | Описание |
 |---|---|
-| `conn_id`  | Airflow Kafka conn_id (kafka_config_id) |
+| `conn_id`  | Airflow Kafka conn_id (kafka_config_id); выпадающий список — kafka-коннекты из Variable `local_connections`, её наполняет `tools_show_connections` |
 | `topic`    | Имя топика |
-| `scenario` | Только out: ScenarioId в XML |
-| `filename` | Только out: имя файла в XML (`Name`) |
-| `mode`     | Только in: `consume` / `read_last` |
-| `timeout`  | Только in: сколько ждать сообщение, сек (poll_timeout / окно read_last) |
-| `max_messages` | Только in: сколько последних сообщений читать в `read_last` |
+| `scenario` | Только write: ScenarioId в XML |
+| `filename` | Только write: имя файла в XML (`Name`) |
+| `mode`     | Только read: `read_last` / `wait` |
+| `timeout`  | Только read: сколько ждать сообщение, сек (окно read_last / poll_timeout) |
+| `max_messages` | Только read: сколько последних сообщений читать в `read_last` |
 
 Режимы приёма (`mode`):
-  • `consume` (по умолчанию) — `ConsumeFromTopicOperator`: синхронно опрашивает топик на
-    воркере, triggerer не требуется. Ловит только сообщения, опубликованные ПОСЛЕ старта
-    опроса (consumer group, auto.offset.reset=latest), в пределах `timeout` секунд.
-  • `read_last` — читает последние `max_messages` сообщений, **уже лежащих** в топике (tail
-    через seek к high_watermark−N), свежей consumer group без коммита offset. Порядок запуска
-    не важен: можно сначала `test_kafka_out`, потом `test_kafka_in`.
+  • `read_last` (по умолчанию) — читает последние `max_messages` сообщений, **уже лежащих**
+    в топике (tail через seek к high_watermark−N), свежей consumer group без коммита offset.
+    Порядок запуска не важен, в боевую группу не входит — ничего ни у кого не перехватывает.
+  • `wait` — `ConsumeFromTopicOperator`: синхронно опрашивает топик на воркере, triggerer
+    не требуется. Ловит только сообщения, опубликованные ПОСЛЕ старта опроса (consumer group,
+    auto.offset.reset=latest), в пределах `timeout` секунд.
+    ⚠️ Работает в consumer group коннекта, а у `tfs-kafka-out` она общая с `wait_confirm`
+    боевого `er_export`: сообщение, доставшееся тесту, до сенсора уже не дойдёт. Для
+    `TFS.HRPLT.OUT` запускать только при простое ER-выгрузок.
 
-Запускать вручную (schedule=None). Для сквозной проверки `consume`: сначала trigger
-`test_kafka_in` на нужный топик, затем — пока идёт опрос (`timeout` секунд) —
-`test_kafka_out` на тот же топик. Для `read_last` порядок любой.
+Запускать вручную (schedule=None). Для сквозной проверки: обоим DAG-ам поставить один топик
+(`TFS.HRPLT.IN` — туда пишем мы, чужих слушателей там нет), и в режиме `wait` сначала
+триггерить `tools_test_kafka_rcv`, а `tools_test_kafka_snd` — пока идёт опрос
+(`timeout` секунд). Для `read_last` порядок любой.
 """
 from __future__ import annotations
 
@@ -37,6 +50,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
+from airflow.models import Variable
 from airflow.models.param import Param
 from airflow.providers.apache.kafka.operators.consume import ConsumeFromTopicOperator
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
@@ -49,11 +63,31 @@ except ImportError:
 logger = logging.getLogger("airflow.task")
 
 # 🔧 Дефолты Kafka (можно переопределить параметрами запуска).
-# Один коннект и один топик на оба DAG-а: test_kafka_in слушает то, что шлёт test_kafka_out.
-# TFS.HRPLT.OUT — тот же топик, из которого читает боевой er_export (wait_confirm),
-# так что одновременно с ним этот тест лучше не запускать
-KAFKA_CONN = "tfs-kafka-out"
-KAFKA_TOPIC = "TFS.HRPLT.OUT"
+# IN/OUT в именах — сторона TFS, и у соединения, и у топика: его вход — наш выход
+SND_CONN  = "tfs-kafka-in"
+SND_TOPIC = "TFS.HRPLT.IN"
+RCV_CONN  = "tfs-kafka-out"
+RCV_TOPIC = "TFS.HRPLT.OUT"
+
+
+def _kafka_conn_ids() -> list[str]:
+    """conn_id всех kafka-соединений из Variable `local_connections` — для выпадающего списка.
+
+    Variable наполняет DAG `tools_show_connections`: {conn_type: [{conn_id, host, ...}]}.
+    Читаем на парсинге, как это делает test_connections._load_groups. Если Variable нет
+    (show_connections ещё не запускали) — остаются дефолты направлений, чтобы список не
+    оказался пустым; они же всегда в списке, иначе выпадашка откроется без своего значения.
+    """
+    conn_ids = {SND_CONN, RCV_CONN}
+    try:
+        var_data = Variable.get("local_connections", deserialize_json=True, default_var=None) or {}
+        conn_ids |= {c["conn_id"] for c in var_data.get("kafka", []) if c.get("conn_id")}
+    except Exception as exc:
+        logger.warning("Не прочитали local_connections, список conn_id только из дефолтов: %s", exc)
+    return sorted(conn_ids)
+
+
+KAFKA_CONN_IDS = _kafka_conn_ids()
 
 
 # ── Kafka helpers ─────────────────────────────────────────────────────────────
@@ -89,7 +123,7 @@ def on_delivery(err: Exception | None, msg) -> None:
 
 
 def consume_msg(msg) -> None:
-    """apply_function для ConsumeFromTopicOperator (режим consume): логирует и кладёт текст в XCom.
+    """apply_function для ConsumeFromTopicOperator (режим wait): логирует и кладёт текст в XCom.
 
     Выполняется на воркере; get_current_context даёт доступ к ti для xcom_push.
     Отображение — в общей задаче show.
@@ -117,10 +151,10 @@ _DEF_ARGS = {
 _TAGS = ["DataLab", "tools", "Kafka", "AutoQA"]
 
 
-# ── DAG: test_kafka_out ───────────────────────────────────────────────────────
+# ── DAG: tools_test_kafka_snd ───────────────────────────────────────────────
 
 @dag(
-    dag_id="test_kafka_out",
+    dag_id="tools_test_kafka_snd",
     schedule=None,
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
@@ -131,13 +165,13 @@ _TAGS = ["DataLab", "tools", "Kafka", "AutoQA"]
     default_args=_DEF_ARGS,
     doc_md=__doc__,
     params={
-        "conn_id":  Param(KAFKA_CONN, type="string", title="Kafka conn_id"),
-        "topic":    Param(KAFKA_TOPIC, type="string", title="Topic"),
+        "conn_id":  Param(SND_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
+        "topic":    Param(SND_TOPIC, type="string", title="Topic"),
         "scenario": Param("HRPLATFORM-4000", type="string", title="Scenario ID"),
         "filename": Param("test.zip", type="string", title="File name"),
     },
 )
-def test_kafka_out():
+def tools_test_kafka_snd():
     ProduceToTopicOperator(
         task_id="notify",
         kafka_config_id="{{ params.conn_id }}",
@@ -149,13 +183,13 @@ def test_kafka_out():
     )
 
 
-test_kafka_out()
+tools_test_kafka_snd()
 
 
-# ── DAG: test_kafka_in ────────────────────────────────────────────────────────
+# ── DAG: tools_test_kafka_rcv ────────────────────────────────────────────────
 
 @dag(
-    dag_id="test_kafka_in",
+    dag_id="tools_test_kafka_rcv",
     schedule=None,
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
@@ -166,34 +200,37 @@ test_kafka_out()
     default_args=_DEF_ARGS,
     doc_md=__doc__,
     params={
-        "conn_id":  Param(KAFKA_CONN, type="string", title="Kafka conn_id"),
-        "topic":    Param(KAFKA_TOPIC, type="string", title="Topic"),
+        "conn_id":  Param(RCV_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
+        "topic":    Param(RCV_TOPIC, type="string", title="Topic"),
         "mode":     Param(
-            "consume",
+            "read_last",
             type="string",
-            enum=["consume", "read_last"],
+            enum=["read_last", "wait"],
             title="Receive mode",
-            description="consume = ConsumeFromTopicOperator (воркер, ловит новые, без triggerer); "
-                        "read_last = прочитать последние N сообщений, уже лежащие в топике.",
+            description="read_last = прочитать последние N сообщений, уже лежащие в топике, "
+                        "свежей consumer group; wait = ConsumeFromTopicOperator (воркер, ловит "
+                        "новые, без triggerer), но работает в боевой consumer group коннекта.",
         ),
         "timeout":  Param(
             180, type="integer", minimum=5, title="Timeout, sec",
-            description="Сколько ждать сообщение: poll_timeout (consume), окно чтения (read_last).",
+            description="Сколько ждать сообщение: poll_timeout (wait), окно чтения (read_last).",
         ),
         "max_messages": Param(1, type="integer", minimum=1, title="Max messages (read_last)"),
     },
 )
-def test_kafka_in():
+def tools_test_kafka_rcv():
     @task.branch(task_id="pick")
     def pick(params=None):
-        return {"consume": "wait_consume", "read_last": "read_last"}[params["mode"]]
+        return {"wait": "wait", "read_last": "read_last"}[params["mode"]]
 
-    # режим consume: синхронный опрос топика на воркере, triggerer не нужен.
+    # режим wait: синхронный опрос топика на воркере, triggerer не нужен.
     # Ловит только сообщения, опубликованные ПОСЛЕ старта опроса (auto.offset.reset=latest),
-    # в пределах poll_timeout — поэтому test_kafka_out нужно триггерить в это окно.
+    # в пределах poll_timeout — поэтому tools_test_kafka_snd нужно триггерить в это окно.
     # commit_cadence='never' — тест read-only: не двигаем offset и убираем warning про auto.commit.
-    wait_consume = ConsumeFromTopicOperator(
-        task_id="wait_consume",
+    # Группа берётся из коннекта: у tfs-kafka-out она общая с wait_confirm боевого er_export,
+    # поэтому дефолтный режим — read_last, со своей одноразовой группой.
+    wait = ConsumeFromTopicOperator(
+        task_id="wait",
         kafka_config_id="{{ params.conn_id }}",
         topics=["{{ params.topic }}"],
         apply_function=consume_msg,
@@ -209,7 +246,7 @@ def test_kafka_in():
         ti = context["ti"]
         msg = (
             ti.xcom_pull(task_ids="read_last")                       # read_last: return list
-            or ti.xcom_pull(task_ids="wait_consume", key="message")  # consume: xcom_push
+            or ti.xcom_pull(task_ids="wait", key="message")  # wait: xcom_push
         )
         if not msg:
             logger.info("No Kafka message received")
@@ -238,7 +275,7 @@ def test_kafka_in():
         conn = BaseHook.get_connection(p["conn_id"])
         config = dict(conn.extra_dejson)  # extra_dejson = librdkafka config (контракт Kafka-провайдера)
         config.setdefault("bootstrap.servers", conn.host)
-        config["group.id"] = f"test_kafka_read_{uuid.uuid4().hex[:8]}"  # свежая группа — без committed offset
+        config["group.id"] = f"test_kafka_rcv_{uuid.uuid4().hex[:8]}"  # свежая группа — без committed offset
         config["enable.auto.commit"] = False
         config["auto.offset.reset"] = "earliest"
 
@@ -274,9 +311,9 @@ def test_kafka_in():
             consumer.close()
 
     p = pick()
-    targets = [wait_consume, read_last()]
+    targets = [wait, read_last()]
     p >> targets
     targets >> show()
 
 
-test_kafka_in()
+tools_test_kafka_rcv()

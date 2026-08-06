@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-06 19:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -32,11 +32,11 @@
 | `compress` | Сжать при копировании |
 | `done` | Удалить исходник после копирования |
 | `unzip` | Распаковать ZIP-архив |
-| `kafka` | `kafka_config_id` входящего соединения |
-| `topic` | Топик входящих сообщений |
+| `kafka_rcv` | `kafka_config_id` для чтения — по умолчанию `tfs-kafka-out`; список kafka-коннектов берётся из Variable `local_connections` |
+| `topic_rcv` | Топик входящих сообщений |
 | `timeout` | Таймаут ожидания (мин, по умолчанию 60) |
-| `kafka_out` | `kafka_config_id` для квитанции (необязательно) |
-| `topic_out` | Топик квитанций (необязательно) |
+| `kafka_snd` | `kafka_config_id` для квитанции — по умолчанию `tfs-kafka-in` |
+| `topic_snd` | Топик квитанций (необязательно: пустой — квитанция не отправляется) |
 """
 
 from airflow import DAG
@@ -44,14 +44,13 @@ from airflow.models import Param
 from airflow.decorators import task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 # from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor 
-from airflow.exceptions import AirflowFailException
+from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.sensors.base import PokeReturnValue
 from airflow.datasets import DatasetAlias, Dataset
 
-from airflow.providers.apache.kafka.sensors.kafka import AwaitMessageSensor
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
 from airflow.utils.session import create_session
-from airflow.models import TaskInstance
+from airflow.models import TaskInstance, Variable
 from airflow.utils.state import State
 
 from plugins.utils import readable_size, add_note, on_callback, str2timedelta
@@ -81,12 +80,66 @@ TFS_IN_DATASET = f'CTL/{profile}/TFS'
 MAX_ITEMS = 25
 
 
+# IN/OUT в именах — сторона TFS, и у соединения, и у топика: читаем из его выхода,
+# квитанцию кладём в его вход
+KAFKA_RCV_CONN = 'tfs-kafka-out'
+KAFKA_SND_CONN = 'tfs-kafka-in'
+
+
+def _kafka_conn_ids() -> list[str]:
+    """conn_id kafka-соединений из Variable `local_connections` — для выпадающего списка.
+
+    Variable наполняет DAG `tools_show_connections`: {conn_type: [{conn_id, host, ...}]}.
+    Читается на парсинге, иначе examples не попадут в форму запуска. Дефолтные коннекты
+    держим в списке всегда: без них выпадашка откроется без своего же значения, а при
+    недоступной Variable осталась бы пустой.
+    """
+    conn_ids = {KAFKA_RCV_CONN, KAFKA_SND_CONN}
+    try:
+        var_data = Variable.get('local_connections', deserialize_json=True, default_var=None) or {}
+        conn_ids |= {c['conn_id'] for c in var_data.get('kafka', []) if c.get('conn_id')}
+    except Exception as exc:
+        logger.warning("Не прочитали local_connections, список conn_id только из дефолтов: %s", exc)
+    return sorted(conn_ids)
+
+
+KAFKA_CONN_IDS = _kafka_conn_ids()
+
+
 tfs_interval = str2timedelta(get_config().get('tfs_interval','minutes=5'))
 
 
-def _kafka_accept_any(msg) -> bool:
-    """apply_function для AwaitMessageSensor: принимает любое сообщение из топика."""
-    return True
+def _kafka_wait_any(conn_id: str, topic: str, timeout_min: int) -> str | None:
+    """Ждёт любое сообщение из топика опросом на воркере, не дольше timeout_min минут.
+
+    Возвращает текст сообщения или None, если ничего не пришло. Группу берём из коннекта
+    и коммитим offset полученного сообщения, чтобы оно не пришло повторно.
+    """
+    import time
+
+    from airflow.hooks.base import BaseHook
+    from confluent_kafka import Consumer
+
+    conn = BaseHook.get_connection(conn_id)
+    config = dict(conn.extra_dejson)  # extra_dejson = librdkafka config (контракт Kafka-провайдера)
+    config.setdefault("bootstrap.servers", conn.host)
+    config["enable.auto.commit"] = False
+
+    consumer = Consumer(config)
+    try:
+        consumer.subscribe([topic])
+        deadline = time.time() + timeout_min * 60
+        while time.time() < deadline:
+            msg = consumer.poll(timeout=5)
+            if msg is None or msg.error():
+                continue
+            text = msg.value().decode("utf-8", errors="replace")
+            consumer.commit(message=msg, asynchronous=False)
+            logger.info("Kafka message received from %s [%s]", msg.topic(), msg.partition())
+            return text
+    finally:
+        consumer.close()
+    return None
 
 
 def _produce_receipt(rq_uid: str, status_code: int, status_desc: str):
@@ -324,33 +377,35 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
         "compress": False,
         "done":     False,
         "unzip":    False,
-        "kafka":     Param('', type="string", description="kafka_config_id"),
-        "topic":     Param('', type="string", description="Kafka topic"),
+        # направления по стороне TFS: читаем через tfs-kafka-out, пишем через tfs-kafka-in
+        "kafka_rcv": Param(KAFKA_RCV_CONN, type="string", description="kafka_config_id для чтения",
+                           examples=KAFKA_CONN_IDS),
+        "topic_rcv": Param('', type="string", description="Kafka topic входящих сообщений"),
         "timeout":   Param(60, type="integer", description="Таймаут ожидания сообщения (мин)"),
-        "kafka_out": Param('', type="string", description="kafka_config_id для отправки квитанции"),
-        "topic_out": Param('', type="string", description="Kafka topic для квитанции"),
+        "kafka_snd": Param(KAFKA_SND_CONN, type="string", description="kafka_config_id для отправки квитанции",
+                           examples=KAFKA_CONN_IDS),
+        "topic_snd": Param('', type="string", description="Kafka topic для квитанции"),
     },
     on_failure_callback=on_callback,
     doc_md=__doc__,
 ) as dag_kafka:
 
-    def _pre_kafka_wait(context):
-        """Устанавливает kafka_config_id/topics/execution_timeout — поля не поддерживают шаблонизацию."""
-        p = context['params']
-        if not p.get('kafka') or not p.get('topic'):
-            raise AirflowFailException("Params 'kafka' and 'topic' are required")
-        context['task'].kafka_config_id = p['kafka']
-        context['task'].topics = [p['topic']]
-        context['task'].execution_timeout = timedelta(minutes=int(p.get('timeout', 60)))
+    @task(task_id='kafka_wait')
+    def kafka_wait(**context):
+        """⏳ Ждёт любое сообщение из топика опросом на воркере.
 
-    kafka_sensor = AwaitMessageSensor(
-        task_id='kafka_wait',
-        kafka_config_id='',
-        topics=[''],
-        apply_function='ctl_tfs._kafka_accept_any',
-        pre_execute=_pre_kafka_wait,
-        soft_fail=True,
-    )
+        Раньше здесь стоял AwaitMessageSensor, но он deferrable: без живого Triggerer
+        таск уходит в deferred и висит со статусом unknown. Поведение сохранено:
+        ждём не дольше params.timeout минут, по истечении — skip (был soft_fail=True).
+        """
+        p = context['params']
+        if not p.get('kafka_rcv') or not p.get('topic_rcv'):
+            raise AirflowFailException("Params 'kafka_rcv' and 'topic_rcv' are required")
+
+        text = _kafka_wait_any(p['kafka_rcv'], p['topic_rcv'], int(p.get('timeout', 60)))
+        if text is None:
+            raise AirflowSkipException(f"Сообщение в {p['topic_rcv']} не пришло за {p.get('timeout', 60)} мин")
+        return text
 
     @task
     def tfs_wait(**context):
@@ -398,11 +453,11 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
     def _pre_receipt(context):
         """Проверяет статусы tfs_copy и формирует аргументы квитанции TransferFileCephRs."""
         p = context['params']
-        if not p.get('kafka_out') or not p.get('topic_out'):
+        if not p.get('kafka_snd') or not p.get('topic_snd'):
             from airflow.exceptions import AirflowSkipException
-            raise AirflowSkipException("kafka_out/topic_out not set, skipping receipt")
-        context['task'].kafka_config_id = p['kafka_out']
-        context['task'].topic = p['topic_out']
+            raise AirflowSkipException("kafka_snd/topic_snd not set, skipping receipt")
+        context['task'].kafka_config_id = p['kafka_snd']
+        context['task'].topic = p['topic_snd']
 
         ti = context['task_instance']
         rq_uid = ti.xcom_pull(task_ids='tfs_wait', key='rq_uid') or ''
@@ -429,6 +484,6 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
     )
 
     path_list = tfs_wait()
-    kafka_sensor >> path_list
+    kafka_wait() >> path_list
     copies = tfs_copy.partial().expand(path=path_list)
     copies >> send_receipt

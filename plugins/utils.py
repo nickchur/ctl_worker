@@ -1,4 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
+*2026-08-07 13:14 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах CTL.
 

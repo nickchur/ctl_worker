@@ -1,4 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
+*2026-07-29 16:46 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Расширенные функции для работы с S3 в системе CTL.
 

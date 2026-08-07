@@ -1,8 +1,12 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-08-07 12:10 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-07 13:45 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Автоматизированный аудит и тестирование всех подключений из secret backend. 
+Автоматизированный аудит и тестирование всех подключений из secret backend.
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
+
+Запускается ежедневно в 23:15 MSK — через 15 минут после `tools_show_connections`,
+который обновляет Variable `local_connections`: список соединений читается из неё на
+парсинге файла, поэтому свежесть Variable определяет состав тасков.
 
 | Группа | Условие (conn_id / type) | Описание проверки |
 |---|---|---|
@@ -26,7 +30,7 @@
 
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
 from airflow.decorators import dag, task
@@ -40,6 +44,10 @@ except ImportError:
     from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
 
 logger = getLogger("airflow.task")
+
+# Москва живёт на постоянном UTC+3 с 2014 года, переходов на летнее время нет,
+# поэтому фиксированное смещение точно описывает пояс и не зависит от tz-базы
+MSK = timezone(timedelta(hours=3))
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
@@ -372,8 +380,12 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         "retries": 0,
         "on_failure_callback": on_callback,
     },
-    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
-    schedule="@once",
+    # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
+    # [core] default_timezone = utc не мешает: 23:15 — московские
+    start_date=datetime(2026, 1, 1, tzinfo=MSK),
+    # Ежедневно в 23:15 MSK, через 15 минут после tools_show_connections: тот обновляет
+    # Variable local_connections, из которой этот DAG набирает список соединений на парсинге
+    schedule="15 23 * * *",
     tags=["DataLab", "tools", "conn", "AutoQA"],
     catchup=False,
     is_paused_upon_creation=False,

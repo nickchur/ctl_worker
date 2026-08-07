@@ -1,8 +1,11 @@
 """### 🔌 DAG: Список Airflow Connections
-*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-07 13:45 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Выводит список всех подключений из secret backend, сгруппированных по их типу. 
+Выводит список всех подключений из secret backend, сгруппированных по их типу.
 Используется для аудита доступных соединений и верификации конфигурации backend'а.
+
+Запускается ежедневно в 23:00 MSK — за 15 минут до `tools_test_connections`, который
+берёт список соединений из Variable `local_connections`, обновляемой здесь.
 
 | Функция | Описание |
 |---|---|
@@ -12,7 +15,7 @@
 | **ClickHouse** | Автоматически подменяет `sqlite` на `clickhouse` для корректного отображения |
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
 from airflow.decorators import dag, task
@@ -23,6 +26,10 @@ except ImportError:
     from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
 
 logger = getLogger("airflow.task")
+
+# Москва живёт на постоянном UTC+3 с 2014 года, переходов на летнее время нет,
+# поэтому фиксированное смещение точно описывает пояс и не зависит от tz-базы
+MSK = timezone(timedelta(hours=3))
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
@@ -36,8 +43,12 @@ ensure_pool(TOOLS_POOL)
         'retries': 2,
         'on_failure_callback': on_callback,
     },
-    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
-    schedule_interval='@once',
+    # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
+    # [core] default_timezone = utc не мешает: 23:00 — московские
+    start_date=datetime(2026, 1, 1, tzinfo=MSK),
+    # Ежедневно в 23:00 MSK: срез соединений обновляется перед ночным tools_test_connections
+    # (23:15), который берёт список из Variable local_connections
+    schedule='0 23 * * *',
     tags=['DataLab', 'tools', 'conn', 'AutoQA'],
     catchup=False,
     is_paused_upon_creation=False,

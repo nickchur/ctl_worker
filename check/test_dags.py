@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-08-07 12:40 MSK · v2.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-07 13:50 MSK · v2.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -77,13 +77,13 @@ dag_snapshots/<dag_id>/00002.<dag_hash>.json.gz
 показывается `dag_id`.
 """
 
-import pendulum
 from airflow.configuration import conf
 from airflow.decorators import dag, task
 from airflow.models import Param
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
+from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
 try:
@@ -92,6 +92,10 @@ except ImportError:
     from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
 
 logger = getLogger("airflow.task")
+
+# Москва живёт на постоянном UTC+3 с 2014 года, переходов на летнее время нет,
+# поэтому фиксированное смещение точно описывает пояс и не зависит от tz-базы
+MSK = timezone(timedelta(hours=3))
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
@@ -299,7 +303,7 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
     },
     # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
     # [core] default_timezone = utc не мешает: 23:00 — московские
-    start_date=pendulum.datetime(2026, 1, 1, tz="Europe/Moscow"),
+    start_date=datetime(2026, 1, 1, tzinfo=MSK),
     schedule="0 23 * * *",
     # Дефолт из airflow.cfg — max_active_tasks_per_dag = 4, а recheck при RECHECK_LIMIT=25
     # растянулся бы на семь волн ожидания (до пары часов). Таски почти всё время спят
@@ -725,7 +729,7 @@ def tools_test_dags():
 
         written = first = unchanged = total_bytes = 0
         pairs: list[dict] = []
-        captured_at = pendulum.now("UTC").isoformat()
+        captured_at = datetime.now(timezone.utc).isoformat()
         for dag_id in targets:
             last = snaps.get(dag_id)
             with create_session() as session:

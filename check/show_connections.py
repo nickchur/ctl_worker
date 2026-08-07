@@ -1,5 +1,5 @@
 """### 🔌 DAG: Список Airflow Connections
-*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список всех подключений из secret backend, сгруппированных по их типу. 
 Используется для аудита доступных соединений и верификации конфигурации backend'а.

@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -37,12 +37,17 @@ import logging
 
 try:
     from CI06932748.analytics.datalab.tools.utils import (  # type: ignore
-        add_note, get_af_conn, on_callback, readable_size,
+        TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
     )
 except ImportError:
-    from plugins.utils import add_note, get_af_conn, on_callback, readable_size  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
+    )
 
 logger = logging.getLogger("airflow.task")
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 
 BATCH_SIZE = 50_000
@@ -276,6 +281,7 @@ params = {
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
+        'pool': TOOLS_POOL,
         'retries': 0,
         'on_failure_callback': on_callback,
     },

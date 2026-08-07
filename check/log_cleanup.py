@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
 Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
@@ -18,9 +18,14 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task, dag
 
 try:
-    from CI06932748.analytics.datalab.tools.utils import add_note, on_callback, readable_size  # type: ignore
+    from CI06932748.analytics.datalab.tools.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size,
+    )
 except ImportError:
-    from plugins.utils import add_note, on_callback, readable_size  # type: ignore
+    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size  # type: ignore
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 # Берём из настроек логирования, а не прописываем именем: бакет и соединение
 # зависят от контура, а conf читается из файла и переменных окружения — в базу
@@ -48,6 +53,7 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
+        'pool': TOOLS_POOL,
         'retries': 2,
         'retry_delay': timedelta(seconds=30),
         'on_failure_callback': on_callback,

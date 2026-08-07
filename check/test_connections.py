@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-08-04 12:40 MSK · v2.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-07 12:10 MSK · v2.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend. 
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -34,7 +34,15 @@ from airflow.models import Connection, Variable
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
+try:
+    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+
 logger = getLogger("airflow.task")
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 
 # Маппинг Airflow conn_type → тип для chk_any_conn / нативная логика
@@ -358,9 +366,11 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     doc_md=__doc__,
     default_args={
         "owner": "DataLab (CI02420667)",
+        "pool": TOOLS_POOL,
         # без ретраев: тест снимает срез доступности здесь и сейчас, повтор только
         # растягивает прогон и маскирует моргнувшее соединение
         "retries": 0,
+        "on_failure_callback": on_callback,
     },
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule="@once",
@@ -368,6 +378,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
+    on_failure_callback=on_callback,
 )
 def tools_test_connections():  # noqa: PLR0915
 

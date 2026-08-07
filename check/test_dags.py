@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-08-04 18:05 MSK · v2.12 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-07 12:40 MSK · v2.14 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -19,6 +19,11 @@
 | **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
 | **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** |
 | **`summary`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга |
+
+**Исключения:** DAG'и с id по префиксам из `SKIP_DAG_PREFIXES` (сейчас `deadlocker_*`)
+не проверяются вовсе — ни в статистике сериализации, ни в версиях, ни в покрытии.
+Нагрузочный генератор переписывает свои DAG'и сам по себе, и в отчётах это шум.
+Исключение не касается `parse_time`: он меряет разбор **файлов**, а не DAG'и по id.
 
 **Параметры:**
 
@@ -81,7 +86,15 @@ from airflow.utils.trigger_rule import TriggerRule
 
 from logging import getLogger
 
+try:
+    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+
 logger = getLogger("airflow.task")
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 # Соединение и бакет берём из настроек логирования, а не именем: на DEV бакет подменяет
 # airflow_entrypoint (REMOTE_BASE_LOG_FOLDER), и хардкод туда не поедет. conf читается из
@@ -93,6 +106,24 @@ SNAP_BUCKET = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].spli
 # попала бы под эту метлу
 SNAP_PREFIX = "dag_snapshots/"
 SNAP_EXT = ".json.gz"
+
+# DAG'и, чей id начинается с одного из этих префиксов, не проверяем вовсе: ни в
+# статистике сериализации, ни в версиях. deadlocker_* — нагрузочный генератор, он
+# плодит и переписывает DAG'и по своей воле, и в отчётах это шум, а не находка
+SKIP_DAG_PREFIXES = ("deadlocker_",)
+
+
+def _skip_dag(dag_id: str) -> bool:
+    """DAG исключён из проверок по префиксу id."""
+    return dag_id.startswith(SKIP_DAG_PREFIXES)
+
+
+# То же условие для SQL. left(), а не LIKE: подчёркивание в LIKE — подстановочный знак,
+# и 'deadlocker_%' поймал бы заодно deadlockerX. Префиксы — константы этого модуля,
+# извне в запрос не приходит ничего
+SKIP_SQL = " AND ".join(
+    f"left(sd.dag_id, {len(p)}) <> '{p}'" for p in SKIP_DAG_PREFIXES
+) or "TRUE"
 
 # Сколько расхождений показывать в заметке. Ячейка — 110 символов (_diff_pair), строка
 # таблицы с двумя ячейками и путём выходит под 270, а заметка режется по MAX_NOTE_LEN
@@ -222,8 +253,11 @@ def _snap_index(hook) -> tuple[dict, list[str]]:
                 continue
             dag_id, _, tail = key[len(SNAP_PREFIX):].rpartition("/")
             ver_s, _, dag_hash = tail[:-len(SNAP_EXT)].partition(".")
-            if not dag_id or not ver_s.isdigit():
-                continue  # чужой объект под префиксом или копия старого формата
+            if not dag_id or not ver_s.isdigit() or _skip_dag(dag_id):
+                # чужой объект под префиксом, копия старого формата или исключённый DAG.
+                # Копии исключённых, если они успели накопиться, остаются в бакете:
+                # мы их просто не видим — ни в покрытии, ни в списке удалённых
+                continue
             all_keys.append(key)
             version = int(ver_s)
             cur = latest.get(dag_id)
@@ -257,9 +291,11 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
     doc_md=__doc__,
     default_args={
         "owner": "DataLab (CI02420667)",
+        "pool": TOOLS_POOL,
         # без ретраев: перепроверка ждёт парсинг до 20 минут, повтор растянул бы прогон вдвое
         # и всё равно смотрел бы на тот же стенд
         "retries": 0,
+        "on_failure_callback": on_callback,
     },
     # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
     # [core] default_timezone = utc не мешает: 23:00 — московские
@@ -273,6 +309,7 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
+    on_failure_callback=on_callback,
     params={
         # 0 — без ограничения, копируем все DAG'и. Ненулевое значение включает ротацию
         # (изменившиеся и самые старые копии вперёд): полное покрытие набирается за
@@ -361,13 +398,14 @@ def tools_test_dags():
             )
             + f", COUNT(*) FILTER (WHERE {at_parse_cond}) AS at_parse"
             + " FROM main.serialized_dag sd LEFT JOIN main.dag d USING (dag_id)"
+            + f" WHERE {SKIP_SQL}"
         )
         # Полный список уходит в XCom, в заметку попадают только первые note_rows
         list_sql = f"""
             SELECT sd.last_updated, sd.dag_id, sd.fileloc, sd.dag_hash, d.last_parsed_time
             FROM main.serialized_dag sd
             JOIN main.dag d USING (dag_id)
-            WHERE {at_parse_cond}
+            WHERE {at_parse_cond} AND {SKIP_SQL}
             ORDER BY sd.last_updated DESC
             LIMIT 500
         """
@@ -609,6 +647,7 @@ def tools_test_dags():
                     SerializedDagModel.dag_id, SerializedDagModel.dag_hash,
                     SerializedDagModel.last_updated,
                 ).all()
+                if not _skip_dag(r[0])
             ]
 
         # Сравнивать не с чем, пока версии нет: такие DAG'и только считаем — на первом
@@ -676,7 +715,8 @@ def tools_test_dags():
         hook = _snap_hook()
         snaps, all_keys = _snap_index(hook)
         with create_session() as session:
-            all_dags = [r[0] for r in session.query(SerializedDagModel.dag_id).all()]
+            all_dags = [r[0] for r in session.query(SerializedDagModel.dag_id).all()
+                        if not _skip_dag(r[0])]
 
         snap_ages = {d: v["at"] for d, v in snaps.items()}
         targets = _snapshot_targets(all_dags, snap_ages, changed, limit)

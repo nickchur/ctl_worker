@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-06 19:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-07 12:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
@@ -56,11 +56,14 @@ from airflow.providers.apache.kafka.operators.consume import ConsumeFromTopicOpe
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
 
 try:
-    from plugins.utils import add_note, on_callback  # type: ignore
+    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import add_note, on_callback  # type: ignore
+    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
 
 logger = logging.getLogger("airflow.task")
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 # 🔧 Дефолты Kafka (можно переопределить параметрами запуска).
 # IN/OUT в именах — сторона TFS, и у соединения, и у топика: его вход — наш выход
@@ -145,6 +148,7 @@ ON_DELIVERY = f"{__name__}.on_delivery"
 _DEF_ARGS = {
     "owner":               "DataLab (CI02420667)",
     "retries":             0,
+    "pool":                TOOLS_POOL,
     "on_failure_callback": on_callback,
     "on_success_callback": on_callback,
 }

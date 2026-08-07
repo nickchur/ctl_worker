@@ -8,6 +8,7 @@
 | `add_xcom()` | Запись в XCom с обрезкой коллекций до `MAX_XCOM` элементов |
 | `on_callback()` | Обработчик событий success/failure/retry |
 | `pool_slots()` / `get_current_load()` | Управление слотами пула |
+| `ensure_pool()` | Создание пула, если его нет (существующий не трогает) |
 | `md5_hash()` | Хеш JSON-совместимых структур |
 | `readable_size()` / `readable()` | Форматирование байтов, datetime, timedelta |
 | `str2timedelta()` | Парсинг строки в timedelta (`'minutes=5'`) |
@@ -114,6 +115,42 @@ def pool_slots(pool_name, slots=None, session=None):
         logger.warning(f'Pool {pool_name} deactivated')
     
     return slots
+
+TOOLS_POOL = 'tools_pool'
+TOOLS_POOL_SLOTS = 16  # с запасом под tools_test_dags с его max_active_tasks=12
+
+_ensured_pools = set()
+
+@provide_session
+def ensure_pool(pool_name, slots=TOOLS_POOL_SLOTS, description='DataLab tools', session=None):
+    """Создаёт пул, если его нет; существующий не трогает.
+
+    Не pool_slots(): та выставляет слоты на каждом вызове, а нас зовут при каждом
+    парсинге DAG-файла — затирали бы значение, выставленное руками, и писали в
+    метабазу впустую. Без аргумента slots она к тому же создаёт пул с нулём слотов,
+    то есть намертво запирает задачи.
+
+    Кэш на процесс: один SELECT на DagFileProcessor, а не на каждый парсинг. Цена —
+    удалённый руками пул восстановится только после перезапуска процесса.
+
+    Исключения гасим: DAG-файл не должен уходить в Broken DAG из-за метабазы.
+    """
+    if pool_name in _ensured_pools:
+        return
+
+    try:
+        if not session.query(Pool).filter(Pool.pool == pool_name).first():
+            session.add(Pool(
+                pool=pool_name,
+                slots=slots,
+                description=description,
+                include_deferred=False
+            ))
+            session.commit()
+            logger.warning(f'Pool {pool_name} created with {slots} slots')
+        _ensured_pools.add(pool_name)
+    except Exception:
+        logger.warning(f'Не удалось проверить пул {pool_name}', exc_info=True)
 
 @provide_session
 def get_current_load(pool_name, pool=True, session=None):

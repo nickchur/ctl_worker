@@ -1,5 +1,5 @@
 """### 🔌 DAG: Список Airflow Connections
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Выводит список всех подключений из secret backend, сгруппированных по их типу. 
 Используется для аудита доступных соединений и верификации конфигурации backend'а.
@@ -17,14 +17,24 @@ from logging import getLogger
 
 from airflow.decorators import dag, task
 
+try:
+    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+
 logger = getLogger("airflow.task")
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 
 @dag(
     doc_md=__doc__,
     default_args={
         'owner': 'DataLab (CI02420667)',
+        'pool': TOOLS_POOL,
         'retries': 2,
+        'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule_interval='@once',
@@ -32,6 +42,7 @@ logger = getLogger("airflow.task")
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
+    on_failure_callback=on_callback,
 )
 def tools_show_connections():
 

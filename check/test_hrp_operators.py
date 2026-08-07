@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
+*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sberbank.ru](mailto:nschurkin@sberbank.ru)*
 
 Config-driven регрессионный стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`.
 Предназначен для прогона на **каждом релизе/хотфиксе** и при обновлении версии
@@ -109,11 +109,14 @@ from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import (
 )
 
 try:
-    from plugins.utils import add_note, on_callback  # type: ignore
+    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import add_note, on_callback  # type: ignore
+    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
 
 logger = getLogger("airflow.task")
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 # ───────────────────────────────── Настройки ──────────────────────────────────
 DEFAULT_PG_CONN = "airflowdb"
@@ -326,6 +329,7 @@ def _ch_insert_sql(table: str) -> str:
     # retries — переживаем transient «Connection reset by peer» от общего ClickHouse/S3
     default_args={
         "owner": "DataLab (CI02420667)",
+        "pool": TOOLS_POOL,
         "retries": 2,
         "retry_delay": dt.timedelta(seconds=30),
         # Единый вывод исхода в заметку КАЖДОГО таска (успех/скип-причина/ошибка-причина).

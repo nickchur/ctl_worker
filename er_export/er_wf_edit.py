@@ -1,5 +1,5 @@
 """✏️ DAG правки настройки ER-выгрузок — export.er_wf_meta из UI.
-*2026-08-12 15:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 15:40 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Заводит новые записи и правит существующие, чтобы не ходить в `clickhouse-client`.
 
@@ -9,6 +9,12 @@
 2. **Патч** — JSON **только с теми полями, которые меняем**. Для новой записи —
    вся запись целиком.
 3. **Синхронизировать** — запустить `export_er_sync` после успешной записи.
+
+Оставить патч пустым — это **просмотр**: даг прочитает выбранную запись из ClickHouse
+(с `FINAL`, то есть самую свежую версию), покажет её в логе и в заметках и завершится
+успешно, ничего не записав и не запуская синк. Для `➕ новая запись` покажет шаблон —
+все поля с умолчаниями. Удобно, чтобы посмотреть текущее состояние и скопировать оттуда
+поля в патч.
 
 Пример правки расписания у существующей группы:
 
@@ -212,7 +218,8 @@ def row_diff(base: dict, merged: dict) -> dict:
         'patch': Param(
             {}, type='object', title='Патч',
             description='JSON только с изменяемыми полями. Для новой записи — вся запись. '
-                        'Выключить запись: {"is_active": 0}.',
+                        'Выключить запись: {"is_active": 0}. Оставить пустым — только '
+                        'посмотреть выбранную запись, ничего не меняя.',
         ),
         'run_sync': Param(
             True, type='boolean', title='Синхронизировать',
@@ -225,18 +232,19 @@ def er_wf_edit_dag():
 
     @task(task_id="apply", pool=EDIT_POOL)
     def apply(**context):
-        """✏️ Накладывает патч на выбранную запись, проверяет и пишет новую версию."""
+        """✏️ Накладывает патч на выбранную запись, проверяет и пишет новую версию.
+
+        С пустым патчем ничего не пишет, а показывает запись — см. ниже.
+        """
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
         p      = context['params']
         record = (p.get('record') or NEW).strip()
         patch  = p.get('patch') or {}
 
-        if not patch:
-            raise AirflowFailException(
-                "Патч пуст — менять нечего. Укажите поля, например {\"schedule\": \"30 2 * * *\"}"
-            )
-        if isinstance(patch, str):     # форма может отдать JSON строкой
+        # Разбираем ДО проверки на пустоту: форма отдаёт объект строкой, и '{}' — это
+        # непустая строка, но пустой патч.
+        if isinstance(patch, str):
             patch = json.loads(patch)
 
         hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
@@ -257,6 +265,26 @@ def er_wf_edit_dag():
                     "Возможно, её удалили после последнего export_er_sync"
                 )
             base = found[0]
+
+        # 👁️ Пустой патч — не ошибка, а просмотр. Выбрал запись, запустил без патча —
+        # увидел, что в ней сейчас, и оттуда же берёшь поля для правки. Ничего не пишем
+        # и синк не дёргаем: менять нечего. Для «новой записи» показываем шаблон —
+        # список полей с умолчаниями, с которого удобно начинать.
+        if not patch:
+            shown = base or dict(COLUMNS)
+            what  = record if record != NEW else 'шаблон новой записи'
+            logger.info("👁️ %s — %s", what, 'из ClickHouse' if base else 'умолчания')
+            for col in COLUMNS:
+                logger.info("    %-13s %r", col, shown.get(col))
+            add_note(
+                {f"👁️ {what}": {col: repr(shown.get(col)) for col in COLUMNS}},
+                level='task,dag', context=context, title='👁️ er_wf_meta',
+            )
+            logger.info(
+                "Патч пуст — ничего не изменено. Чтобы править, заполните «Патч», "
+                "например {\"schedule\": \"30 2 * * *\"}"
+            )
+            return record
 
         merged = merge_patch(base, patch)
         diff   = row_diff(base, merged)

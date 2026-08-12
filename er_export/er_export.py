@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-12 16:10 MSK · v2.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 16:15 MSK · v2.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -456,8 +456,16 @@ def _er_init(cfg, **context):
         )
 
     s3 = S3Hook(aws_conn_id=S3_CONN)
+    # 🪣 Бакет заводится заранее, вместе с коннектом, и на лету НЕ создаётся. Отсутствие
+    # бакета означает ошибку в настройке контура — не тот стенд, не тот endpoint, опечатка
+    # в имени. Молча созданный бакет такую ошибку прячет: выгрузка отработает «успешно»,
+    # файлы лягут в пустоту, которую ТФС не читает, и обнаружится это только по
+    # неприходящим квитанциям.
     if not s3.check_for_bucket(bucket_name=BUCKET):
-        s3.create_bucket(bucket_name=BUCKET)
+        raise AirflowFailException(
+            f"Бакет '{BUCKET}' не найден в S3 '{S3_CONN}'. Он должен существовать заранее: "
+            f"проверьте endpoint коннекта и имя бакета в er_config.py"
+        )
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
 
     tf  = cfg.get('time_field', 'extract_time')

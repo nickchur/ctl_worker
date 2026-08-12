@@ -9,9 +9,16 @@ from __future__ import annotations
 import json
 import logging
 import os
-import unicodedata
 from datetime import timedelta
 from typing import Any
+
+# Общие хелперы Airflow берём из plugins.utils, а не держим свои копии: заметки и
+# колбэки должны вести себя одинаково во всех DAG-ах контура. add_note и ensure_pool
+# здесь же реэкспортируются — их импортируют соседние модули этого каталога.
+try:
+    from plugins.utils import add_note, ensure_pool, on_callback  # noqa: F401  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import add_note, ensure_pool, on_callback  # noqa: F401  # type: ignore
 
 ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
 
@@ -38,71 +45,6 @@ POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
 
 logger = logging.getLogger("airflow.task")
-
-
-def _on_callback(context, level=None):
-    """Обработчик on_failure_callback/on_success_callback — формирует заметку о статусе таска/DAG в Airflow UI."""
-    from airflow.utils.state import TaskInstanceState
-    from datetime import datetime
-
-    ti = context.get('task_instance')
-    dag_run = context.get('dag_run')
-    dag_id = ti.dag_id
-    dag_state = dag_run.state
-
-    if not level:
-        if dag_state.lower() in ('success', 'failed') or not context.get('task'):
-            level = 'DAG'
-        else:
-            level = 'task'
-
-    if level == 'DAG':
-        tis = dag_run.get_task_instances()
-        finished_tis = [t for t in tis if t.end_date is not None]
-        task = sorted(finished_tis, key=lambda x: x.end_date, reverse=True)[0] if finished_tis else ti
-    else:
-        task = ti
-
-    task_id = task.task_id
-    map_index = task.map_index
-    map_ind_str = getattr(task, 'rendered_map_index', '')
-    try_number = task.try_number
-    state = task.state
-
-    msg = context.get('exception')
-
-    map_str = f"   *Map Index*: ({map_index}) **{map_ind_str}**" if str(map_index) != '-1' else ""
-    try_str = f"   *Try number*: **{try_number}**" if try_number > 1 else ""
-    msg_str = f"```\n{str(msg)[:1000]}\n```\n" if msg else ""
-
-    task_msg = '❌ FAILED' if state.lower() == 'failed' else '✅ SUCCESS' if state.lower() == 'success' else state.upper()
-
-    message = f"*{datetime.now().astimezone().strftime('%d.%m.%Y %H:%M:%S %Z')}*\n\n"
-
-    if level == 'DAG':
-        dag_msg = '❌ FAILED' if dag_state.lower() == 'failed' else '✅ SUCCESS'
-        message += f"*DAG:* **{dag_id}**: **{dag_msg}**\n\n"
-    else:
-        message += (
-            f"*Task:* **{task_id}**: **{task_msg}**\n\n"
-            f"{try_str}{map_str}\n\n"
-            f"{msg_str}"
-        )
-
-    add_note(message, context, level, add=True)
-
-    if state == TaskInstanceState.SUCCESS:
-        logger.info(message)
-    elif state == TaskInstanceState.FAILED:
-        logger.error(message)
-        if level != 'DAG':
-            add_note(message, context, level='DAG', add=True)
-    else:
-        logger.warning(message)
-
-
-def on_callback(context, level=None):
-    return _on_callback(context, level)
 
 
 DEF_ARGS = {
@@ -197,61 +139,6 @@ def obj_save(key: str, data: Any) -> None:
     desc     = f"{{'ts': '{ts}', 'len': {length}, 'size': '{size_str}'}}"
 
     Variable.set(key, data, description=desc, serialize_json=True)
-
-
-def add_note(msg, context=None, level='task', add=True, title='', compact=False):
-    """📝 Добавляет структурированную заметку в Airflow UI (Task и/или DAG Run).
-
-    level  — 'task', 'dag' или 'task,dag' (регистр не важен; макс. 2 объекта)
-    add    — True = prepend к существующей заметке; False = заменить полностью
-    compact — передаётся в PrettyPrinter для компактного форматирования dict/list
-
-    Скопировано из plugins.utils для устранения внешней зависимости.
-    """
-    from airflow.utils.session import create_session
-    from airflow.operators.python import get_current_context
-    from pprint import PrettyPrinter
-
-    MAX_NOTE_LEN = 1000
-
-    if not context:
-        try:
-            context = get_current_context()
-        except Exception:
-            logger.warning("Could not get Airflow context for add_note")
-            return
-
-    # Если передан dict с одним ключом — распаковываем его как заголовок
-    if isinstance(msg, dict) and len(msg) == 1:
-        t, msg = next(iter(msg.items()))
-        title += str(t) + (f' ({len(msg)})' if isinstance(msg, (dict, list, tuple, set)) else '')
-
-    if not isinstance(msg, str):
-        msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
-        msg = '```\n' + msg + '\n```'
-
-    logger.info("📝 Note added to %s %s:\n%s", level, title, msg)
-
-    with create_session() as session:
-        for lvl in list(set(level.upper().split(',')))[:2]:
-            new_note = msg.strip()
-            obj = session.merge(context['dag_run'] if lvl == 'DAG' else context['task_instance'])
-            session.expire(obj)
-
-            if title:
-                # Если title не начинается с emoji — добавляем стандартный префикс
-                if not unicodedata.category(title[0]) == 'So':
-                    title = "📝 " + title
-                new_note = f"{title}\n---\n{new_note}"
-
-            # Пропускаем если заметка уже начинается с того же текста (идемпотентность)
-            if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
-                continue
-
-            if add:
-                new_note = f"{new_note}\n\n---\n{obj.note if obj.note else ''}"
-
-            obj.note = new_note[:MAX_NOTE_LEN]
 
 
 def get_dict(ch_hook, sql: str) -> list[dict]:

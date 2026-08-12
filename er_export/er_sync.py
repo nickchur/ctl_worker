@@ -58,10 +58,10 @@ from airflow.exceptions import AirflowFailException
 
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
-        get_config, get_dict, obj_save, add_note, replica_base,
+        get_config, get_dict, obj_save, add_note, ensure_pool, replica_base,
     )
 except ImportError:
-    from er_export.er_config import get_config, get_dict, obj_save, add_note, replica_base
+    from er_export.er_config import get_config, get_dict, obj_save, add_note, ensure_pool, replica_base
 
 _cfg           = get_config()
 CH_ID          = _cfg['CH_ID']
@@ -304,22 +304,15 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
 def _ensure_pool() -> None:
     """🏊 Создаёт Airflow Pool для ER-выгрузок, если его ещё нет.
 
-    Вызывается внутри таска (не при парсинге DAG), чтобы не создавать сессию БД
-    при каждом обходе scheduler-ом.
+    Вызывается внутри таска, а не при разборе DAG: ensure_pool кэширует результат
+    на процесс, но лишний SELECT на каждом обходе scheduler-ом всё равно не нужен.
 
     Пулы тракта ТФС здесь не заводятся — их создаёт tfs_kafka (ensure_pools в приёмнике).
     Прежние tfs_{scenario_id} не нужны: требование ЕР «не передаётся несколько пакетов
     одновременно» выполняет сам отправитель, разбирая очередь пакетами целиком.
     Уже созданные tfs_* можно удалить руками, код их не использует.
     """
-    from airflow.models import Pool
-    from airflow.utils.session import create_session
-
-    with create_session() as session:
-        exists = session.query(Pool).filter(Pool.pool == POOL_NAME).first()
-        if not exists:
-            session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS,
-                             description='Пул для ER-выгрузок', include_deferred=False))
+    ensure_pool(POOL_NAME, slots=POOL_SLOTS, description='Пул для ER-выгрузок')
 
 
 @dag(

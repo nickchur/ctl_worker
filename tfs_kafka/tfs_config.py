@@ -21,9 +21,9 @@ from datetime import timedelta
 # колбэки должны вести себя одинаково во всех DAG-ах контура. add_note и ensure_pool
 # здесь же реэкспортируются — их импортируют соседние модули этого каталога.
 try:
-    from plugins.utils import add_note, ensure_pool, on_callback  # noqa: F401  # type: ignore
+    from plugins.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import add_note, ensure_pool, on_callback  # noqa: F401  # type: ignore
+    from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
 
 CH_ID = 'dlab-click'
 
@@ -72,15 +72,6 @@ TFS_SEND_SLOTS = 1
 TFS_RCV_POOL   = 'default_pool'
 
 logger = logging.getLogger("airflow.task")
-
-def get_dict(ch_hook, sql: str) -> list[dict]:
-    """🔍 Выполняет SQL и возвращает результат как список словарей {column: value}."""
-    res, cols = ch_hook.execute(sql, with_column_types=True)
-    if res:
-        cols = [col[0] for col in cols]
-        return [dict(zip(cols, row)) for row in res]
-    return []
-
 
 def tfs_limits(scenario_id: str) -> dict[str, int]:
     """🚦 Лимиты маршрута: свои из TFS_LIMITS либо общие TFS_LIMITS_DEFAULT."""

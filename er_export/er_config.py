@@ -16,9 +16,9 @@ from typing import Any
 # колбэки должны вести себя одинаково во всех DAG-ах контура. add_note и ensure_pool
 # здесь же реэкспортируются — их импортируют соседние модули этого каталога.
 try:
-    from plugins.utils import add_note, ensure_pool, on_callback  # noqa: F401  # type: ignore
+    from plugins.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import add_note, ensure_pool, on_callback  # noqa: F401  # type: ignore
+    from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
 
 ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
 
@@ -139,15 +139,6 @@ def obj_save(key: str, data: Any) -> None:
     desc     = f"{{'ts': '{ts}', 'len': {length}, 'size': '{size_str}'}}"
 
     Variable.set(key, data, description=desc, serialize_json=True)
-
-
-def get_dict(ch_hook, sql: str) -> list[dict]:
-    """🔍 Выполняет SQL и возвращает результат как список словарей {column: value}."""
-    res, cols = ch_hook.execute(sql, with_column_types=True)
-    if res:
-        cols = [col[0] for col in cols]
-        return [dict(zip(cols, row)) for row in res]
-    return []
 
 
 # 📦 Параметры уровня ПАКЕТА (группы). Задаются в строке-дефолте группы (replica заполнена,

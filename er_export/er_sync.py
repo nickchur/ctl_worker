@@ -58,10 +58,10 @@ from airflow.exceptions import AirflowFailException
 
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
-        get_config, get_dict, obj_save, add_note, ensure_pool, replica_base,
+        get_config, get_dict_from_ch, obj_save, add_note, ensure_pool, replica_base,
     )
 except ImportError:
-    from er_export.er_config import get_config, get_dict, obj_save, add_note, ensure_pool, replica_base
+    from er_export.er_config import get_config, get_dict_from_ch, obj_save, add_note, ensure_pool, replica_base
 
 _cfg           = get_config()
 CH_ID          = _cfg['CH_ID']
@@ -375,7 +375,7 @@ def er_sync_dag():
         # погасить всю группу. Уйди она из выборки — поставки синхронизировались бы дальше,
         # растеряв групповые параметры и вернувшись к умолчаниям из кода (а notify_kafka
         # там 1, то есть стендовый пакет молча поехал бы в ТФС).
-        rows = get_dict(hook, """
+        rows = get_dict_from_ch(hook, """
             SELECT
                 extract_name, db_name, replica, schema_name,
                 pk, uk, fields,
@@ -404,7 +404,7 @@ def er_sync_dag():
             pairs = ", ".join(f"('{_q(db)}', '{_q(tbl)}')" for db, tbl in no_desc)
             ch_comments = {
                 (r["database"], r["name"]): r["comment"]
-                for r in get_dict(hook, f"SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})")
+                for r in get_dict_from_ch(hook, f"SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})")
             }
 
         wfs, errors, warnings = build_wfs(tables, defaults, ch_comments)

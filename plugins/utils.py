@@ -363,6 +363,19 @@ def query_to_dict(gp_hook, sql, timeout=300):
             rows = cursor.fetchall()
     return [dict(zip(cols, row)) for row in rows]
 
+def get_dict_from_ch(ch_hook, sql):
+    """Выполняет SQL в ClickHouse и возвращает результат списком словарей {колонка: значение}.
+
+    Отдельно от query_to_dict: та работает через DB-API курсор Greenplum, а ClickHouseHook
+    отдаёт данные и описание колонок одним вызовом execute(with_column_types=True).
+    """
+    res, cols = ch_hook.execute(sql, with_column_types=True)
+    if res:
+        cols = [col[0] for col in cols]
+        return [dict(zip(cols, row)) for row in res]
+    return []
+
+
 def get_conns_by_type(conn_type='aws'):
     from airflow.configuration import get_custom_secret_backend
     from airflow.models import Connection

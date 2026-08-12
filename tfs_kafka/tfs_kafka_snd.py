@@ -39,10 +39,10 @@ from airflow.exceptions import AirflowFailException
 
 try:
     from CI06932748.analytics.datalab.tfs_kafka.tfs_config import (  # type: ignore
-        get_config, get_dict, add_note, tfs_limits, send_budget,
+        get_config, get_dict_from_ch, add_note, tfs_limits, send_budget,
     )
 except ImportError:
-    from tfs_kafka.tfs_config import get_config, get_dict, add_note, tfs_limits, send_budget
+    from tfs_kafka.tfs_config import get_config, get_dict_from_ch, add_note, tfs_limits, send_budget
 
 _cfg             = get_config()
 CH_ID            = _cfg['CH_ID']
@@ -137,7 +137,7 @@ def tfs_kafka_snd_dag():
 
         # FINAL обязателен: отправленная строка дописывается второй версией, и без
         # схлопывания уже ушедший файл уехал бы повторно.
-        pending = get_dict(hook, f"""
+        pending = get_dict_from_ch(hook, f"""
             SELECT rq_uid, file_name, replica, scenario_id, package_ts, created_at
             FROM {SENT_FILES_TABLE} FINAL
             WHERE notified_at = toDateTime64(0, 3)
@@ -166,7 +166,7 @@ def tfs_kafka_snd_dag():
                 continue  # маршрут упёрся в лимит, остальные его файлы ждут
 
             limits = tfs_limits(scenario)
-            counts = get_dict(hook, f"""
+            counts = get_dict_from_ch(hook, f"""
                 SELECT
                     countIf(notified_at > now64(3) - INTERVAL 1 SECOND) AS sec,
                     countIf(notified_at > now64(3) - INTERVAL 1 MINUTE) AS min,

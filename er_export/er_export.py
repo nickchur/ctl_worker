@@ -32,10 +32,10 @@ from airflow.utils.task_group import TaskGroup
 
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
-        get_config, get_dict, obj_load, add_note, get_params, replica_base,
+        get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
     )
 except ImportError:
-    from er_export.er_config import get_config, get_dict, obj_load, add_note, get_params, replica_base
+    from er_export.er_config import get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base
 
 logger = logging.getLogger("airflow.task")
 
@@ -449,7 +449,7 @@ def _er_init(cfg, **context):
     }
 
     if cfg['sql_get_current']:
-        cur_res = get_dict(hook, cfg['sql_get_current'])
+        cur_res = get_dict_from_ch(hook, cfg['sql_get_current'])
         if not cur_res:
             logger.warning("First execution for %s. Bootstrapping from lower_bound=%s.", cfg['tbl'], lb)
             state = {
@@ -828,7 +828,7 @@ def _er_wait_confirm(gcfg, **context):
     deadline = time.time() + timeout * 60
 
     while True:
-        got = get_dict(hook, f"""
+        got = get_dict_from_ch(hook, f"""
             SELECT rq_uid, file_name, status_code, toString(rq_tm) AS rq_tm
             FROM {RECEIPTS_TABLE} FINAL
             WHERE rq_uid IN ({uids})
@@ -854,7 +854,7 @@ def _er_wait_confirm(gcfg, **context):
 
     # Таймаут. Различаем два диагноза: очередь стоит или ТФС молчит — лечатся они разно.
     missing = set(rq_uids) - {r['rq_uid'] for r in got}
-    queued  = get_dict(hook, f"""
+    queued  = get_dict_from_ch(hook, f"""
         SELECT file_name, notified_at = toDateTime64(0, 3) AS pending
         FROM {SENT_FILES_TABLE} FINAL
         WHERE rq_uid IN ({", ".join(f"'{u}'" for u in missing)})

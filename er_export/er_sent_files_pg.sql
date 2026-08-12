@@ -1,4 +1,5 @@
 -- DDL для export.er_sent_files — вариант PostgreSQL / Greenplum (STORAGE = 'pg')
+-- 2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
 --
 -- Для ClickHouse (STORAGE = 'ch') используйте er_sent_files.sql.
 -- Для STORAGE = 's3' таблица не нужна: очередь лежит объектами под queue/pending

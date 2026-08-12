@@ -1,4 +1,5 @@
 -- DDL для export.er_wf_meta
+-- 2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
 -- Управляющая таблица ER-выгрузок. Синхронизируется в Airflow Variable "datalab_er_wfs"
 -- DAG-ом export_er_sync, который раскладывает записи по группам поставок.
 --

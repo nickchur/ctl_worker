@@ -1,4 +1,5 @@
 -- DDL для export.tfs_receipts — вариант PostgreSQL / Greenplum (STORAGE = 'pg')
+-- 2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
 --
 -- Для ClickHouse (STORAGE = 'ch') используйте tfs_receipts.sql.
 -- Для STORAGE = 's3' таблица не нужна вовсе: квитанции лежат объектами рядом с логами.

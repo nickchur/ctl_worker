@@ -1,4 +1,5 @@
 -- DDL для export.er_sent_files
+-- 2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
 -- Вариант ClickHouse (STORAGE = 'ch' в plugins/tfs_utils.py).
 -- Для PostgreSQL/Greenplum — er_sent_files_pg.sql; при STORAGE = 's3' таблица не нужна.
 -- Очередь отправки и реестр отправленных файлов ER.

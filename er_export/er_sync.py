@@ -1,5 +1,5 @@
 """🔄 DAG синхронизации метаданных ER-выгрузок.
-*2026-08-10 21:40 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 14:48 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Читает таблицу export.er_wf_meta из ClickHouse и сохраняет активные записи
 в Airflow Variable `datalab_er_wfs` (JSON-словарь), который используется

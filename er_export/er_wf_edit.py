@@ -1,5 +1,5 @@
 """✏️ DAG правки настройки ER-выгрузок — export.er_wf_meta из UI.
-*2026-08-12 16:20 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 14:48 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Заводит новые записи и правит существующие, чтобы не ходить в `clickhouse-client`.
 

@@ -183,7 +183,7 @@ def row_diff(base: dict, merged: dict) -> dict:
 
 
 @dag(
-    dag_id="er_wf_edit",
+    dag_id="export_er_wf_edit",
     description="✏️ Правка и создание записей в export.er_wf_meta",
     default_args=DEF_ARGS,
     start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),

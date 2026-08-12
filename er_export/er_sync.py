@@ -58,38 +58,27 @@ from airflow.exceptions import AirflowFailException
 
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
-        get_config, get_dict_from_ch, obj_save, add_note, ensure_pool, replica_base,
+        get_config, get_dict_from_ch, obj_save, add_note, ensure_pool,
+        INHERITED, DEFAULT_SCHEDULE, parse_params, explicit_schedule, check_table, raw_key,
     )
 except ImportError:
-    from er_export.er_config import get_config, get_dict_from_ch, obj_save, add_note, ensure_pool, replica_base
+    from er_export.er_config import (
+        get_config, get_dict_from_ch, obj_save, add_note, ensure_pool,
+        INHERITED, DEFAULT_SCHEDULE, parse_params, explicit_schedule, check_table, raw_key,
+    )
 
 _cfg           = get_config()
 CH_ID          = _cfg['CH_ID']
 DEF_ARGS       = _cfg['DEF_ARGS']
 ENV_STAND      = _cfg['ENV_STAND']
 VAR_NAME       = _cfg['VAR_NAME']
+RAW_VAR_NAME   = _cfg['RAW_VAR_NAME']
 POOL_NAME      = _cfg['POOL_NAME']
 POOL_SLOTS     = _cfg['POOL_SLOTS']
 TFS_MAP        = _cfg['TFS_MAP']
 DEFAULT_PARAMS = _cfg['DEFAULT_PARAMS']
 GROUP_PARAMS   = _cfg['GROUP_PARAMS']
 FORMAT_MAP     = _cfg['FORMAT_MAP']
-
-# 🧬 Поля строки-дефолта группы, наследуемые поставками. SQL и ключи (pk, uk, fields,
-# sql_*) сюда намеренно не входят — они всегда описывают конкретную таблицу.
-#
-# is_recent тоже не наследуется, хотя это и не SQL: колонка UInt8 DEFAULT 0, и «не задано»
-# от «явно delta» не отличить. При наследовании через `or` таблица в recent-группе не смогла
-# бы вернуться к дельте — её sql_stmt_export_delta уехал бы под ключом recent.
-#
-# description обрабатывается отдельно (см. build_wfs): у него есть третий источник —
-# комментарий таблицы в ClickHouse, и он должен быть приоритетнее группового текста.
-INHERITED = ('schema_name',)
-
-# Значение колонки schedule по умолчанию в DDL. Отличать его от осознанно заданного нельзя
-# (ClickHouse возвращает дефолт, а не пустую строку), поэтому при сверке расписаний внутри
-# пакета такое значение считаем «не задано».
-DEFAULT_SCHEDULE = '55 0 * * *'
 
 logger = logging.getLogger("airflow.task")
 
@@ -105,15 +94,6 @@ _doc_cfg = {k: v for k, v in _cfg.items() if k not in _HIDDEN_CFG_KEYS}
 def _q(s: str) -> str:
     """Экранирует одинарные кавычки для подстановки в ClickHouse-строковый литерал."""
     return s.replace("'", "''")
-
-
-def _parse_params(raw: str, where: str) -> dict:
-    """Разбирает JSON-поле params; при битом JSON возвращает {} и пишет предупреждение."""
-    try:
-        return json.loads(raw or '{}')
-    except json.JSONDecodeError as err:
-        logger.warning("⚠️ %s: битый JSON в params (%s) — параметры проигнорированы", where, err)
-        return {}
 
 
 def split_rows(rows: list[dict]) -> tuple[dict, list[dict], set[str]]:
@@ -134,52 +114,6 @@ def split_rows(rows: list[dict]) -> tuple[dict, list[dict], set[str]]:
          if r["extract_name"] and r.get("is_active", 1) and r["replica"] not in off],
         off,
     )
-
-
-def _explicit_schedule(row: dict) -> str:
-    """Расписание, заданное осознанно. Колоночный дефолт трактуем как «не задано»."""
-    sched = (row or {}).get('schedule') or ''
-    return '' if sched == DEFAULT_SCHEDULE else sched
-
-
-def _check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
-    """Проверяет строку-поставку. Непрошедшая запись ломает всю группу, причина — в errors.
-
-    params — уже слитые параметры (дефолты + группа + таблица): проверять надо именно их,
-    иначе опечатка в params строки-дефолта проходит синк и роняет разбор файла в фабрике.
-    """
-    if not row["sql_from"]:
-        errors.append(f"{key}: пустой sql_from")
-        return False
-
-    base = replica_base(row["replica"])
-    if base not in TFS_MAP:
-        errors.append(f"{key}: базовая реплика '{base}' не найдена в TFS_MAP")
-        return False
-
-    # Без схемы фабрика падает на schema_name.replace(), а падение при разборе файла
-    # уносит с собой ВСЕ пакеты, а не только этот.
-    if not row.get("schema_name"):
-        errors.append(f"{key}: пустой schema_name — задайте его в строке-дефолте группы или в поставке")
-        return False
-
-    # Состав полей задаётся только настройкой: иначе новая колонка источника уехала бы
-    # в выгрузку и в .meta сама по себе, без единого изменения конфигурации.
-    fields = row["fields"] or []
-    if not fields:
-        errors.append(f"{key}: пустой fields — состав колонок надо задать явно")
-        return False
-    star = [f for f in fields if str(f).strip() == '*' or str(f).strip().endswith('.*')]
-    if star:
-        errors.append(f"{key}: fields содержит {star} — звёздочка запрещена, нужен явный список")
-        return False
-
-    fmt = params.get('format', DEFAULT_PARAMS['format'])
-    if fmt not in FORMAT_MAP:
-        errors.append(f"{key}: неизвестный format '{fmt}', допустимы {sorted(FORMAT_MAP)}")
-        return False
-
-    return True
 
 
 def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[dict, list[str]]:
@@ -215,9 +149,9 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
     # попавшейся строкой нельзя — порядок строк не гарантирует, что она осмысленная.
     schedules = {}
     for replica in {r["replica"] for r in tables}:
-        own = [_explicit_schedule(r) for r in tables if r["replica"] == replica]
+        own = [explicit_schedule(r) for r in tables if r["replica"] == replica]
         schedules[replica] = (
-            _explicit_schedule(defaults.get(replica, {}))
+            explicit_schedule(defaults.get(replica, {}))
             or next((s for s in own if s), '')
             or DEFAULT_SCHEDULE
         )
@@ -231,11 +165,11 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
         # Наследование: непустое значение поставки перебивает дефолт группы.
         row = {**row, **{k: (row.get(k) or grp_row.get(k) or '') for k in INHERITED}}
 
-        grp_params = _parse_params(grp_row.get("params", ""), f"группа {replica}")
-        tbl_params = _parse_params(row["params"], table_key)
+        grp_params = parse_params(grp_row.get("params", ""), f"группа {replica}")
+        tbl_params = parse_params(row["params"], table_key)
         params     = {**DEFAULT_PARAMS, **grp_params, **tbl_params}
 
-        if not _check_table(row, table_key, errors.setdefault(replica, []), params):
+        if not check_table(row, table_key, errors.setdefault(replica, []), params):
             continue
 
         group = wfs.setdefault(replica, {
@@ -249,7 +183,7 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
 
         # Cron у пакета один — пакет уезжает целиком. Расхождение не отбрасывает поставку
         # (потерять таблицу из-за косметики хуже), но должно быть видно в логе и заметке.
-        own_sched = _explicit_schedule(row)
+        own_sched = explicit_schedule(row)
         if own_sched and own_sched != group["schedule"]:
             warnings.append(
                 f"{table_key}: schedule '{own_sched}' расходится с расписанием группы "
@@ -423,6 +357,11 @@ def er_sync_dag():
         # 💾 Сохраняем ДО падения: опечатка в одной строке не должна замораживать правки
         # по всем остальным пакетам. obj_save пропускает запись, если данные не изменились.
         obj_save(VAR_NAME, wfs)
+
+        # Сырые строки — для дага правки export_er_config: он строит выпадающий список
+        # при разборе файла и в ClickHouse ходить не может. Пишем ВСЕ строки, включая
+        # выключенные: править надо уметь и их.
+        obj_save(RAW_VAR_NAME, {raw_key(r): r for r in rows})
 
         # Полные списки — в лог и в XCom. Именно xcom_push, а не return: таск ниже падает,
         # а у упавшего таска return_value в XCom не сохраняется.

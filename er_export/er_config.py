@@ -24,6 +24,12 @@ ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
 
 VAR_NAME = "datalab_er_wfs"
 
+# Сырые строки er_wf_meta — как они лежат в таблице, без наследования и разрешения
+# параметров. Нужны дагу правки export_er_config: выпадающий список записей строится
+# при разборе файла, а ходить в ClickHouse на каждом парсинге нельзя.
+# Пишет тот же er_sync, он и так читает всю таблицу.
+RAW_VAR_NAME = "datalab_er_wf_meta"
+
 CH_ID   = 'dlab-click'
 S3_CONN = 's3-tfs-hrplt'
 
@@ -196,6 +202,30 @@ FORMAT_MAP: dict[str, dict] = {
 }
 
 
+def raw_key(row: dict) -> str:
+    """🔑 Ключ строки er_wf_meta для Variable и выпадающего списка.
+
+    У поставки — 'db_name.extract_name', как в остальном фреймворке. У строки-дефолта
+    группы extract_name пуст, а db_name равен replica, поэтому ключ превратился бы
+    в 'replica.' — вместо этого помечаем её явно, чтобы в списке было понятно, что это.
+    """
+    if not row.get('extract_name'):
+        return f"{row.get('replica', '')} (дефолты группы)"
+    return f"{row.get('db_name', '')}.{row['extract_name']}"
+
+
+def key_to_where(key: str) -> tuple[str, str]:
+    """🔎 Ключ из выпадающего списка → (db_name, extract_name) для WHERE.
+
+    Обратная к raw_key: у строки-дефолта extract_name пуст, а db_name равен replica.
+    """
+    marker = ' (дефолты группы)'
+    if key.endswith(marker):
+        return key[:-len(marker)], ''
+    db, _, name = key.partition('.')
+    return db, name
+
+
 def replica_base(replica: str) -> str:
     """🔀 Базовая реплика — часть до первого '__'; остальное считается номером группы.
 
@@ -217,6 +247,78 @@ def get_params(row: dict, group: dict | None = None) -> dict:
     return {**DEFAULT_PARAMS, **(group or {}), **overrides}
 
 
+# 🧬 Поля строки-дефолта группы, наследуемые поставками. SQL и ключи (pk, uk, fields,
+# sql_*) сюда намеренно не входят — они всегда описывают конкретную таблицу.
+#
+# is_recent тоже не наследуется, хотя это и не SQL: колонка UInt8 DEFAULT 0, и «не задано»
+# от «явно delta» не отличить. При наследовании через `or` таблица в recent-группе не смогла
+# бы вернуться к дельте — её sql_stmt_export_delta уехал бы под ключом recent.
+#
+# description обрабатывается отдельно (см. build_wfs): у него есть третий источник —
+# комментарий таблицы в ClickHouse, и он должен быть приоритетнее группового текста.
+INHERITED = ('schema_name',)
+
+# Значение колонки schedule по умолчанию в DDL. Отличать его от осознанно заданного нельзя
+# (ClickHouse возвращает дефолт, а не пустую строку), поэтому при сверке расписаний внутри
+# пакета такое значение считаем «не задано».
+DEFAULT_SCHEDULE = '55 0 * * *'
+
+
+def parse_params(raw: str, where: str) -> dict:
+    """Разбирает JSON-поле params; при битом JSON возвращает {} и пишет предупреждение."""
+    try:
+        return json.loads(raw or '{}')
+    except json.JSONDecodeError as err:
+        logger.warning("⚠️ %s: битый JSON в params (%s) — параметры проигнорированы", where, err)
+        return {}
+
+
+def explicit_schedule(row: dict) -> str:
+    """Расписание, заданное осознанно. Колоночный дефолт трактуем как «не задано»."""
+    sched = (row or {}).get('schedule') or ''
+    return '' if sched == DEFAULT_SCHEDULE else sched
+
+
+def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
+    """Проверяет строку-поставку. Непрошедшая запись ломает всю группу, причина — в errors.
+
+    params — уже слитые параметры (дефолты + группа + таблица): проверять надо именно их,
+    иначе опечатка в params строки-дефолта проходит синк и роняет разбор файла в фабрике.
+    """
+    if not row["sql_from"]:
+        errors.append(f"{key}: пустой sql_from")
+        return False
+
+    base = replica_base(row["replica"])
+    if base not in TFS_MAP:
+        errors.append(f"{key}: базовая реплика '{base}' не найдена в TFS_MAP")
+        return False
+
+    # Без схемы фабрика падает на schema_name.replace(), а падение при разборе файла
+    # уносит с собой ВСЕ пакеты, а не только этот.
+    if not row.get("schema_name"):
+        errors.append(f"{key}: пустой schema_name — задайте его в строке-дефолте группы или в поставке")
+        return False
+
+    # Состав полей задаётся только настройкой: иначе новая колонка источника уехала бы
+    # в выгрузку и в .meta сама по себе, без единого изменения конфигурации.
+    fields = row["fields"] or []
+    if not fields:
+        errors.append(f"{key}: пустой fields — состав колонок надо задать явно")
+        return False
+    star = [f for f in fields if str(f).strip() == '*' or str(f).strip().endswith('.*')]
+    if star:
+        errors.append(f"{key}: fields содержит {star} — звёздочка запрещена, нужен явный список")
+        return False
+
+    fmt = params.get('format', DEFAULT_PARAMS['format'])
+    if fmt not in FORMAT_MAP:
+        errors.append(f"{key}: неизвестный format '{fmt}', допустимы {sorted(FORMAT_MAP)}")
+        return False
+
+    return True
+
+
 def get_config() -> dict:
     """📦 Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта."""
     return {
@@ -231,6 +333,7 @@ def get_config() -> dict:
         'TFS_MAP':         TFS_MAP,
         'S3_CONN':         S3_CONN,
         'VAR_NAME':        VAR_NAME,
+        'RAW_VAR_NAME':    RAW_VAR_NAME,
         'POOL_NAME':       POOL_NAME,
         'POOL_SLOTS':      POOL_SLOTS,
         'DEFAULT_PARAMS':  DEFAULT_PARAMS,

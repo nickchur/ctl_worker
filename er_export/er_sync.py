@@ -70,8 +70,6 @@ ENV_STAND      = _cfg['ENV_STAND']
 VAR_NAME       = _cfg['VAR_NAME']
 POOL_NAME      = _cfg['POOL_NAME']
 POOL_SLOTS     = _cfg['POOL_SLOTS']
-TFS_SEND_POOL  = _cfg['TFS_SEND_POOL']
-TFS_SEND_SLOTS = _cfg['TFS_SEND_SLOTS']
 TFS_MAP        = _cfg['TFS_MAP']
 DEFAULT_PARAMS = _cfg['DEFAULT_PARAMS']
 GROUP_PARAMS   = _cfg['GROUP_PARAMS']
@@ -304,34 +302,24 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
 
 
 def _ensure_pool() -> None:
-    """🏊 Создаёт Airflow Pool-ы фреймворка, если их ещё нет.
+    """🏊 Создаёт Airflow Pool для ER-выгрузок, если его ещё нет.
 
     Вызывается внутри таска (не при парсинге DAG), чтобы не создавать сессию БД
     при каждом обходе scheduler-ом.
 
-    Прежние пулы tfs_{scenario_id} больше не заводятся: требование ЕР «не передаётся
-    несколько пакетов одновременно» теперь выполняет сам export_er_sender — он
-    единственный отправитель и разбирает очередь пакетами целиком. Уже созданные
-    tfs_* можно удалить руками, код их не использует.
+    Пулы тракта ТФС здесь не заводятся — их создаёт tfs_kafka (ensure_pools в приёмнике).
+    Прежние tfs_{scenario_id} не нужны: требование ЕР «не передаётся несколько пакетов
+    одновременно» выполняет сам отправитель, разбирая очередь пакетами целиком.
+    Уже созданные tfs_* можно удалить руками, код их не использует.
     """
     from airflow.models import Pool
     from airflow.utils.session import create_session
 
-    pools = {
-        POOL_NAME: (POOL_SLOTS, 'Пул для ER-выгрузок'),
-        TFS_SEND_POOL: (
-            TFS_SEND_SLOTS,
-            'Отправка в ТФС: не больше одного отправителя одновременно. Берёт '
-            'export_er_sender и обязан брать любой даг, шлющий в ТФС мимо очереди. '
-            'Лимиты маршрута пул НЕ соблюдает — только взаимное исключение',
-        ),
-    }
-
     with create_session() as session:
-        existing = {p.pool for p in session.query(Pool).filter(Pool.pool.in_(pools)).all()}
-        for name, (slots, desc) in pools.items():
-            if name not in existing:
-                session.add(Pool(pool=name, slots=slots, description=desc, include_deferred=False))
+        exists = session.query(Pool).filter(Pool.pool == POOL_NAME).first()
+        if not exists:
+            session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS,
+                             description='Пул для ER-выгрузок', include_deferred=False))
 
 
 @dag(

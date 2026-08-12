@@ -1,12 +1,12 @@
-"""🚚 DAG отправки файлов ER в ТФС с соблюдением темпа.
-*2026-08-12 11:30 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""🚚 DAG отправки файлов в ТФС с соблюдением темпа маршрута.
+*2026-08-12 13:20 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Единственное место, откуда файлы ЕР уходят уведомлением в Kafka. Пакетные даги только
 ставят файлы в очередь (`export.er_sent_files`, `notified_at = 0`), а разгребает её этот
 даг — раз в минуту, в темпе, который декларирует ТФС.
 
 📊 **Зачем централизованно.** ТФС отбивает лишние файлы, а лимиты заданы на маршрут:
-файлов в секунду, минуту, час и сутки (см. `TFS_LIMITS` в `er_config.py`). Считать их
+файлов в секунду, минуту, час и сутки (см. `TFS_LIMITS` в `tfs_config.py`). Считать их
 можно только там, где видно все отправки сразу. Прежняя схема — `sleep 1` внутри
 `produce_msg` плюс 1-слотовый пул `tfs_{scenario}` — держала темп лишь внутри пакета:
 пул сериализовал соседние `notify_tfs`, но не разводил их по времени, а минутного,
@@ -38,11 +38,11 @@ from airflow.decorators import dag, task
 from airflow.exceptions import AirflowFailException
 
 try:
-    from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
+    from CI06932748.analytics.datalab.tfs_kafka.tfs_config import (  # type: ignore
         get_config, get_dict, add_note, tfs_limits, send_budget,
     )
 except ImportError:
-    from er_export.er_config import get_config, get_dict, add_note, tfs_limits, send_budget
+    from tfs_kafka.tfs_config import get_config, get_dict, add_note, tfs_limits, send_budget
 
 _cfg             = get_config()
 CH_ID            = _cfg['CH_ID']
@@ -105,19 +105,19 @@ def order_queue(rows: list[dict]) -> list[dict]:
 
 
 @dag(
-    dag_id="export_er_sender",
-    description="🚚 Очередь отправки ER в ТФС: соблюдение лимитов маршрута",
+    dag_id="tfs_kafka_snd",
+    description="🚚 Очередь отправки в ТФС: соблюдение лимитов маршрута",
     default_args=DEF_ARGS,
     start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
     schedule_interval="*/1 * * * *",
     max_active_runs=1,
     catchup=False,
     dagrun_timeout=timedelta(minutes=5),
-    tags=["DataLab", "CI02420667", "ER", "TFS"],
+    tags=["DataLab", "CI02420667", "TFS", "kafka"],
     is_paused_upon_creation=False,
     doc_md=__doc__,
 )
-def er_sender_dag():
+def tfs_kafka_snd_dag():
 
     @task(task_id="send", pool=SEND_POOL)
     def send(**context):
@@ -216,7 +216,7 @@ def er_sender_dag():
         if left:
             note[f"⏳ Осталось в очереди: {len(left)}"] = [r['file_name'] for r in left[:20]]
         if note:
-            add_note(note, level='task,dag', context=context, title='🚚 er_sender')
+            add_note(note, level='task,dag', context=context, title='🚚 tfs_kafka_snd')
 
         # Затор виден только тогда, когда о нём кто-то кричит. Падаем в самом конце:
         # всё, что влезло в бюджет, к этому моменту уже отправлено.
@@ -235,4 +235,4 @@ def er_sender_dag():
     send()
 
 
-er_sender_dag()  # вызов регистрирует DAG в globals() через декоратор @dag
+tfs_kafka_snd_dag()  # вызов регистрирует DAG в globals() через декоратор @dag

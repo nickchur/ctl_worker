@@ -208,7 +208,7 @@ def _run_ts(context) -> datetime:
 def _enqueue_files(gcfg: dict, files: list[str], context) -> list[dict]:
     """📮 Ставит файлы пакета в очередь отправки, выдавая каждому свой RqUID.
 
-    Отправкой занимается отдельный даг export_er_sender — он один видит все выгрузки
+    Отправкой занимается отдельный даг tfs_kafka_snd — он один видит все выгрузки
     сразу и потому только он может соблюдать лимиты маршрута (файлов в секунду, минуту,
     час и сутки). Пакетный даг лишь регистрирует намерение.
 
@@ -866,7 +866,7 @@ def _er_wait_confirm(gcfg, **context):
         f"Квитанции ТФС не пришли за {timeout} мин.\n"
         + (f"  Ещё не отправлены (очередь стоит): {not_sent}\n" if not_sent else "")
         + (f"  Отправлены, ответа нет: {no_answer}\n" if no_answer else "")
-        + f"  Смотреть: {SENT_FILES_TABLE}, {RECEIPTS_TABLE}, даги export_er_sender и tfs_kafka_rcv"
+        + f"  Смотреть: {SENT_FILES_TABLE}, {RECEIPTS_TABLE}, даги tfs_kafka_snd и tfs_kafka_rcv"
     )
 
 
@@ -1095,7 +1095,7 @@ def _dag_params(gp: dict) -> dict:
                 'при разборе файла и через форму запуска не меняется.'
             ),
         ),
-        # Таймаута отправки здесь нет: шлёт файлы export_er_sender, у него свой темп.
+        # Таймаута отправки здесь нет: шлёт файлы tfs_kafka_snd, у него свой темп.
         'selfrun_timeout': Param(
             gp['selfrun_timeout'], type='integer', title='Selfrun timeout (мин)',
             description='Задержка до следующего автозапуска, если дельта не догнала текущее время.',
@@ -1248,7 +1248,7 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
                 packed.append(t_zip)
 
         # Отправки здесь нет: make_summary только ставит файлы в очередь, а шлёт их
-        # export_er_sender — он один видит все выгрузки и потому только он может
+        # tfs_kafka_snd — он один видит все выгрузки и потому только он может
         # соблюдать лимиты маршрута (файлов в секунду, минуту, час и сутки).
         t_sum = _er_make_summary(gcfg=gcfg)
         # execution_timeout с запасом к собственному дедлайну таска: снимать его должен

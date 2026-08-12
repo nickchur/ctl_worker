@@ -17,9 +17,9 @@
 --   notified_at = 0  → файл поставлен в очередь, но ещё не отправлен
 --   notified_at > 0  → уведомление ушло в Kafka, ждём квитанцию
 --
--- Ставит в очередь таск make_summary пакета, разгребает даг export_er_sender —
+-- Ставит в очередь таск make_summary пакета, разгребает даг tfs_kafka_snd —
 -- он единственный, кто шлёт файлы ЕР, и потому единственное место, где соблюдается
--- темп, задекларированный ТФС (см. TFS_LIMITS в er_config.py).
+-- темп, задекларированный ТФС (см. TFS_LIMITS в tfs_kafka/tfs_config.py).
 --
 --
 -- ⚠️ ОБНОВЛЕНИЕ СТРОКИ
@@ -51,7 +51,7 @@ ORDER BY (rq_uid);
 -- Полезные запросы
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Очередь на отправку (что увидит export_er_sender):
+-- Очередь на отправку (что увидит tfs_kafka_snd):
 --   SELECT package_ts, replica, file_name, created_at
 --   FROM export.er_sent_files FINAL
 --   WHERE notified_at = toDateTime64(0, 3)

@@ -17,7 +17,7 @@
         </File>
     </TransferFileCephRs>
 
-📚 **Топиков может быть несколько.** Список — в `KAFKA_RCV_TOPICS` (`er_config.py`),
+📚 **Топиков может быть несколько.** Список — в `KAFKA_RCV_TOPICS` (`tfs_config.py`),
 одним коннектом слушаем их все сразу. Добавление маршрута со своим топиком сводится
 к строчке в списке; в таблице сохраняется, из какого топика пришла квитанция.
 
@@ -43,11 +43,11 @@ from datetime import datetime, timedelta, timezone
 from airflow.decorators import dag, task
 
 try:
-    from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
-        get_config, add_note, parse_receipt,
+    from CI06932748.analytics.datalab.tfs_kafka.tfs_config import (  # type: ignore
+        get_config, add_note, parse_receipt, ensure_pools,
     )
 except ImportError:
-    from er_export.er_config import get_config, add_note, parse_receipt
+    from tfs_kafka.tfs_config import get_config, add_note, parse_receipt, ensure_pools
 
 _cfg            = get_config()
 CH_ID           = _cfg['CH_ID']
@@ -55,11 +55,9 @@ DEF_ARGS        = _cfg['DEF_ARGS']
 KAFKA_RCV_CONN  = _cfg['KAFKA_RCV_CONN']
 KAFKA_RCV_TOPICS = _cfg['KAFKA_RCV_TOPICS']
 RECEIPTS_TABLE  = _cfg['RECEIPTS_TABLE']
+RCV_POOL        = _cfg['TFS_RCV_POOL']
 
 logger = logging.getLogger("airflow.task")
-
-# Пул приёмника — не экспортный: чтение квитанций не должно занимать слоты выгрузок.
-SYNC_POOL = "default_pool"
 
 # Сколько ждать очередное сообщение, прежде чем считать топики вычерпанными (сек).
 IDLE_TIMEOUT = 15
@@ -98,18 +96,23 @@ def _values(row: dict) -> str:
 )
 def tfs_kafka_rcv_dag():
 
-    @task(task_id="receive", pool=SYNC_POOL)
+    @task(task_id="receive", pool=RCV_POOL)
     def receive(**context):
         """📥 Вычитывает квитанции из всех топиков и складывает в ClickHouse.
 
         Порядок важен: сначала вставка, только потом коммит offset. При обратном порядке
         падение между операциями потеряло бы квитанцию навсегда — а её ждёт выгрузка.
+
+        Заодно заводит пулы тракта: приёмник ходит раз в минуту и сам сидит в default_pool,
+        поэтому создаст tfs_send раньше, чем он понадобится отправителю.
         """
         import time
 
         from airflow.hooks.base import BaseHook
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
         from confluent_kafka import Consumer, TopicPartition
+
+        ensure_pools()
 
         conn = BaseHook.get_connection(KAFKA_RCV_CONN)
         config = dict(conn.extra_dejson)  # extra_dejson = librdkafka config (контракт Kafka-провайдера)

@@ -1,5 +1,5 @@
 """✏️ DAG правки настройки ER-выгрузок — export.er_wf_meta из UI.
-*2026-08-12 14:48 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 15:30 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Заводит новые записи и правит существующие, чтобы не ходить в `clickhouse-client`.
 
@@ -114,13 +114,33 @@ def _record_choices() -> list[str]:
 
     Variable наполняет export_er_sync. Если её ещё нет (синк ни разу не отрабатывал),
     остаётся один пункт «новая запись» — завести первую запись это не мешает.
+
+    Принимаем ДВЕ формы значения. Свою — объект {ключ: запись}, как его пишет
+    export_er_sync. И массив записей [{...}, {...}] — так переменную набивают руками,
+    выгружая SELECT из ClickHouse; ключи тогда считаем сами через raw_key. Раньше на
+    массиве список молча схлопывался до одной «новой записи»: sorted() не умеет
+    сравнивать словари, а except прятал TypeError в предупреждение при разборе файла,
+    которого в UI не видно.
     """
     try:
-        rows = obj_load(RAW_VAR_NAME, default={}) or {}
-        return [NEW] + sorted(rows)
+        raw = obj_load(RAW_VAR_NAME, default={}) or {}
     except Exception as exc:
         logger.warning("Не прочитали %s, список записей только с «новой»: %s", RAW_VAR_NAME, exc)
         return [NEW]
+
+    if isinstance(raw, dict):
+        keys = [str(k) for k in raw]
+    elif isinstance(raw, list):
+        keys = [raw_key(r) if isinstance(r, dict) else str(r) for r in raw]
+    else:
+        logger.warning(
+            "%s содержит %s, а нужен объект {ключ: запись} или массив записей — "
+            "список записей только с «новой»", RAW_VAR_NAME, type(raw).__name__,
+        )
+        return [NEW]
+
+    logger.info("Записей в выпадающем списке: %d (из %s)", len(keys), RAW_VAR_NAME)
+    return [NEW] + sorted(keys)
 
 
 def _q(v) -> str:

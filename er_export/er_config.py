@@ -34,13 +34,6 @@ TFS_MAP = {
     "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
 }
 
-# 📇 Таблицы тракта ТФС, которые читает и пишет ER.
-# 🔗 Имена продублированы в tfs_kafka/tfs_config.py — это общий контракт двух каталогов.
-# Импортом их не связать: tfs_kafka разворачивается отдельно и не должен зависеть от ER.
-# Менять синхронно.
-RECEIPTS_TABLE   = 'export.tfs_receipts'    # квитанции ТФС, пишет их даг tfs_kafka_rcv
-SENT_FILES_TABLE = 'export.er_sent_files'   # очередь отправки, разгребает её tfs_kafka_snd
-
 POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
 
@@ -244,6 +237,4 @@ def get_config() -> dict:
         'GROUP_PARAMS':    GROUP_PARAMS,
         'TABLE_PARAMS':    TABLE_PARAMS,
         'FORMAT_MAP':      FORMAT_MAP,
-        'RECEIPTS_TABLE':   RECEIPTS_TABLE,
-        'SENT_FILES_TABLE': SENT_FILES_TABLE,
     }

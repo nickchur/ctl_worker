@@ -1,5 +1,5 @@
-"""📨 DAG приёма обратных квитанций ТФС из Kafka в ClickHouse.
-*2026-08-12 12:40 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
+*2026-08-12 14:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
 и сопоставляется с отправкой по `RqUID`. Результат передачи — в `Status/StatusCode`,
@@ -32,8 +32,11 @@
 ⏱️ Расписание: раз в минуту, `max_active_runs=1`. Ран короткий: опрашивает, пока идут
 сообщения, и выходит по тишине либо по потолку сообщений.
 
-🔁 Доставка at-least-once: offset коммитится ПОСЛЕ успешной вставки в ClickHouse.
-Падение между вставкой и коммитом даст повтор, его схлопнет ReplacingMergeTree.
+🗄️ Куда складывать — решает `STORAGE` в `plugins/tfs_utils.py`: ClickHouse, S3 или
+Postgres. Даг об этом не знает, он зовёт `save_receipts`.
+
+🔁 Доставка at-least-once: offset коммитится ПОСЛЕ успешной записи. Падение между
+записью и коммитом даст повтор — все три хранилища снимают дубль при чтении.
 """
 from __future__ import annotations
 
@@ -43,18 +46,18 @@ from datetime import datetime, timedelta, timezone
 from airflow.decorators import dag, task
 
 try:
-    from CI06932748.analytics.datalab.tfs_kafka.tfs_config import (  # type: ignore
-        get_config, add_note, parse_receipt, ensure_pools,
+    from plugins.tfs_utils import (  # type: ignore
+        get_config, add_note, parse_receipt, ensure_pools, save_receipts,
     )
 except ImportError:
-    from tfs_kafka.tfs_config import get_config, add_note, parse_receipt, ensure_pools
+    from CI06932748.tools.tfs_utils import (  # type: ignore
+        get_config, add_note, parse_receipt, ensure_pools, save_receipts,
+    )
 
 _cfg            = get_config()
-CH_ID           = _cfg['CH_ID']
 DEF_ARGS        = _cfg['DEF_ARGS']
 KAFKA_RCV_CONN  = _cfg['KAFKA_RCV_CONN']
 KAFKA_RCV_TOPICS = _cfg['KAFKA_RCV_TOPICS']
-RECEIPTS_TABLE  = _cfg['RECEIPTS_TABLE']
 RCV_POOL        = _cfg['TFS_RCV_POOL']
 
 logger = logging.getLogger("airflow.task")
@@ -64,21 +67,6 @@ IDLE_TIMEOUT = 15
 # Потолок сообщений за ран: страховка от бесконечного цикла на большом отставании.
 MAX_MESSAGES = 5000
 
-
-def _q(s: str) -> str:
-    """Экранирует одинарные кавычки для подстановки в ClickHouse-строковый литерал."""
-    return str(s).replace("'", "''")
-
-
-def _values(row: dict) -> str:
-    """Строит VALUES-кортеж одной квитанции для INSERT."""
-    rq_tm = f"toDateTime64('{row['rq_tm'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}', 3)" \
-        if row['rq_tm'] else "NULL"
-    return (
-        f"('{_q(row['rq_uid'])}', '{_q(row['file_name'])}', '{_q(row['scenario_id'])}', "
-        f"{int(row['status_code'])}, {rq_tm}, '{_q(row['raw_xml'])}', "
-        f"'{_q(row['kafka_topic'])}', {int(row['kafka_partition'])}, {int(row['kafka_offset'])})"
-    )
 
 
 @dag(
@@ -98,9 +86,9 @@ def tfs_kafka_rcv_dag():
 
     @task(task_id="receive", pool=RCV_POOL)
     def receive(**context):
-        """📥 Вычитывает квитанции из всех топиков и складывает в ClickHouse.
+        """📥 Вычитывает квитанции из всех топиков и складывает в хранилище тракта.
 
-        Порядок важен: сначала вставка, только потом коммит offset. При обратном порядке
+        Порядок важен: сначала запись, только потом коммит offset. При обратном порядке
         падение между операциями потеряло бы квитанцию навсегда — а её ждёт выгрузка.
 
         Заодно заводит пулы тракта: приёмник ходит раз в минуту и сам сидит в default_pool,
@@ -109,7 +97,6 @@ def tfs_kafka_rcv_dag():
         import time
 
         from airflow.hooks.base import BaseHook
-        from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
         from confluent_kafka import Consumer, TopicPartition
 
         ensure_pools()
@@ -149,14 +136,8 @@ def tfs_kafka_rcv_dag():
                 idle_until = time.time() + IDLE_TIMEOUT  # пока идут сообщения — продолжаем
 
             if rows:
-                hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-                hook.execute(
-                    f"INSERT INTO {RECEIPTS_TABLE} "
-                    "(rq_uid, file_name, scenario_id, status_code, rq_tm, raw_xml, "
-                    "kafka_topic, kafka_partition, kafka_offset) "
-                    "VALUES " + ", ".join(_values(r) for r in rows)
-                )
-                # Только теперь: квитанции уже в ClickHouse, повтор при падении не страшен.
+                save_receipts(rows)
+                # Только теперь: квитанции уже в хранилище, повтор при падении не страшен.
                 # offset + 1 — семантика Kafka: коммитим позицию СЛЕДУЮЩЕГО сообщения.
                 consumer.commit(
                     offsets=[TopicPartition(t, p, o + 1) for (t, p), o in positions.items()],

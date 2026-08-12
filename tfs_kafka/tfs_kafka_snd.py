@@ -36,20 +36,23 @@ from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowFailException
+from airflow.models import Param
 
 try:
-    from CI06932748.analytics.datalab.tfs_kafka.tfs_config import (  # type: ignore
-        get_config, get_dict_from_ch, add_note, tfs_limits, send_budget,
+    from plugins.tfs_utils import (  # type: ignore
+        get_config, add_note, tfs_limits, send_budget,
+        enqueue, pending, mark_sent, sent_counts,
     )
 except ImportError:
-    from tfs_kafka.tfs_config import get_config, get_dict_from_ch, add_note, tfs_limits, send_budget
+    from CI06932748.tools.tfs_utils import (  # type: ignore
+        get_config, add_note, tfs_limits, send_budget,
+        enqueue, pending, mark_sent, sent_counts,
+    )
 
 _cfg             = get_config()
-CH_ID            = _cfg['CH_ID']
 DEF_ARGS         = _cfg['DEF_ARGS']
 KAFKA_SND_CONN   = _cfg['KAFKA_SND_CONN']
 KAFKA_SND_TOPIC  = _cfg['KAFKA_SND_TOPIC']
-SENT_FILES_TABLE = _cfg['SENT_FILES_TABLE']
 QUEUE_ALERT_MIN  = _cfg['TFS_QUEUE_ALERT_MIN']
 SEND_POOL        = _cfg['TFS_SEND_POOL']
 
@@ -59,15 +62,7 @@ logger = logging.getLogger("airflow.task")
 # Меньше минуты, чтобы раны не накладывались даже при max_active_runs=1.
 RUN_BUDGET_SEC = 50
 
-# 🕐 Окно суточного лимита — СКОЛЬЗЯЩЕЕ (подтверждено ТФС), как и все остальные.
-# Не календарные сутки: полночь бюджет не обнуляет, освобождается он постепенно, по мере
-# того как отправки уходят за границу окна.
-DAY_WINDOW_SQL = "notified_at > now64(3) - INTERVAL 1 DAY"
 
-
-def _q(s: str) -> str:
-    """Экранирует одинарные кавычки для подстановки в ClickHouse-строковый литерал."""
-    return str(s).replace("'", "''")
 
 
 def build_message(scenario_id: str, rq_uid: str, file_name: str) -> str:
@@ -85,6 +80,38 @@ def build_message(scenario_id: str, rq_uid: str, file_name: str) -> str:
     <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
     <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
 </TransferFileCephRq>"""
+
+
+def _files_from_params(context) -> list[dict]:
+    """📮 Файлы из параметров ручного запуска → строки очереди.
+
+    Пустой список при запуске по расписанию: там params остаются со своими умолчаниями.
+    RqUID генерируем здесь же — по нему потом ищется обратная квитанция.
+    """
+    import uuid
+
+    p = context.get('params') or {}
+    files = [f.strip() for f in (p.get('files') or []) if str(f).strip()]
+    if not files:
+        return []
+
+    scenario = (p.get('scenario') or '').strip()
+    if not scenario:
+        raise AirflowFailException("Передан files, но не задан scenario — маршрут ТФС неизвестен")
+
+    replica = (p.get('replica') or scenario).strip()
+    now = datetime.now(timezone.utc)
+    dag_run = context.get('dag_run')
+
+    return [{
+        'rq_uid':      uuid.uuid4().hex,
+        'file_name':   f,
+        'replica':     replica,
+        'scenario_id': scenario,
+        'package_ts':  now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+        'dag_id':      'tfs_kafka_snd',
+        'run_id':      getattr(dag_run, 'run_id', '') or '',
+    } for f in files]
 
 
 def order_queue(rows: list[dict]) -> list[dict]:
@@ -116,6 +143,20 @@ def order_queue(rows: list[dict]) -> list[dict]:
     tags=["DataLab", "CI02420667", "TFS", "kafka"],
     is_paused_upon_creation=False,
     doc_md=__doc__,
+    params={
+        'files': Param(
+            [], type='array', title='Файлы',
+            description='Ручная досылка: имена файлов, уже лежащих в S3. Пусто — только очередь.',
+        ),
+        'scenario': Param(
+            None, type=['string', 'null'], title='ScenarioId',
+            description='Маршрут ТФС для файлов из «Файлы». Обязателен, если список непустой.',
+        ),
+        'replica': Param(
+            None, type=['string', 'null'], title='Реплика',
+            description='Имя пакета для файлов из «Файлы». Пусто — берётся ScenarioId.',
+        ),
+    },
 )
 def tfs_kafka_snd_dag():
 
@@ -131,24 +172,21 @@ def tfs_kafka_snd_dag():
         import time
 
         from airflow.providers.apache.kafka.hooks.produce import KafkaProducerHook
-        from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
-        hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+        # Параметры запуска не обходят очередь, а наполняют её: так досланный руками файл
+        # попадает в учёт лимитов и потом находится по RqUID вместе с остальными.
+        extra = _files_from_params(context)
+        if extra:
+            enqueue(extra)
+            logger.info("📮 Из параметров запуска в очередь добавлено файлов: %d", len(extra))
 
-        # FINAL обязателен: отправленная строка дописывается второй версией, и без
-        # схлопывания уже ушедший файл уехал бы повторно.
-        pending = get_dict_from_ch(hook, f"""
-            SELECT rq_uid, file_name, replica, scenario_id, package_ts, created_at
-            FROM {SENT_FILES_TABLE} FINAL
-            WHERE notified_at = toDateTime64(0, 3)
-            ORDER BY package_ts, created_at
-        """)
+        queued = pending()
 
-        if not pending:
+        if not queued:
             logger.info("📭 Очередь пуста")
             return 0
 
-        queue = order_queue(pending)
+        queue = order_queue(queued)
         logger.info("📦 В очереди %d файлов, пакетов: %d",
                     len(queue), len({(r['replica'], r['package_ts']) for r in queue}))
 
@@ -166,15 +204,7 @@ def tfs_kafka_snd_dag():
                 continue  # маршрут упёрся в лимит, остальные его файлы ждут
 
             limits = tfs_limits(scenario)
-            counts = get_dict_from_ch(hook, f"""
-                SELECT
-                    countIf(notified_at > now64(3) - INTERVAL 1 SECOND) AS sec,
-                    countIf(notified_at > now64(3) - INTERVAL 1 MINUTE) AS min,
-                    countIf(notified_at > now64(3) - INTERVAL 1 HOUR)   AS hour,
-                    countIf({DAY_WINDOW_SQL})                           AS day
-                FROM {SENT_FILES_TABLE} FINAL
-                WHERE scenario_id = '{_q(scenario)}' AND notified_at > toDateTime64(0, 3)
-            """)[0]
+            counts = sent_counts(scenario)
 
             allowed, hit = send_budget(counts, limits)
             if not allowed:
@@ -194,14 +224,8 @@ def tfs_kafka_snd_dag():
             producer.flush()
             last_send[scenario] = time.time()
 
-            # Дописываем строку с отметкой отправки — только после подтверждения доставки
-            hook.execute(f"""
-                INSERT INTO {SENT_FILES_TABLE}
-                    (rq_uid, file_name, replica, scenario_id, package_ts, created_at, notified_at)
-                SELECT rq_uid, file_name, replica, scenario_id, package_ts, created_at, now64(3)
-                FROM {SENT_FILES_TABLE} FINAL
-                WHERE rq_uid = '{_q(row['rq_uid'])}'
-            """)
+            # Отметка отправки — только после подтверждения доставки
+            mark_sent(row['rq_uid'])
             sent.append(row)
             logger.info("📤 %s → %s (RqUID %s)", row['file_name'], scenario, row['rq_uid'])
 

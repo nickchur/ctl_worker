@@ -37,6 +37,13 @@ try:
 except ImportError:
     from er_export.er_config import get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base
 
+# Хранилище тракта — общее с tfs_kafka: STORAGE живёт в одном месте, иначе писатель
+# и читатель разъедутся и пакет зависнет без внятной причины.
+try:
+    from plugins.tfs_utils import enqueue, find_receipts, queue_state  # type: ignore
+except ImportError:
+    from CI06932748.tools.tfs_utils import enqueue, find_receipts, queue_state  # type: ignore
+
 logger = logging.getLogger("airflow.task")
 
 # ── Configuration & Constants ────────────────────────────────────────────────
@@ -54,8 +61,6 @@ TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
 VAR_NAME        = _cfg['VAR_NAME']
 FORMAT_MAP      = _cfg['FORMAT_MAP']
-RECEIPTS_TABLE   = _cfg['RECEIPTS_TABLE']
-SENT_FILES_TABLE = _cfg['SENT_FILES_TABLE']
 
 # Hive keywords (all versions, reserved + non-reserved) — имена колонок из этого набора
 # получают суффикс '_' согласно требованиям KAP/TFS (раздел 11 документации ЕР).
@@ -208,33 +213,30 @@ def _run_ts(context) -> datetime:
 def _enqueue_files(gcfg: dict, files: list[str], context) -> list[dict]:
     """📮 Ставит файлы пакета в очередь отправки, выдавая каждому свой RqUID.
 
-    Отправкой занимается отдельный даг tfs_kafka_snd — он один видит все выгрузки
-    сразу и потому только он может соблюдать лимиты маршрута (файлов в секунду, минуту,
-    час и сутки). Пакетный даг лишь регистрирует намерение.
+    Отправкой занимается отдельный даг tfs_kafka_snd — он один видит все выгрузки сразу
+    и потому только он может соблюдать лимиты маршрута. Пакетный даг лишь регистрирует
+    намерение.
 
-    RqUID сохраняется здесь же: по нему потом ищется обратная квитанция в общей таблице
-    export.tfs_receipts.
+    RqUID сохраняется здесь же: по нему потом ищется обратная квитанция.
+    Куда именно ложится очередь — ClickHouse, S3 или Postgres — решает STORAGE
+    в plugins/tfs_utils.py; здесь это неважно.
     """
     import uuid
 
-    from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-
     package_ts = _run_ts(context).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-    dag_run    = context.get('dag_run')
-    run_id     = getattr(dag_run, 'run_id', '') or ''
+    run_id     = getattr(context.get('dag_run'), 'run_id', '') or ''
 
-    rows = [{'rq_uid': uuid.uuid4().hex, 'file_name': f} for f in files]
-    values = ", ".join(
-        f"('{r['rq_uid']}', '{_sql_str(r['file_name'])}', '{_sql_str(gcfg['replica'])}', "
-        f"'{_sql_str(gcfg['scenario'])}', toDateTime64('{package_ts}', 3), "
-        f"'{_sql_str(gcfg['dag_id'])}', '{_sql_str(run_id)}')"
-        for r in rows
-    )
-    ClickHouseHook(clickhouse_conn_id=CH_ID).execute(
-        f"INSERT INTO {SENT_FILES_TABLE} "
-        "(rq_uid, file_name, replica, scenario_id, package_ts, dag_id, run_id) "
-        f"VALUES {values}"
-    )
+    rows = [{
+        'rq_uid':      uuid.uuid4().hex,
+        'file_name':   f,
+        'replica':     gcfg['replica'],
+        'scenario_id': gcfg['scenario'],
+        'package_ts':  package_ts,
+        'dag_id':      gcfg['dag_id'],
+        'run_id':      run_id,
+    } for f in files]
+
+    enqueue(rows)
     logger.info("📮 В очередь отправки поставлено %d файлов пакета %s", len(rows), gcfg['replica'])
     return rows
 
@@ -810,8 +812,6 @@ def _er_wait_confirm(gcfg, **context):
     """
     import time
 
-    from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-
     _pre_await(context)  # auto_confirm / notify_kafka / нет данных → skip
 
     rq_uids = context['ti'].xcom_pull(task_ids="make_summary", key='rq_uids') or []
@@ -823,16 +823,10 @@ def _er_wait_confirm(gcfg, **context):
     # Из params, а не из gcfg: значение в форме запуска должно работать. Потолок ему всё
     # равно ставит execution_timeout, посчитанный при разборе файла.
     timeout = int(context['params'].get('confirm_timeout') or gcfg['confirm_timeout'])
-    uids    = ", ".join(f"'{u}'" for u in rq_uids)
-    hook    = ClickHouseHook(clickhouse_conn_id=CH_ID)
     deadline = time.time() + timeout * 60
 
     while True:
-        got = get_dict_from_ch(hook, f"""
-            SELECT rq_uid, file_name, status_code, toString(rq_tm) AS rq_tm
-            FROM {RECEIPTS_TABLE} FINAL
-            WHERE rq_uid IN ({uids})
-        """)
+        got = find_receipts(rq_uids)
 
         bad = [r for r in got if r['status_code'] != 0]
         if bad:
@@ -853,12 +847,8 @@ def _er_wait_confirm(gcfg, **context):
         time.sleep(10)
 
     # Таймаут. Различаем два диагноза: очередь стоит или ТФС молчит — лечатся они разно.
-    missing = set(rq_uids) - {r['rq_uid'] for r in got}
-    queued  = get_dict_from_ch(hook, f"""
-        SELECT file_name, notified_at = toDateTime64(0, 3) AS pending
-        FROM {SENT_FILES_TABLE} FINAL
-        WHERE rq_uid IN ({", ".join(f"'{u}'" for u in missing)})
-    """)
+    missing = list(set(rq_uids) - {r['rq_uid'] for r in got})
+    queued  = queue_state(missing)
     not_sent  = [r['file_name'] for r in queued if r['pending']]
     no_answer = [r['file_name'] for r in queued if not r['pending']]
 
@@ -866,7 +856,7 @@ def _er_wait_confirm(gcfg, **context):
         f"Квитанции ТФС не пришли за {timeout} мин.\n"
         + (f"  Ещё не отправлены (очередь стоит): {not_sent}\n" if not_sent else "")
         + (f"  Отправлены, ответа нет: {no_answer}\n" if no_answer else "")
-        + f"  Смотреть: {SENT_FILES_TABLE}, {RECEIPTS_TABLE}, даги tfs_kafka_snd и tfs_kafka_rcv"
+        + "  Смотреть: хранилище тракта (STORAGE в plugins/tfs_utils.py), даги tfs_kafka_snd и tfs_kafka_rcv"
     )
 
 

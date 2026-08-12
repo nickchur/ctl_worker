@@ -34,7 +34,7 @@ hrplatform_datalab__lm    — суффикс произвольный, не об
 | :--- | :--- |
 | `er_export.py` | Фабрика DAG-ов. Создаёт по DAG-у на группу, внутри — TaskGroup на каждую поставку. Содержит бизнес-логику: SQL-билдеры, таски. |
 | `er_sent_files.sql` | DDL `export.er_sent_files` — очередь отправки и реестр отправленных файлов. Разгребает её `tfs_kafka_snd` (см. `ctl/tfs_kafka/`). |
-| `er_wf_meta_edit.py` | DAG `er_wf_edit` — правка и создание записей `export.er_wf_meta` из UI |
+| `er_wf_edit.py` | DAG `er_wf_edit` — правка и создание записей `export.er_wf_meta` из UI |
 | `er_sync.py` | DAG синхронизации `export_er_sync` (**без расписания, только ручной запуск**). Раскладывает `export.er_wf_meta` по группам, разрешает наследование и валидирует записи → Airflow Variable `datalab_er_wfs`. При ошибках в метаданных **краснеет**. Создаёт пулы. |
 | `er_config.py` | Конфигурация и утилиты. Константы, маппинг типов, `GROUP_PARAMS`/`TABLE_PARAMS`, `FORMAT_MAP`, `replica_base`, хелперы `obj_load`, `obj_save`, `add_note`, `get_params`, `on_callback`. |
 | `er_wf_meta.sql` | DDL управляющей таблицы `export.er_wf_meta` + скрипт миграции. |
@@ -416,7 +416,7 @@ ORDER BY s.package_ts DESC, s.file_name;
 
 ## ✏️ Правка настройки из UI
 
-Даг `er_wf_edit` (`er_wf_meta_edit.py`) заводит новые записи и правит существующие,
+Даг `er_wf_edit` (`er_wf_edit.py`) заводит новые записи и правит существующие,
 чтобы не ходить в `clickhouse-client`. Три параметра:
 
 | Параметр | Смысл |

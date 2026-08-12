@@ -212,7 +212,7 @@ def row_diff(base: dict, merged: dict) -> dict:
         ),
     },
 )
-def er_wf_meta_edit_dag():
+def er_wf_edit_dag():
 
     @task(task_id="apply", pool=EDIT_POOL)
     def apply(**context):
@@ -297,4 +297,4 @@ def er_wf_meta_edit_dag():
     apply()
 
 
-er_wf_meta_edit_dag()  # вызов регистрирует DAG в globals() через декоратор @dag
+er_wf_edit_dag()  # вызов регистрирует DAG в globals() через декоратор @dag

@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-12 15:45 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 16:10 MSK · v2.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -433,8 +433,27 @@ def _er_init(cfg, **context):
     Возвращаемый словарь (XCom "return_value") используется всеми downstream-тасками
     через _xcom(context, cfg['tg'], 'init') — внутри TaskGroup id составной.
     """
+    from airflow.hooks.base import BaseHook
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
+    # 🔌 Коннекты проверяем САМИ, до первого обращения. Провайдер amazon на отсутствующий
+    # conn_id не падает: пишет «Unable to find AWS Connection ID …, switching to empty»
+    # и переключается на дефолтную стратегию boto3 — то есть уходит в настоящий AWS
+    # и валится там NoCredentialsError из глубины botocore, где ни conn_id, ни стенда
+    # уже не видно. AirflowFailException, а не обычная ошибка: отсутствующий коннект
+    # за четыре ретрая сам не появится, а это 20 минут ожидания на ровном месте.
+    missing = []
+    for conn_id in (S3_CONN, CH_ID):
+        try:
+            BaseHook.get_connection(conn_id)
+        except Exception:
+            missing.append(conn_id)
+    if missing:
+        raise AirflowFailException(
+            f"Не найдены Airflow connection: {', '.join(missing)}. "
+            f"Заведите их на стенде — выгрузка ходит в S3 '{S3_CONN}' и ClickHouse '{CH_ID}'"
+        )
 
     s3 = S3Hook(aws_conn_id=S3_CONN)
     if not s3.check_for_bucket(bucket_name=BUCKET):

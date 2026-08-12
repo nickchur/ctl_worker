@@ -1,9 +1,10 @@
 """⚙️ Конфигурация и константы фреймворка ER-выгрузок.
-*2026-08-12 17:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 17:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
-Поведение на стенде управляется ENVIRONMENT (PROM / UAT / QA / IFT / DEV).
+Поведение на стенде управляется ENV_STAND, при её отсутствии — ENVIRONMENT
+(PROM / UAT / QA / IFT / DEV).
 """
 # ⛔ Здесь НЕ место декоратору @dag — даже для маленького служебного дага.
 #
@@ -31,7 +32,12 @@ try:
 except ImportError:
     from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
 
-ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
+# 🌍 Стенд. Сначала ENV_STAND — именно её читают платформенные операторы
+# (hrp_operators/clickhouse_to_s3.py: os.getenv("ENV_STAND")) и соседний xs_export.
+# ENVIRONMENT остаётся запасным именем: раньше конфиг читал только её, и там, где
+# выставлена лишь она, поведение не должно измениться. Ни одной — пустая строка,
+# то есть лимитов стенда нет и берутся дефолты.
+ENV_STAND = (os.getenv("ENV_STAND") or os.getenv("ENVIRONMENT") or "").strip().upper()
 
 VAR_NAME = "datalab_er_wfs"
 

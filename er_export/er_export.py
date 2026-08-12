@@ -50,14 +50,12 @@ EXTRA_PRE      = _cfg['EXTRA_PRE']
 EXTRA_SUF      = _cfg['EXTRA_SUF']
 LIMITS         = _cfg['LIMITS']
 BUCKET         = _cfg['BUCKET']
-KAFKA_SND_CONN  = _cfg['KAFKA_SND_CONN']
-KAFKA_SND_TOPIC = _cfg['KAFKA_SND_TOPIC']
-KAFKA_RCV_CONN  = _cfg['KAFKA_RCV_CONN']
-KAFKA_RCV_TOPIC = _cfg['KAFKA_RCV_TOPIC']
 TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
 VAR_NAME        = _cfg['VAR_NAME']
 FORMAT_MAP      = _cfg['FORMAT_MAP']
+RECEIPTS_TABLE   = _cfg['RECEIPTS_TABLE']
+SENT_FILES_TABLE = _cfg['SENT_FILES_TABLE']
 
 # Hive keywords (all versions, reserved + non-reserved) — имена колонок из этого набора
 # получают суффикс '_' согласно требованиям KAP/TFS (раздел 11 документации ЕР).
@@ -122,8 +120,6 @@ HIVE_RESERVED: frozenset = frozenset({
     'compactionid','connector','connectors','convert','ddl','force','leading','older',
     'pkfk_join','prepare','qualify','real','some','than','trailing',
 })
-
-ON_DELIVERY      = f'{__name__}.on_delivery'        # dot-notation для delivery_callback
 
 # ── SQL Builders ──────────────────────────────────────────────────────────────
 
@@ -207,6 +203,45 @@ def _run_ts(context) -> datetime:
     if ts is None:  # ручной вызов вне контекста рана — лучше отдать хоть что-то, чем упасть
         ts = getattr(context.get('dag_run'), 'start_date', None) or datetime.now(timezone.utc)
     return ts.astimezone(timezone.utc)
+
+
+def _enqueue_files(gcfg: dict, files: list[str], context) -> list[dict]:
+    """📮 Ставит файлы пакета в очередь отправки, выдавая каждому свой RqUID.
+
+    Отправкой занимается отдельный даг export_er_sender — он один видит все выгрузки
+    сразу и потому только он может соблюдать лимиты маршрута (файлов в секунду, минуту,
+    час и сутки). Пакетный даг лишь регистрирует намерение.
+
+    RqUID сохраняется здесь же: по нему потом ищется обратная квитанция в общей таблице
+    export.tfs_receipts.
+    """
+    import uuid
+
+    from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
+    package_ts = _run_ts(context).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    dag_run    = context.get('dag_run')
+    run_id     = getattr(dag_run, 'run_id', '') or ''
+
+    rows = [{'rq_uid': uuid.uuid4().hex, 'file_name': f} for f in files]
+    values = ", ".join(
+        f"('{r['rq_uid']}', '{_sql_str(r['file_name'])}', '{_sql_str(gcfg['replica'])}', "
+        f"'{_sql_str(gcfg['scenario'])}', toDateTime64('{package_ts}', 3), "
+        f"'{_sql_str(gcfg['dag_id'])}', '{_sql_str(run_id)}')"
+        for r in rows
+    )
+    ClickHouseHook(clickhouse_conn_id=CH_ID).execute(
+        f"INSERT INTO {SENT_FILES_TABLE} "
+        "(rq_uid, file_name, replica, scenario_id, package_ts, dag_id, run_id) "
+        f"VALUES {values}"
+    )
+    logger.info("📮 В очередь отправки поставлено %d файлов пакета %s", len(rows), gcfg['replica'])
+    return rows
+
+
+def _sql_str(s) -> str:
+    """Экранирует одинарные кавычки для подстановки в ClickHouse-строковый литерал."""
+    return str(s).replace("'", "''")
 
 
 def _xcom(context, tg: str, task_id: str, key: str = 'return_value', required: bool = True):
@@ -344,88 +379,6 @@ def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool, int | None, i
     return mapping.get(base, "STRING"), notnull, length, precision, scale
 
 
-def produce_msg(scenario_id: str, file_names: list[str], throttle_delay: int = 1):
-    """Генератор Kafka-сообщений для TFS: отдаёт XML-уведомление о передаче каждого файла.
-
-    throttle_delay — пауза перед каждой отправкой (сек), защита от перегрузки брокера.
-    Функция — генератор (yield key, value), как того требует ProduceToTopicOperator.
-    """
-    import time
-    import uuid
-
-    for file_name in file_names:
-        time.sleep(throttle_delay)
-        rq_uuid = str(uuid.uuid4()).replace('-', '')
-        # isoformat(ms) воспроизводит формат pendulum 'YYYY-MM-DDTHH:mm:ss.SSSZ' (смещение с двоеточием)
-        rq_tm = datetime.now().astimezone().isoformat(timespec='milliseconds')
-        message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<TransferFileCephRq>
-    <RqUID>{rq_uuid}</RqUID>
-    <RqTm>{rq_tm}</RqTm>
-    <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
-    <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
-</TransferFileCephRq>"""
-        logger.info("Kafka message prepared: %s", rq_uuid)
-        yield None, message
-
-
-def on_delivery(err: Exception | None, msg) -> None:
-    """Колбэк подтверждения доставки Kafka: падает с AirflowFailException при ошибке."""
-    if err: raise AirflowFailException(f"Kafka delivery failed: {err}")
-    logger.info("Message delivered to %s [%s]", msg.topic(), msg.partition())
-
-
-def _kafka_wait_any(conn_id: str, topic: str, timeout_min: int) -> str | None:
-    """Ждёт любое сообщение из топика опросом на воркере, не дольше timeout_min минут.
-
-    Возвращает текст сообщения или None, если за отведённое время ничего не пришло.
-    Группу берём из коннекта (как раньше брал сенсор) и коммитим offset полученного
-    сообщения, чтобы подтверждение не пришло повторно на следующем запуске.
-    """
-    import time
-
-    from airflow.hooks.base import BaseHook
-    from confluent_kafka import Consumer
-
-    conn = BaseHook.get_connection(conn_id)
-    config = dict(conn.extra_dejson)  # extra_dejson = librdkafka config (контракт Kafka-провайдера)
-    config.setdefault("bootstrap.servers", conn.host)
-    config["enable.auto.commit"] = False
-
-    consumer = Consumer(config)
-    try:
-        consumer.subscribe([topic])
-        deadline = time.time() + timeout_min * 60
-        while time.time() < deadline:
-            msg = consumer.poll(timeout=5)
-            if msg is None or msg.error():
-                continue
-            text = msg.value().decode("utf-8", errors="replace")
-            consumer.commit(message=msg, asynchronous=False)
-            logger.info("Kafka confirmation received from %s [%s]: %s", msg.topic(), msg.partition(), text)
-            return text
-    finally:
-        consumer.close()
-    return None
-
-
-def _pre_kafka(scenario: str):
-    """Фабрика pre_execute для ProduceToTopicOperator.
-
-    Пропускает отправку если notify_kafka=False или пакет пуст.
-    Динамически подставляет список файлов (summary TKT + ZIP всех таблиц пакета).
-    """
-    def pre_execute(context):
-        if not context['params'].get('notify_kafka', True):
-            raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
-        summary_tkt = context['ti'].xcom_pull(task_ids="make_summary", key='summary_tkt_name')
-        if not summary_tkt:
-            raise AirflowSkipException("No data exported, skipping notification")
-        zip_names = context['ti'].xcom_pull(task_ids="make_summary", key='zip_name_list') or []
-        context['task'].producer_function_args = [scenario, [summary_tkt] + zip_names]
-    return pre_execute
-
-
 def _pre_await(context):
     """Пропускает ожидание подтверждения: auto_confirm=True, notify_kafka=False или пакет пуст.
 
@@ -440,8 +393,6 @@ def _pre_await(context):
     summary_tkt = context['ti'].xcom_pull(task_ids="make_summary", key='summary_tkt_name')
     if not summary_tkt:
         raise AirflowSkipException("No data exported, skipping wait")
-
-
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
 class _ZipReader:
@@ -830,34 +781,93 @@ def _er_make_summary(gcfg, **context):
         "\n".join(zips).encode(), key=f"{gcfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True,
     )
 
+    # 📮 Ставим файлы в очередь отправки. RqUID генерируется ЗДЕСЬ и сохраняется: именно
+    # по нему потом ищется обратная квитанция. Раньше он рождался внутри produce_msg
+    # и умирал там же, поэтому сопоставить отправку с квитанцией было нечем.
+    files = [summary_tkt] + zips
+    queued = _enqueue_files(gcfg, files, context) if context['params'].get('notify_kafka', True) else []
+    if not queued:
+        logger.info("📭 notify_kafka=0 — файлы в очередь отправки не ставим")
+
     ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
     ti.xcom_push(key="zip_name_list",    value=zips)
-    add_note({f"🧾 {summary_tkt}": zips}, title=f"архивов в пакете: {len(zips)}",
+    ti.xcom_push(key="rq_uids",          value=[q['rq_uid'] for q in queued])
+    add_note({f"🧾 {summary_tkt}": zips}, title=f"архивов в пакете: {len(zips)}, в очереди: {len(queued)}",
              level='task,dag', context=context)
 
 
 @task(task_id='wait_confirm', trigger_rule='none_failed')
 def _er_wait_confirm(gcfg, **context):
-    """⏳ Ждёт квитанцию TFS в Kafka — опросом на воркере.
+    """⏳ Ждёт обратные квитанции ТФС по всем файлам пакета.
 
-    Раньше здесь стоял AwaitMessageSensor, но он deferrable: без живого Triggerer
-    таск уходит в deferred и висит там со статусом unknown, пока его не снимут руками.
-    Читаем сами, с тем же поведением: подойдёт любое сообщение из топика, ждём не
-    дольше confirm_timeout минут, по истечении — падаем.
+    Kafka здесь больше не читается. Топик квитанций общий на все маршруты ТФС, и прежнее
+    прямое чтение брало ЛЮБОЕ сообщение: пакет подтверждался чужой квитанцией, настоящий
+    адресат её терял, а StatusCode не проверялся вовсе. Теперь топик вычитывает один
+    даг tfs_receipts_sync, а мы ждём появления СВОИХ строк по своим RqUID.
+
+    Любой status_code != 0 роняет таск сразу, не дожидаясь остальных файлов: пакет уже
+    не доедет целиком, ждать бессмысленно.
     """
+    import time
+
+    from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
     _pre_await(context)  # auto_confirm / notify_kafka / нет данных → skip
+
+    rq_uids = context['ti'].xcom_pull(task_ids="make_summary", key='rq_uids') or []
+    if not rq_uids:
+        raise AirflowFailException(
+            "В XCom make_summary нет rq_uids — файлы не встали в очередь отправки"
+        )
 
     # Из params, а не из gcfg: значение в форме запуска должно работать. Потолок ему всё
     # равно ставит execution_timeout, посчитанный при разборе файла.
-    timeout = context['params'].get('confirm_timeout') or gcfg['confirm_timeout']
+    timeout = int(context['params'].get('confirm_timeout') or gcfg['confirm_timeout'])
+    uids    = ", ".join(f"'{u}'" for u in rq_uids)
+    hook    = ClickHouseHook(clickhouse_conn_id=CH_ID)
+    deadline = time.time() + timeout * 60
 
-    text = _kafka_wait_any(KAFKA_RCV_CONN, KAFKA_RCV_TOPIC, timeout)
-    if text is None:
-        raise AirflowFailException(
-            f"Подтверждение TFS не пришло в {KAFKA_RCV_TOPIC} за {timeout} мин"
-        )
-    add_note(f"```\n{text}\n```", context=context, level='task', title='📨 TFS confirm')
-    return text
+    while True:
+        got = get_dict(hook, f"""
+            SELECT rq_uid, file_name, status_code, toString(rq_tm) AS rq_tm
+            FROM {RECEIPTS_TABLE} FINAL
+            WHERE rq_uid IN ({uids})
+        """)
+
+        bad = [r for r in got if r['status_code'] != 0]
+        if bad:
+            add_note({"❌ Квитанции с ошибкой": [f"{r['file_name']}: код {r['status_code']}" for r in bad]},
+                     level='task,dag', context=context, title='📨 TFS confirm')
+            raise AirflowFailException(
+                "ТФС отверг файлы пакета:\n"
+                + "\n".join(f"  • {r['file_name']}: StatusCode={r['status_code']}" for r in bad)
+            )
+
+        if len(got) == len(rq_uids):
+            add_note({"✅ Квитанции получены": [f"{r['file_name']} @ {r['rq_tm']}" for r in got]},
+                     level='task,dag', context=context, title='📨 TFS confirm')
+            return datetime.now(timezone.utc).isoformat()
+
+        if time.time() >= deadline:
+            break
+        time.sleep(10)
+
+    # Таймаут. Различаем два диагноза: очередь стоит или ТФС молчит — лечатся они разно.
+    missing = set(rq_uids) - {r['rq_uid'] for r in got}
+    queued  = get_dict(hook, f"""
+        SELECT file_name, notified_at = toDateTime64(0, 3) AS pending
+        FROM {SENT_FILES_TABLE} FINAL
+        WHERE rq_uid IN ({", ".join(f"'{u}'" for u in missing)})
+    """)
+    not_sent  = [r['file_name'] for r in queued if r['pending']]
+    no_answer = [r['file_name'] for r in queued if not r['pending']]
+
+    raise AirflowFailException(
+        f"Квитанции ТФС не пришли за {timeout} мин.\n"
+        + (f"  Ещё не отправлены (очередь стоит): {not_sent}\n" if not_sent else "")
+        + (f"  Отправлены, ответа нет: {no_answer}\n" if no_answer else "")
+        + f"  Смотреть: {SENT_FILES_TABLE}, {RECEIPTS_TABLE}, даги export_er_sender и tfs_receipts_sync"
+    )
 
 
 @task(task_id='save_status', trigger_rule='none_failed')
@@ -867,13 +877,19 @@ def _er_save_status(gcfg, **context):
     Одна вставка на весь пакет: строк столько, сколько таблиц отработало.
     trigger_rule=none_failed: запускается при успехе или при skipped-тасках
     (wait_confirm пропускается при auto_confirm=True или отсутствии данных).
-    confirmed=null — ожидает Kafka-подтверждения от TFS (или остаётся null при auto_confirm).
+    confirmed — время квитанции ТФС из wait_confirm; null, если ждать не стали
+    (auto_confirm=1) или пакет был пуст. Раньше сюда всегда писался null: подтверждение
+    было неотличимо от его отсутствия.
     extract_time берётся из XCom init как SQL-литерал (уже в кавычках).
 
     Разовая выгрузка за период (ad_hoc) состояние не двигает — иначе следующая штатная
     дельта оттолкнулась бы от вручную заданных границ.
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
+    # wait_confirm вернул время получения квитанций; при skip (auto_confirm=1) — None
+    confirmed_at = context['ti'].xcom_pull(task_ids='wait_confirm')
+    confirmed = f"toDateTime64('{confirmed_at[:23].replace('T', ' ')}', 3)" if confirmed_at else 'null'
 
     selects, noted, skipped = [], {}, []
     for tg, tbl in gcfg['tables'].items():
@@ -890,7 +906,7 @@ def _er_save_status(gcfg, **context):
 
         selects.append(f"""
             SELECT
-                '{tbl}', {dp['extract_time']}, {rows}, now(), now(), null,
+                '{tbl}', {dp['extract_time']}, {rows}, now(), now(), {confirmed},
                 {dp['increment']}, {dp['overlap']}, {dp['recent_interval']},
                 {dp['time_field']}, {dp['time_from']}, {dp['time_to']}, {zip_arr}
         """)
@@ -1079,8 +1095,7 @@ def _dag_params(gp: dict) -> dict:
                 'при разборе файла и через форму запуска не меняется.'
             ),
         ),
-        # notify_timeout сюда не выносим: он влияет только на execution_timeout таска
-        # notify_tfs, а тот фиксируется при разборе файла — параметр в форме был бы мёртвым.
+        # Таймаута отправки здесь нет: шлёт файлы export_er_sender, у него свой темп.
         'selfrun_timeout': Param(
             gp['selfrun_timeout'], type='integer', title='Selfrun timeout (мин)',
             description='Задержка до следующего автозапуска, если дельта не догнала текущее время.',
@@ -1135,7 +1150,6 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
     Возвращает (dag_id, dag) для регистрации в globals().
     """
     from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
-    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
 
     base = replica_base(replica)
     if base not in TFS_MAP:
@@ -1156,7 +1170,6 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
         'scenario':        scen,
         's3_prefix':       prefix,
         'confirm_timeout': gp['confirm_timeout'],
-        'notify_timeout':  gp['notify_timeout'],
         'selfrun_timeout': gp['selfrun_timeout'],
         # Соответствие «TaskGroup → имя выгрузки»: по нему групповые таски собирают XCom
         'groups':          [c['tg'] for c in cfgs.values()],
@@ -1234,21 +1247,17 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
                 t_init >> [t_meta, t_exp] >> t_zip
                 packed.append(t_zip)
 
+        # Отправки здесь нет: make_summary только ставит файлы в очередь, а шлёт их
+        # export_er_sender — он один видит все выгрузки и потому только он может
+        # соблюдать лимиты маршрута (файлов в секунду, минуту, час и сутки).
         t_sum = _er_make_summary(gcfg=gcfg)
-        t_msg = ProduceToTopicOperator(
-            task_id='notify_tfs', kafka_config_id=KAFKA_SND_CONN, topic=KAFKA_SND_TOPIC,
-            pool=f"tfs_{scen}",
-            producer_function=produce_msg, producer_function_args=[scen, []],
-            delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(scen),
-            execution_timeout=timedelta(minutes=gcfg['notify_timeout']),
-        )
         # execution_timeout с запасом к собственному дедлайну таска: снимать его должен
         # он сам, с внятной ошибкой, а не Airflow по таймауту
         t_wait = _er_wait_confirm.override(
             execution_timeout=timedelta(minutes=gcfg['confirm_timeout'] + 5),
         )(gcfg=gcfg)
 
-        packed >> t_sum >> t_msg >> t_wait >> _er_save_status(gcfg=gcfg) >> _er_schedule_next(gcfg=gcfg)
+        packed >> t_sum >> t_wait >> _er_save_status(gcfg=gcfg) >> _er_schedule_next(gcfg=gcfg)
 
     return dag_id, dag
 

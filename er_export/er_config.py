@@ -23,9 +23,11 @@ S3_CONN = 's3-tfs-hrplt'
 BUCKET          = 'tfshrplt'
 # IN/OUT в conn_id и топиках — сторона TFS, и у соединения, и у топика: пишем мы в его
 # вход, читаем из его выхода. Префиксы констант — наше действие, чтобы не путаться
-KAFKA_SND_CONN  = 'tfs-kafka-in'    # notify_tfs: шлём уведомление
+KAFKA_SND_CONN  = 'tfs-kafka-in'    # export_er_sender: шлём уведомление
 KAFKA_SND_TOPIC = 'TFS.HRPLT.IN'
-KAFKA_RCV_CONN  = 'tfs-kafka-out'   # wait_confirm: ждём квитанцию
+# Топик квитанций общий на ВСЕ маршруты ТФС, поэтому читает его ровно один потребитель —
+# даг tfs_receipts_sync. Выгрузки ER сюда не ходят: они ждут строку в RECEIPTS_TABLE.
+KAFKA_RCV_CONN  = 'tfs-kafka-out'
 KAFKA_RCV_TOPIC = 'TFS.HRPLT.OUT'
 
 # 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
@@ -33,8 +35,39 @@ TFS_MAP = {
     "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
 }
 
+# 📇 Таблицы тракта ТФС
+RECEIPTS_TABLE   = 'export.tfs_receipts'    # квитанции из Kafka, общие для всех маршрутов
+SENT_FILES_TABLE = 'export.er_sent_files'   # очередь и реестр отправок ER
+
+# 🚦 Лимиты ТФС на маршрут: файлов в секунду / минуту / час / сутки.
+# ТФС отбивает лишние файлы, соблюдать темп должны мы сами. Значения задекларированы
+# в документации маршрутов; счётчики на их стороне, предположительно, считают сообщения
+# в Kafka — гипотеза не доказана, поэтому числа держим здесь и правим по факту.
+TFS_LIMITS_DEFAULT = {'sec': 10, 'min': 200, 'hour': 500, 'day': 2000}
+TFS_LIMITS: dict[str, dict[str, int]] = {
+    'HRPLATFORM-2100': {'sec': 1, 'min': 15, 'hour': 100, 'day': 500},
+}
+
+# Очередь старше этого возраста (мин) роняет даг-отправитель: затор должен быть виден
+# в мониторинге, а не только в логе.
+TFS_QUEUE_ALERT_MIN = 60
+
 POOL_NAME   = 'datalab_export_er'
 POOL_SLOTS  = 20
+
+# 🔒 Пул на 1 слот: в ТФС пишет кто-то один. Его берёт export_er_sender и обязан брать
+# любой даг, который шлёт в ТФС МИМО очереди.
+#
+# Что он даёт и чего не даёт: взаимное исключение — да, соблюдение лимитов — нет.
+# Отправитель мимо очереди не пишет в SENT_FILES_TABLE, поэтому его файлы не попадут
+# в счётчики и бюджет маршрута окажется посчитан заниженным. Правильный путь для нового
+# отправителя — не пул, а та же очередь.
+#
+# Пул один общий, а не tfs_{scenario}: пул назначается таску при разборе файла,
+# а export_er_sender — один таск на все сценарии и заранее не знает, чьи файлы попадутся
+# в очереди. Строже, чем нужно, но при темпе в единицы файлов в секунду это незаметно.
+TFS_SEND_POOL  = 'tfs_send'
+TFS_SEND_SLOTS = 1
 
 logger = logging.getLogger("airflow.task")
 
@@ -268,8 +301,7 @@ def get_dict(ch_hook, sql: str) -> list[dict]:
 GROUP_PARAMS: dict = {
     'notify_kafka':      1,            # 1 = отправлять уведомления в Kafka; 0 = пропустить (стенд)
     'auto_confirm':      1,            # 1 = не ждать Kafka-подтверждения от TFS
-    'confirm_timeout':   60,           # таймаут ожидания подтверждения, мин
-    'notify_timeout':    30,           # таймаут notify_tfs, мин
+    'confirm_timeout':   60,           # таймаут ожидания квитанций ТФС, мин (включая ожидание в очереди отправки)
     'selfrun_timeout':   60,           # задержка до следующего автозапуска, мин (не чаще 1 пакета/час)
     'max_active_tasks':  4,            # сколько таблиц пакета грузятся одновременно
 }
@@ -325,6 +357,74 @@ FORMAT_MAP: dict[str, dict] = {
 }
 
 
+def tfs_limits(scenario_id: str) -> dict[str, int]:
+    """🚦 Лимиты маршрута: свои из TFS_LIMITS либо общие TFS_LIMITS_DEFAULT."""
+    return TFS_LIMITS.get(scenario_id, TFS_LIMITS_DEFAULT)
+
+
+def send_budget(counts: dict[str, int], limits: dict[str, int]) -> tuple[int, str]:
+    """🧮 Сколько файлов можно отправить прямо сейчас и какой лимит упёрся первым.
+
+    counts — уже отправлено за окно: {'sec', 'min', 'hour', 'day'}
+    limits — потолки по тем же окнам
+
+    Возвращает (сколько можно, имя упёршегося лимита или '').
+    Минимум по всем окнам: свободен тот бюджет, что кончается раньше всех.
+    """
+    free = {w: limits[w] - counts.get(w, 0) for w in ('sec', 'min', 'hour', 'day')}
+    window = min(free, key=lambda w: free[w])
+    allowed = max(free[window], 0)
+    return allowed, (window if allowed == 0 else '')
+
+
+def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> dict:
+    """📨 Разбирает XML обратной квитанции TransferFileCephRs.
+
+    Битый XML не роняет разбор: возвращается строка со status_code = -1 и текстом
+    в raw_xml. Потерять квитанцию хуже, чем сохранить её неразобранной, а застрявшее
+    сообщение заблокировало бы очередь.
+
+    findtext с '{*}' и без: у ТФС встречаются оба варианта — с неймспейсом и без.
+    """
+    import xml.etree.ElementTree as ET
+    from datetime import datetime
+
+    row = {
+        'rq_uid': '', 'file_name': '', 'scenario_id': '',
+        'status_code': -1, 'rq_tm': None, 'raw_xml': raw,
+        'kafka_partition': partition, 'kafka_offset': offset,
+    }
+
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as err:
+        logger.error("❌ Квитанция не разобрана как XML (%s): %.500s", err, raw)
+        return row
+
+    def _text(tag: str) -> str:
+        return (root.findtext(f'.//{{*}}{tag}') or root.findtext(f'.//{tag}') or '').strip()
+
+    row['rq_uid']      = _text('RqUID')
+    row['file_name']   = _text('Name')
+    row['scenario_id'] = _text('ScenarioId')
+
+    code = _text('StatusCode')
+    try:
+        row['status_code'] = int(code)
+    except ValueError:
+        logger.error("❌ StatusCode '%s' не число, RqUID=%s", code, row['rq_uid'])
+        return row
+
+    rq_tm = _text('RqTm')
+    if rq_tm:
+        try:
+            row['rq_tm'] = datetime.fromisoformat(rq_tm)
+        except ValueError:
+            logger.warning("⚠️ RqTm '%s' не разобран, RqUID=%s", rq_tm, row['rq_uid'])
+
+    return row
+
+
 def replica_base(replica: str) -> str:
     """🔀 Базовая реплика — часть до первого '__'; остальное считается номером группы.
 
@@ -366,8 +466,15 @@ def get_config() -> dict:
         'VAR_NAME':        VAR_NAME,
         'POOL_NAME':       POOL_NAME,
         'POOL_SLOTS':      POOL_SLOTS,
+        'TFS_SEND_POOL':   TFS_SEND_POOL,
+        'TFS_SEND_SLOTS':  TFS_SEND_SLOTS,
         'DEFAULT_PARAMS':  DEFAULT_PARAMS,
         'GROUP_PARAMS':    GROUP_PARAMS,
         'TABLE_PARAMS':    TABLE_PARAMS,
         'FORMAT_MAP':      FORMAT_MAP,
+        'RECEIPTS_TABLE':   RECEIPTS_TABLE,
+        'SENT_FILES_TABLE': SENT_FILES_TABLE,
+        'TFS_LIMITS':       TFS_LIMITS,
+        'TFS_LIMITS_DEFAULT': TFS_LIMITS_DEFAULT,
+        'TFS_QUEUE_ALERT_MIN': TFS_QUEUE_ALERT_MIN,
     }

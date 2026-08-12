@@ -70,6 +70,8 @@ ENV_STAND      = _cfg['ENV_STAND']
 VAR_NAME       = _cfg['VAR_NAME']
 POOL_NAME      = _cfg['POOL_NAME']
 POOL_SLOTS     = _cfg['POOL_SLOTS']
+TFS_SEND_POOL  = _cfg['TFS_SEND_POOL']
+TFS_SEND_SLOTS = _cfg['TFS_SEND_SLOTS']
 TFS_MAP        = _cfg['TFS_MAP']
 DEFAULT_PARAMS = _cfg['DEFAULT_PARAMS']
 GROUP_PARAMS   = _cfg['GROUP_PARAMS']
@@ -302,31 +304,34 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
 
 
 def _ensure_pool() -> None:
-    """🏊 Создаёт Airflow Pool-ы для ER-выгрузок, если они ещё не существуют.
+    """🏊 Создаёт Airflow Pool-ы фреймворка, если их ещё нет.
 
-    Создаёт основной пул datalab_export_er (POOL_SLOTS слотов) и по одному пулу
-    tfs_{scenario_id} на каждый сценарий TFS (1 слот — лимит одного пакета в очереди).
-    Вызывается внутри таска (не при парсинге DAG), чтобы не создавать
-    сессию БД при каждом обходе scheduler-ом.
+    Вызывается внутри таска (не при парсинге DAG), чтобы не создавать сессию БД
+    при каждом обходе scheduler-ом.
+
+    Прежние пулы tfs_{scenario_id} больше не заводятся: требование ЕР «не передаётся
+    несколько пакетов одновременно» теперь выполняет сам export_er_sender — он
+    единственный отправитель и разбирает очередь пакетами целиком. Уже созданные
+    tfs_* можно удалить руками, код их не использует.
     """
     from airflow.models import Pool
     from airflow.utils.session import create_session
 
-    # Пул на сценарий, а не на группу: ЕР не принимает два пакета одновременно, и это
-    # ограничение общее для всех групп одной реплики (TFS_MAP ищется по базовой реплике).
-    tfs_pools = {
-        f"tfs_{scenario_id}": (1, f'TFS сценарий {scenario_id} — макс. 1 уведомление одновременно')
-        for scenario_id, _ in TFS_MAP.values()
+    pools = {
+        POOL_NAME: (POOL_SLOTS, 'Пул для ER-выгрузок'),
+        TFS_SEND_POOL: (
+            TFS_SEND_SLOTS,
+            'Отправка в ТФС: не больше одного отправителя одновременно. Берёт '
+            'export_er_sender и обязан брать любой даг, шлющий в ТФС мимо очереди. '
+            'Лимиты маршрута пул НЕ соблюдает — только взаимное исключение',
+        ),
     }
 
     with create_session() as session:
-        needed = {POOL_NAME} | set(tfs_pools)
-        existing = {p.pool for p in session.query(Pool).filter(Pool.pool.in_(needed)).all()}
-        if POOL_NAME not in existing:
-            session.add(Pool(pool=POOL_NAME, slots=POOL_SLOTS, description='Пул для ER-выгрузок', include_deferred=False))
-        for pool_name, (slots, desc) in tfs_pools.items():
-            if pool_name not in existing:
-                session.add(Pool(pool=pool_name, slots=slots, description=desc, include_deferred=False))
+        existing = {p.pool for p in session.query(Pool).filter(Pool.pool.in_(pools)).all()}
+        for name, (slots, desc) in pools.items():
+            if name not in existing:
+                session.add(Pool(pool=name, slots=slots, description=desc, include_deferred=False))
 
 
 @dag(

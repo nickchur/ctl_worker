@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-12 16:15 MSK · v2.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 16:30 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1231,13 +1232,16 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
             op = ctx['task']
             op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
 
-            # Пустой max_file_size означает «дефолт оператора» (10 ГБ на PROM, 1 ГБ иначе).
-            # Обнулять атрибут нельзя: деление потока на файлы сравнивает размер с ним
-            # напрямую и на None падает с TypeError.
-            try:
-                op.max_size = int(dp.get('max_file_size'))
-            except (TypeError, ValueError):
-                pass
+            # max_size оператор ждёт СТРОКОЙ: '100MB' либо просто число байт. Разбирает он
+            # её сам, в _init_check через parse_size(), а тот сразу зовёт .strip() — int
+            # роняет его с AttributeError: 'int' object has no attribute 'strip'.
+            # None безопасен: _init_check подставит вместо него дефолт (10 ГБ на PROM,
+            # 1 ГБ иначе), так что до сравнения размеров в execute() None не доживает.
+            # Ноль тоже отдаём как None: parse_size('0') вернёт 0, а оператор считает это
+            # неверным форматом и падает уже своей ошибкой.
+            raw = str(dp.get('max_file_size') or '').strip().upper()
+            num = re.fullmatch(r'(\d+)\s?(MB|KB|GB|B)?', raw)
+            op.max_size = raw if num and int(num.group(1)) > 0 else None
 
             op.pg_array_format  = dp['pg_array_format'] == 'True'
             op.xstream_sanitize = dp.get('xstream_sanitize', 'False') == 'True'

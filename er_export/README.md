@@ -138,7 +138,7 @@ hrplatform_datalab__lm    — суффикс произвольный, не об
 
 Обратная квитанция приходит по всем маршрутам в один топик `TFS.HRPLT.OUT` и
 сопоставляется с отправкой по `RqUID`. Читает топик единственный потребитель — даг
-`tfs_receipts_sync` (см. `ctl/tfs_receipts/`), он складывает всё в `export.tfs_receipts`.
+`tfs_receipts_sync` (см. `ctl/tfs_kafka/`), он складывает всё в `export.tfs_receipts`.
 
 `wait_confirm` ждёт появления **своих** строк по своим `RqUID`:
 

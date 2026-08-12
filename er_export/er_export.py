@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-12 16:30 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 17:15 MSK · v2.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -66,6 +66,7 @@ ENV_STAND      = _cfg['ENV_STAND']
 EXTRA_PRE      = _cfg['EXTRA_PRE']
 EXTRA_SUF      = _cfg['EXTRA_SUF']
 LIMITS         = _cfg['LIMITS']
+MAX_FILE_SIZE  = _cfg['MAX_FILE_SIZE']
 BUCKET         = _cfg['BUCKET']
 TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
@@ -167,6 +168,26 @@ def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
     if sql_meta.get("settings"): parts.append(f"SETTINGS {sql_meta['settings']}")
 
     return "\n".join(parts)
+
+
+def with_condition(where: str | None) -> str:
+    """🕐 Дописывает окно дельты в WHERE, если его там ещё нет.
+
+    Раньше плейсхолдер `{condition}` писали руками в поле sql_where таблицы. Забыл его —
+    и выгрузка молча уезжала таблицей целиком на каждом ране; заметно это становилось
+    только по объёму пакета. Теперь окно дописывается само, а в sql_where остаётся
+    только бизнес-фильтр.
+
+    Плейсхолдер сохраняется как отдушина: он нужен, когда окно надо положить внутрь CTE
+    или подзапроса — там это бывает на порядок быстрее внешнего WHERE. Если он в тексте
+    есть, подставляем на месте и ничего не дописываем.
+    """
+    w = (where or '').strip()
+    if not w:
+        return '{condition}'
+    if '{condition}' in w:
+        return w
+    return '{condition} AND (' + w + ')'
 
 
 def sql_cur_delta(tbl: str) -> str:
@@ -433,10 +454,28 @@ def _er_init(cfg, **context):
 
     Возвращаемый словарь (XCom "return_value") используется всеми downstream-тасками
     через _xcom(context, cfg['tg'], 'init') — внутри TaskGroup id составной.
+
+    Снятый флаг `tbl_<tg>` в форме запуска скипает всю TaskGroup таблицы: downstream
+    с all_success уходит в skipped следом, XCom не появляется, а save_status
+    и schedule_next таблицу без XCom пропускают — состояние дельты остаётся на месте.
     """
+    from airflow.exceptions import AirflowSkipException
     from airflow.hooks.base import BaseHook
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
+    # 🚦 Флаги таблиц. Все снятые — это не «пропустить всё», а ошибка запуска: пустой
+    # пакет означал бы тикет без единого файла, чего ТФС от нас не ждёт.
+    flags = {k: v for k, v in context['params'].items() if k.startswith('tbl_')}
+    if flags and not any(flags.values()):
+        raise AirflowFailException(
+            "Сняты флаги всех таблиц пакета — грузить нечего. "
+            "Отметьте хотя бы одну таблицу либо не запускайте пакет"
+        )
+    if not context['params'].get(f"tbl_{cfg['tg']}", True):
+        add_note({f"⏭️ {cfg['db']}.{cfg['tbl']}": "флаг таблицы снят — поставка пропущена"},
+                 level='task', context=context)
+        raise AirflowSkipException(f"{cfg['db']}.{cfg['tbl']}: флаг таблицы снят в параметрах запуска")
 
     # 🔌 Коннекты проверяем САМИ, до первого обращения. Провайдер amazon на отсутствующий
     # conn_id не падает: пишет «Unable to find AWS Connection ID …, switching to empty»
@@ -476,7 +515,7 @@ def _er_init(cfg, **context):
     reg = {
         'lower_bound':        f"'{lb}'",
         'selfrun_timeout':    str(cfg.get('selfrun_timeout', 10)),
-        'max_file_size':      cfg.get('max_file_size', ''),
+        'max_file_size':      cfg.get('max_file_size') or MAX_FILE_SIZE,
         'pg_array_format':    cfg.get('pg_array_format', 'False'),
         'format_params':      cfg.get('format_params', ''),
         'xstream_sanitize':   cfg.get('xstream_sanitize', 'False'),
@@ -526,24 +565,21 @@ def _er_init(cfg, **context):
     # Переопределения из DAG Params (ручной запуск): применяются поверх состояния дельты
     p = context['params']
     key_map = {
-        'extract_time':    lambda v: f"'{v}'",
-        'condition':       str,
-        'is_current':      lambda v: 'True' if v == 'true' else 'False',
-        'increment':       str,
         'selfrun_timeout': str,
         'strategy':        str,
+        'max_file_size':   str,
         'notify_kafka':    lambda v: 'True' if v else 'False',
-        'auto_confirm':     lambda v: 'True' if v else 'False',
-        'max_file_size':    str,
-        'pg_array_format':  lambda v: 'True' if v else 'False',
-        'xstream_sanitize': lambda v: 'True' if v else 'False',
-        'sanitize_array':   lambda v: 'True' if v else 'False',
-        'sanitize_list':    str,
-        'send_empty':       lambda v: 'True' if v else 'False',
+        'auto_confirm':    lambda v: 'True' if v else 'False',
     }
     for key, transform in key_map.items():
         if p.get(key) not in (None, '', 'None'):
             result[key] = transform(p[key])
+
+    # is_current — галка, а не тристейт: снятая означает «не переопределять», поэтому
+    # False здесь ничего не делает, иначе каждый ран форсил бы неактуальное состояние
+    # и бесконечно взводил следующий цикл.
+    if p.get('is_current'):
+        result['is_current'] = 'True'
 
     # 📅 Ручная выгрузка за период. Задаётся на весь пакет и перебивает состояние дельты.
     date_from = str(p.get('date_from') or '').strip()
@@ -552,7 +588,7 @@ def _er_init(cfg, **context):
         if not (date_from and date_to):
             raise AirflowFailException(
                 "Для выгрузки за период нужны обе даты: date_from и date_to. "
-                "Одна граница «с» задаётся параметром extract_time"
+                "Одной границы недостаточно — окно задаётся парой"
             )
         if date_to <= date_from:
             raise AirflowFailException(f"date_to ({date_to}) должна быть больше date_from ({date_from})")
@@ -570,7 +606,11 @@ def _er_init(cfg, **context):
         })
         logger.info("📅 Разовая выгрузка за период %s .. %s, состояние дельты не сохраняется", date_from, date_to)
 
-    add_note({k: result.get(k) for k in list(key_map) + ['time_from', 'time_to', 'ad_hoc']},
+    # extract_time, condition и increment перечислены явно: из формы они больше не правятся
+    # (у каждой таблицы своё состояние), но в заметке нужны — смотрят именно на них.
+    shown = list(key_map) + ['is_current', 'extract_time', 'condition', 'increment',
+                             'time_from', 'time_to', 'ad_hoc']
+    add_note({k: result.get(k) for k in shown},
              level='task', context=context, title=f"⚙️ Delta State · {cfg['db']}.{cfg['tbl']}")
     return result
 
@@ -614,9 +654,10 @@ def _er_build_meta(cfg, **context):
         алиасах и вычисляемых выражениях. Комментариев у результата подзапроса нет,
         поэтому description подмешивается из DESCRIBE TABLE источника по имени колонки.
         {condition} подставляем заведомо ложным: DESCRIBE запрос не выполняет, но разобрать
-        его обязан.
+        его обязан. Подстановка адресными replace, а не str.format: format спотыкается
+        о любую фигурную скобку в SQL — JSON-функции, map(), литерал '{}'.
         """
-        q = sql.format(export_time='now64(6)', condition='1=0')
+        q = sql.replace('{export_time}', 'now64(6)').replace('{condition}', '1=0')
         qrows, _ = hook.execute(f"DESCRIBE ({q})", with_column_types=True)
         out = []
         for r in qrows:
@@ -729,11 +770,9 @@ def _er_pack_zip(cfg, **context):
     mtime   = base_ts.replace(tzinfo=None)
 
     if not s3_keys:
-        # Param по умолчанию None = «не переопределять»: у пакета много таблиц, и одно
-        # умолчание в UI не должно перебивать настройку каждой из них.
-        override   = context['params'].get('send_empty')
-        send_empty = cfg['send_empty'] if override is None else bool(override)
-        if not send_empty:
+        # Только из настройки таблицы: параметра формы у send_empty нет намеренно —
+        # у пакета много таблиц, и одно значение в UI перебило бы настройку каждой.
+        if not cfg['send_empty']:
             ti.xcom_push(key="zip_name_list",   value=[])
             ti.xcom_push(key="total_row_count", value=0)
             add_note({f"📦 pack_zip · {cfg['tbl']}": "пусто, send_empty=0 — архив не создан"},
@@ -1008,10 +1047,12 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         )
 
     def _prep_sql(key):
-        """Читает SQL-метадату по ключу и добавляет обязательные поля (export_time, ctl_*)."""
+        """Читает SQL-метадату по ключу, добавляет обязательные поля и окно дельты."""
         m = entry.get(key)
         if isinstance(m, dict) and "fields" not in m:
             m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + fields + [c['sql'] for c in EXTRA_SUF]}
+        if isinstance(m, dict):
+            m = {**m, "where": with_condition(m.get("where"))}
         return build_sql(m)
 
     def _prep_sql_data(key):
@@ -1060,7 +1101,8 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         'overlap':         p['overlap'],
         'recent_interval': p['recent_interval'],
         'export_timeout':  p['export_timeout'],
-        'max_file_size':    str(p['max_file_size']),
+        # Из конфига стенда, а не из p: к таблице ограничение размера отношения не имеет.
+        'max_file_size':    MAX_FILE_SIZE,
         'format_params':    p['csv_format_params'],
         'pg_array_format':  'True' if p['pg_array_format'] else 'False',
         'xstream_sanitize': 'True' if p['xstream_sanitize'] else 'False',
@@ -1070,13 +1112,18 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
     }
 
 
-def _dag_params(gp: dict) -> dict:
+def _dag_params(gp: dict, tables: dict) -> dict:
     """🎛️ DAG Params пакета.
 
-    Групповые параметры (notify_kafka, auto_confirm, таймауты) имеют реальные умолчания —
-    они одни на весь пакет. Табличные умолчаний НЕ имеют (None): пустое значение означает
-    «взять из er_wf_meta», иначе умолчание одной таблицы молча перебило бы настройку всех
-    остальных таблиц группы.
+    Состав намеренно скупой. Табличные настройки (формат, санитизация, стратегия слияния,
+    признак recent) живут в er_wf_meta и правятся дагом export_er_wf_edit — как параметр
+    ПАКЕТА они применяли бы одно значение ко ВСЕМ таблицам сразу, то есть чинили одну
+    поставку и молча ломали остальные. Рычаги правки состояния дельты (extract_time,
+    condition, increment) убраны по той же причине, усиленной тем, что состояние у каждой
+    таблицы своё и сохраняется в extract_history.
+
+    Все умолчания подобраны так, чтобы автозапуск (`schedule_next` → trigger_dag(conf={}))
+    отрабатывал обычный цикл дельты без единого заполненного поля.
     """
     return {
         # ── Окно выгрузки ────────────────────────────────────────────────────
@@ -1089,21 +1136,14 @@ def _dag_params(gp: dict) -> dict:
             None, type=['string', 'null'], title='Дата по',
             description='Верхняя граница периода (включительно). Задавать вместе с «Дата с».',
         ),
-        'extract_time': Param(
-            None, type=['string', 'null'], title='Extract time',
-            description='Переопределить время выгрузки (ISO 8601). Игнорирует состояние дельты.',
-        ),
-        'condition': Param(
-            None, type=['string', 'null'], title='Condition',
-            description='SQL WHERE-условие. Переопределяет условие из состояния дельты.',
-        ),
+        # Именно type='boolean', а не ['boolean','null']: чекбокс в форме Airflow рисуется
+        # по сравнению schema.type == "boolean" строкой, и с типом-списком поле выпадает
+        # в обычный текстовый ввод. Поэтому «не переопределять» выражено снятой галкой,
+        # а не пустым значением: срабатывает только True.
         'is_current': Param(
-            'None', type='string', enum=['None', 'true', 'false'], title='Is current',
-            description='Принудительно пометить состояние как актуальное (не запускать следующий цикл).',
-        ),
-        'increment': Param(
-            None, type=['integer', 'null'], title='Increment (мин)',
-            description='Шаг дельты: time_to = time_from + increment. Пусто — из настройки таблицы.',
+            False, type='boolean', title='Пометить актуальным',
+            description='Отметить — состояние считается актуальным и следующий цикл '
+                        'не запускается. Снято = признак берётся из состояния дельты.',
         ),
         # ── Групповые: одни на весь пакет ────────────────────────────────────
         'notify_kafka': Param(
@@ -1127,7 +1167,12 @@ def _dag_params(gp: dict) -> dict:
             gp['selfrun_timeout'], type='integer', title='Selfrun timeout (мин)',
             description='Задержка до следующего автозапуска, если дельта не догнала текущее время.',
         ),
-        # ── Табличные: пусто = взять из er_wf_meta ───────────────────────────
+        'max_file_size': Param(
+            MAX_FILE_SIZE, type=['string', 'null'], title='Max file size',
+            description=f"Ограничение размера файла данных: '10GB', '100MB' или число байт. "
+                        f"Умолчание задано стендом ({ENV_STAND or 'не задан'}), к таблице отношения не имеет.",
+        ),
+        # ── Табличное: пусто = взять из er_wf_meta ───────────────────────────
         'strategy': Param(
             None, type=['string', 'null'], title='Strategy',
             enum=[None, 'FULL_UK', 'FULL_NO_UK', 'INC', 'APPEND'],
@@ -1140,30 +1185,17 @@ def _dag_params(gp: dict) -> dict:
                 'APPEND — только добавление; ctl_action игнорируется TFS, всегда I.'
             ),
         ),
-        'max_file_size': Param(
-            None, type=['integer', 'null'], title='Max file size',
-            description='Ограничение размера файла данных, байт. Пусто — из настройки таблицы.',
-        ),
-        'send_empty': Param(
-            None, type=['boolean', 'null'], title='Send Empty',
-            description='True = слать пустой ZIP+Kafka при нулевой дельте (требование TFS).',
-        ),
-        'pg_array_format': Param(
-            None, type=['boolean', 'null'], title='PG Array Format',
-            description='PostgreSQL-формат массивов в TSV. Для JSON не применяется.',
-        ),
-        'xstream_sanitize': Param(
-            None, type=['boolean', 'null'], title='XStream Sanitize',
-            description='Экранировать спецсимволы XStream. Для JSON не применяется.',
-        ),
-        'sanitize_array': Param(
-            None, type=['boolean', 'null'], title='Sanitize Array',
-            description='Санитизировать CH-массивы в строки.',
-        ),
-        'sanitize_list': Param(
-            None, type=['string', 'null'], title='Sanitize List',
-            description='JSON-массив пар [[pattern, replacement], ...] для re.sub по каждой строке.',
-        ),
+        # ── Что грузим: по флагу на таблицу ──────────────────────────────────
+        # Снятый флаг скипает TaskGroup таблицы целиком, состояние её дельты не двигается.
+        # Нужно, чтобы перелить одну сломавшуюся поставку, не гоняя весь пакет.
+        **{
+            f'tbl_{tg}': Param(
+                True, type='boolean', title=f'Грузить {tbl}',
+                description='Снять — эта таблица в текущем ране пропускается: '
+                            'в ZIP и тикет не попадёт, её дельта останется на месте.',
+            )
+            for tg, tbl in tables.items()
+        },
     }
 
 
@@ -1222,7 +1254,7 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
         max_active_tasks=int(gp['max_active_tasks']), max_active_runs=1, catchup=False,
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, *schemas],
         render_template_as_native_obj=True, is_paused_upon_creation=True,
-        params=_dag_params(gp),
+        params=_dag_params(gp, {c['tg']: tk for tk, c in cfgs.items()}),
     )
 
     def _make_pre_exp(tcfg):
@@ -1230,7 +1262,11 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
         def _pre_exp(ctx):
             dp = _xcom(ctx, tcfg['tg'], 'init')
             op = ctx['task']
-            op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
+            # replace, а не format: в SQL встречаются фигурные скобки (JSON-функции, map(),
+            # литерал '{}'), и str.format на них падает KeyError/IndexError.
+            op.sql = (op.sql
+                      .replace('{export_time}', dp['extract_time'])
+                      .replace('{condition}', dp['condition']))
 
             # max_size оператор ждёт СТРОКОЙ: '100MB' либо просто число байт. Разбирает он
             # её сам, в _init_check через parse_size(), а тот сразу зовёт .strip() — int

@@ -1,5 +1,5 @@
 """⚙️ Конфигурация и константы фреймворка ER-выгрузок.
-*2026-08-12 14:31 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 17:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -75,6 +75,18 @@ LIMITS = {
     "QA":   100,
     "IFT":  100,
     "DEV":  100,
+}
+
+# 📏 Ограничение размера одного файла данных. Зависит от СТЕНДА, а не от таблицы:
+# делить поток крупнее имеет смысл там, где канал до ТФС это выдерживает. Значение —
+# строка в формате оператора ('10GB', '100MB' или просто число байт), оно же умолчание
+# параметра «Max file size» в форме запуска.
+MAX_FILE_SIZE = {
+    "PROM": '10GB',
+    "UAT":  '1GB',
+    "QA":   '1GB',
+    "IFT":  '1GB',
+    "DEV":  '1GB',
 }
 
 TYPE_MAP: dict[str, str] = {
@@ -177,7 +189,7 @@ TABLE_PARAMS: dict = {
     'export_timeout':    120,          # таймаут export_to_s3, мин
 
     # ── Файлы ────────────────────────────────────────────────────────────────
-    'max_file_size':     '',           # ограничение размера файла, байт; '' = дефолт оператора
+    # max_file_size здесь НЕТ: он зависит от стенда, а не от таблицы — см. MAX_FILE_SIZE.
     'send_empty':        0,            # 1 = слать пустой ZIP+Kafka при нулевой дельте
 
     # ── Формат и санитизация ─────────────────────────────────────────────────
@@ -340,6 +352,7 @@ def get_config() -> dict:
         'EXTRA_PRE':       EXTRA_PRE,
         'EXTRA_SUF':       EXTRA_SUF,
         'LIMITS':          LIMITS,
+        'MAX_FILE_SIZE':   MAX_FILE_SIZE.get(ENV_STAND, '1GB'),
         'BUCKET':          BUCKET,
         'TFS_MAP':         TFS_MAP,
         'S3_CONN':         S3_CONN,

@@ -1,5 +1,5 @@
 """✏️ DAG правки настройки ER-выгрузок — export.er_wf_meta из UI.
-*2026-08-12 15:40 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 17:15 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Заводит новые записи и правит существующие, чтобы не ходить в `clickhouse-client`.
 
@@ -26,7 +26,7 @@
       "extract_name": "lc_items_opened", "db_name": "evolution",
       "replica": "hrplatform_datalab__1", "schema_name": "learning",
       "uk": ["item_id"], "fields": ["item_id", "title"],
-      "sql_from": "evolution.lc_items_opened", "sql_where": "{condition}",
+      "sql_from": "evolution.lc_items_opened",
       "params": "{\\"selfrun_timeout\\": 10}"
     }
 

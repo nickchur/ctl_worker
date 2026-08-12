@@ -1,5 +1,5 @@
 """🔄 DAG синхронизации метаданных ER-выгрузок.
-*2026-08-12 14:48 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 17:15 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Читает таблицу export.er_wf_meta из ClickHouse и сохраняет активные записи
 в Airflow Variable `datalab_er_wfs` (JSON-словарь), который используется
@@ -289,7 +289,7 @@ def er_sync_dag():
                     uk              Array(String) DEFAULT []             COMMENT 'Список колонок уникального ключа; не наследуется',
                     fields          Array(String) DEFAULT []             COMMENT 'SELECT-выражения; ОБЯЗАТЕЛЬНО и явно, "*" и "t1.*" запрещены',
                     sql_from        String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос; у поставки обязательное',
-                    sql_where       String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; {condition} подставляется рантаймом',
+                    sql_where       String        DEFAULT ''             COMMENT 'WHERE-условие: только бизнес-фильтр, окно дельты дописывается само',
                     sql_join        String        DEFAULT ''             COMMENT 'JOIN-clause (полное выражение: JOIN t ON ...); вставляется между FROM и WHERE',
                     sql_with        String        DEFAULT ''             COMMENT 'WITH-блок (CTE); вставляется перед SELECT',
                     sql_settings    String        DEFAULT ''             COMMENT 'SETTINGS-блок ClickHouse; вставляется в конец запроса',

@@ -22,8 +22,7 @@
         "params": "{\"selfrun_timeout\": 10}",
         "description": "Открытые элементы обучения из Evolution",
         "sql_stmt_export_delta": {
-          "from": "evolution.lc_items_opened",
-          "where": "{condition}"
+          "from": "evolution.lc_items_opened"
         }
       },
       "evolution.lc_items_meta": {
@@ -34,8 +33,7 @@
         "params": "{\"selfrun_timeout\": 10, \"format\": \"JSONEachRow\"}",
         "description": "Карточки элементов обучения, выгрузка построчным JSON",
         "sql_stmt_export_delta": {
-          "from": "evolution.lc_items_meta",
-          "where": "{condition}"
+          "from": "evolution.lc_items_meta"
         }
       }
     }
@@ -61,8 +59,7 @@
         "params": "{\"recent_interval\": 30}",
         "description": "Активность по курсам (recent, скользящее окно 30 мин)",
         "sql_stmt_export_recent": {
-          "from": "evolution.lc_courses_activity",
-          "where": "{condition}"
+          "from": "evolution.lc_courses_activity"
         }
       }
     }

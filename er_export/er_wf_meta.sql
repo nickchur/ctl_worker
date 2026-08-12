@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
     uk            Array(String) DEFAULT []             COMMENT 'Список колонок уникального ключа; не наследуется',
     fields        Array(String) DEFAULT []             COMMENT 'SELECT-выражения таблицы-источника; ОБЯЗАТЕЛЬНО и явно — "*" и "t1.*" запрещены, чтобы новая колонка источника не уезжала в выгрузку сама',
     sql_from      String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос; у поставки обязательное',
-    sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие; пустая строка — без фильтра; {condition} подставляется рантаймом',
+    sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие: только бизнес-фильтр, окно дельты дописывается само',
     sql_join      String        DEFAULT ''             COMMENT 'JOIN-clause (полное выражение: JOIN t ON ...); вставляется между FROM и WHERE',
     sql_with      String        DEFAULT ''             COMMENT 'WITH-блок (CTE); вставляется перед SELECT',
     sql_settings  String        DEFAULT ''             COMMENT 'SETTINGS-блок ClickHouse; вставляется в конец запроса',
@@ -123,7 +123,7 @@ VALUES (
     ['t1.person_uuid', 't1.item_id', 't1.opened_at', 't1.status'],
     'evolution.lc_items_opened t1',
     'LEFT JOIN evolution_export.lc_items_opened_exp t2 ON t1.person_uuid = t2.person_uuid AND t1.item_id = t2.item_id',
-    '{condition}',
+    '',
     '{"selfrun_timeout": 10}'
 );
 
@@ -137,7 +137,7 @@ VALUES (
     ['item_id'],
     ['item_id', 'title', 'tags'],
     'evolution.lc_items_meta',
-    '{condition}',
+    '',
     '{"format": "JSONEachRow"}'
 );
 

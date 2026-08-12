@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-12 14:48 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 15:45 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -37,12 +37,21 @@ try:
 except ImportError:
     from er_export.er_config import get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base
 
-# Хранилище тракта — общее с tfs_kafka: STORAGE живёт в одном месте, иначе писатель
-# и читатель разъедутся и пакет зависнет без внятной причины.
-try:
-    from plugins.tfs_utils import enqueue, find_receipts, queue_state  # type: ignore
-except ImportError:
-    from CI06932748.tools.tfs_utils import enqueue, find_receipts, queue_state  # type: ignore
+
+def _tfs():
+    """Слой тракта ТФС — общий с tfs_kafka: STORAGE живёт в одном месте, иначе писатель
+    и читатель разъедутся и пакет зависнет без внятной причины.
+
+    Импорт ЛЕНИВЫЙ, на уровне модуля его нет намеренно. Во-первых, транспорт нужен только
+    таскам постановки в очередь и ожидания квитанции, а при `notify_kafka: 0` не нужен
+    вовсе. Во-вторых, модуль этот — фабрика: жёсткий импорт при неполной выкладке ронял
+    Broken DAG'ом ВСЕ пакеты ЕР разом, включая те, что в ТФС ничего не шлют.
+    """
+    try:
+        from plugins import tfs_utils  # type: ignore
+    except ImportError:
+        from CI06932748.tools import tfs_utils  # type: ignore
+    return tfs_utils
 
 logger = logging.getLogger("airflow.task")
 
@@ -236,7 +245,7 @@ def _enqueue_files(gcfg: dict, files: list[str], context) -> list[dict]:
         'run_id':      run_id,
     } for f in files]
 
-    enqueue(rows)
+    _tfs().enqueue(rows)
     logger.info("📮 В очередь отправки поставлено %d файлов пакета %s", len(rows), gcfg['replica'])
     return rows
 
@@ -826,7 +835,7 @@ def _er_wait_confirm(gcfg, **context):
     deadline = time.time() + timeout * 60
 
     while True:
-        got = find_receipts(rq_uids)
+        got = _tfs().find_receipts(rq_uids)
 
         bad = [r for r in got if r['status_code'] != 0]
         if bad:
@@ -848,7 +857,7 @@ def _er_wait_confirm(gcfg, **context):
 
     # Таймаут. Различаем два диагноза: очередь стоит или ТФС молчит — лечатся они разно.
     missing = list(set(rq_uids) - {r['rq_uid'] for r in got})
-    queued  = queue_state(missing)
+    queued  = _tfs().queue_state(missing)
     not_sent  = [r['file_name'] for r in queued if r['pending']]
     no_answer = [r['file_name'] for r in queued if not r['pending']]
 

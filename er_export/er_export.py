@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-12 17:25 MSK · v2.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 19:05 MSK · v2.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -170,8 +170,12 @@ def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
     return "\n".join(parts)
 
 
-def with_condition(where: str | None) -> str:
+def with_condition(where: str | None, full: bool = False) -> str:
     """🕐 Дописывает окно дельты в WHERE, если его там ещё нет.
+
+    При full=True (параметр таблицы full_export) окно не подставляется вовсе: условие
+    остаётся тем, что задано в sql_where, а пустое даёт запрос совсем без WHERE.
+    Так выгружается таблица, у которой поля времени нет в принципе.
 
     Раньше плейсхолдер `{condition}` писали руками в поле sql_where таблицы. Забыл его —
     и выгрузка молча уезжала таблицей целиком на каждом ране; заметно это становилось
@@ -183,6 +187,8 @@ def with_condition(where: str | None) -> str:
     есть, подставляем на месте и ничего не дописываем.
     """
     w = (where or '').strip()
+    if full:
+        return w
     if not w:
         return '{condition}'
     if '{condition}' in w:
@@ -526,7 +532,30 @@ def _er_init(cfg, **context):
         'time_field':         f"'{tf}'",
     }
 
-    if cfg['sql_get_current']:
+    if cfg.get('full_export'):
+        # 📚 Полная выгрузка: окна нет, состояние дельты не ведём. Применимо и к таблицам
+        # без поля времени — condition в SQL не подставляется, а '1=1' лежит здесь на
+        # случай, если {condition} всё-таки написан в sql_where руками.
+        now_s = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        reg.update({
+            'extract_time':    f"'{now_s}'",
+            'extract_count':   'null',
+            'loaded':          'null',
+            'sent':            'null',
+            'confirmed':       'null',
+            # Границы окна условны и нужны только истории: выгружено всё, что было на now.
+            'time_from':       f"'{lb}'",
+            'time_to':         f"'{now_s}'",
+            'condition':       '1=1',
+            # Всегда актуально: догонять нечего, следующий ран придёт по расписанию,
+            # а schedule_next при is_current=True цикл не взводит.
+            'is_current':      'True',
+            'recent_interval': '0',
+            'num_state':       '0',
+        })
+        result = reg
+        logger.info("📚 %s.%s: полная выгрузка, окно дельты не применяется", cfg['db'], cfg['tbl'])
+    elif cfg['sql_get_current']:
         cur_res = get_dict_from_ch(hook, cfg['sql_get_current'])
         if not cur_res:
             logger.warning("First execution for %s. Bootstrapping from lower_bound=%s.", cfg['tbl'], lb)
@@ -1052,7 +1081,7 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         if isinstance(m, dict) and "fields" not in m:
             m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + fields + [c['sql'] for c in EXTRA_SUF]}
         if isinstance(m, dict):
-            m = {**m, "where": with_condition(m.get("where"))}
+            m = {**m, "where": with_condition(m.get("where"), full=bool(p['full_export']))}
         return build_sql(m)
 
     def _prep_sql_data(key):
@@ -1084,7 +1113,8 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         's3_prefix':       prefix,
         # ── SQL ──────────────────────────────────────────────────────────────
         'sql_export':      sql_exp,
-        'sql_get_current': sql_cur_delta(tbl) if sql_delta else None,  # None → recent-режим
+        # None → состояние дельты не читается: так работают recent и full_export
+        'sql_get_current': sql_cur_delta(tbl) if (sql_delta and not p['full_export']) else None,
         'sql_meta':        _prep_sql_data('sql_stmt_export_delta') or _prep_sql_data('sql_stmt_export_recent'),
         # ── Схема ────────────────────────────────────────────────────────────
         'fields':          fields,
@@ -1094,6 +1124,7 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         # ── Параметры таблицы ────────────────────────────────────────────────
         'format':          p['format'],
         'strategy':        p['strategy'],
+        'full_export':     bool(p['full_export']),
         'increment':       p['increment'],
         'selfrun_timeout': p['selfrun_timeout'],
         'lower_bound':     p['lower_bound'],

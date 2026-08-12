@@ -1,5 +1,5 @@
 """⚙️ Конфигурация и константы фреймворка ER-выгрузок.
-*2026-08-12 17:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 19:05 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -184,10 +184,11 @@ GROUP_PARAMS: dict = {
 # в строке-таблице.
 TABLE_PARAMS: dict = {
     # ── Дельта ───────────────────────────────────────────────────────────────
+    'full_export':       0,            # 1 = выгружать таблицу целиком: окно дельты не подставляется, состояние не ведётся
     'increment':         60,           # шаг дельты, мин: time_to = time_from + increment (не чаще 1 пакета/час по стандарту ТФС)
     'overlap':           0,            # перекрытие окна дельты назад, сек (для компенсации задержек CDC)
     'lower_bound':       '',           # нижняя граница первой дельты (bootstrap); '' → 1970-01-01
-    'time_field':        'extract_time',  # поле времени в таблице-источнике
+    'time_field':        'extract_time',  # поле времени в источнике; пустое допустимо только при full_export=1
     'recent_interval':   60,           # окно для режима recent, мин (используется вместо дельты)
 
     # ── Стратегия ────────────────────────────────────────────────────────────
@@ -338,6 +339,17 @@ def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
     star = [f for f in fields if str(f).strip() == '*' or str(f).strip().endswith('.*')]
     if star:
         errors.append(f"{key}: fields содержит {star} — звёздочка запрещена, нужен явный список")
+        return False
+
+    # Поля времени у таблицы может не быть вовсе — тогда дельта невозможна физически:
+    # окно строится как 'from' < time_field and time_field <= 'to'. Такую поставку
+    # выгружаем целиком, и это должно быть заявлено явно, а не выясняться в рантайме
+    # запросом к несуществующей колонке.
+    if not params.get('full_export') and not str(params.get('time_field') or '').strip():
+        errors.append(
+            f"{key}: пустой time_field — без поля времени окно дельты не построить. "
+            "Поставьте full_export=1, если таблицу надо выгружать целиком"
+        )
         return False
 
     fmt = params.get('format', DEFAULT_PARAMS['format'])

@@ -1,8 +1,12 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-06 19:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-10 21:40 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Жизненный цикл одного запуска:
-  init → [build_meta, export_to_s3] → pack_zip → notify_tfs → wait_confirm → save_status → schedule_next
+Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
+значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
+
+  <db>__<tbl>: init → [build_meta, export_to_s3] → pack_zip
+                                                      ↓
+  make_summary → notify_tfs → wait_confirm → save_status → schedule_next
 
 Метаданные выгрузок хранятся в Airflow Variable `datalab_er_wfs` (JSON-словарь),
 который синхронизируется DAG-ом export_er_sync из таблицы export.er_wf_meta.
@@ -10,6 +14,7 @@
 Поддерживаемые режимы выгрузки:
   📈 delta  — инкрементальный, окно [time_from, time_to] из export.extract_current_vw
   🔄 recent — скользящее окно [now() - recent_interval, now()], без сохранения состояния
+  📅 период — ручной запуск с date_from/date_to; состояние дельты при этом не двигается
 """
 from __future__ import annotations
 
@@ -23,11 +28,14 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Param
+from airflow.utils.task_group import TaskGroup
 
 try:
-    from CI06932748.analytics.datalab.export_er.er_config import get_config, get_dict, obj_load, add_note, get_params  # type: ignore
+    from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
+        get_config, get_dict, obj_load, add_note, get_params, replica_base,
+    )
 except ImportError:
-    from er_export.er_config import get_config, get_dict, obj_load, add_note, get_params
+    from er_export.er_config import get_config, get_dict, obj_load, add_note, get_params, replica_base
 
 logger = logging.getLogger("airflow.task")
 
@@ -49,6 +57,7 @@ KAFKA_RCV_TOPIC = _cfg['KAFKA_RCV_TOPIC']
 TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
 VAR_NAME        = _cfg['VAR_NAME']
+FORMAT_MAP      = _cfg['FORMAT_MAP']
 
 # Hive keywords (all versions, reserved + non-reserved) — имена колонок из этого набора
 # получают суффикс '_' согласно требованиям KAP/TFS (раздел 11 документации ЕР).
@@ -182,6 +191,37 @@ def _fmt_val(v: Any) -> str:
     return 'null' if v is None else f"'{v}'"
 
 
+def _run_ts(context) -> datetime:
+    """🕐 Единая точка отсчёта пакета — logical_date рана.
+
+    От неё строятся имена ВСЕХ файлов пакета: и архивов по каждой таблице, и общего тикета,
+    а ЕР требует у них одинаковый ts. Поэтому значение обязано быть неизменным.
+
+    Именно logical_date, а не dag_run.start_date: последний перештамповывается при каждом
+    переходе рана в RUNNING, то есть после clear упавшей таблицы её архивы получили бы новое
+    время, а тикет — третье, и пакет развалился бы на разные метки. logical_date у рана одна
+    навсегда. Она же стоит в ключе промежуточного файла ({{ ts_nodash }}), так что имена
+    сходятся на всех этапах.
+    """
+    ts = context.get('logical_date') or getattr(context.get('dag_run'), 'logical_date', None)
+    if ts is None:  # ручной вызов вне контекста рана — лучше отдать хоть что-то, чем упасть
+        ts = getattr(context.get('dag_run'), 'start_date', None) or datetime.now(timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _xcom(context, tg: str, task_id: str, key: str = 'return_value', required: bool = True):
+    """📤 Тянет XCom таска внутри TaskGroup — id там составной: '<group>.<task>'.
+
+    required=True превращает отсутствие значения в падение: молчаливый None выше по
+    течению даёт не ошибку, а пустой пакет с тикетом на пустой список архивов.
+    """
+    full_id = f"{tg}.{task_id}" if tg else task_id
+    val = context['ti'].xcom_pull(task_ids=full_id, key=key)
+    if val is None and required:
+        raise AirflowFailException(f"XCom '{full_id}' (key={key}) пуст — таск не отработал")
+    return val
+
+
 def _format_cur_state(cur: dict) -> dict:
     """Преобразует сырую строку extract_current_vw в словарь SQL-литералов.
 
@@ -206,6 +246,74 @@ def _format_cur_state(cur: dict) -> dict:
         'is_current':      'True' if cur.get('current_time') == cur.get('extract_time') else 'False',
         'recent_interval': str(cur.get('recent_interval', 0)),
     }
+
+
+def safe_name(name: str) -> str:
+    """Имя колонки для .meta: совпавшее с зарезервированным словом Hive получает суффикс '_'."""
+    return name + '_' if name.lower() in HIVE_RESERVED else name
+
+
+def field_name(expr: str) -> str | None:
+    """Сырое имя колонки, которое даст выражение из fields. None — если вывести его нельзя.
+
+    Надёжных случаев два: явный алиас в конце ('expr as name') и простая колонка, возможно
+    с квалификатором ('t1.col'). Всё остальное — выражение вроде cast(x as String): наивный
+    split по ' as ' дал бы 'String)', а ClickHouse назовёт колонку по-своему. Такие поля
+    честно помечаем неизвестными, иначе сверка в build_meta падала бы вечно и без шансов
+    на успешный ретрай.
+
+    Имя возвращается БЕЗ hive-суффикса: по нему ищут колонку в DESCRIBE TABLE, где имена
+    сырые. safe_name() навешивается уже на результат, при формировании .meta.
+    """
+    import re
+
+    expr = str(expr).strip()
+    alias = re.search(r'\sas\s+([A-Za-z_]\w*)\s*$', expr, re.I)
+    if alias:
+        return alias.group(1)
+    if re.fullmatch(r'[A-Za-z_]\w*(\.[A-Za-z_]\w*)*', expr):
+        return expr.rsplit('.', 1)[-1]
+    return None
+
+
+def cols_from_fields(fields: list, ch_cols: dict, describe_rows: list) -> list[dict]:
+    """Колонки .meta по списку fields — запасной путь, когда DESCRIBE запроса недоступен.
+
+    Работает, если sql_meta пуст (SQL задан строкой или со своим списком fields) либо если
+    DESCRIBE (<запрос>) упал. JOIN-ы и вычисляемые выражения тут не учитываются: имя каждой
+    колонки выводится из самого выражения.
+
+    Выражение, у которого имя не вывести (нет алиаса, не простая колонка), — ошибка.
+    Взять имя неоткуда, а .meta управляет загрузкой в КАП: молча уехавшее 'String)' вместо
+    имени колонки хуже падения, и сверка состава его не поймает — для таких выражений она
+    проверяет только количество.
+
+    ch_cols       — {имя колонки источника: описание} по DESCRIBE TABLE
+    describe_rows — сырые строки DESCRIBE TABLE, нужны для ветки «все колонки»
+    """
+    # 't1.*' — тот же «все колонки таблицы», что и '*', но с явным алиасом.
+    # Через синхронизацию сюда уже не попасть (fields обязателен и звёздочка запрещена),
+    # ветка оставлена для обратной совместимости со старыми записями Variable.
+    if not fields or fields in (['*'], '*') or all(str(f).strip().endswith('.*') for f in fields):
+        return [{**ch_cols[r[0]], "column_name": safe_name(r[0])} for r in describe_rows]
+
+    out = []
+    for f in fields:
+        name = field_name(f)
+        if name is None:
+            raise AirflowFailException(
+                f"Не удалось определить имя колонки для выражения '{f}'. "
+                "Схема строится по DESCRIBE TABLE источника (запрос разобрать не удалось "
+                "или он задан строкой), поэтому имя берётся из самого выражения. "
+                f"Добавьте алиас в fields: '{f} as <имя_колонки>'"
+            )
+        base = ch_cols.get(name, {
+            "column_name": name, "source_type": "STRING", "length": None,
+            "notnull": False, "precision": None, "scale": None,
+            "description": f"Calculated: {f}",
+        })
+        out.append({**base, "column_name": safe_name(base["column_name"])})
+    return out
 
 
 def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool, int | None, int | None, int | None]:
@@ -304,22 +412,22 @@ def _kafka_wait_any(conn_id: str, topic: str, timeout_min: int) -> str | None:
 def _pre_kafka(scenario: str):
     """Фабрика pre_execute для ProduceToTopicOperator.
 
-    Пропускает отправку если notify_kafka=False или данных нет.
-    Динамически подставляет список файлов (summary TKT + ZIP) в аргументы продюсера.
+    Пропускает отправку если notify_kafka=False или пакет пуст.
+    Динамически подставляет список файлов (summary TKT + ZIP всех таблиц пакета).
     """
     def pre_execute(context):
         if not context['params'].get('notify_kafka', True):
             raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
-        summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
+        summary_tkt = context['ti'].xcom_pull(task_ids="make_summary", key='summary_tkt_name')
         if not summary_tkt:
             raise AirflowSkipException("No data exported, skipping notification")
-        zip_names = context['ti'].xcom_pull(task_ids="pack_zip", key='zip_name_list') or []
+        zip_names = context['ti'].xcom_pull(task_ids="make_summary", key='zip_name_list') or []
         context['task'].producer_function_args = [scenario, [summary_tkt] + zip_names]
     return pre_execute
 
 
 def _pre_await(context):
-    """Пропускает ожидание подтверждения: auto_confirm=True, notify_kafka=False или данных не было.
+    """Пропускает ожидание подтверждения: auto_confirm=True, notify_kafka=False или пакет пуст.
 
     Вызывается первым делом в wait_confirm — так один таск заменяет
     EmptyOperator/ожидание switch.
@@ -329,7 +437,7 @@ def _pre_await(context):
         raise AirflowSkipException("Auto confirm enabled, skipping wait")
     if not p.get('notify_kafka', True):
         raise AirflowSkipException("Kafka notification disabled (notify_kafka=0)")
-    summary_tkt = context['ti'].xcom_pull(task_ids="pack_zip", key='summary_tkt_name')
+    summary_tkt = context['ti'].xcom_pull(task_ids="make_summary", key='summary_tkt_name')
     if not summary_tkt:
         raise AirflowSkipException("No data exported, skipping wait")
 
@@ -358,9 +466,10 @@ def _er_init(cfg, **context):
     Delta-режим: читает export.extract_current_vw; при первом запуске создаёт bootstrap-состояние
     с time_from/time_to = lower_bound.
     Recent-режим: вычисляет окно [now() - recent_interval, now()] без обращения к CH.
+    Период: date_from/date_to из DAG Params перебивают состояние и помечают ран как ad_hoc.
 
     Возвращаемый словарь (XCom "return_value") используется всеми downstream-тасками
-    через xcom_pull(task_ids="init").
+    через _xcom(context, cfg['tg'], 'init') — внутри TaskGroup id составной.
     """
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
@@ -446,13 +555,33 @@ def _er_init(cfg, **context):
         if p.get(key) not in (None, '', 'None'):
             result[key] = transform(p[key])
 
-    # Фиксируем время старта DAG-рана один раз: все имена файлов в pack_zip строятся
-    # от этого значения, а не от пересчитанного now() (стабильность имён при ретраях/задержках).
-    dr = context.get('dag_run')
-    dag_start = getattr(dr, 'start_date', None) or datetime.now(timezone.utc)
-    result['dag_start_time'] = dag_start.astimezone(timezone.utc).isoformat()
+    # 📅 Ручная выгрузка за период. Задаётся на весь пакет и перебивает состояние дельты.
+    date_from = str(p.get('date_from') or '').strip()
+    date_to   = str(p.get('date_to') or '').strip()
+    if date_from or date_to:
+        if not (date_from and date_to):
+            raise AirflowFailException(
+                "Для выгрузки за период нужны обе даты: date_from и date_to. "
+                "Одна граница «с» задаётся параметром extract_time"
+            )
+        if date_to <= date_from:
+            raise AirflowFailException(f"date_to ({date_to}) должна быть больше date_from ({date_from})")
 
-    add_note({k: result.get(k) for k in key_map}, level='Task,DAG', context=context, title='⚙️ Delta State')
+        result.update({
+            'extract_time': f"'{date_to}'",
+            'time_from':    f"'{date_from}'",
+            'time_to':      f"'{date_to}'",
+            'condition':    f"'{date_from}' < {tf} and {tf} <= '{date_to}'",
+            # Состояние дельты не двигаем: save_status пропустит запись в extract_history,
+            # а is_current=True не даст schedule_next запустить следующий цикл. Иначе разовая
+            # доливка за прошлый месяц отбросила бы регулярный поток назад.
+            'is_current':   'True',
+            'ad_hoc':       'True',
+        })
+        logger.info("📅 Разовая выгрузка за период %s .. %s, состояние дельты не сохраняется", date_from, date_to)
+
+    add_note({k: result.get(k) for k in list(key_map) + ['time_from', 'time_to', 'ad_hoc']},
+             level='task', context=context, title=f"⚙️ Delta State · {cfg['db']}.{cfg['tbl']}")
     return result
 
 
@@ -474,9 +603,7 @@ def _er_build_meta(cfg, **context):
     length/precision/scale. UK передаётся плоским массивом: ['id'] (стандарт ЕР).
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-    dp = context['ti'].xcom_pull(task_ids="init")
-    if dp is None:
-        raise AirflowFailException("XCom 'init' is None — init task failed before returning")
+    dp = _xcom(context, cfg['tg'], 'init')
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
     rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
 
@@ -489,9 +616,6 @@ def _er_build_meta(cfg, **context):
             "notnull": notnull, "precision": precision, "scale": scale,
             "description": comment or None,
         }
-
-    def _safe(name: str) -> str:
-        return name + '_' if name.lower() in HIVE_RESERVED else name
 
     def _cols_from_query(sql: str) -> list[dict]:
         """Колонки по DESCRIBE итогового запроса — так же, как их видит TSVWithNames.
@@ -508,7 +632,7 @@ def _er_build_meta(cfg, **context):
         for r in qrows:
             stype, notnull, length, precision, scale = parse_ch_type(r[1], TYPE_MAP)
             out.append({
-                "column_name": _safe(r[0]), "source_type": stype, "length": length,
+                "column_name": safe_name(r[0]), "source_type": stype, "length": length,
                 "notnull": notnull, "precision": precision, "scale": scale,
                 "description": ch_cols.get(r[0], {}).get("description"),
             })
@@ -516,22 +640,7 @@ def _er_build_meta(cfg, **context):
 
     def _cols_from_table() -> list[dict]:
         """Запасной путь: колонки по DESCRIBE TABLE источника, без учёта JOIN и выражений."""
-        fields = cfg.get('fields', ['*'])
-        # 't1.*' — тот же «все колонки таблицы», что и '*', но с явным алиасом
-        if not fields or fields in (['*'], '*') or all(str(f).strip().endswith('.*') for f in fields):
-            return [{**ch_cols[r[0]], "column_name": _safe(r[0])} for r in rows]
-        out = []
-        for f in fields:
-            name = f.split()[-1] if ' as ' in f.lower() else f
-            # 't1.col' → 'col': алиас таблицы нужен в SQL при JOIN, но не в .meta
-            name = name.rsplit('.', 1)[-1]
-            base = ch_cols.get(name, {
-                "column_name": name, "source_type": "STRING", "length": None,
-                "notnull": False, "precision": None, "scale": None,
-                "description": f"Calculated: {f}",
-            })
-            out.append({**base, "column_name": _safe(base["column_name"])})
-        return out
+        return cols_from_fields(cfg.get('fields', ['*']), ch_cols, rows)
 
     sql_meta = cfg.get('sql_meta')
     if sql_meta:
@@ -541,10 +650,44 @@ def _er_build_meta(cfg, **context):
             # Схема из DESCRIBE TABLE лучше, чем упавший DAG, но она может разойтись с CSV
             logger.warning("DESCRIBE по запросу не удался, откат на DESCRIBE TABLE: %s", err)
             add_note(f"DESCRIBE по запросу не удался, схема взята по DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}\n\n{err}",
-                     level='task,dag', context=context, title='⚠️ build_meta fallback')
+                     level='task', context=context, title='⚠️ build_meta fallback')
             data_cols = _cols_from_table()
     else:
         data_cols = _cols_from_table()
+
+    # 🔍 Состав колонок обязан совпадать с настройкой. Смысл всей проверки: новая колонка
+    # в источнике не должна доезжать до КАП сама — только через правку fields в er_wf_meta.
+    # Заодно ловится опечатка в выражении, у которого ClickHouse выведет неожиданное имя.
+    # actual уже с hive-суффиксами (safe_name при сборке), поэтому и ожидаемые имена
+    # приводим к тому же виду.
+    actual = [c['column_name'] for c in data_cols]
+    expected = [safe_name(n) if n is not None else None
+                for n in (field_name(f) for f in cfg['fields'])]
+
+    if len(actual) != len(expected):
+        raise AirflowFailException(
+            f"Состав колонок {cfg['db']}.{cfg['tbl']} разошёлся с настройкой fields: "
+            f"запрос вернул {len(actual)} колонок, в настройке {len(expected)}.\n"
+            f"  запрос:    {actual}\n"
+            f"  настройка: {cfg['fields']}\n"
+            "Если изменение источника ожидаемо — поправьте fields в export.er_wf_meta"
+        )
+
+    # Позиции с невыводимым именем (выражения без алиаса) сверяем только по количеству:
+    # имя такой колонки определяет ClickHouse, и предсказать его мы не берёмся.
+    mismatch = [(i, e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e is not None and e != a]
+    if mismatch:
+        raise AirflowFailException(
+            f"Состав колонок {cfg['db']}.{cfg['tbl']} разошёлся с настройкой fields.\n"
+            + "\n".join(f"  позиция {i}: запрос '{a}', настройка '{e}'" for i, e, a in mismatch)
+            + "\nЕсли изменение источника ожидаемо — поправьте fields в export.er_wf_meta"
+        )
+
+    if unnamed := [f for f, e in zip(cfg['fields'], expected) if e is None]:
+        logger.warning(
+            "Выражения без алиаса, имена колонок для них не проверены: %s. "
+            "Добавьте 'as <имя>', чтобы сверка работала полностью", unnamed,
+        )
 
     meta = {
         "mask_file":   None,
@@ -554,102 +697,147 @@ def _er_build_meta(cfg, **context):
         "strategy":    dp.get('strategy', cfg['strategy']),
         "PK":          cfg['PK'],
         "UK":          cfg['UK'] or [],
-        "params":      {"separation": "\t"},
+        "params":      FORMAT_MAP[cfg['format']]['meta_params'],
         "columns":     [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_PRE] + data_cols + [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_SUF],
     }
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
-    add_note({"🗂️ build_meta": [c["column_name"] for c in meta["columns"]]}, level='task,dag', context=context)
+    add_note({f"🗂️ build_meta · {cfg['tbl']}": [c["column_name"] for c in meta["columns"]]},
+             level='task', context=context)
 
 
 @task(task_id='pack_zip')
 def _er_pack_zip(cfg, **context):
-    """📦 Упаковывает CSV-файлы из S3 в ZIP-архивы формата ЕР и загружает обратно в S3.
+    """📦 Упаковывает выгруженные файлы одной таблицы в ZIP-архивы формата ЕР.
 
-    Каждый CSV оборачивается в отдельный ZIP (стриминг, без буферизации в памяти):
+    Каждый файл данных оборачивается в отдельный ZIP (стриминг, без буферизации в памяти):
       [replica]__[ts].tkt      — `filename;rowcount` (TKT внутри архива, стандарт ЕР)
-      [schema]__[table]__[ts].meta — JSON-схема колонок
-      [schema]__[table]__[ts].csv  — данные из S3
+      [schema]__[table]__[ts].meta        — JSON-схема колонок
+      [schema]__[table]__[ts].csv|.json   — данные из S3, расширение по формату выгрузки
 
     Имена файлов — строго нижний регистр, расширение архива .zip (стандарт ЕР).
-    После упаковки исходные CSV удаляются из S3.
-    Summary TKT (снаружи архива) перечисляет все ZIP-файлы пакета — передаётся в Kafka вместе с именами ZIP.
+    После упаковки исходные файлы удаляются из S3.
+
+    Общий тикет пакета здесь НЕ пишется: архивов в пакете много, тикет один, и собирает
+    его make_summary после того, как отработают все таблицы группы.
     """
     from stat import S_IFREG
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from stream_zip import ZIP_32, stream_zip # type: ignore
 
-    ti = context["ti"]
-    s3_keys = ti.xcom_pull(task_ids="export_to_s3", key='s3_key_list')
-    counts  = ti.xcom_pull(task_ids="export_to_s3", key='row_count_list')
-    meta_s  = ti.xcom_pull(task_ids="build_meta",   key='meta_json')
+    ti  = context["ti"]
+    tg  = cfg['tg']
+    ext = FORMAT_MAP[cfg['format']]['ext']
 
-    # Зафиксированное в init время старта DAG — единая точка отсчёта для имён файлов.
-    dp = ti.xcom_pull(task_ids="init")
-    base_ts = datetime.fromisoformat(dp['dag_start_time']) if dp and dp.get('dag_start_time') else datetime.now(timezone.utc)
+    # s3_key_list пуст при нулевой дельте — это штатно. А вот row_count_list при непустом
+    # списке ключей обязан быть: без него zip() молча даст TypeError вместо внятной ошибки.
+    s3_keys = _xcom(context, tg, 'export_to_s3', key='s3_key_list',   required=False)
+    counts  = _xcom(context, tg, 'export_to_s3', key='row_count_list', required=bool(s3_keys))
+    meta_s  = _xcom(context, tg, 'build_meta',   key='meta_json')
+
+    base_ts = _run_ts(context)
+    ts      = base_ts.strftime("%Y%m%d%H%M%S")
+    mtime   = base_ts.replace(tzinfo=None)
 
     if not s3_keys:
-        send_empty = context['params'].get('send_empty', cfg.get('send_empty', False))
+        # Param по умолчанию None = «не переопределять»: у пакета много таблиц, и одно
+        # умолчание в UI не должно перебивать настройку каждой из них.
+        override   = context['params'].get('send_empty')
+        send_empty = cfg['send_empty'] if override is None else bool(override)
         if not send_empty:
-            ti.xcom_push(key="summary_tkt_name", value="")
+            ti.xcom_push(key="zip_name_list",   value=[])
+            ti.xcom_push(key="total_row_count", value=0)
+            add_note({f"📦 pack_zip · {cfg['tbl']}": "пусто, send_empty=0 — архив не создан"},
+                     level='task', context=context)
             return
 
+        # Пустой пакет по требованию ТФС. У TSV это файл с одной строкой заголовка,
+        # у NDJSON заголовка нет вовсе — пустой файл нулевой длины.
         meta_obj = json.loads(meta_s)
-        header   = "\t".join(c["column_name"] for c in meta_obj["columns"]) + "\n"
-        ts0    = base_ts.strftime("%Y%m%d%H%M%S")
-        csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts0}__0_1_0.csv".lower()
-        meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts0}__0_1_0.meta".lower()
-        tkt_n  = f"{cfg['replica']}__{ts0}.tkt".lower()
-        zip_n  = f"{cfg['replica']}__{ts0}__{cfg['tbl']}__0_1_0.zip".lower()
-        mtime  = base_ts.replace(tzinfo=None)
+        body     = ("\t".join(c["column_name"] for c in meta_obj["columns"]) + "\n").encode() \
+                   if FORMAT_MAP[cfg['format']]['header'] else b""
+        data_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__0_1_0.{ext}".lower()
+        meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__0_1_0.meta".lower()
+        tkt_n  = f"{cfg['replica']}__{ts}.tkt".lower()
+        zip_n  = f"{cfg['replica']}__{ts}__{cfg['tbl']}__0_1_0.zip".lower()
         members = [
-            (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{csv_n};0".encode()]),
+            (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{data_n};0".encode()]),
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
-            (csv_n,  mtime, S_IFREG | 0o600, ZIP_32, [header.encode()]),
+            (data_n, mtime, S_IFREG | 0o600, ZIP_32, [body]),
         ]
         hook_e = S3Hook(aws_conn_id=S3_CONN)
         hook_e.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
-        summary_tkt = f"{cfg['replica']}__{ts0}.tkt".lower()
-        hook_e.load_bytes(zip_n.encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
-        ti.xcom_push(key="zip_name_list",    value=[zip_n])
-        ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
-        ti.xcom_push(key="total_row_count",  value=0)
-        add_note({"📦 pack_zip (empty)": [zip_n]}, title="rows=0 send_empty=True", level='task,dag', context=context)
+        ti.xcom_push(key="zip_name_list",   value=[zip_n])
+        ti.xcom_push(key="total_row_count", value=0)
+        add_note({f"📦 pack_zip · {cfg['tbl']} (empty)": [zip_n]}, title="rows=0 send_empty=True",
+                 level='task', context=context)
         return
 
     hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
     uploaded = []
-    # Единый таймстемп пакета: ЕР требует одинаковый ts у архива (.zip) и тикета (.tkt).
-    ts    = base_ts.strftime("%Y%m%d%H%M%S")
-    mtime = base_ts.replace(tzinfo=None)
 
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
-        csv_n  = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.csv".lower()
+        data_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.{ext}".lower()
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.meta".lower()
         tkt_n  = f"{cfg['replica']}__{ts}.tkt".lower()
         zip_n  = f"{cfg['replica']}__{ts}__{cfg['tbl']}__{i+1}_{total}_{rows}.zip".lower()
 
         s3_body = hook.get_key(key=key, bucket_name=BUCKET).get()["Body"]
         members = [
-            (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{csv_n};{rows}".encode()]),
+            (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{data_n};{rows}".encode()]),
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
-            (csv_n,  mtime, S_IFREG | 0o600, ZIP_32, s3_body.iter_chunks(chunk_size=8*1024*1024)),
+            (data_n, mtime, S_IFREG | 0o600, ZIP_32, s3_body.iter_chunks(chunk_size=8*1024*1024)),
         ]
         hook.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
         hook.delete_objects(bucket=BUCKET, keys=[key])
         uploaded.append(zip_n)
 
-    summary_tkt = f"{cfg['replica']}__{ts}.tkt".lower()
-    hook.load_bytes("\n".join(uploaded).encode(), key=f"{cfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True)
-
     total_rows = sum(int(r) for r in counts)
-    ti.xcom_push(key="zip_name_list",    value=uploaded)
+    ti.xcom_push(key="zip_name_list",   value=uploaded)
+    ti.xcom_push(key="total_row_count", value=total_rows)
+    add_note({f"📦 pack_zip · {cfg['tbl']}": uploaded}, title=f"rows={total_rows} files={total}",
+             level='task', context=context)
+
+
+@task(task_id='make_summary', trigger_rule='none_failed')
+def _er_make_summary(gcfg, **context):
+    """🧾 Собирает общий тикет пакета — один .tkt на все архивы группы.
+
+    Тикет `[replica]__[ts].tkt` перечисляет ZIP-файлы всех таблиц пакета, по имени в строке.
+    Его имя уникально по построению: replica включает суффикс группы, а внутри группы
+    max_active_runs=1 не даёт двум пакетам родиться одновременно.
+
+    trigger_rule=none_failed: падение любой таблицы блокирует пакет целиком — тикет
+    на неполный список архивов ушёл бы в ЕР как полноценная поставка.
+    """
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+    ti = context["ti"]
+    zips: list[str] = []
+    for tg in gcfg['groups']:
+        zips.extend(_xcom(context, tg, 'pack_zip', key='zip_name_list', required=False) or [])
+
+    if not zips:
+        # Пусто во всех таблицах и send_empty=0: уведомлять ЕР не о чем.
+        ti.xcom_push(key="summary_tkt_name", value="")
+        ti.xcom_push(key="zip_name_list",    value=[])
+        add_note("пакет пуст — тикет не создан, уведомление пропущено",
+                 level='task,dag', context=context, title='🧾 make_summary')
+        return
+
+    ts          = _run_ts(context).strftime("%Y%m%d%H%M%S")
+    summary_tkt = f"{gcfg['replica']}__{ts}.tkt".lower()
+    S3Hook(aws_conn_id=S3_CONN).load_bytes(
+        "\n".join(zips).encode(), key=f"{gcfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True,
+    )
+
     ti.xcom_push(key="summary_tkt_name", value=summary_tkt)
-    ti.xcom_push(key="total_row_count",  value=total_rows)
-    add_note({"📦 pack_zip": uploaded}, title=f"rows={total_rows} files={total}", level='task,dag', context=context)
+    ti.xcom_push(key="zip_name_list",    value=zips)
+    add_note({f"🧾 {summary_tkt}": zips}, title=f"архивов в пакете: {len(zips)}",
+             level='task,dag', context=context)
 
 
 @task(task_id='wait_confirm', trigger_rule='none_failed')
-def _er_wait_confirm(cfg, **context):
+def _er_wait_confirm(gcfg, **context):
     """⏳ Ждёт квитанцию TFS в Kafka — опросом на воркере.
 
     Раньше здесь стоял AwaitMessageSensor, но он deferrable: без живого Triggerer
@@ -659,143 +847,176 @@ def _er_wait_confirm(cfg, **context):
     """
     _pre_await(context)  # auto_confirm / notify_kafka / нет данных → skip
 
-    text = _kafka_wait_any(KAFKA_RCV_CONN, KAFKA_RCV_TOPIC, cfg['confirm_timeout'])
+    # Из params, а не из gcfg: значение в форме запуска должно работать. Потолок ему всё
+    # равно ставит execution_timeout, посчитанный при разборе файла.
+    timeout = context['params'].get('confirm_timeout') or gcfg['confirm_timeout']
+
+    text = _kafka_wait_any(KAFKA_RCV_CONN, KAFKA_RCV_TOPIC, timeout)
     if text is None:
         raise AirflowFailException(
-            f"Подтверждение TFS не пришло в {KAFKA_RCV_TOPIC} за {cfg['confirm_timeout']} мин"
+            f"Подтверждение TFS не пришло в {KAFKA_RCV_TOPIC} за {timeout} мин"
         )
     add_note(f"```\n{text}\n```", context=context, level='task', title='📨 TFS confirm')
     return text
 
 
 @task(task_id='save_status', trigger_rule='none_failed')
-def _er_save_status(cfg, **context):
-    """💾 Записывает результат выгрузки в export.extract_history.
+def _er_save_status(gcfg, **context):
+    """💾 Записывает результат по каждой таблице пакета в export.extract_history.
 
+    Одна вставка на весь пакет: строк столько, сколько таблиц отработало.
     trigger_rule=none_failed: запускается при успехе или при skipped-тасках
     (wait_confirm пропускается при auto_confirm=True или отсутствии данных).
     confirmed=null — ожидает Kafka-подтверждения от TFS (или остаётся null при auto_confirm).
     extract_time берётся из XCom init как SQL-литерал (уже в кавычках).
+
+    Разовая выгрузка за период (ad_hoc) состояние не двигает — иначе следующая штатная
+    дельта оттолкнулась бы от вручную заданных границ.
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-    ti, dp = context['ti'], context['ti'].xcom_pull(task_ids="init")
-    if not dp: return
 
-    rows = ti.xcom_pull(task_ids="pack_zip", key='total_row_count') or 0
-    zips = ti.xcom_pull(task_ids="pack_zip", key='zip_name_list') or []
-    zip_arr = "[" + ", ".join(f"'{z}'" for z in zips) + "]"
+    selects, noted, skipped = [], {}, []
+    for tg, tbl in gcfg['tables'].items():
+        dp = _xcom(context, tg, 'init', required=False)
+        if not dp:
+            continue
+        if str(dp.get('ad_hoc')).lower() == 'true':
+            skipped.append(tbl)
+            continue
 
-    ClickHouseHook(clickhouse_conn_id=CH_ID).execute(f"""
-        INSERT INTO export.extract_history (
-            extract_name, extract_time, extract_count, loaded, sent, confirmed,
-            increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
-        ) SELECT
-            '{cfg['tbl']}', {dp['extract_time']}, {rows}, now(), now(), null,
-            {dp['increment']}, {dp['overlap']}, {dp['recent_interval']},
-            {dp['time_field']}, {dp['time_from']}, {dp['time_to']}, {zip_arr}
-    """)
-    add_note(
-        {"💾 save_status": {"time_from": dp['time_from'], "time_to": dp['time_to'], "rows": rows, "zips": zips}},
-        level='task,dag', context=context,
-    )
+        rows = _xcom(context, tg, 'pack_zip', key='total_row_count', required=False) or 0
+        zips = _xcom(context, tg, 'pack_zip', key='zip_name_list',   required=False) or []
+        zip_arr = "[" + ", ".join(f"'{z}'" for z in zips) + "]"
+
+        selects.append(f"""
+            SELECT
+                '{tbl}', {dp['extract_time']}, {rows}, now(), now(), null,
+                {dp['increment']}, {dp['overlap']}, {dp['recent_interval']},
+                {dp['time_field']}, {dp['time_from']}, {dp['time_to']}, {zip_arr}
+        """)
+        noted[tbl] = {"time_from": dp['time_from'], "time_to": dp['time_to'], "rows": rows, "zips": zips}
+
+    if selects:
+        ClickHouseHook(clickhouse_conn_id=CH_ID).execute(f"""
+            INSERT INTO export.extract_history (
+                extract_name, extract_time, extract_count, loaded, sent, confirmed,
+                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
+            ) {' UNION ALL '.join(selects)}
+        """)
+
+    if skipped:
+        add_note(f"📅 разовая выгрузка за период — состояние не сохранено: {', '.join(skipped)}",
+                 level='task,dag', context=context, title='💾 save_status')
+    if noted:
+        add_note({"💾 save_status": noted}, level='task,dag', context=context)
 
 
 @task(task_id='schedule_next')
-def _er_schedule_next(cfg, **context):
-    """⏭️ Запускает следующий цикл дельты, если time_to ещё не догнал текущее время.
+def _er_schedule_next(gcfg, **context):
+    """⏭️ Запускает следующий цикл, если хотя бы одна таблица пакета отстаёт от текущего времени.
 
+    Пакет ходит целиком, поэтому и решение об автозапуске одно на группу: догонять
+    отставшую таблицу отдельным раном нельзя — тикет формируется на весь пакет.
     Запуск откладывается на selfrun_timeout минут, чтобы избежать гонки с источником.
-    Для recent-режима is_current всегда True — автозапуск не нужен.
+    Для recent-режима и для выгрузки за период is_current всегда True — автозапуск не нужен.
     """
     from airflow.api.common.trigger_dag import trigger_dag
-    dp = context['ti'].xcom_pull(task_ids="init")
-    if str(dp.get('is_current')).lower() in ('true', 't', '1'):
+
+    behind = []
+    for tg, tbl in gcfg['tables'].items():
+        dp = _xcom(context, tg, 'init', required=False)
+        if dp and str(dp.get('is_current')).lower() not in ('true', 't', '1'):
+            behind.append(tbl)
+
+    if not behind:
         add_note("✅ delta is current — next run not scheduled", level='task,dag', context=context)
         return
 
-    next_run = datetime.now(timezone.utc) + timedelta(minutes=int(dp['selfrun_timeout']))
-    trigger_dag(dag_id=cfg['dag_id'], execution_date=next_run, conf={}, replace_microseconds=False)
-    add_note(f"⏭️ next run scheduled at {next_run.strftime('%Y-%m-%d %H:%M:%S')} UTC", level='task,dag', context=context)
+    # Из params, а не из gcfg: иначе поле «Selfrun timeout» в форме запуска ничего не меняет.
+    delay = context['params'].get('selfrun_timeout') or gcfg['selfrun_timeout']
+    next_run = datetime.now(timezone.utc) + timedelta(minutes=int(delay))
+    trigger_dag(dag_id=gcfg['dag_id'], execution_date=next_run, conf={}, replace_microseconds=False)
+    add_note(f"⏭️ next run scheduled at {next_run.strftime('%Y-%m-%d %H:%M:%S')} UTC\n\nотстают: {', '.join(behind)}",
+             level='task,dag', context=context)
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────
 
-def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
-    """🏭 Создаёт Airflow DAG для одной ER-выгрузки на основе записи из Variable.
+def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
+    """🗂️ Конфиг одной поставки внутри пакета.
 
-    table_key — ключ вида "db_name.extract_name"
-    params    — словарь из Variable datalab_er_wfs (одна запись er_wf_meta):
-                replica, schema, PK, UK, params (JSON),
-                sql_stmt_export_delta | sql_stmt_export_recent, fields, description
-
-    Возвращает (dag_id, dag) для регистрации в globals().
+    entry — запись из Variable: schema, PK, UK, fields, params (уже разрешённые
+    наследованием от строки-дефолта группы) и ровно один из sql_stmt_export_delta /
+    sql_stmt_export_recent.
     """
-    from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
-    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
-
-    p = get_params(params)
-
+    p = get_params(entry)
     db, tbl = table_key.split(".", maxsplit=1)
-    replica, schema = params['replica'], params['schema']
-    if p['format'] != 'TSVWithNames':
-        raise AirflowFailException("Only TSVWithNames format is supported.")
 
-    scen, prefix = TFS_MAP[replica]
-    fields = params.get("fields", [])
-    if not fields or fields in (['*'], '*'): fields = ['*']
+    if p['format'] not in FORMAT_MAP:
+        raise AirflowFailException(
+            f"{table_key}: неизвестный формат '{p['format']}', допустимы {sorted(FORMAT_MAP)}"
+        )
+
+    # Состав колонок задаётся только настройкой — иначе новая колонка источника уедет
+    # в выгрузку и в КАП сама, без единой правки er_wf_meta.
+    fields = entry.get("fields") or []
+    if not fields or any(str(f).strip() == '*' or str(f).strip().endswith('.*') for f in fields):
+        raise AirflowFailException(
+            f"{table_key}: fields должен быть явным списком колонок, '*' и 't1.*' запрещены"
+        )
 
     def _prep_sql(key):
         """Читает SQL-метадату по ключу и добавляет обязательные поля (export_time, ctl_*)."""
-        m = params.get(key)
+        m = entry.get(key)
         if isinstance(m, dict) and "fields" not in m:
             m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + fields + [c['sql'] for c in EXTRA_SUF]}
         return build_sql(m)
 
     def _prep_sql_data(key):
-        """Тот же запрос, но только с data-колонками — build_meta делает по нему DESCRIBE.
-
-        Пусто, если SQL задан строкой или со своим списком fields: тогда состав колонок
-        мы не контролируем, и build_meta откатывается на DESCRIBE TABLE источника.
-        """
-        m = params.get(key)
+        """Тот же запрос, но только с data-колонками — build_meta делает по нему DESCRIBE."""
+        m = entry.get(key)
         return build_sql({**m, "fields": fields}) if isinstance(m, dict) and "fields" not in m else ""
 
     sql_delta, sql_recent = _prep_sql('sql_stmt_export_delta'), _prep_sql('sql_stmt_export_recent')
     if not (sql_delta or sql_recent) or (sql_delta and sql_recent):
-        raise AirflowFailException("Must specify exactly one of delta or recent SQL statements.")
+        raise AirflowFailException(f"{table_key}: нужен ровно один из delta/recent SQL-запросов")
 
     sql_exp = sql_delta or sql_recent
     if LIMITS.get(ENV_STAND, 0) > 0:
         sql_exp = f"SELECT * FROM ({sql_exp}) LIMIT {LIMITS[ENV_STAND]}"
 
-    cfg = {
+    if p['format'] != 'TSVWithNames' and (p['pg_array_format'] or p['xstream_sanitize']):
+        logger.warning(
+            "%s: pg_array_format/xstream_sanitize не применяются к формату %s — "
+            "orjson сериализует массивы и экранирует спецсимволы сам", table_key, p['format'],
+        )
+
+    return {
         # ── Идентификация ────────────────────────────────────────────────────
+        'tg':              table_key.replace('.', '__'),   # id TaskGroup, он же префикс XCom
         'db':              db,
         'tbl':             tbl,
-        'dag_id':          f"export_er__{schema}__{tbl}",
-        'schema_name':     schema,
+        'schema_name':     entry['schema'],
         'replica':         replica,
-        'scenario':        scen,
         's3_prefix':       prefix,
         # ── SQL ──────────────────────────────────────────────────────────────
+        'sql_export':      sql_exp,
         'sql_get_current': sql_cur_delta(tbl) if sql_delta else None,  # None → recent-режим
         'sql_meta':        _prep_sql_data('sql_stmt_export_delta') or _prep_sql_data('sql_stmt_export_recent'),
         # ── Схема ────────────────────────────────────────────────────────────
         'fields':          fields,
-        'PK':              params.get('PK', []),
-        'UK':              params.get('UK', []),
-        # ── Метаданные ───────────────────────────────────────────────────────
-        'description':     params.get('description', ''),
-        # ── Параметры из er_wf_meta.params (DEFAULT_PARAMS + overrides) ─────
+        'PK':              entry.get('PK', []),
+        'UK':              entry.get('UK', []),
+        'description':     entry.get('description', ''),
+        # ── Параметры таблицы ────────────────────────────────────────────────
+        'format':          p['format'],
         'strategy':        p['strategy'],
-        'notify_kafka':    bool(p['notify_kafka']),
-        'auto_confirm':    p['auto_confirm'],
-        'confirm_timeout': p['confirm_timeout'],
         'increment':       p['increment'],
         'selfrun_timeout': p['selfrun_timeout'],
         'lower_bound':     p['lower_bound'],
         'time_field':      p['time_field'],
         'overlap':         p['overlap'],
         'recent_interval': p['recent_interval'],
+        'export_timeout':  p['export_timeout'],
         'max_file_size':    str(p['max_file_size']),
         'format_params':    p['csv_format_params'],
         'pg_array_format':  'True' if p['pg_array_format'] else 'False',
@@ -803,107 +1024,182 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
         'sanitize_array':   'True' if p['sanitize_array'] else 'False',
         'sanitize_list':    p['sanitize_list'],
         'send_empty':       bool(p['send_empty']),
-        'export_timeout':   p['export_timeout'],
-        'notify_timeout':   p['notify_timeout'],
     }
 
+
+def _dag_params(gp: dict) -> dict:
+    """🎛️ DAG Params пакета.
+
+    Групповые параметры (notify_kafka, auto_confirm, таймауты) имеют реальные умолчания —
+    они одни на весь пакет. Табличные умолчаний НЕ имеют (None): пустое значение означает
+    «взять из er_wf_meta», иначе умолчание одной таблицы молча перебило бы настройку всех
+    остальных таблиц группы.
+    """
+    return {
+        # ── Окно выгрузки ────────────────────────────────────────────────────
+        'date_from': Param(
+            None, type=['string', 'null'], title='Дата с',
+            description='Разовая выгрузка за период. Задавать вместе с «Дата по». '
+                        'Состояние дельты при этом НЕ сохраняется.',
+        ),
+        'date_to': Param(
+            None, type=['string', 'null'], title='Дата по',
+            description='Верхняя граница периода (включительно). Задавать вместе с «Дата с».',
+        ),
+        'extract_time': Param(
+            None, type=['string', 'null'], title='Extract time',
+            description='Переопределить время выгрузки (ISO 8601). Игнорирует состояние дельты.',
+        ),
+        'condition': Param(
+            None, type=['string', 'null'], title='Condition',
+            description='SQL WHERE-условие. Переопределяет условие из состояния дельты.',
+        ),
+        'is_current': Param(
+            'None', type='string', enum=['None', 'true', 'false'], title='Is current',
+            description='Принудительно пометить состояние как актуальное (не запускать следующий цикл).',
+        ),
+        'increment': Param(
+            None, type=['integer', 'null'], title='Increment (мин)',
+            description='Шаг дельты: time_to = time_from + increment. Пусто — из настройки таблицы.',
+        ),
+        # ── Групповые: одни на весь пакет ────────────────────────────────────
+        'notify_kafka': Param(
+            bool(gp['notify_kafka']), type='boolean', title='Notify Kafka',
+            description='True = отправлять уведомление в Kafka; False = пропустить (стенд).',
+        ),
+        'auto_confirm': Param(
+            bool(gp['auto_confirm']), type='boolean', title='Auto confirm',
+            description='True = не ждать Kafka-подтверждения от TFS.',
+        ),
+        'confirm_timeout': Param(
+            gp['confirm_timeout'], type='integer', title='Confirm timeout (мин)',
+            description=(
+                'Максимальное время ожидания подтверждения из Kafka. Сверху ограничено '
+                f"execution_timeout таска ({gp['confirm_timeout'] + 5} мин), он считается "
+                'при разборе файла и через форму запуска не меняется.'
+            ),
+        ),
+        # notify_timeout сюда не выносим: он влияет только на execution_timeout таска
+        # notify_tfs, а тот фиксируется при разборе файла — параметр в форме был бы мёртвым.
+        'selfrun_timeout': Param(
+            gp['selfrun_timeout'], type='integer', title='Selfrun timeout (мин)',
+            description='Задержка до следующего автозапуска, если дельта не догнала текущее время.',
+        ),
+        # ── Табличные: пусто = взять из er_wf_meta ───────────────────────────
+        'strategy': Param(
+            None, type=['string', 'null'], title='Strategy',
+            enum=[None, 'FULL_UK', 'FULL_NO_UK', 'INC', 'APPEND'],
+            description=(
+                'Стратегия загрузки TFS; применяется ко ВСЕМ таблицам пакета. '
+                'FULL_UK — полное обновление snp с дедубликацией по UK; строки с ctl_action=D отбрасываются TFS. '
+                'FULL_NO_UK — полное обновление без дедубликации; строки с ctl_action=D отбрасываются TFS. '
+                'INC — инкрементальное обновление: ctl_action=D+UK→удаление, ctl_action=D без UK→отброс, '
+                'остальные+UK→обновление, остальные без UK→вставка. '
+                'APPEND — только добавление; ctl_action игнорируется TFS, всегда I.'
+            ),
+        ),
+        'max_file_size': Param(
+            None, type=['integer', 'null'], title='Max file size',
+            description='Ограничение размера файла данных, байт. Пусто — из настройки таблицы.',
+        ),
+        'send_empty': Param(
+            None, type=['boolean', 'null'], title='Send Empty',
+            description='True = слать пустой ZIP+Kafka при нулевой дельте (требование TFS).',
+        ),
+        'pg_array_format': Param(
+            None, type=['boolean', 'null'], title='PG Array Format',
+            description='PostgreSQL-формат массивов в TSV. Для JSON не применяется.',
+        ),
+        'xstream_sanitize': Param(
+            None, type=['boolean', 'null'], title='XStream Sanitize',
+            description='Экранировать спецсимволы XStream. Для JSON не применяется.',
+        ),
+        'sanitize_array': Param(
+            None, type=['boolean', 'null'], title='Sanitize Array',
+            description='Санитизировать CH-массивы в строки.',
+        ),
+        'sanitize_list': Param(
+            None, type=['string', 'null'], title='Sanitize List',
+            description='JSON-массив пар [[pattern, replacement], ...] для re.sub по каждой строке.',
+        ),
+    }
+
+
+def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
+    """🏭 Создаёт Airflow DAG на одну группу поставок — то есть на один пакет ЕР.
+
+    replica — ключ группы из Variable, он же имя в архивах и тикете
+              ('hrplatform_datalab__1'); маршрут в TFS ищется по части до первого '__'
+    group   — {schedule, description, params (групповые), tables: {"db.tbl": entry}}
+
+    Возвращает (dag_id, dag) для регистрации в globals().
+    """
+    from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
+    from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
+
+    base = replica_base(replica)
+    if base not in TFS_MAP:
+        raise AirflowFailException(f"{replica}: базовая реплика '{base}' не найдена в TFS_MAP")
+    scen, prefix = TFS_MAP[base]
+
+    gp     = get_params(group)
+    tables = group.get('tables') or {}
+    if not tables:
+        raise AirflowFailException(f"{replica}: в группе нет ни одной поставки")
+
+    cfgs   = {tk: _table_cfg(tk, entry, replica, prefix) for tk, entry in tables.items()}
+    dag_id = f"export_er__{replica}"
+
+    gcfg = {
+        'dag_id':          dag_id,
+        'replica':         replica,
+        'scenario':        scen,
+        's3_prefix':       prefix,
+        'confirm_timeout': gp['confirm_timeout'],
+        'notify_timeout':  gp['notify_timeout'],
+        'selfrun_timeout': gp['selfrun_timeout'],
+        # Соответствие «TaskGroup → имя выгрузки»: по нему групповые таски собирают XCom
+        'groups':          [c['tg'] for c in cfgs.values()],
+        'tables':          {c['tg']: c['tbl'] for c in cfgs.values()},
+    }
+
+    schemas = sorted({c['schema_name'].replace(' ', '_').lower() for c in cfgs.values()})
+
     dag = DAG(
-        dag_id=cfg['dag_id'], description=params.get('description', f"ER: {table_key}"),
-        doc_md=f"```json\n{json.dumps(p, indent=2, default=str)}\n```",
+        dag_id=dag_id,
+        description=group.get('description') or f"ER: пакет {replica} ({len(cfgs)} табл.)",
+        doc_md=(
+            f"### Пакет ЕР `{replica}` — {len(cfgs)} поставок, один тикет\n\n"
+            f"Групповые параметры:\n```json\n{json.dumps(gp, indent=2, default=str)}\n```\n\n"
+            + "\n".join(
+                f"**{tk}** — формат `{c['format']}`, стратегия `{c['strategy']}`, "
+                f"колонок {len(c['fields'])}"
+                for tk, c in cfgs.items()
+            )
+        ),
         default_args=DEF_ARGS, start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
-        schedule_interval=params.get('schedule', '55 0 * * *'), max_active_tasks=1, max_active_runs=1, catchup=False,
-        tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, schema.replace(' ', '_').lower()],
+        schedule_interval=group.get('schedule', '55 0 * * *'),
+        max_active_tasks=int(gp['max_active_tasks']), max_active_runs=1, catchup=False,
+        tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, *schemas],
         render_template_as_native_obj=True, is_paused_upon_creation=True,
-        params={
-            'extract_time': Param(
-                None, type=['string', 'null'], title='Extract time',
-                description='Переопределить время выгрузки (ISO 8601). Игнорирует состояние дельты.',
-            ),
-            'condition': Param(
-                None, type=['string', 'null'], title='Condition',
-                description='SQL WHERE-условие. Переопределяет условие из состояния дельты.',
-            ),
-            'is_current': Param(
-                'None', type='string', enum=['None', 'true', 'false'], title='Is current',
-                description='Принудительно пометить состояние как актуальное (не запускать следующий цикл).',
-            ),
-            'increment': Param(
-                p['increment'], type=['integer', 'null'], title='Increment (мин)',
-                description='Шаг дельты: time_to = time_from + increment.',
-            ),
-            'selfrun_timeout': Param(
-                p['selfrun_timeout'], type=['integer', 'null'], title='Selfrun timeout (мин)',
-                description='Задержка до следующего автозапуска, если дельта не догнала текущее время.',
-            ),
-            'strategy': Param(
-                p['strategy'], type='string', title='Strategy',
-                enum=['FULL_UK', 'FULL_NO_UK', 'INC', 'APPEND'],
-                description=(
-                    'Стратегия загрузки TFS. '
-                    'FULL_UK — полное обновление snp с дедубликацией по UK; строки с ctl_action=D отбрасываются TFS. '
-                    'FULL_NO_UK — полное обновление без дедубликации; строки с ctl_action=D отбрасываются TFS. '
-                    'INC — инкрементальное обновление: ctl_action=D+UK→удаление, ctl_action=D без UK→отброс, '
-                    'остальные+UK→обновление, остальные без UK→вставка. '
-                    'APPEND — только добавление; ctl_action игнорируется TFS, всегда I.'
-                ),
-            ),
-            'notify_kafka': Param(
-                bool(p['notify_kafka']), type='boolean', title='Notify Kafka',
-                description='True = отправлять уведомления в Kafka; False = пропустить (стенд).',
-            ),
-            'auto_confirm': Param(
-                bool(p['auto_confirm']), type='boolean', title='Auto confirm',
-                description='True = не ждать Kafka-подтверждения от TFS.',
-            ),
-            'confirm_timeout': Param(
-                p['confirm_timeout'], type='integer', title='Confirm timeout (мин)',
-                description='Максимальное время ожидания подтверждения из Kafka.',
-            ),
-            'export_timeout': Param(
-                p['export_timeout'], type='integer', title='Export timeout (мин)',
-                description='Максимальное время выгрузки в S3.',
-            ),
-            'notify_timeout': Param(
-                p['notify_timeout'], type='integer', title='Notify timeout (мин)',
-                description='Максимальное время отправки уведомления в Kafka TFS.',
-            ),
-            'max_file_size': Param(
-                None, type=['integer', 'null'], title='Max file size',
-                description='Ограничение размера CSV-файла, байт. None — без ограничений.',
-            ),
-            'pg_array_format': Param(
-                bool(p['pg_array_format']), type='boolean', title='PG Array Format',
-                description='PostgreSQL-формат массивов в TSV.',
-            ),
-            'xstream_sanitize': Param(
-                bool(p['xstream_sanitize']), type='boolean', title='XStream Sanitize',
-                description='Экранировать спецсимволы XStream.',
-            ),
-            'sanitize_array': Param(
-                bool(p['sanitize_array']), type='boolean', title='Sanitize Array',
-                description='Санитизировать CH-массивы в строки.',
-            ),
-            'sanitize_list': Param(
-                p['sanitize_list'], type=['string', 'null'], title='Sanitize List',
-                description='JSON-массив пар [[pattern, replacement], ...] для re.sub по каждой строке. Пусто — не переопределять.',
-            ),
-            'send_empty': Param(
-                bool(p['send_empty']), type='boolean', title='Send Empty',
-                description='True = слать пустой ZIP+Kafka при нулевой дельте (требование TFS).',
-            ),
-        },
+        params=_dag_params(gp),
     )
 
-    with dag:
+    def _make_pre_exp(tcfg):
+        """pre_execute для export_to_s3: подставляет состояние дельты в SQL и параметры оператора."""
         def _pre_exp(ctx):
-            """pre_execute для export_to_s3: подставляет состояние дельты в SQL и параметры оператора."""
-            dp = ctx['ti'].xcom_pull(task_ids="init")
+            dp = _xcom(ctx, tcfg['tg'], 'init')
             op = ctx['task']
             op.sql = op.sql.format(export_time=dp['extract_time'], condition=dp['condition'])
+
+            # Пустой max_file_size означает «дефолт оператора» (10 ГБ на PROM, 1 ГБ иначе).
+            # Обнулять атрибут нельзя: деление потока на файлы сравнивает размер с ним
+            # напрямую и на None падает с TypeError.
             try:
                 op.max_size = int(dp.get('max_file_size'))
             except (TypeError, ValueError):
-                op.max_size = None
+                pass
+
             op.pg_array_format  = dp['pg_array_format'] == 'True'
             op.xstream_sanitize = dp.get('xstream_sanitize', 'False') == 'True'
             op.sanitize_array   = dp.get('sanitize_array', 'False') == 'True'
@@ -912,31 +1208,105 @@ def create_export_dag(table_key: str, params: dict) -> tuple[str, DAG]:
                 op.format_params = ast.literal_eval(dp['format_params'])
             except (ValueError, SyntaxError):
                 op.format_params = {}
+        return _pre_exp
 
-        t_init, t_meta = _er_init(cfg=cfg), _er_build_meta(cfg=cfg)
-        t_exp = HrpClickNativeToS3ListOperator(
-            task_id='export_to_s3', s3_bucket=BUCKET, s3_key=f"{cfg['s3_prefix']}/{{{{ ts_nodash }}}}.csv",
-            aws_conn_id=S3_CONN, clickhouse_conn_id=CH_ID,
-            sql=sql_exp, compression=None, replace=True, post_file_check=False, pre_execute=_pre_exp,
-            execution_timeout=timedelta(minutes=cfg['export_timeout']),
-        )
-        t_zip = _er_pack_zip(cfg=cfg)
+    with dag:
+        packed = []
+        for table_key, tcfg in cfgs.items():
+            fmt = FORMAT_MAP[tcfg['format']]
+            with TaskGroup(group_id=tcfg['tg']):
+                t_init, t_meta = _er_init(cfg=tcfg), _er_build_meta(cfg=tcfg)
+                t_exp = HrpClickNativeToS3ListOperator(
+                    task_id='export_to_s3', s3_bucket=BUCKET,
+                    # Ключ обязан различать и таблицу, и группу: s3_prefix общий у всех групп
+                    # одной базовой реплики, ts_nodash совпадает у пакетов на одном cron, а
+                    # оператор лишь дописывает номер части. Только имени таблицы мало —
+                    # одноимённые таблицы из разных баз (tg = db__tbl) или из разных групп
+                    # писали бы в один ключ и затирали друг друга при replace=True.
+                    s3_key=f"{tcfg['s3_prefix']}/{tcfg['replica']}__{tcfg['tg']}__{{{{ ts_nodash }}}}.{fmt['ext']}",
+                    aws_conn_id=S3_CONN, clickhouse_conn_id=CH_ID,
+                    sql=tcfg['sql_export'], fmt=fmt['fmt'], header=fmt['header'],
+                    compression=None, replace=True, post_file_check=False,
+                    pre_execute=_make_pre_exp(tcfg),
+                    execution_timeout=timedelta(minutes=tcfg['export_timeout']),
+                )
+                t_zip = _er_pack_zip(cfg=tcfg)
+                t_init >> [t_meta, t_exp] >> t_zip
+                packed.append(t_zip)
+
+        t_sum = _er_make_summary(gcfg=gcfg)
         t_msg = ProduceToTopicOperator(
             task_id='notify_tfs', kafka_config_id=KAFKA_SND_CONN, topic=KAFKA_SND_TOPIC,
-            pool=f"tfs_{cfg['scenario']}",
-            producer_function=produce_msg, producer_function_args=[cfg['scenario'], []],
-            delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(cfg['scenario']),
-            execution_timeout=timedelta(minutes=cfg['notify_timeout']),
+            pool=f"tfs_{scen}",
+            producer_function=produce_msg, producer_function_args=[scen, []],
+            delivery_callback=ON_DELIVERY, pre_execute=_pre_kafka(scen),
+            execution_timeout=timedelta(minutes=gcfg['notify_timeout']),
         )
         # execution_timeout с запасом к собственному дедлайну таска: снимать его должен
         # он сам, с внятной ошибкой, а не Airflow по таймауту
         t_wait = _er_wait_confirm.override(
-            execution_timeout=timedelta(minutes=cfg['confirm_timeout'] + 5),
-        )(cfg=cfg)
+            execution_timeout=timedelta(minutes=gcfg['confirm_timeout'] + 5),
+        )(gcfg=gcfg)
 
-        t_init >> [t_meta, t_exp] >> t_zip >> t_msg >> t_wait >> _er_save_status(cfg=cfg) >> _er_schedule_next(cfg=cfg)
+        packed >> t_sum >> t_msg >> t_wait >> _er_save_status(gcfg=gcfg) >> _er_schedule_next(gcfg=gcfg)
 
-    return cfg['dag_id'], dag
+    return dag_id, dag
+
+@task(task_id='config_error')
+def _er_config_error(replica: str, errors: list, **context):
+    """💥 Единственный таск даг-заглушки: сообщает, что пакет сломан, и падает.
+
+    Не EmptyOperator: зелёный таск создавал бы ощущение работающей выгрузки. Причины
+    дублируются в лог и в заметки, чтобы их было видно и из списка ранов, и из алертов,
+    а не только в описании DAG.
+    """
+    for err in errors:
+        logger.error("❌ %s: %s", replica, err)
+
+    add_note({f"❌ Пакет {replica} сломан ({len(errors)})": errors},
+             level='task,dag', context=context, title='🚫 Ошибки настройки er_wf_meta')
+
+    raise AirflowFailException(
+        f"Пакет {replica} не собран: {len(errors)} ошибок в настройке export.er_wf_meta.\n"
+        + "\n".join(f"  • {e}" for e in errors)
+        + "\nПоправьте настройку и перезапустите export_er_sync"
+    )
+
+
+def create_broken_dag(replica: str, errors: list, schedule=None) -> tuple[str, DAG]:
+    """🚧 DAG-заглушка вместо пакета, который не удалось собрать.
+
+    dag_id тот же, что у рабочего пакета: DAG не двоится, а подменяется — в списке сразу
+    видно, что выгрузки нет. Расписание группы сохраняется, поэтому поломка продолжает
+    сигналить красным раном в том же ритме, в каком должен был ходить пакет.
+    """
+    dag_id = f"export_er__{replica}"
+    dag = DAG(
+        dag_id=dag_id,
+        description=f"❌ Пакет сломан: {len(errors)} ошибок в настройке er_wf_meta",
+        doc_md=(
+            f"## ❌ Пакет `{replica}` не собран\n\n"
+            f"Выгрузка не работает: в `export.er_wf_meta` {len(errors)} ошибок.\n\n"
+            + "\n".join(f"- {e}" for e in errors)
+            + "\n\nПоправьте настройку и перезапустите `export_er_sync`."
+        ),
+        # Ретраить ошибку настройки бессмысленно; пул экспорта заглушке не нужен,
+        # а on_failure_callback оставляем — он пишет штатную заметку о падении.
+        default_args={
+            'owner': DEF_ARGS['owner'],
+            'retries': 0,
+            'email_on_failure': False,
+            'on_failure_callback': DEF_ARGS['on_failure_callback'],
+        },
+        start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
+        schedule_interval=schedule, max_active_runs=1, catchup=False,
+        tags=['DataLab', 'CI02420667', 'ER', replica, 'BROKEN'],
+        is_paused_upon_creation=True,
+    )
+    with dag:
+        _er_config_error(replica=replica, errors=errors)
+
+    return dag_id, dag
 
 # ── Dynamic DAG Registration ──────────────────────────────────────────────────
 
@@ -946,10 +1316,17 @@ except Exception as e:
     logger.error("Failed to load workflows: %s", e)
     workflows = {}
 
-for table_key, workflow_params in workflows.items():
+for _replica, _group in workflows.items():
+    # Сломанную группу подменяем заглушкой, а не роняем разбор файла: раньше одна битая
+    # запись уносила ВСЕ ER-пакеты. Причины видны в описании DAG, в логе и в заметках,
+    # а таск заглушки падает — молча пропущенной выгрузки не остаётся.
     try:
-        dag_id, dag_obj = create_export_dag(table_key, workflow_params)
-        globals()[dag_id] = dag_obj
+        if _group.get('errors'):
+            dag_id, dag_obj = create_broken_dag(_replica, _group['errors'], _group.get('schedule'))
+        else:
+            dag_id, dag_obj = create_export_dag(_replica, _group)
     except Exception as e:
-        logger.error("DAG generation failed for %s: %s", table_key, e)
-        raise  # прерываем парсинг файла: broken DAG лучше, чем молчаливо пропущенная выгрузка
+        logger.error("DAG generation failed for %s: %s", _replica, e)
+        dag_id, dag_obj = create_broken_dag(_replica, [f"Ошибка сборки DAG: {e}"],
+                                            _group.get('schedule'))
+    globals()[dag_id] = dag_obj

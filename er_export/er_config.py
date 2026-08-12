@@ -262,29 +262,38 @@ def get_dict(ch_hook, sql: str) -> list[dict]:
     return []
 
 
-DEFAULT_PARAMS: dict = {
-    # ── Дельта / расписание ──────────────────────────────────────────────────
-    'increment':         60,           # шаг дельты, мин: time_to = time_from + increment (не чаще 1 пакета/час по стандарту ТФС)
+# 📦 Параметры уровня ПАКЕТА (группы). Задаются в строке-дефолте группы (replica заполнена,
+# extract_name пуст) и относятся к дагу целиком: один тикет, одно уведомление, одно
+# расписание автозапуска. В строках-таблицах игнорируются — у пакета они физически одни.
+GROUP_PARAMS: dict = {
+    'notify_kafka':      1,            # 1 = отправлять уведомления в Kafka; 0 = пропустить (стенд)
+    'auto_confirm':      1,            # 1 = не ждать Kafka-подтверждения от TFS
+    'confirm_timeout':   60,           # таймаут ожидания подтверждения, мин
+    'notify_timeout':    30,           # таймаут notify_tfs, мин
     'selfrun_timeout':   60,           # задержка до следующего автозапуска, мин (не чаще 1 пакета/час)
+    'max_active_tasks':  4,            # сколько таблиц пакета грузятся одновременно
+}
+
+# 🗂️ Параметры уровня ТАБЛИЦЫ. Наследуются из строки-дефолта группы и переопределяются
+# в строке-таблице.
+TABLE_PARAMS: dict = {
+    # ── Дельта ───────────────────────────────────────────────────────────────
+    'increment':         60,           # шаг дельты, мин: time_to = time_from + increment (не чаще 1 пакета/час по стандарту ТФС)
     'overlap':           0,            # перекрытие окна дельты назад, сек (для компенсации задержек CDC)
     'lower_bound':       '',           # нижняя граница первой дельты (bootstrap); '' → 1970-01-01
     'time_field':        'extract_time',  # поле времени в таблице-источнике
     'recent_interval':   60,           # окно для режима recent, мин (используется вместо дельты)
 
-    # ── Стратегия и подтверждение ────────────────────────────────────────────
+    # ── Стратегия ────────────────────────────────────────────────────────────
     'strategy':          'FULL_UK',    # стратегия слияния на стороне TFS
-    'notify_kafka':      1,            # 1 = отправлять уведомления в Kafka; 0 = пропустить (стенд)
-    'auto_confirm':      1,            # 1 = не ждать Kafka-подтверждения от TFS
-    'confirm_timeout':   60,           # таймаут ожидания подтверждения, мин
     'export_timeout':    120,          # таймаут export_to_s3, мин
-    'notify_timeout':    30,           # таймаут notify_tfs, мин
 
     # ── Файлы ────────────────────────────────────────────────────────────────
-    'max_file_size':     '',           # ограничение размера CSV-файла, байт; '' = без ограничений
+    'max_file_size':     '',           # ограничение размера файла, байт; '' = дефолт оператора
     'send_empty':        0,            # 1 = слать пустой ZIP+Kafka при нулевой дельте
 
     # ── Формат и санитизация ─────────────────────────────────────────────────
-    'format':            'TSVWithNames',  # формат выгрузки ClickHouse
+    'format':            'TSVWithNames',  # формат выгрузки ClickHouse (ключ FORMAT_MAP)
     'pg_array_format':   0,            # 1 = PostgreSQL-формат массивов в TSV
     'csv_format_params': '',           # доп. параметры форматирования (dict-литерал)
     'xstream_sanitize':  0,            # 1 = экранировать спецсимволы XStream
@@ -292,11 +301,49 @@ DEFAULT_PARAMS: dict = {
     'sanitize_list':     '',           # список колонок для санитизации (через запятую)
 }
 
+DEFAULT_PARAMS: dict = {**GROUP_PARAMS, **TABLE_PARAMS}
 
-def get_params(row: dict) -> dict:
-    """🔧 Мёржит JSON-поле params из er_wf_meta с DEFAULT_PARAMS. Значения из row побеждают."""
+# 🔤 Поддерживаемые форматы выгрузки. Ключ — имя формата ClickHouse (как его пишут в params),
+# значение — как этот формат прокинуть в оператор и как назвать файл.
+#
+# header для JSON обязан быть False: ветка JSON в NativeClickhouseStream при header=True
+# пишет первой строкой TSV-заголовок, что в .json — мусор. Заодно это держит верным счёт
+# строк: _cur_result вычитает заголовок только при header=True.
+FORMAT_MAP: dict[str, dict] = {
+    'TSVWithNames': {
+        'fmt':         'CSV',            # значение аргумента fmt оператора
+        'header':      True,
+        'ext':         'csv',
+        'meta_params': {"separation": "\t"},  # блок params в .meta-файле для TFS
+    },
+    'JSONEachRow': {
+        'fmt':         'JSON',           # JSON Lines (NDJSON): объект на строку, экранирует orjson
+        'header':      False,
+        'ext':         'json',
+        'meta_params': {"format": "JSONEachRow"},
+    },
+}
+
+
+def replica_base(replica: str) -> str:
+    """🔀 Базовая реплика — часть до первого '__'; остальное считается номером группы.
+
+    Группа поставок кодируется суффиксом в replica ('hrplatform_datalab__1'), сама replica
+    целиком уходит в имена архива и тикета и тем разводит пакеты по именам. А маршрут в TFS
+    (scenario_id + префикс в S3) один на всю реплику, поэтому TFS_MAP ищется по базе —
+    новая группа заводится строкой в er_wf_meta, без правки кода.
+    """
+    return replica.split('__', 1)[0]
+
+
+def get_params(row: dict, group: dict | None = None) -> dict:
+    """🔧 Собирает итоговые параметры: DEFAULT_PARAMS → params группы → params строки.
+
+    row   — запись er_wf_meta (или entry из Variable) с JSON-полем params
+    group — параметры строки-дефолта группы; уже разрешённый dict либо None
+    """
     overrides = json.loads(row.get('params') or '{}')
-    return {**DEFAULT_PARAMS, **overrides}
+    return {**DEFAULT_PARAMS, **(group or {}), **overrides}
 
 
 def get_config() -> dict:
@@ -320,4 +367,7 @@ def get_config() -> dict:
         'POOL_NAME':       POOL_NAME,
         'POOL_SLOTS':      POOL_SLOTS,
         'DEFAULT_PARAMS':  DEFAULT_PARAMS,
+        'GROUP_PARAMS':    GROUP_PARAMS,
+        'TABLE_PARAMS':    TABLE_PARAMS,
+        'FORMAT_MAP':      FORMAT_MAP,
     }

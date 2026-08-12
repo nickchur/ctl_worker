@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-12 20:50 MSK · v2.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 21:25 MSK · v3.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -1209,17 +1209,17 @@ def _dag_params(gp: dict, tables: dict) -> dict:
                         f"Умолчание задано стендом ({ENV_STAND or 'не задан'}), к таблице отношения не имеет.",
         ),
         # ── Табличное: пусто = взять из er_wf_meta ───────────────────────────
-        # Пустой вариант — именно '', а не None. Форма запуска рендерит опции как
-        # <option value="{{ option }}">, и None превращается в строку 'None', которую
-        # схема потом отвергает: «'None' is not one of [None, 'FULL_UK', ...]».
-        # values_display подписывает пустую опцию, чтобы список не начинался с пустоты.
+        # Пустой вариант — строка 'None', а не сам None: форма рендерит опции как
+        # <option value="{{ option }}">, и None превращается в 'None', которую схема
+        # потом отвергает («'None' is not one of [None, 'FULL_UK', ...]»). Строковый
+        # 'None' — принятая в репозитории договорённость, key_map отбрасывает его
+        # наравне с пустотой, см. tools/s3_checker.py.
         'strategy': Param(
-            '', type=['string', 'null'], title='Strategy',
-            enum=['', 'FULL_UK', 'FULL_NO_UK', 'INC', 'APPEND'],
-            values_display={'': '— из настройки таблицы —'},
+            'None', type=['string'], title='Strategy',
+            enum=['None', 'FULL_UK', 'FULL_NO_UK', 'INC', 'APPEND'],
             description=(
                 'Стратегия загрузки TFS; применяется ко ВСЕМ таблицам пакета. '
-                'Пусто — у каждой таблицы своя, из er_wf_meta. '
+                'None — у каждой таблицы своя, из er_wf_meta. '
                 'FULL_UK — полное обновление snp с дедубликацией по UK; строки с ctl_action=D отбрасываются TFS. '
                 'FULL_NO_UK — полное обновление без дедубликации; строки с ctl_action=D отбрасываются TFS. '
                 'INC — инкрементальное обновление: ctl_action=D+UK→удаление, ctl_action=D без UK→отброс, '

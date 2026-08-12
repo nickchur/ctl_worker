@@ -1,9 +1,9 @@
-"""📨 DAG сбора обратных квитанций ТФС из Kafka в ClickHouse.
-*2026-08-12 11:30 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""📨 DAG приёма обратных квитанций ТФС из Kafka в ClickHouse.
+*2026-08-12 12:40 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
-в один топик `TFS.HRPLT.OUT` и сопоставляется с отправкой по `RqUID`. Результат передачи —
-в `Status/StatusCode`, где `0` означает успех.
+и сопоставляется с отправкой по `RqUID`. Результат передачи — в `Status/StatusCode`,
+где `0` означает успех.
 
 Пример сообщения:
 
@@ -17,13 +17,17 @@
         </File>
     </TransferFileCephRs>
 
-⚠️ Этот даг — ЕДИНСТВЕННЫЙ потребитель топика. Топик общий на все маршруты, и кто первым
-вычитал сообщение, тот его и забрал: читать `TFS.HRPLT.OUT` откуда-то ещё значит воровать
-чужие квитанции. Выгрузки ничего из Kafka не читают — они ждут появления своей строки
+📚 **Топиков может быть несколько.** Список — в `KAFKA_RCV_TOPICS` (`er_config.py`),
+одним коннектом слушаем их все сразу. Добавление маршрута со своим топиком сводится
+к строчке в списке; в таблице сохраняется, из какого топика пришла квитанция.
+
+⚠️ Этот даг — ЕДИНСТВЕННЫЙ потребитель этих топиков. Kafka отдаёт сообщение одному
+потребителю в группе: читать те же топики откуда-то ещё значит воровать чужие квитанции.
+Выгрузки ничего из Kafka не читают — они ждут появления своей строки
 в `export.tfs_receipts` по своему `RqUID`.
 
 Единственный конкурент, который остался, — `tools_test_kafka_rcv` в режиме `wait`
-(`ctl/check/test_kafka.py`). Его на этом топике запускать нельзя.
+(`ctl/check/test_kafka.py`). На этих топиках его запускать нельзя.
 
 ⏱️ Расписание: раз в минуту, `max_active_runs=1`. Ран короткий: опрашивает, пока идут
 сообщения, и выходит по тишине либо по потолку сообщений.
@@ -45,19 +49,19 @@ try:
 except ImportError:
     from er_export.er_config import get_config, add_note, parse_receipt
 
-_cfg           = get_config()
-CH_ID          = _cfg['CH_ID']
-DEF_ARGS       = _cfg['DEF_ARGS']
-KAFKA_RCV_CONN = _cfg['KAFKA_RCV_CONN']
-KAFKA_RCV_TOPIC = _cfg['KAFKA_RCV_TOPIC']
-RECEIPTS_TABLE = _cfg['RECEIPTS_TABLE']
+_cfg            = get_config()
+CH_ID           = _cfg['CH_ID']
+DEF_ARGS        = _cfg['DEF_ARGS']
+KAFKA_RCV_CONN  = _cfg['KAFKA_RCV_CONN']
+KAFKA_RCV_TOPICS = _cfg['KAFKA_RCV_TOPICS']
+RECEIPTS_TABLE  = _cfg['RECEIPTS_TABLE']
 
 logger = logging.getLogger("airflow.task")
 
-# Пул сборщика — не экспортный: чтение квитанций не должно занимать слоты выгрузок.
+# Пул приёмника — не экспортный: чтение квитанций не должно занимать слоты выгрузок.
 SYNC_POOL = "default_pool"
 
-# Сколько ждать очередное сообщение, прежде чем считать топик вычерпанным (сек).
+# Сколько ждать очередное сообщение, прежде чем считать топики вычерпанными (сек).
 IDLE_TIMEOUT = 15
 # Потолок сообщений за ран: страховка от бесконечного цикла на большом отставании.
 MAX_MESSAGES = 5000
@@ -75,13 +79,13 @@ def _values(row: dict) -> str:
     return (
         f"('{_q(row['rq_uid'])}', '{_q(row['file_name'])}', '{_q(row['scenario_id'])}', "
         f"{int(row['status_code'])}, {rq_tm}, '{_q(row['raw_xml'])}', "
-        f"{int(row['kafka_partition'])}, {int(row['kafka_offset'])})"
+        f"'{_q(row['kafka_topic'])}', {int(row['kafka_partition'])}, {int(row['kafka_offset'])})"
     )
 
 
 @dag(
-    dag_id="tfs_receipts_sync",
-    description="📨 Обратные квитанции ТФС: Kafka TFS.HRPLT.OUT → export.tfs_receipts",
+    dag_id="tfs_kafka_rcv",
+    description="📨 Приём квитанций ТФС: Kafka → export.tfs_receipts",
     default_args=DEF_ARGS,
     start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
     schedule_interval="*/1 * * * *",
@@ -92,11 +96,11 @@ def _values(row: dict) -> str:
     is_paused_upon_creation=False,
     doc_md=__doc__,
 )
-def tfs_receipts_dag():
+def tfs_kafka_rcv_dag():
 
-    @task(task_id="collect", pool=SYNC_POOL)
-    def collect(**context):
-        """📥 Вычитывает квитанции из топика и складывает в ClickHouse.
+    @task(task_id="receive", pool=SYNC_POOL)
+    def receive(**context):
+        """📥 Вычитывает квитанции из всех топиков и складывает в ClickHouse.
 
         Порядок важен: сначала вставка, только потом коммит offset. При обратном порядке
         падение между операциями потеряло бы квитанцию навсегда — а её ждёт выгрузка.
@@ -105,7 +109,7 @@ def tfs_receipts_dag():
 
         from airflow.hooks.base import BaseHook
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
-        from confluent_kafka import Consumer
+        from confluent_kafka import Consumer, TopicPartition
 
         conn = BaseHook.get_connection(KAFKA_RCV_CONN)
         config = dict(conn.extra_dejson)  # extra_dejson = librdkafka config (контракт Kafka-провайдера)
@@ -114,10 +118,15 @@ def tfs_receipts_dag():
 
         consumer = Consumer(config)
         rows: list[dict] = []
-        last_msg = None
+        # Максимальный offset по каждой паре (топик, партиция). Коммитить по последнему
+        # сообщению нельзя: оно относится к ОДНОЙ партиции, и остальные остались бы
+        # незакоммиченными — их бы перечитывало каждый ран.
+        positions: dict[tuple[str, int], int] = {}
 
         try:
-            consumer.subscribe([KAFKA_RCV_TOPIC])
+            consumer.subscribe(list(KAFKA_RCV_TOPICS))
+            logger.info("👂 Слушаем топики: %s", ", ".join(KAFKA_RCV_TOPICS))
+
             idle_until = time.time() + IDLE_TIMEOUT
             while time.time() < idle_until and len(rows) < MAX_MESSAGES:
                 msg = consumer.poll(timeout=5)
@@ -128,19 +137,28 @@ def tfs_receipts_dag():
                     continue
 
                 raw = msg.value().decode("utf-8", errors="replace")
-                rows.append(parse_receipt(raw, msg.partition(), msg.offset()))
-                last_msg = msg
+                row = parse_receipt(raw, msg.partition(), msg.offset())
+                row['kafka_topic'] = msg.topic()
+                rows.append(row)
+
+                key = (msg.topic(), msg.partition())
+                positions[key] = max(positions.get(key, -1), msg.offset())
                 idle_until = time.time() + IDLE_TIMEOUT  # пока идут сообщения — продолжаем
 
             if rows:
                 hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
                 hook.execute(
                     f"INSERT INTO {RECEIPTS_TABLE} "
-                    "(rq_uid, file_name, scenario_id, status_code, rq_tm, raw_xml, kafka_partition, kafka_offset) "
+                    "(rq_uid, file_name, scenario_id, status_code, rq_tm, raw_xml, "
+                    "kafka_topic, kafka_partition, kafka_offset) "
                     "VALUES " + ", ".join(_values(r) for r in rows)
                 )
-                # Только теперь: квитанции уже в ClickHouse, повтор при падении не страшен
-                consumer.commit(message=last_msg, asynchronous=False)
+                # Только теперь: квитанции уже в ClickHouse, повтор при падении не страшен.
+                # offset + 1 — семантика Kafka: коммитим позицию СЛЕДУЮЩЕГО сообщения.
+                consumer.commit(
+                    offsets=[TopicPartition(t, p, o + 1) for (t, p), o in positions.items()],
+                    asynchronous=False,
+                )
         finally:
             consumer.close()
 
@@ -151,8 +169,8 @@ def tfs_receipts_dag():
         failed  = [r for r in rows if r['status_code'] > 0]
         unknown = [r for r in rows if r['status_code'] < 0]
 
-        logger.info("📨 Квитанций: %d, с ошибкой передачи: %d, неразобранных: %d",
-                    len(rows), len(failed), len(unknown))
+        logger.info("📨 Квитанций: %d из %d топиков, с ошибкой передачи: %d, неразобранных: %d",
+                    len(rows), len({r['kafka_topic'] for r in rows}), len(failed), len(unknown))
 
         note: dict = {}
         if failed:
@@ -162,15 +180,15 @@ def tfs_receipts_dag():
         if unknown:
             note[f"⚠️ Не разобрано ({len(unknown)})"] = [r['raw_xml'][:200] for r in unknown]
         note[f"📨 Получено квитанций: {len(rows)}"] = [
-            f"{r['file_name']} → {r['status_code']}" for r in rows[:20]
+            f"{r['kafka_topic']} · {r['file_name']} → {r['status_code']}" for r in rows[:20]
         ]
-        add_note(note, level='task,dag', context=context, title='📨 tfs_receipts')
+        add_note(note, level='task,dag', context=context, title='📨 tfs_kafka_rcv')
 
-        # Ненулевой StatusCode — не проблема сборщика: его увидит и покажет та выгрузка,
+        # Ненулевой StatusCode — не проблема приёмника: его увидит и покажет та выгрузка,
         # которая ждёт эту квитанцию. Здесь он только логируется.
         return len(rows)
 
-    collect()
+    receive()
 
 
-tfs_receipts_dag()  # вызов регистрирует DAG в globals() через декоратор @dag
+tfs_kafka_rcv_dag()  # вызов регистрирует DAG в globals() через декоратор @dag

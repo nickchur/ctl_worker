@@ -803,7 +803,7 @@ def _er_wait_confirm(gcfg, **context):
     Kafka здесь больше не читается. Топик квитанций общий на все маршруты ТФС, и прежнее
     прямое чтение брало ЛЮБОЕ сообщение: пакет подтверждался чужой квитанцией, настоящий
     адресат её терял, а StatusCode не проверялся вовсе. Теперь топик вычитывает один
-    даг tfs_receipts_sync, а мы ждём появления СВОИХ строк по своим RqUID.
+    даг tfs_kafka_rcv, а мы ждём появления СВОИХ строк по своим RqUID.
 
     Любой status_code != 0 роняет таск сразу, не дожидаясь остальных файлов: пакет уже
     не доедет целиком, ждать бессмысленно.
@@ -866,7 +866,7 @@ def _er_wait_confirm(gcfg, **context):
         f"Квитанции ТФС не пришли за {timeout} мин.\n"
         + (f"  Ещё не отправлены (очередь стоит): {not_sent}\n" if not_sent else "")
         + (f"  Отправлены, ответа нет: {no_answer}\n" if no_answer else "")
-        + f"  Смотреть: {SENT_FILES_TABLE}, {RECEIPTS_TABLE}, даги export_er_sender и tfs_receipts_sync"
+        + f"  Смотреть: {SENT_FILES_TABLE}, {RECEIPTS_TABLE}, даги export_er_sender и tfs_kafka_rcv"
     )
 
 

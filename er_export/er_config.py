@@ -25,10 +25,12 @@ BUCKET          = 'tfshrplt'
 # вход, читаем из его выхода. Префиксы констант — наше действие, чтобы не путаться
 KAFKA_SND_CONN  = 'tfs-kafka-in'    # export_er_sender: шлём уведомление
 KAFKA_SND_TOPIC = 'TFS.HRPLT.IN'
-# Топик квитанций общий на ВСЕ маршруты ТФС, поэтому читает его ровно один потребитель —
-# даг tfs_receipts_sync. Выгрузки ER сюда не ходят: они ждут строку в RECEIPTS_TABLE.
-KAFKA_RCV_CONN  = 'tfs-kafka-out'
-KAFKA_RCV_TOPIC = 'TFS.HRPLT.OUT'
+# Топики квитанций общие на ВСЕ маршруты ТФС, поэтому читает их ровно один потребитель —
+# даг tfs_kafka_rcv. Выгрузки ER сюда не ходят: они ждут строку в RECEIPTS_TABLE.
+# Список, а не строка: одним коннектом можно слушать несколько топиков сразу, и добавление
+# нового маршрута сводится к строчке здесь.
+KAFKA_RCV_CONN   = 'tfs-kafka-out'
+KAFKA_RCV_TOPICS = ['TFS.HRPLT.OUT']
 
 # 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
 TFS_MAP = {
@@ -460,7 +462,7 @@ def get_config() -> dict:
         'KAFKA_SND_CONN':  KAFKA_SND_CONN,
         'KAFKA_SND_TOPIC': KAFKA_SND_TOPIC,
         'KAFKA_RCV_CONN':   KAFKA_RCV_CONN,
-        'KAFKA_RCV_TOPIC':  KAFKA_RCV_TOPIC,
+        'KAFKA_RCV_TOPICS': KAFKA_RCV_TOPICS,
         'TFS_MAP':         TFS_MAP,
         'S3_CONN':         S3_CONN,
         'VAR_NAME':        VAR_NAME,

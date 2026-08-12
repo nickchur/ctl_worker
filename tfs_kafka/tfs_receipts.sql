@@ -7,10 +7,10 @@
 --
 -- 📨 ЗАЧЕМ
 --
--- Квитанция приходит по ВСЕМ маршрутам ТФС (xStream и ЕР) в один топик TFS.HRPLT.OUT
--- и сопоставляется с отправкой по RqUID. Топик общий, поэтому читать его напрямую из
--- выгрузок нельзя: кто первым вычитал сообщение — тот его и забрал, остальные ждут
--- вечно. Единственный потребитель — даг tfs_receipts_sync, он складывает всё сюда,
+-- Квитанция приходит по ВСЕМ маршрутам ТФС (xStream и ЕР) и сопоставляется с отправкой
+-- по RqUID. Топики общие, поэтому читать их напрямую из выгрузок нельзя: кто первым
+-- вычитал сообщение — тот его и забрал, остальные ждут вечно. Единственный потребитель —
+-- даг tfs_kafka_rcv (слушает список KAFKA_RCV_TOPICS), он складывает всё сюда,
 -- а выгрузки ждут появления СВОЕЙ строки по своему RqUID.
 --
 -- Таблица намеренно ничего не знает про ER: сюда же лягут квитанции xStream, когда
@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS export.tfs_receipts ON CLUSTER datalab
     rq_tm            Nullable(DateTime64(3))   COMMENT 'RqTm из квитанции (время на стороне ТФС)',
     received_at      DateTime64(3) DEFAULT now64(3)  COMMENT 'Когда мы вычитали сообщение; версия строки для ReplacingMergeTree',
     raw_xml          String                    COMMENT 'Исходное сообщение целиком — для разбора инцидентов',
+    kafka_topic      String        DEFAULT ''  COMMENT 'Топик, из которого прочитано (их может быть несколько)',
     kafka_partition  Int32         DEFAULT -1  COMMENT 'Партиция, из которой прочитано',
     kafka_offset     Int64         DEFAULT -1  COMMENT 'Offset сообщения'
 )
@@ -66,6 +67,6 @@ TTL toDateTime(received_at) + INTERVAL 90 DAY;
 --     AND s.notified_at < now() - INTERVAL 1 HOUR;
 
 -- Сообщения, которые не разобрались:
---   SELECT received_at, kafka_partition, kafka_offset, substring(raw_xml, 1, 500)
+--   SELECT received_at, kafka_topic, kafka_partition, kafka_offset, substring(raw_xml, 1, 500)
 --   FROM export.tfs_receipts FINAL
 --   WHERE status_code = -1 ORDER BY received_at DESC;

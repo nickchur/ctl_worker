@@ -1,4 +1,5 @@
 """⚙️ Конфигурация и константы фреймворка ER-выгрузок.
+*2026-08-12 14:31 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 

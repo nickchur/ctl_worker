@@ -1,7 +1,8 @@
 -- DDL для export.tfs_receipts
--- 2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
--- Вариант ClickHouse (STORAGE = 'ch' в plugins/tfs_utils.py).
--- Для PostgreSQL/Greenplum — tfs_receipts_pg.sql; при STORAGE = 's3' таблица не нужна.
+-- 2026-08-13 11:41 MSK · v1.1 · Чуркин Николай · nschurkin@sber.ru
+-- Вариант ClickHouse: нужен, только если включено зеркало — непустой CH_ID
+-- в plugins/tfs_utils.py. Для PostgreSQL/Greenplum — tfs_receipts_pg.sql.
+-- Источник истины — S3, там квитанции лежат объектами и таблиц не требуют.
 -- Обратные квитанции ТФС (TransferFileCephRs), как они пришли из Kafka.
 --
 -- ВАЖНО: выполнять через clickhouse-client или HTTP-интерфейс, НЕ через JDBC.

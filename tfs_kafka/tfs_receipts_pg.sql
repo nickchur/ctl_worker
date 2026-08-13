@@ -1,8 +1,9 @@
--- DDL для export.tfs_receipts — вариант PostgreSQL / Greenplum (STORAGE = 'pg')
--- 2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
+-- DDL для export.tfs_receipts — вариант PostgreSQL / Greenplum
+-- 2026-08-13 11:41 MSK · v1.1 · Чуркин Николай · nschurkin@sber.ru
 --
--- Для ClickHouse (STORAGE = 'ch') используйте tfs_receipts.sql.
--- Для STORAGE = 's3' таблица не нужна вовсе: квитанции лежат объектами рядом с логами.
+-- Нужна, только если включено зеркало в Postgres — непустой PG_CONN в plugins/tfs_utils.py.
+-- Для зеркала в ClickHouse (непустой CH_ID) используйте tfs_receipts.sql.
+-- Источник истины — S3, там квитанции лежат объектами рядом с логами и таблиц не требуют.
 --
 --
 -- 🐘 GREENPLUM vs POSTGRESQL

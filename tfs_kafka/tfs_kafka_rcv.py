@@ -1,5 +1,5 @@
 """📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
-*2026-08-12 14:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-13 13:33 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
 и сопоставляется с отправкой по `RqUID`. Результат передачи — в `Status/StatusCode`,
@@ -17,26 +17,36 @@
         </File>
     </TransferFileCephRs>
 
-📚 **Топиков может быть несколько.** Список — в `KAFKA_RCV_TOPICS` (`tfs_config.py`),
-одним коннектом слушаем их все сразу. Добавление маршрута со своим топиком сводится
-к строчке в списке; в таблице сохраняется, из какого топика пришла квитанция.
+📚 **Свой сенсор на каждый топик.** Список топиков — в `KAFKA_RCV_TOPICS`
+(`plugins/tfs_utils.py`), на каждый заводится отдельный таск. Добавление маршрута со
+своим топиком сводится к строчке в списке; в хранилище пишется, откуда пришла квитанция.
+
+⏱️ **Ран живёт час.** Сенсор опрашивает топик раз в 15 секунд в режиме `reschedule`
+(между опросами слот воркера свободен) и держит окно до конца — так квитанция, пришедшая
+на пятой минуте, не обрывает чтение на оставшиеся пятьдесят пять. В конце окна:
+
+* пришла хоть одна квитанция → таск **зелёный**, в XCom их число за окно;
+* за час тишина → таск **скипнут** (`soft_fail`), и стартует следующий ран.
+
+Так пустой час и час с квитанциями видно в UI, не открывая логи.
 
 ⚠️ Этот даг — ЕДИНСТВЕННЫЙ потребитель этих топиков. Kafka отдаёт сообщение одному
 потребителю в группе: читать те же топики откуда-то ещё значит воровать чужие квитанции.
-Выгрузки ничего из Kafka не читают — они ждут появления своей строки
-в `export.tfs_receipts` по своему `RqUID`.
+Выгрузки ничего из Kafka не читают — они ждут появления своей квитанции по `RqUID`.
 
 Единственный конкурент, который остался, — `tools_test_kafka_rcv` в режиме `wait`
 (`ctl/check/test_kafka.py`). На этих топиках его запускать нельзя.
 
-⏱️ Расписание: раз в минуту, `max_active_runs=1`. Ран короткий: опрашивает, пока идут
-сообщения, и выходит по тишине либо по потолку сообщений.
+📌 Партиции берутся через `assign()`, а не `subscribe()`. В режиме `reschedule` процесс
+между опросами умирает, и подписка вступала бы в группу заново каждые 15 секунд —
+ребаланс на ровном месте, задевающий и соседние топики той же группы. `OFFSET_STORED`
+сохраняет коммиченные offset'ы: группа та же, читаем с того же места.
 
-🗄️ Куда складывать — решает `STORAGE` в `plugins/tfs_utils.py`: ClickHouse, S3 или
-Postgres. Даг об этом не знает, он зовёт `save_receipts`.
+🗄️ Куда складывать — решает слой `plugins/tfs_utils.py`: S3 всегда, ClickHouse и
+Postgres зеркалом, если задан их conn_id. Даг об этом не знает, он зовёт `save_receipts`.
 
 🔁 Доставка at-least-once: offset коммитится ПОСЛЕ успешной записи. Падение между
-записью и коммитом даст повтор — все три хранилища снимают дубль при чтении.
+записью и коммитом даст повтор — хранилище снимает дубль при чтении.
 """
 from __future__ import annotations
 
@@ -44,14 +54,17 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
+from airflow.sensors.base import PokeReturnValue  # type: ignore
 
 try:
     from plugins.tfs_utils import (  # type: ignore
         get_config, add_note, parse_receipt, ensure_pools, save_receipts,
+        run_state_get, run_state_set,
     )
 except ImportError:
     from CI06932748.tools.tfs_utils import (  # type: ignore
         get_config, add_note, parse_receipt, ensure_pools, save_receipts,
+        run_state_get, run_state_set,
     )
 
 _cfg            = get_config()
@@ -62,42 +75,53 @@ RCV_POOL        = _cfg['TFS_RCV_POOL']
 
 logger = logging.getLogger("airflow.task")
 
-# Сколько ждать очередное сообщение, прежде чем считать топики вычерпанными (сек).
-IDLE_TIMEOUT = 15
-# Потолок сообщений за ран: страховка от бесконечного цикла на большом отставании.
+# Сколько живёт ран, сек. Ровно столько сенсор держит окно, после чего зеленеет или скипается.
+WINDOW = 60 * 60
+# Пауза между опросами. В reschedule на это время слот воркера освобождается.
+POKE_EVERY = 15
+# Тишина внутри одного опроса, после которой считаем топик вычерпанным (сек).
+IDLE_TIMEOUT = 5
+# Потолок сообщений за один опрос: страховка от бесконечного цикла на большом отставании.
 MAX_MESSAGES = 5000
-
+# Ключ счётчика окна. Между опросами процесс умирает, память не годится, а обычный
+# xcom_push стирается перед каждым опросом — держим через run_state_* (см. tfs_utils).
+SEEN_KEY = 'seen'
 
 
 @dag(
     dag_id="tfs_kafka_rcv",
-    description="📨 Приём квитанций ТФС: Kafka → export.tfs_receipts",
+    description="📨 Приём квитанций ТФС: Kafka → хранилище тракта",
     default_args=DEF_ARGS,
     start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
-    schedule_interval="*/1 * * * *",
+    # Ран живёт час, следующий создаётся по расписанию и ждёт в queued из-за
+    # max_active_runs=1 — стартует сразу, как текущий закончился. Разрыв в покрытии
+    # равен задержке шедулера, а не длине паузы между ранами.
+    schedule_interval="@hourly",
     max_active_runs=1,
     catchup=False,
-    dagrun_timeout=timedelta(minutes=5),
+    dagrun_timeout=timedelta(minutes=70),
     tags=["DataLab", "CI02420667", "TFS", "kafka"],
     is_paused_upon_creation=False,
     doc_md=__doc__,
 )
 def tfs_kafka_rcv_dag():
 
-    @task(task_id="receive", pool=RCV_POOL)
-    def receive(**context):
-        """📥 Вычитывает квитанции из всех топиков и складывает в хранилище тракта.
+    def poke_topic(topic: str, **context) -> PokeReturnValue:
+        """📥 Вычитывает квитанции топика и складывает их в хранилище тракта.
 
         Порядок важен: сначала запись, только потом коммит offset. При обратном порядке
         падение между операциями потеряло бы квитанцию навсегда — а её ждёт выгрузка.
 
-        Заодно заводит пулы тракта: приёмник ходит раз в минуту и сам сидит в default_pool,
+        Заодно заводит пулы тракта: приёмник крутится постоянно и сам сидит в default_pool,
         поэтому создаст tfs_send раньше, чем он понадобится отправителю.
+
+        ⚠️ Здесь нельзя кидать AirflowFailException: при soft_fail сенсор превращает его
+        в скип, и реальная поломка притворится тишиной. Обычные исключения роняют таск.
         """
         import time
 
         from airflow.hooks.base import BaseHook
-        from confluent_kafka import Consumer, TopicPartition
+        from confluent_kafka import OFFSET_STORED, Consumer, TopicPartition
 
         ensure_pools()
 
@@ -108,18 +132,25 @@ def tfs_kafka_rcv_dag():
 
         consumer = Consumer(config)
         rows: list[dict] = []
-        # Максимальный offset по каждой паре (топик, партиция). Коммитить по последнему
-        # сообщению нельзя: оно относится к ОДНОЙ партиции, и остальные остались бы
-        # незакоммиченными — их бы перечитывало каждый ран.
-        positions: dict[tuple[str, int], int] = {}
+        # Максимальный offset по каждой партиции. Коммитить по последнему сообщению
+        # нельзя: оно относится к ОДНОЙ партиции, и остальные остались бы
+        # незакоммиченными — их бы перечитывало каждый опрос.
+        positions: dict[int, int] = {}
 
         try:
-            consumer.subscribe(list(KAFKA_RCV_TOPICS))
-            logger.info("👂 Слушаем топики: %s", ", ".join(KAFKA_RCV_TOPICS))
+            meta = consumer.list_topics(topic, timeout=10)
+            if topic not in meta.topics or meta.topics[topic].error is not None:
+                raise RuntimeError(f"Топик {topic} недоступен: {meta.topics.get(topic)}")
+
+            # OFFSET_STORED — читаем с коммиченной позиции своей группы; для партиции
+            # без коммита действует auto.offset.reset из настроек соединения.
+            consumer.assign([TopicPartition(topic, pid, OFFSET_STORED)
+                             for pid in meta.topics[topic].partitions])
+            logger.info("👂 Слушаем %s, партиций: %d", topic, len(meta.topics[topic].partitions))
 
             idle_until = time.time() + IDLE_TIMEOUT
             while time.time() < idle_until and len(rows) < MAX_MESSAGES:
-                msg = consumer.poll(timeout=5)
+                msg = consumer.poll(timeout=1)
                 if msg is None:
                     continue
                 if msg.error():
@@ -128,11 +159,10 @@ def tfs_kafka_rcv_dag():
 
                 raw = msg.value().decode("utf-8", errors="replace")
                 row = parse_receipt(raw, msg.partition(), msg.offset())
-                row['kafka_topic'] = msg.topic()
+                row['kafka_topic'] = topic
                 rows.append(row)
 
-                key = (msg.topic(), msg.partition())
-                positions[key] = max(positions.get(key, -1), msg.offset())
+                positions[msg.partition()] = max(positions.get(msg.partition(), -1), msg.offset())
                 idle_until = time.time() + IDLE_TIMEOUT  # пока идут сообщения — продолжаем
 
             if rows:
@@ -140,39 +170,55 @@ def tfs_kafka_rcv_dag():
                 # Только теперь: квитанции уже в хранилище, повтор при падении не страшен.
                 # offset + 1 — семантика Kafka: коммитим позицию СЛЕДУЮЩЕГО сообщения.
                 consumer.commit(
-                    offsets=[TopicPartition(t, p, o + 1) for (t, p), o in positions.items()],
+                    offsets=[TopicPartition(topic, p, o + 1) for p, o in positions.items()],
                     asynchronous=False,
                 )
         finally:
             consumer.close()
 
-        if not rows:
-            logger.info("📭 Новых квитанций нет")
-            return 0
+        seen = int(run_state_get(context, SEEN_KEY) or 0)
 
-        failed  = [r for r in rows if r['status_code'] > 0]
-        unknown = [r for r in rows if r['status_code'] < 0]
+        if rows:
+            seen += len(rows)
+            run_state_set(context, SEEN_KEY, seen)
 
-        logger.info("📨 Квитанций: %d из %d топиков, с ошибкой передачи: %d, неразобранных: %d",
-                    len(rows), len({r['kafka_topic'] for r in rows}), len(failed), len(unknown))
+            failed  = [r for r in rows if r['status_code'] > 0]
+            unknown = [r for r in rows if r['status_code'] < 0]
+            logger.info("📨 %s: квитанций %d (за окно %d), с ошибкой передачи: %d, неразобранных: %d",
+                        topic, len(rows), seen, len(failed), len(unknown))
 
-        note: dict = {}
-        if failed:
-            note[f"❌ StatusCode != 0 ({len(failed)})"] = [
-                f"{r['file_name']}: код {r['status_code']}" for r in failed
-            ]
-        if unknown:
-            note[f"⚠️ Не разобрано ({len(unknown)})"] = [r['raw_xml'][:200] for r in unknown]
-        note[f"📨 Получено квитанций: {len(rows)}"] = [
-            f"{r['kafka_topic']} · {r['file_name']} → {r['status_code']}" for r in rows[:20]
-        ]
-        add_note(note, level='task,dag', context=context, title='📨 tfs_kafka_rcv')
+            # Заметка короткая намеренно: за час опросов их накопится много, а add_note
+            # склеивает записи и режет всё вместе по MAX_NOTE_LEN.
+            line = f"+{len(rows)} (за окно {seen})"
+            if failed:
+                line += f", ❌ StatusCode != 0: {len(failed)}"
+            if unknown:
+                line += f", ⚠️ не разобрано: {len(unknown)}"
+            add_note({f"📨 {topic}": line}, level='dag', context=context, title='📨 tfs_kafka_rcv')
 
-        # Ненулевой StatusCode — не проблема приёмника: его увидит и покажет та выгрузка,
-        # которая ждёт эту квитанцию. Здесь он только логируется.
-        return len(rows)
+        # Окно считаем от старта рана: оно общее для всех топиков и переживает reschedule.
+        elapsed = (datetime.now(timezone.utc) - context['dag_run'].start_date).total_seconds()
+        if elapsed >= WINDOW and seen:
+            logger.info("✅ %s: окно закрыто, квитанций за час: %d", topic, seen)
+            return PokeReturnValue(is_done=True, xcom_value=seen)
 
-    receive()
+        # Ложный ответ = ждём дальше. Когда окно выйдет, а seen так и останется нулём,
+        # сенсор упрётся в timeout и при soft_fail пометит таск скипнутым.
+        return PokeReturnValue(is_done=False)
+
+    for _topic in KAFKA_RCV_TOPICS:
+        # timeout заведомо больше окна: сенсор проверяет его ТОЛЬКО после ложного ответа
+        # (airflow/sensors/base.py), поэтому зелёный по концу окна успевает сработать
+        # первым, а скип по таймауту достаётся ровно случаю «за час ничего не пришло».
+        task.sensor(
+            task_id=f"rcv_{_topic.lower().replace('.', '_')}",
+            mode='reschedule',
+            poke_interval=POKE_EVERY,
+            timeout=WINDOW + 2 * POKE_EVERY,
+            soft_fail=True,
+            pool=RCV_POOL,
+            doc_md=f"Приём квитанций из топика `{_topic}`",
+        )(poke_topic)(topic=_topic)
 
 
 tfs_kafka_rcv_dag()  # вызов регистрирует DAG в globals() через декоратор @dag

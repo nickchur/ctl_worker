@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-12 14:31 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-13 13:33 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -8,10 +8,12 @@
 
 🔑 Копии здесь недопустимы принципиально. Если приёмник запишет квитанцию в ClickHouse,
 а `wait_confirm` пойдёт искать её в S3 — пакет зависнет до таймаута, и причина не будет
-видна ниоткуда. Поэтому `STORAGE` ровно один, и он тут.
+видна ниоткуда. Поэтому источник истины ровно один, и он тут.
 
-Хранилище сменное: `ch` (ClickHouse), `s3` (там же, где логи) или `pg` (Greenplum либо
-PostgreSQL — провод у них общий). Все три реализации дают одинаковые сигнатуры.
+🗄️ **S3 — источник истины.** Пишем туда всегда и читаем только оттуда: писатель и
+читатель обязаны смотреть в одно место. ClickHouse и Postgres — зеркала для аналитики
+и глаз: пишем в них, если задан их conn_id, и их сбой тракт не роняет. Три реализации
+дают одинаковые сигнатуры, различие только в том, кто из них обязателен.
 """
 from __future__ import annotations
 
@@ -28,7 +30,7 @@ except ImportError:
     from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, query_to_dict  # noqa: F401  # type: ignore
     from CI06932748.tools.s3_utils import s3_move_s3, s3_path_parse  # type: ignore
 
-CH_ID = 'dlab-click'
+CH_ID = 'dlab-click'   # зеркало тракта в ClickHouse; пусто — выключено
 
 # IN/OUT в conn_id и топиках — сторона ТФС: пишем мы в его вход, читаем из его выхода.
 KAFKA_SND_CONN  = 'tfs-kafka-in'
@@ -43,23 +45,25 @@ KAFKA_RCV_TOPICS = ['TFS.HRPLT.OUT']
 
 # 🗄️ Где держим квитанции и очередь отправки.
 #
-#   'ch' — ClickHouse (DDL: tfs_kafka/tfs_receipts.sql, er_export/er_sent_files.sql)
-#   's3' — объекты там же, где логи: путь берётся из airflow.cfg, см. s3_base()
-#   'pg' — Greenplum или PostgreSQL, один код на оба (DDL: *_pg.sql)
+# S3 (объекты там же, где логи, см. s3_base) — обязателен: туда идёт каждая запись,
+# оттуда идёт КАЖДОЕ чтение. Зеркала подключаются непустым conn_id и нужны только
+# чтобы смотреть на тракт запросами:
 #
-# ⚠️ Значение ОДНО на весь тракт. Разъехавшиеся значения у писателя и читателя дают
-# зависший пакет без внятной причины, поэтому копировать эту константу никуда нельзя.
-STORAGE = 'ch'
+#   CH_ID   — ClickHouse (DDL: tfs_kafka/tfs_receipts.sql, er_export/er_sent_files.sql)
+#   PG_CONN — Greenplum или PostgreSQL, один код на оба (DDL: *_pg.sql)
+#
+# Сбой зеркала только предупреждает: запись в S3 к этому моменту уже прошла, и ронять
+# приём квитанций из-за аналитической копии нельзя. Расхождение лечится дозаливкой.
 
-# 📇 Таблицы тракта — для STORAGE в ('ch', 'pg').
+# 📇 Таблицы тракта — для зеркал в ClickHouse и Postgres.
 RECEIPTS_TABLE   = 'export.tfs_receipts'    # квитанции из Kafka, общие для всех маршрутов
 SENT_FILES_TABLE = 'export.er_sent_files'   # очередь и реестр отправок ER
 
-# Соединение для STORAGE='pg'. Нужно ЗАПИСЫВАЮЩЕЕ: alpha-adb_dev_comm-read по имени
-# только на чтение. Пустое значение при STORAGE='pg' — ошибка на старте, а не тихий сбой.
+# Соединение зеркала в Postgres. Нужно ЗАПИСЫВАЮЩЕЕ: alpha-adb_dev_comm-read по имени
+# только на чтение. Пусто — зеркало выключено.
 PG_CONN = ''
 
-# Префикс тракта внутри логового бакета (STORAGE='s3').
+# Префикс тракта внутри логового бакета.
 S3_PREFIX = 'tfs'
 
 # 🚦 Лимиты ТФС на маршрут: файлов в секунду / минуту / час / сутки.
@@ -159,6 +163,29 @@ def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> dict:
 
     return row
 
+
+def build_message(scenario_id: str, rq_uid: str, file_name: str) -> str:
+    """📤 Собирает XML-уведомление TransferFileCephRq с ГОТОВЫМ RqUID.
+
+    RqUID приходит из очереди, а не генерируется здесь: он записан при постановке
+    в очередь, и именно по нему потом ищется обратная квитанция.
+
+    Живёт рядом с parse_receipt, а не в даге-отправителе: это формат тракта, и
+    оба конца — что мы пишем, что нам отвечают — должны меняться в одном месте.
+    """
+    from datetime import datetime
+
+    # isoformat(ms) воспроизводит формат pendulum 'YYYY-MM-DDTHH:mm:ss.SSSZ' (смещение с двоеточием)
+    rq_tm = datetime.now().astimezone().isoformat(timespec='milliseconds')
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<TransferFileCephRq>
+    <RqUID>{rq_uid}</RqUID>
+    <RqTm>{rq_tm}</RqTm>
+    <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
+    <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
+</TransferFileCephRq>"""
+
+
 DEF_ARGS = {
     "owner":            "DataLab (CI02420667)",
     "retries":          1,
@@ -175,7 +202,7 @@ def ensure_pools() -> None:
     Вызывать из таска, а не при разборе файла: ensure_pool кэширует результат на процесс,
     но лишний SELECT на каждом обходе scheduler-ом всё равно ни к чему.
 
-    Делает это приёмник — он ходит раз в минуту и сам сидит в default_pool, поэтому
+    Делает это приёмник — он опрашивает топики постоянно и сам сидит в default_pool, поэтому
     создаст tfs_send до того, как отправителю понадобится слот: таск с несуществующим
     пулом Airflow просто не поставит в очередь.
     """
@@ -187,11 +214,60 @@ def ensure_pools() -> None:
     )
 
 
+# 🧠 Состояние сенсора между опросами.
+#
+# ⚠️ XCom для этого НЕ ГОДИТСЯ, и обе очевидные попытки разбиваются об Airflow:
+#
+#   • ti.xcom_push — в режиме reschedule каждый опрос это отдельное исполнение таска,
+#     а TaskInstance._execute_task_with_callbacks перед запуском зовёт clear_xcom_data()
+#     и стирает ВСЕ XCom своего task_id за ран (исключение сделано только для отложенных
+#     задач, reschedule к ним не относится). Записанное прошлым опросом следующий не видит:
+#     у отправителя это давало повторную постановку файлов в очередь на КАЖДОМ опросе,
+#     у приёмника — потерянный счётчик окна;
+#   • запись под соседний task_id — у таблицы xcom внешний ключ на task_instance,
+#     строки для несуществующего таска СУБД не принимает (ForeignKeyViolation).
+#
+# Поэтому состояние живёт там же, где остальной тракт, — объектом в S3. Обращение
+# всегда точечное, по ключу рана; папка по дате, как у отправленных, чтобы при желании
+# чистить целыми днями. Объект крошечный, пишется только когда есть что помнить.
+
+def _state_key(context) -> str:
+    from datetime import datetime, timezone
+
+    ti = context['ti']
+    safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in ti.run_id)
+    day = datetime.now(timezone.utc).strftime('%Y%m%d')
+    return f"{s3_base()}/state/{day}/{ti.dag_id}__{ti.task_id}__{safe}.json"
+
+
+def run_state_get(context, key: str, default=None):
+    """📤 Значение, пережившее reschedule. См. комментарий выше — почему не XCom."""
+    import json as _json
+
+    hook, bucket, obj = _s3_hook_key(_state_key(context))
+    if not hook.check_for_key(key=obj, bucket_name=bucket):
+        return default
+    return _json.loads(hook.read_key(key=obj, bucket_name=bucket)).get(key, default)
+
+
+def run_state_set(context, key: str, value) -> None:
+    """📥 Кладёт значение так, чтобы его увидел следующий опрос того же рана."""
+    import json as _json
+
+    hook, bucket, obj = _s3_hook_key(_state_key(context))
+    state = {}
+    if hook.check_for_key(key=obj, bucket_name=bucket):
+        state = _json.loads(hook.read_key(key=obj, bucket_name=bucket))
+    state[key] = value
+    hook.load_string(string_data=_json.dumps(state, ensure_ascii=False),
+                     key=obj, bucket_name=bucket, replace=True)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 🗄️ Хранилище тракта
 #
-# Три реализации за одним интерфейсом. Публичные функции внизу выбирают бэкенд
-# по STORAGE, вызывающему знать о нём не нужно.
+# Три реализации за одним интерфейсом. Публичные функции внизу пишут в S3 и в
+# включённые зеркала, а читают всегда из S3; вызывающему знать об этом не нужно.
 #
 #   save_receipts(rows)              — приёмник сложил квитанции
 #   find_receipts(rq_uids)           — wait_confirm ищет свои
@@ -329,7 +405,7 @@ def _pg_hook():
     # и разбираться будут не с тем.
     if not PG_CONN:
         raise ValueError(
-            "STORAGE='pg', но PG_CONN пуст. Укажите ЗАПИСЫВАЮЩЕЕ соединение "
+            "Зеркало в Postgres вызвано, но PG_CONN пуст. Укажите ЗАПИСЫВАЮЩЕЕ соединение "
             "в plugins/tfs_utils.py — на чтение (…-read) не подойдёт"
         )
 
@@ -438,16 +514,22 @@ def _pg_queue_state(rq_uids: list[str]) -> list[dict]:
 #
 # Раскладка под {логовый бакет}/{S3_PREFIX}/:
 #
-#   receipts/{rq_uid}.json                              — квитанция целиком
-#   queue/pending/{package_ts}__{rq_uid}.json           — ждёт отправки
-#   queue/sent/{scenario}/{YYYYMMDDHHMMSS}__{rq_uid}.json — отправлено
+#   receipts/{rq_uid}.json                                    — квитанция целиком
+#   queue/pending/{rq_uid}.json                               — ждёт отправки
+#   queue/sent/{YYYYMMDD}/{scenario}/{rq_uid}__{HHMMSS}.json  — отправлено
 #
-# Плоский receipts/{rq_uid}.json — ради wait_confirm: он знает только RqUID, и поиск
-# сводится к одному GET, без обхода префикса.
+# 🔑 RqUID — ПРЕФИКС имени, а не хвост. Все три вопроса тракта задаются по RqUID
+# («есть квитанция?», «ещё в очереди?», «куда переносить при отправке?»), и с ним
+# в начале каждый решается точечным обращением к ключу вместо обхода префикса.
+# Так уже был устроен receipts/ ради wait_confirm — очередь приведена к тому же виду.
 #
-# ⚠️ Счётчики лимитов тут заметно дороже, чем в СУБД: вместо одного countIf идёт обход
-# ключей. Поэтому время отправки лежит В ИМЕНИ ключа — окно считается по именам, без
-# чтения объектов, а разбиение по сценариям не даёт листать чужие маршруты.
+# 📅 Дата в пути у sent/ идёт ПЕРЕД сценарием, и это не косметика:
+#   • счётчики лимитов листают только папки дня и вчера — объём ограничен суточным
+#     лимитом маршрута, а не всем архивом отправок, который никто не чистит;
+#   • диагностика по RqUID (queue_state) не знает сценария, зато знает дату, и с датой
+#     впереди ей хватает тех же двух папок на все маршруты сразу.
+# Время отправки при этом остаётся В ИМЕНИ ключа: окна считаются по именам, без чтения
+# объектов. Скользящее суточное окно живёт максимум в двух соседних датах.
 
 def s3_base() -> str:
     """Корень тракта в S3 — рядом с логами, из airflow.cfg.
@@ -493,10 +575,18 @@ def _s3_find_receipts(rq_uids: list[str]) -> list[dict]:
 
 def _s3_enqueue(rows: list[dict]) -> None:
     import json as _json
+    from datetime import datetime, timezone
+
+    # created_at проставляем здесь: в СУБД это делает колоночный DEFAULT, а объекту
+    # его дать некому. Без него очередь не упорядочить — order_queue сортирует пакеты
+    # по времени появления первого файла.
+    stamp = _ts(datetime.now(timezone.utc))
 
     for r in rows:
-        name = f"{str(r['package_ts']).replace(' ', 'T')}__{r['rq_uid']}.json"
-        hook, bucket, key = _s3_hook_key(f"{s3_base()}/queue/pending/{name}")
+        r = {'created_at': stamp, **{k: v for k, v in r.items() if v is not None}}
+        # Имя ключа — только RqUID: package_ts лежит внутри объекта, и порядок пакетов
+        # строится по содержимому (см. _s3_pending), а не по именам.
+        hook, bucket, key = _s3_hook_key(f"{s3_base()}/queue/pending/{r['rq_uid']}.json")
         hook.load_string(string_data=_json.dumps(r, ensure_ascii=False, default=str),
                          key=key, bucket_name=bucket, replace=True)
 
@@ -512,51 +602,88 @@ def _s3_pending() -> list[dict]:
     return sorted(rows, key=lambda r: (str(r['package_ts']), str(r.get('created_at', ''))))
 
 
+def _s3_days(now) -> list[str]:
+    """Даты, в которых может лежать скользящее суточное окно: сегодня и вчера (UTC)."""
+    from datetime import timedelta
+
+    return [(now - timedelta(days=d)).strftime('%Y%m%d') for d in (0, 1)]
+
+
 def _s3_mark_sent(rq_uid: str) -> None:
+    import json as _json
     from datetime import datetime, timezone
 
-    hook, bucket, prefix = _s3_hook_key(f"{s3_base()}/queue/pending/")
-    src = next((k for k in hook.list_keys(bucket_name=bucket, prefix=prefix) or []
-                if k.endswith(f"__{rq_uid}.json")), None)
-    if not src:
+    # RqUID — префикс ключа, поэтому строка очереди берётся адресно, без обхода pending/
+    src = f"{s3_base()}/queue/pending/{rq_uid}.json"
+    hook, bucket, key = _s3_hook_key(src)
+    if not hook.check_for_key(key=key, bucket_name=bucket):
         logger.warning("⚠️ %s: в очереди не найден, отметка отправки пропущена", rq_uid)
         return
 
-    import json as _json
-    row = _json.loads(hook.read_key(key=src, bucket_name=bucket))
-    # Время отправки — в ИМЕНИ ключа: по нему считаются окна лимитов, без чтения объектов
-    stamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-    dst = f"{s3_base()}/queue/sent/{row['scenario_id']}/{stamp}__{rq_uid}.json"
-    s3_move_s3(f"{s3_base()}/queue/pending/{src.split('/')[-1]}", dst)
+    row = _json.loads(hook.read_key(key=key, bucket_name=bucket))
+    now = datetime.now(timezone.utc)
+    # Время отправки — в ИМЕНИ ключа, дата — в пути: окна считаются без чтения объектов
+    dst = (f"{s3_base()}/queue/sent/{now:%Y%m%d}/{row['scenario_id']}/"
+           f"{rq_uid}__{now:%H%M%S}.json")
+    s3_move_s3(src, dst)
 
 
 def _s3_sent_counts(scenario_id: str) -> dict:
     from datetime import datetime, timezone
 
-    hook, bucket, prefix = _s3_hook_key(f"{s3_base()}/queue/sent/{scenario_id}/")
     now = datetime.now(timezone.utc)
     counts = dict.fromkeys(WINDOWS, 0)
 
-    for key in hook.list_keys(bucket_name=bucket, prefix=prefix) or []:
-        stamp = key.split('/')[-1].split('__')[0]
-        try:
-            sent_at = datetime.strptime(stamp, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
-        except ValueError:
-            logger.warning("⚠️ Ключ без разбираемой метки времени, пропущен: %s", key)
-            continue
-        for window in window_hits(sent_at, now):
-            counts[window] += 1
+    # Только сегодня и вчера: суточное окно дальше не тянется, а весь архив отправок
+    # листать нельзя — он растёт вечно и никем не чистится.
+    for day in _s3_days(now):
+        hook, bucket, prefix = _s3_hook_key(f"{s3_base()}/queue/sent/{day}/{scenario_id}/")
+        for key in hook.list_keys(bucket_name=bucket, prefix=prefix) or []:
+            stamp = key.split('/')[-1].removesuffix('.json').split('__')[-1]
+            try:
+                sent_at = datetime.strptime(day + stamp, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            except ValueError:
+                logger.warning("⚠️ Ключ без разбираемой метки времени, пропущен: %s", key)
+                continue
+            for window in window_hits(sent_at, now):
+                counts[window] += 1
     return counts
 
 
 def _s3_queue_state(rq_uids: list[str]) -> list[dict]:
-    hook, bucket, prefix = _s3_hook_key(f"{s3_base()}/queue/")
-    keys = hook.list_keys(bucket_name=bucket, prefix=prefix) or []
+    import json as _json
+    from datetime import datetime, timezone
+
     out = []
+    # Ещё в очереди — точечная проверка ключа: RqUID стоит в его начале.
+    missing = []
     for uid in rq_uids:
-        match = next((k for k in keys if k.endswith(f"__{uid}.json")), None)
-        if match:
-            out.append({'file_name': match.split('/')[-1], 'pending': '/pending/' in match})
+        hook, bucket, key = _s3_hook_key(f"{s3_base()}/queue/pending/{uid}.json")
+        if hook.check_for_key(key=key, bucket_name=bucket):
+            row = _json.loads(hook.read_key(key=key, bucket_name=bucket))
+            out.append({'file_name': row.get('file_name', uid), 'pending': True})
+        else:
+            missing.append(uid)
+
+    if not missing:
+        return out
+
+    # Остальные уже ушли: из pending путь один — в sent. Сценарий отсюда неизвестен,
+    # зато известна дата, и с ней впереди хватает двух папок на все маршруты сразу.
+    # Путь редкий (диагностика таймаута), объём ограничен суточной отправкой.
+    sent: dict[str, str] = {}
+    hook, bucket, _ = _s3_hook_key(f"{s3_base()}/queue/")
+    for day in _s3_days(datetime.now(timezone.utc)):
+        _, _, prefix = _s3_hook_key(f"{s3_base()}/queue/sent/{day}/")
+        for key in hook.list_keys(bucket_name=bucket, prefix=prefix) or []:
+            sent.setdefault(key.split('/')[-1].split('__')[0], key)
+
+    for uid in missing:
+        key = sent.get(uid)
+        if not key:
+            continue   # ни в очереди, ни в отправленных — сказать нечего
+        row = _json.loads(hook.read_key(key=key, bucket_name=bucket))
+        out.append({'file_name': row.get('file_name', uid), 'pending': False})
     return out
 
 
@@ -572,52 +699,131 @@ _BACKENDS = {
 }
 
 
-def _backend(idx: int):
-    """Функция выбранного бэкенда по позиции в _BACKENDS."""
-    if STORAGE not in _BACKENDS:
-        raise ValueError(f"Неизвестное STORAGE='{STORAGE}', допустимы {sorted(_BACKENDS)}")
-    return _BACKENDS[STORAGE][idx]
+def mirrors() -> list[str]:
+    """Включённые зеркала: те, у кого задан conn_id. Пустой список — только S3."""
+    return [name for name, conn in (('ch', CH_ID), ('pg', PG_CONN)) if conn]
+
+
+def _write(idx: int, *args) -> None:
+    """Запись: S3 обязателен, зеркала — по возможности.
+
+    Ошибка S3 прокидывается: это источник истины, без него тракт слепнет. Ошибка
+    зеркала только предупреждает — данные к этому моменту уже сохранены, и ронять
+    приём квитанций или отправку из-за аналитической копии нельзя.
+    """
+    _BACKENDS['s3'][idx](*args)
+
+    for name in mirrors():
+        try:
+            _BACKENDS[name][idx](*args)
+        except Exception as exc:
+            logger.warning("⚠️ Зеркало %s: запись не прошла (%s). В S3 записано, "
+                           "расхождение лечится дозаливкой", name, exc)
+
+
+def _read(idx: int, *args):
+    """Чтение всегда из S3: писатель и читатель обязаны смотреть в одно место."""
+    return _BACKENDS['s3'][idx](*args)
 
 
 def save_receipts(rows: list[dict]) -> None:
     """Сохраняет разобранные квитанции (приёмник)."""
-    return _backend(0)(rows)
+    return _write(0, rows)
 
 
 def find_receipts(rq_uids: list[str]) -> list[dict]:
     """Квитанции по списку RqUID: rq_uid, file_name, status_code, rq_tm."""
-    return _backend(1)(rq_uids)
+    return _read(1, rq_uids)
 
 
 def enqueue(rows: list[dict]) -> None:
     """Ставит файлы в очередь отправки (rq_uid, file_name, replica, scenario_id, package_ts…)."""
-    return _backend(2)(rows)
+    return _write(2, rows)
+
+
+def enqueue_files(files: list[str], scenario_id: str, replica: str = '',
+                  dag_id: str = '', run_id: str = '') -> list[dict]:
+    """📮 Ставит в очередь готовые имена файлов из S3 — ручная досылка.
+
+    RqUID генерируется здесь: по нему потом ищется обратная квитанция. Возвращает
+    поставленные строки, чтобы вызывающий мог их показать в логе и заметке.
+
+    Досылка идёт через очередь, а не мимо неё: только так файл попадает в учёт
+    лимитов маршрута и потом находится по RqUID вместе с остальными.
+
+    ⚠️ Каждый вызов заводит НОВЫЕ RqUID. Повторный вызов с тем же списком поставит
+    файлы в очередь ещё раз — вызывающий обязан звать это ровно один раз на запуск.
+    """
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    names = [str(f).strip() for f in (files or []) if str(f).strip()]
+    if not names:
+        return []
+
+    scenario_id = (scenario_id or '').strip()
+    if not scenario_id:
+        raise ValueError("Переданы файлы, но не задан scenario_id — маршрут ТФС неизвестен")
+
+    now = datetime.now(timezone.utc)
+    rows = [{
+        'rq_uid':      uuid4().hex,
+        'file_name':   name,
+        'replica':     (replica or scenario_id).strip(),
+        'scenario_id': scenario_id,
+        'package_ts':  now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+        'dag_id':      dag_id,
+        'run_id':      run_id,
+    } for name in names]
+
+    enqueue(rows)
+    return rows
+
+
+def order_queue(rows: list[dict]) -> list[dict]:
+    """📦 Упорядочивает очередь так, чтобы файлы одного пакета шли подряд.
+
+    Пакеты — по времени появления (package_ts, затем created_at первого файла), внутри
+    пакета — по created_at. Разрывать пакет чужими файлами нельзя: ЕР не принимает
+    несколько пакетов одновременно.
+    """
+    packages: dict = {}
+    for row in rows:
+        packages.setdefault((row['replica'], row['package_ts']), []).append(row)
+
+    ordered = []
+    # get, а не [], намеренно: строка без created_at не должна ронять всю отправку —
+    # она просто встанет первой в своём пакете.
+    for key in sorted(packages, key=lambda k: (k[1], min(str(r.get('created_at', '')) for r in packages[k]))):
+        ordered.extend(sorted(packages[key], key=lambda r: str(r.get('created_at', ''))))
+    return ordered
 
 
 def pending() -> list[dict]:
     """Файлы, ещё не ушедшие в Kafka, в порядке package_ts, created_at."""
-    return _backend(3)()
+    return _read(3)
 
 
 def mark_sent(rq_uid: str) -> None:
     """Отмечает файл отправленным."""
-    return _backend(4)(rq_uid)
+    return _write(4, rq_uid)
 
 
 def sent_counts(scenario_id: str) -> dict:
     """Расход лимитов маршрута: {'sec', 'min', 'hour', 'day'}. Окна скользящие."""
-    return _backend(5)(scenario_id)
+    return _read(5, scenario_id)
 
 
 def queue_state(rq_uids: list[str]) -> list[dict]:
     """file_name + pending: отличить «ещё не отправлено» от «нет квитанции»."""
-    return _backend(6)(rq_uids)
+    return _read(6, rq_uids)
 
 
 def get_config() -> dict:
     """📦 Снимок констант модуля для передачи в DAG-файлы."""
     return {
         'CH_ID':            CH_ID,
+        'MIRRORS':          mirrors(),   # включённые зеркала; S3 обязателен и в список не входит
         'DEF_ARGS':         DEF_ARGS,
         'KAFKA_SND_CONN':   KAFKA_SND_CONN,
         'KAFKA_SND_TOPIC':  KAFKA_SND_TOPIC,

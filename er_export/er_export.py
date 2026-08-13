@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-13 13:00 MSK · v3.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-13 17:26 MSK · v3.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -169,8 +169,8 @@ def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
     return "\n".join(parts)
 
 
-def with_condition(where: str | None, full: bool = False) -> str:
-    """🕐 Дописывает окно дельты в WHERE, если его там ещё нет.
+def with_condition(where: str | None, full: bool = False, elsewhere: str = '') -> str:
+    """🕐 Дописывает окно дельты в WHERE, если его нет больше нигде в запросе.
 
     При full=True (параметр таблицы full_export) окно не подставляется вовсе: условие
     остаётся тем, что задано в sql_where, а пустое даёт запрос совсем без WHERE.
@@ -182,16 +182,21 @@ def with_condition(where: str | None, full: bool = False) -> str:
     только бизнес-фильтр.
 
     Плейсхолдер сохраняется как отдушина: он нужен, когда окно надо положить внутрь CTE
-    или подзапроса — там это бывает на порядок быстрее внешнего WHERE. Если он в тексте
-    есть, подставляем на месте и ничего не дописываем.
+    или подзапроса — там это бывает на порядок быстрее внешнего WHERE.
+
+    elsewhere — остальные части запроса (sql_with, sql_from, sql_join) одной строкой.
+    Плейсхолдер в них считается таким же указанием «окно поставлено вручную», как и в самом
+    WHERE. Без этого окно, положенное только в CTE, дублировалось наружу: снаружи после
+    GROUP BY колонки времени уже нет, и запрос падал с UNKNOWN_IDENTIFIER — обойти это
+    удавалось лишь фиктивным упоминанием плейсхолдера в sql_where.
     """
     w = (where or '').strip()
     if full:
         return w
+    if '{condition}' in w or '{condition}' in (elsewhere or ''):
+        return w
     if not w:
         return '{condition}'
-    if '{condition}' in w:
-        return w
     return '{condition} AND (' + w + ')'
 
 
@@ -226,6 +231,20 @@ def sql_cur_delta(tbl: str) -> str:
 def _fmt_val(v: Any) -> str:
     """None → 'null', иначе → SQL-строковый литерал в одинарных кавычках."""
     return 'null' if v is None else f"'{v}'"
+
+
+def _ch_ts(dt: datetime) -> str:
+    """🕐 Момент времени так, как его принимает ClickHouse: 'ГГГГ-ММ-ДД ЧЧ:ММ:СС'.
+
+    Намеренно не isoformat(): у tz-aware времени он даёт '2026-08-12T12:47:47+00:00',
+    а смещение ClickHouse не разбирает вовсе — такую строку он отказывается и сравнивать
+    с DateTime64 (TYPE_MISMATCH при построении WHERE), и вставлять в колонку этого типа
+    (CANNOT_PARSE_TEXT в extract_history). Разделитель 'T' сам по себе допустим, ломает
+    именно хвост со смещением, но пробел заодно совпадает с тем, что отдаёт toString()
+    в состоянии дельты: export_time не должен выглядеть по-разному в зависимости от
+    режима выгрузки, принимающая сторона парсит его одним форматом.
+    """
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def _run_ts(context) -> datetime:
@@ -513,7 +532,12 @@ def _er_init(cfg, **context):
         )
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
 
-    tf  = cfg.get('time_field', 'extract_time')
+    # `or ''`, а не значение по умолчанию у get: пустая строка приезжает в cfg как None.
+    # DAG собран с render_template_as_native_obj=True, а Jinja в native-режиме отдаёт None
+    # для шаблона без единого узла — то есть ровно для ''. Без этого time_field таблицы
+    # с full_export уходил в extract_history строкой 'None'. Пустым он бывает только там:
+    # у дельты его отсутствие не пропускает check_table.
+    tf  = cfg.get('time_field') or ''
     lb  = cfg.get('lower_bound') or '1970-01-01 00:00:00'
 
     # Параметры, общие для delta и recent: передаются оператору экспорта и сохраняются в историю
@@ -535,7 +559,7 @@ def _er_init(cfg, **context):
         # 📚 Полная выгрузка: окна нет, состояние дельты не ведём. Применимо и к таблицам
         # без поля времени — condition в SQL не подставляется, а '1=1' лежит здесь на
         # случай, если {condition} всё-таки написан в sql_where руками.
-        now_s = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        now_s = _ch_ts(datetime.now(timezone.utc))
         reg.update({
             'extract_time':    f"'{now_s}'",
             'extract_count':   'null',
@@ -574,7 +598,7 @@ def _er_init(cfg, **context):
         ri  = int(cfg.get('recent_interval', 60))
         now = datetime.now(timezone.utc).replace(microsecond=0)
         t0  = now - timedelta(minutes=ri)
-        now_s, t0_s = now.isoformat(), t0.isoformat()
+        now_s, t0_s = _ch_ts(now), _ch_ts(t0)
         reg.update({
             'extract_time':    f"'{now_s}'",
             'extract_count':   'null',
@@ -736,9 +760,25 @@ def _er_build_meta(cfg, **context):
     # имя такой колонки определяет ClickHouse, и предсказать его мы не берёмся.
     mismatch = [(i, e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e is not None and e != a]
     if mismatch:
+        # Точка в имени колонки запроса — почти всегда квалификатор таблицы, а не изменение
+        # источника, и совет «поправьте fields» тут уводит не туда: список полей верен,
+        # не хватает алиаса. Отдаём готовые строки замены, чтобы не разбираться заново.
+        dotted = [i for i, _, a in mismatch if '.' in a]
+        hint = ''
+        if dotted:
+            fixes = "\n".join(f"    '{cfg['fields'][i]} AS {field_name(cfg['fields'][i])}'"
+                              for i in dotted[:5])
+            hint = (
+                "\nВ именах колонок запроса остался квалификатор таблицы. При ДВУХ и более "
+                "JOIN-ах ClickHouse сохраняет префикс у колонки, чьё короткое имя есть ещё "
+                "в одной из соединяемых таблиц (с одним JOIN-ом префикс срезается — то есть "
+                "поведение меняется от добавления третьей таблицы). Точка уедет и в заголовок "
+                f"файла данных, и в .meta. Лечится алиасом в fields:\n{fixes}"
+            )
         raise AirflowFailException(
             f"Состав колонок {cfg['db']}.{cfg['tbl']} разошёлся с настройкой fields.\n"
             + "\n".join(f"  позиция {i}: запрос '{a}', настройка '{e}'" for i, e, a in mismatch)
+            + hint
             + "\nЕсли изменение источника ожидаемо — поправьте fields в export.er_wf_meta"
         )
 
@@ -998,11 +1038,21 @@ def _er_save_status(gcfg, **context):
         zips = _xcom(context, tg, 'pack_zip', key='zip_name_list',   required=False) or []
         zip_arr = "[" + ", ".join(f"'{z}'" for z in zips) + "]"
 
+        # Алиас у КАЖДОЙ колонки обязателен, хотя INSERT и подставляет их по позиции.
+        # Неименованную константу ClickHouse называет текстом выражения, поэтому у таблицы
+        # с нулём строк extract_count, overlap и recent_interval превращаются в три колонки
+        # с именем '0', а у таблицы с данными таких только две. Ветки UNION ALL сверяются
+        # по именам, и пакет из двух и более поставок падал с AMBIGUOUS_COLUMN_NAME
+        # («Block structure mismatch»). На пакете из одной таблицы UNION ALL не возникает —
+        # оттого и не всплывало.
         selects.append(f"""
             SELECT
-                '{tbl}', {dp['extract_time']}, {rows}, now(), now(), {confirmed},
-                {dp['increment']}, {dp['overlap']}, {dp['recent_interval']},
-                {dp['time_field']}, {dp['time_from']}, {dp['time_to']}, {zip_arr}
+                '{tbl}' AS extract_name, {dp['extract_time']} AS extract_time,
+                {rows} AS extract_count, now() AS loaded, now() AS sent, {confirmed} AS confirmed,
+                {dp['increment']} AS increment, {dp['overlap']} AS overlap,
+                {dp['recent_interval']} AS recent_interval,
+                {dp['time_field']} AS time_field, {dp['time_from']} AS time_from,
+                {dp['time_to']} AS time_to, {zip_arr} AS exported_files
         """)
         noted[tbl] = {"time_from": dp['time_from'], "time_to": dp['time_to'], "rows": rows, "zips": zips}
 
@@ -1080,7 +1130,12 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         if isinstance(m, dict) and "fields" not in m:
             m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + fields + [c['sql'] for c in EXTRA_SUF]}
         if isinstance(m, dict):
-            m = {**m, "where": with_condition(m.get("where"), full=bool(p['full_export']))}
+            # Плейсхолдер ищем и в остальных частях запроса: окно, положенное внутрь CTE
+            # или подзапроса FROM, снаружи дописывать не надо. settings и fields сюда не
+            # входят — окну там не место.
+            rest = ' '.join(str(m.get(k) or '') for k in ('with', 'from', 'joins'))
+            m = {**m, "where": with_condition(m.get("where"), full=bool(p['full_export']),
+                                              elsewhere=rest)}
         return build_sql(m)
 
     def _prep_sql_data(key):

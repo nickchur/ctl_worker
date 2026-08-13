@@ -16,7 +16,7 @@ from airflow.utils.task_group import TaskGroup
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseOperator
 from airflow_clickhouse_plugin.operators.clickhouse_dbapi import ClickHouseBranchSQLOperator
 
-from CI06932748.analytics.datalab.default_default_args import DEFAULT_DEFAULT_ARGS
+from CI06932748.analytics.datalab.default_default_args import DEFAULT_DEFAULT_ARGS  # type: ignore
 from hrp_operators import HrpClickNativeToS3Operator, HrpClickNativeToS3ListOperator
 
 logger = logging.getLogger(__name__)

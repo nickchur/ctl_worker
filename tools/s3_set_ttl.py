@@ -17,8 +17,8 @@ from airflow.decorators import task, dag
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.exceptions import AirflowFailException
 
-from plugins.utils import get_conns_by_type, add_note, on_callback
-from plugins.s3_utils import s3_get_ttl, s3_set_ttl, s3_del_ttl, s3_get_buckets
+from plugins.utils import get_conns_by_type, add_note, on_callback  # type: ignore
+from plugins.s3_utils import s3_get_ttl, s3_set_ttl, s3_del_ttl, s3_get_buckets  # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")

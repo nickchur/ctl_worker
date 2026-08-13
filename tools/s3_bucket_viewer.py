@@ -13,7 +13,7 @@ from airflow.models import Param
 from airflow.decorators import dag
 
 from hrp_operators import HrpS3BucketViewerOperator  # type: ignore
-from plugins.utils import get_conns_by_type
+from plugins.utils import get_conns_by_type  # type: ignore
 
 
 @dag(

@@ -53,8 +53,8 @@ from airflow.utils.session import create_session
 from airflow.models import TaskInstance, Variable
 from airflow.utils.state import State
 
-from plugins.utils import readable_size, add_note, on_callback, str2timedelta
-from plugins.s3_utils import s3_move_s3, s3_path_parse, s3_from_zip, s3_keys
+from plugins.utils import readable_size, add_note, on_callback, str2timedelta  # type: ignore
+from plugins.s3_utils import s3_move_s3, s3_path_parse, s3_from_zip, s3_keys  # type: ignore
 from plugins.ctl_utils import get_config   # type: ignore
 
 import xml.etree.ElementTree as ET

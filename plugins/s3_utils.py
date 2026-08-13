@@ -24,7 +24,7 @@ from boto3.s3.transfer import TransferConfig
 from urllib.parse import urlparse
 from stream_unzip import stream_unzip # type: ignore
 
-from  plugins.utils import readable_size, get_conns_by_type
+from  plugins.utils import readable_size, get_conns_by_type  # type: ignore
 
 from fnmatch import fnmatch
 import time

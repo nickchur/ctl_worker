@@ -1,5 +1,5 @@
 """🔄 DAG синхронизации метаданных ER-выгрузок.
-*2026-08-12 17:15 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-13 14:31 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Читает таблицу export.er_wf_meta из ClickHouse и сохраняет активные записи
 в Airflow Variable `datalab_er_wfs` (JSON-словарь), который используется
@@ -45,7 +45,7 @@
 легко не заметить, а пакет уедет неполным составом. Исправные группы при этом всё равно
 записываются в Variable: опечатка в одной строке не должна замораживать правки по остальным
 пакетам. Полные списки ошибок и предупреждений — в логе и в XCom ('errors', 'warnings',
-'summary'). При пустой таблице на не-DEV стенде падает, чтобы не затереть Variable.
+'summary'). При пустой таблице падает, чтобы не затереть Variable.
 """
 from __future__ import annotations
 
@@ -59,18 +59,17 @@ from airflow.exceptions import AirflowFailException
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_save, add_note, ensure_pool,
-        INHERITED, DEFAULT_SCHEDULE, parse_params, explicit_schedule, check_table, raw_key,
+        INHERITED, replica_full, parse_params, explicit_schedule, check_table, raw_key,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_save, add_note, ensure_pool,
-        INHERITED, DEFAULT_SCHEDULE, parse_params, explicit_schedule, check_table, raw_key,
+        INHERITED, replica_full, parse_params, explicit_schedule, check_table, raw_key,
     )
 
 _cfg           = get_config()
 CH_ID          = _cfg['CH_ID']
 DEF_ARGS       = _cfg['DEF_ARGS']
-ENV_STAND      = _cfg['ENV_STAND']
 VAR_NAME       = _cfg['VAR_NAME']
 RAW_VAR_NAME   = _cfg['RAW_VAR_NAME']
 POOL_NAME      = _cfg['POOL_NAME']
@@ -104,7 +103,12 @@ def split_rows(rows: list[dict]) -> tuple[dict, list[dict], set[str]]:
     параметры и вернувшись к умолчаниям из кода (где notify_kafka=1).
 
     Возвращает ({replica: строка-дефолт}, [поставки], {выключенные группы}).
+
+    Реплика тут же приводится к виду с суффиксом группы: 'hrplatform_datalab' →
+    'hrplatform_datalab__0'. Копией, а не правкой на месте: исходные строки уходят
+    в Variable для дага правки, и там они обязаны совпадать с таблицей.
     """
+    rows     = [{**r, "replica": replica_full(r["replica"])} for r in rows]
     defaults = {r["replica"]: r for r in rows if not r["extract_name"]}
     off      = {rep for rep, r in defaults.items() if not r.get("is_active", 1)}
 
@@ -147,14 +151,20 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
 
     # Расписание пакета считаем до цикла: оно одно на группу, и определять его первой
     # попавшейся строкой нельзя — порядок строк не гарантирует, что она осмысленная.
+    # Умолчания у cron нет намеренно: пакет, поехавший не в своё окно, хуже непоехавшего,
+    # а «55 0 * * *» из ниоткуда — ровно такой сюрприз.
     schedules = {}
     for replica in {r["replica"] for r in tables}:
         own = [explicit_schedule(r) for r in tables if r["replica"] == replica]
         schedules[replica] = (
             explicit_schedule(defaults.get(replica, {}))
             or next((s for s in own if s), '')
-            or DEFAULT_SCHEDULE
         )
+        if not schedules[replica]:
+            errors.setdefault(replica, []).append(
+                f"группа {replica}: не задано расписание — проставьте cron в поле schedule "
+                "строки-дефолта группы; умолчания у него нет"
+            )
 
     for row in tables:
         replica   = row["replica"]
@@ -226,7 +236,9 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
         if not msgs:
             continue
         wfs[rep] = {
-            "schedule": schedules.get(rep, DEFAULT_SCHEDULE),
+            # Расписание могло и не найтись — тогда его отсутствие и есть причина ошибки.
+            # Заглушка без cron не поедет вовсе, и это честнее выдуманного времени.
+            "schedule": schedules.get(rep, ''),
             "errors":   msgs,
             "tables":   {},
         }
@@ -267,43 +279,16 @@ def er_sync_dag():
     def sync(**context):
         """🔄 Читает er_wf_meta, собирает словарь выгрузок и сохраняет в Airflow Variable.
 
-        🧪 DEV: создаёт таблицу er_wf_meta если её нет; пропускает обновление при пустой таблице.
-        🏭 Остальные стенды: пустая таблица — ошибка (защита от затирания Variable).
+        Пустая таблица — ошибка на любом стенде: защита от затирания Variable.
+
+        Таблицу синк не создаёт: DDL живёт в er_wf_meta.sql и накатывается отдельно.
+        Держать вторую копию схемы в коде значило бы разъезд с боевым файлом.
         """
         from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
         _ensure_pool()
 
         hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-
-        if ENV_STAND == 'DEV':
-            # На DEV кластер datalab существует — создаём идентичную продовой реплицированную таблицу.
-            hook.execute("""
-                CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
-                (
-                    extract_name    String                    COMMENT 'Имя выгрузки (table name без схемы); ПУСТО = строка-дефолт группы',
-                    db_name         String                    COMMENT 'База данных источника в ClickHouse; у строки-дефолта группы = replica, иначе дефолты групп схлопнутся по ключу',
-                    replica         String                    COMMENT 'Реплика с суффиксом группы: база до "__" ищется в TFS_MAP (er_config.py); обязательное',
-                    schema_name     String                    COMMENT 'Целевая схема в .meta-файле для TFS; наследуется от строки-дефолта группы',
-                    pk              Array(String) DEFAULT []             COMMENT 'Список колонок первичного ключа; не наследуется',
-                    uk              Array(String) DEFAULT []             COMMENT 'Список колонок уникального ключа; не наследуется',
-                    fields          Array(String) DEFAULT []             COMMENT 'SELECT-выражения; ОБЯЗАТЕЛЬНО и явно, "*" и "t1.*" запрещены',
-                    sql_from        String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос; у поставки обязательное',
-                    sql_where       String        DEFAULT ''             COMMENT 'WHERE-условие: только бизнес-фильтр, окно дельты дописывается само',
-                    sql_join        String        DEFAULT ''             COMMENT 'JOIN-clause (полное выражение: JOIN t ON ...); вставляется между FROM и WHERE',
-                    sql_with        String        DEFAULT ''             COMMENT 'WITH-блок (CTE); вставляется перед SELECT',
-                    sql_settings    String        DEFAULT ''             COMMENT 'SETTINGS-блок ClickHouse; вставляется в конец запроса',
-                    params          String        DEFAULT '{}'           COMMENT 'JSON с параметрами выгрузки (см. GROUP_PARAMS/TABLE_PARAMS в er_config)',
-                    description     String        DEFAULT ''             COMMENT 'Описание (отображается в Airflow UI); наследуется',
-                    schedule        String        DEFAULT '55 0 * * *'  COMMENT 'Cron-расписание DAG-а группы; задаётся в строке-дефолте',
-                    is_recent       UInt8         DEFAULT 0              COMMENT '0 = delta (sql_stmt_export_delta), 1 = recent (sql_stmt_export_recent); НЕ наследуется',
-                    is_active       UInt8         DEFAULT 1              COMMENT '0 = запись игнорируется; на строке-дефолте выключает всю группу',
-                    updated_at      DateTime64(3) DEFAULT now64(3)       COMMENT 'Версия строки для ReplacingMergeTree (мс-точность исключает коллизии при быстрых обновлениях)'
-                )
-                ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/er_wf_meta_{uuid}', '{replica}', updated_at)
-                ORDER BY (db_name, extract_name)
-            """)
-            logger.info("🧪 DEV: ensured export.er_wf_meta exists")
 
         # is_active НЕ фильтруем в SQL: выключенную строку-дефолт надо увидеть, чтобы
         # погасить всю группу. Уйди она из выборки — поставки синхронизировались бы дальше,
@@ -321,9 +306,9 @@ def er_sync_dag():
         """)  # порядок только для читаемости логов; ключ таблицы — (db_name, extract_name)
 
         if not rows:
-            if ENV_STAND == 'DEV':
-                logger.warning("⚠️ export.er_wf_meta is empty — skipping Variable update on DEV stand")
-                return
+            # Пустая выборка на любом стенде — ошибка, а не повод тихо выйти: Variable
+            # осталась бы от прошлой синхронизации, и фабрика продолжила бы поднимать
+            # даги по устаревшей настройке, ничем этого не показывая.
             raise ValueError("🚫 No active workflows found in export.er_wf_meta — aborting to avoid overwriting Variable with empty dict")
 
         defaults, tables, off = split_rows(rows)

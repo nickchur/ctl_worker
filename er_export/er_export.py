@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-12 21:25 MSK · v3.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-13 13:00 MSK · v3.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -66,7 +66,6 @@ ENV_STAND      = _cfg['ENV_STAND']
 EXTRA_PRE      = _cfg['EXTRA_PRE']
 EXTRA_SUF      = _cfg['EXTRA_SUF']
 LIMITS         = _cfg['LIMITS']
-MAX_FILE_SIZE  = _cfg['MAX_FILE_SIZE']
 BUCKET         = _cfg['BUCKET']
 TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
@@ -521,7 +520,7 @@ def _er_init(cfg, **context):
     reg = {
         'lower_bound':        f"'{lb}'",
         'selfrun_timeout':    str(cfg.get('selfrun_timeout', 10)),
-        'max_file_size':      cfg.get('max_file_size') or MAX_FILE_SIZE,
+        'max_file_size':      cfg.get('max_file_size', ''),
         'pg_array_format':    cfg.get('pg_array_format', 'False'),
         'format_params':      cfg.get('format_params', ''),
         'xstream_sanitize':   cfg.get('xstream_sanitize', 'False'),
@@ -1132,8 +1131,7 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         'overlap':         p['overlap'],
         'recent_interval': p['recent_interval'],
         'export_timeout':  p['export_timeout'],
-        # Из конфига стенда, а не из p: к таблице ограничение размера отношения не имеет.
-        'max_file_size':    MAX_FILE_SIZE,
+        'max_file_size':    p['max_file_size'],
         'format_params':    p['csv_format_params'],
         'pg_array_format':  'True' if p['pg_array_format'] else 'False',
         'xstream_sanitize': 'True' if p['xstream_sanitize'] else 'False',
@@ -1203,11 +1201,6 @@ def _dag_params(gp: dict, tables: dict) -> dict:
             gp['selfrun_timeout'], type='integer', title='Selfrun timeout (мин)',
             description='Задержка до следующего автозапуска, если дельта не догнала текущее время.',
         ),
-        'max_file_size': Param(
-            MAX_FILE_SIZE, type=['string', 'null'], title='Max file size',
-            description=f"Ограничение размера файла данных: '10GB', '100MB' или число байт. "
-                        f"Умолчание задано стендом ({ENV_STAND or 'не задан'}), к таблице отношения не имеет.",
-        ),
         # ── Табличное: пусто = взять из er_wf_meta ───────────────────────────
         # Пустой вариант — строка 'None', а не сам None: форма рендерит опции как
         # <option value="{{ option }}">, и None превращается в 'None', которую схема
@@ -1226,6 +1219,11 @@ def _dag_params(gp: dict, tables: dict) -> dict:
                 'остальные+UK→обновление, остальные без UK→вставка. '
                 'APPEND — только добавление; ctl_action игнорируется TFS, всегда I.'
             ),
+        ),
+        'max_file_size': Param(
+            None, type=['string', 'null'], title='Max file size',
+            description=("Предел размера одного файла данных: '500MB', '10GB' или число байт. "
+                         'Применяется ко ВСЕМ таблицам пакета; пусто — у каждой своя, из er_wf_meta.'),
         ),
         # ── Что грузим: по флагу на таблицу ──────────────────────────────────
         # Снятый флаг скипает TaskGroup таблицы целиком, состояние её дельты не двигается.
@@ -1292,7 +1290,9 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
             )
         ),
         default_args=DEF_ARGS, start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
-        schedule_interval=group.get('schedule', '55 0 * * *'),
+        # Расписание обязательное: синк не пропускает группу без cron, и подставлять
+        # что-то своё здесь нельзя — пакет поехал бы не в своё окно.
+        schedule_interval=group['schedule'],
         max_active_tasks=int(gp['max_active_tasks']), max_active_runs=1, catchup=False,
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, *schemas],
         render_template_as_native_obj=True, is_paused_upon_creation=True,
@@ -1304,9 +1304,14 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
         def _pre_exp(ctx):
             dp = _xcom(ctx, tcfg['tg'], 'init')
             op = ctx['task']
+            # Шаблон берём из настройки таблицы, а НЕ с оператора (op.sql): подстановка
+            # одноразовая, после неё плейсхолдеров в op.sql уже нет, и повторная отрисовка
+            # в том же процессе взяла бы старое окно дельты. Заодно хук перестаёт зависеть
+            # от того, донёс ли оператор это поле до запуска.
+            #
             # replace, а не format: в SQL встречаются фигурные скобки (JSON-функции, map(),
             # литерал '{}'), и str.format на них падает KeyError/IndexError.
-            op.sql = (op.sql
+            op.sql = (tcfg['sql_export']
                       .replace('{export_time}', dp['extract_time'])
                       .replace('{condition}', dp['condition']))
 

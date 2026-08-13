@@ -1,5 +1,5 @@
 """⚙️ Конфигурация и константы фреймворка ER-выгрузок.
-*2026-08-12 19:30 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-13 13:00 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -81,22 +81,6 @@ LIMITS = {
     "QA":   100,
     "IFT":  100,
     "DEV":  100,
-}
-
-# 📏 Ограничение размера одного файла данных по стендам — рядом с LIMITS и по тому же
-# принципу: зависит от СТЕНДА, а не от таблицы, потому что делить поток крупнее имеет
-# смысл там, где канал до ТФС это выдерживает. Значение — строка в формате оператора
-# ('10GB', '100MB' или просто число байт).
-#
-# Имя не MAX_FILE_SIZE намеренно: под этим именем get_config() отдаёт уже РАЗРЕШЁННОЕ
-# по стенду значение, строкой, и его же держит er_export.py. Один и тот же идентификатор
-# для словаря и для строки — готовая ловушка при импорте не из того модуля.
-SIZE_LIMITS = {
-    "PROM": '10GB',
-    "UAT":  '1GB',
-    "QA":   '1GB',
-    "IFT":  '1GB',
-    "DEV":  '1GB',
 }
 
 TYPE_MAP: dict[str, str] = {
@@ -200,7 +184,10 @@ TABLE_PARAMS: dict = {
     'export_timeout':    120,          # таймаут export_to_s3, мин
 
     # ── Файлы ────────────────────────────────────────────────────────────────
-    # max_file_size здесь НЕТ: он зависит от стенда, а не от таблицы — см. SIZE_LIMITS.
+    # Формат — строка оператора: '500MB', '10GB' или просто число байт. Свойство таблицы:
+    # ТФС ограничивает размер одинаково на всех стендах, а вот делить ли поток мельче,
+    # зависит от самой выгрузки.
+    'max_file_size':     '500MB',      # предел размера одного файла данных
     'send_empty':        0,            # 1 = слать пустой ZIP+Kafka при нулевой дельте
 
     # ── Формат и санитизация ─────────────────────────────────────────────────
@@ -260,6 +247,22 @@ def key_to_where(key: str) -> tuple[str, str]:
     return db, name
 
 
+# Номер группы, который подставляется реплике без суффикса. Пустым он быть не может:
+# имена архива и тикета строятся как '{replica}__{ts}...', и реплика без суффикса дала бы
+# на одно '__' меньше — принимающая сторона разбирает имя по разделителям.
+DEFAULT_GROUP = '0'
+
+
+def replica_full(replica: str) -> str:
+    """🔢 Реплика с обязательным суффиксом группы: без него подставляется DEFAULT_GROUP.
+
+    Нужна, чтобы у всех пакетов был один формат имени файла с одинаковым числом '__'.
+    'hrplatform_datalab' → 'hrplatform_datalab__0', 'hrplatform_datalab__1' — как есть.
+    """
+    rep = (replica or '').strip()
+    return rep if not rep or '__' in rep else f"{rep}__{DEFAULT_GROUP}"
+
+
 def replica_base(replica: str) -> str:
     """🔀 Базовая реплика — часть до первого '__'; остальное считается номером группы.
 
@@ -292,12 +295,6 @@ def get_params(row: dict, group: dict | None = None) -> dict:
 # комментарий таблицы в ClickHouse, и он должен быть приоритетнее группового текста.
 INHERITED = ('schema_name',)
 
-# Значение колонки schedule по умолчанию в DDL. Отличать его от осознанно заданного нельзя
-# (ClickHouse возвращает дефолт, а не пустую строку), поэтому при сверке расписаний внутри
-# пакета такое значение считаем «не задано».
-DEFAULT_SCHEDULE = '55 0 * * *'
-
-
 def parse_params(raw: str, where: str) -> dict:
     """Разбирает JSON-поле params; при битом JSON возвращает {} и пишет предупреждение."""
     try:
@@ -308,9 +305,8 @@ def parse_params(raw: str, where: str) -> dict:
 
 
 def explicit_schedule(row: dict) -> str:
-    """Расписание, заданное осознанно. Колоночный дефолт трактуем как «не задано»."""
-    sched = (row or {}).get('schedule') or ''
-    return '' if sched == DEFAULT_SCHEDULE else sched
+    """Расписание строки. Пусто — не задано; умолчания у cron нет, см. er_sync."""
+    return ((row or {}).get('schedule') or '').strip()
 
 
 def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
@@ -374,8 +370,6 @@ def get_config() -> dict:
         'EXTRA_PRE':       EXTRA_PRE,
         'EXTRA_SUF':       EXTRA_SUF,
         'LIMITS':          LIMITS,
-        # Разрешённое по стенду значение, строкой: словарь наружу не отдаём.
-        'MAX_FILE_SIZE':   SIZE_LIMITS.get(ENV_STAND, '1GB'),
         'BUCKET':          BUCKET,
         'TFS_MAP':         TFS_MAP,
         'S3_CONN':         S3_CONN,

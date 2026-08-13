@@ -1,5 +1,5 @@
 """✏️ DAG правки настройки ER-выгрузок — export.er_wf_meta из UI.
-*2026-08-12 17:15 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-13 13:00 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Заводит новые записи и правит существующие, чтобы не ходить в `clickhouse-client`.
 
@@ -114,7 +114,7 @@ COLUMNS: dict = {
     'sql_settings': '',
     'params':       '{}',
     'description':  '',
-    'schedule':     '55 0 * * *',
+    'schedule':     '',
     'is_recent':    0,
     'is_active':    1,
 }

@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-07-29 16:46 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-13 13:33 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Расширенные функции для работы с S3 в системе CTL.
 
@@ -21,7 +21,6 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
-from urllib.parse import urlparse
 from stream_unzip import stream_unzip # type: ignore
 
 from  plugins.utils import readable_size, get_conns_by_type  # type: ignore
@@ -181,11 +180,18 @@ def s3_get_pages(conn, bucket, prefix='', page_size=1000, max_items=10000):
 def s3_path_parse(path: str) -> dict:
     """
     Разбирает S3 путь на составляющие и определяет наличие маски.
+
+    Схему режем вручную, а не urlparse: в нашем формате слева от '://' стоит conn_id,
+    а он не обязан быть валидной URL-схемой. RFC 3986 разрешает в схеме только буквы,
+    цифры, '+', '-' и '.', поэтому на 's3_minio://bucket/key' urlparse молча отдаёт
+    пустые scheme и netloc — и дальше по коду улетает пустое имя бакета.
     """
-    parsed = urlparse(path)
-    conn_id = parsed.scheme
-    bucket = parsed.netloc
-    full_path = parsed.path.lstrip('/')
+    head, sep, rest = path.partition('://')
+    if sep:
+        conn_id = head
+        bucket, _, full_path = rest.partition('/')
+    else:
+        conn_id, bucket, full_path = '', '', path.lstrip('/')
     
     # Поиск спецсимволов
     star_pos = full_path.find('*')

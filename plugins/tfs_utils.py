@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-14 11:35 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 11:50 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -153,6 +153,50 @@ def parse_rq_tm(raw: str):
         return None
 
 
+# Один корневой документ квитанции целиком, с неймспейсом или без. Нужен, когда в одном
+# сообщении Kafka приезжает несколько документов подряд: ET такое не разбирает вовсе.
+_RS_DOC_RE = re.compile(
+    r'<(?:[A-Za-z_][\w.-]*:)?TransferFileCephRs\b.*?</(?:[A-Za-z_][\w.-]*:)?TransferFileCephRs\s*>',
+    re.S,
+)
+
+
+def _status_text(node) -> str:
+    """Текст причины из блока Status: основной StatusDesc плюс дополнительный.
+
+    У настоящих отказов ТФС основного StatusDesc может не быть вовсе — текст лежит
+    только в AdditionalStatus, и там же более конкретный код. Пример из боя:
+
+        <Status><StatusCode>104</StatusCode>
+            <AdditionalStatus><StatusCode>601</StatusCode>
+                <StatusDesc>ошибка при разархивации [stage=KAFKA_DIFF_TOPICS] …</StatusDesc>
+
+    Поэтому дополнительный статус не отбрасывается, а дописывается с его кодом: 104
+    («ошибка смежной системы») сам по себе не говорит ничего, а «601 ошибка при
+    разархивации …» показывает, что именно чинить.
+    """
+    def _find(parent, tag):
+        found = parent.find(f'{{*}}{tag}')
+        return found if found is not None else parent.find(tag)
+
+    def _own(parent, tag) -> str:
+        found = _find(parent, tag)
+        return (found.text or '').strip() if found is not None else ''
+
+    if node is None:
+        return ''
+
+    parts = [_own(node, 'StatusDesc')]
+
+    extra = _find(node, 'AdditionalStatus')
+    if extra is not None:
+        code, desc = _own(extra, 'StatusCode'), _own(extra, 'StatusDesc')
+        if code or desc:
+            parts.append(f"[{code}] {desc}".strip() if code else desc)
+
+    return ' | '.join(p for p in parts if p)
+
+
 def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> list[dict]:
     """📨 Разбирает XML обратной квитанции TransferFileCephRs — по строке на файл.
 
@@ -164,7 +208,9 @@ def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> list[dict]
 
     Битый XML не роняет разбор: возвращается одна строка со status_code = -1 и текстом
     в raw_xml. Потерять квитанцию хуже, чем сохранить её неразобранной, а застрявшее
-    сообщение заблокировало бы очередь.
+    сообщение заблокировало бы очередь. Цена такой строки, впрочем, немаленькая: у неё
+    пустой rq_uid, то есть ждущая выгрузка её не найдёт и досидит до таймаута с диагнозом
+    «ответа нет» — поэтому разбираем настолько терпимо, насколько можем.
 
     findall/findtext с '{*}' и без: у ТФС встречаются оба варианта — с неймспейсом и без.
     """
@@ -179,6 +225,17 @@ def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> list[dict]
     try:
         root = ET.fromstring(raw)
     except ET.ParseError as err:
+        # Несколько документов подряд в одном сообщении ET не берёт вовсе («junk after
+        # document element»), а квитанция при этом читаемая. Вырезаем корневые блоки
+        # и разбираем каждый отдельно — иначе потеряли бы их все разом.
+        docs = _RS_DOC_RE.findall(raw)
+        if len(docs) > 1:
+            logger.warning("⚠️ В сообщении %d документов подряд, разбираем каждый: %s", len(docs), err)
+            rows = []
+            for doc in docs:
+                rows.extend(parse_receipt(doc, partition, offset))
+            return rows
+
         logger.error("❌ Квитанция не разобрана как XML (%s): %.500s", err, raw)
         return [base]
 
@@ -198,10 +255,14 @@ def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> list[dict]
 
     rows = []
     for node in files:
-        # StatusDesc и StatusCode ищутся внутри своего File, а первым в порядке документа
-        # идёт Status — AdditionalStatus (тоже с парой code/desc) лежит после него.
-        row = {**base, 'file_name': _text(node, 'Name'), 'status_desc': _text(node, 'StatusDesc')}
-        code = _text(node, 'StatusCode')
+        status = node.find('{*}Status')
+        if status is None:
+            status = node.find('Status')
+        row = {**base, 'file_name': _text(node, 'Name'), 'status_desc': _status_text(status)}
+
+        # Код берём из своего Status, а не первый попавшийся: в AdditionalStatus лежит
+        # второй, и порядок документа — единственное, что их различало бы.
+        code = _text(status, 'StatusCode') if status is not None else _text(node, 'StatusCode')
         try:
             row['status_code'] = int(code)
         except ValueError:

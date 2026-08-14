@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-14 19:40 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-15 00:30 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -301,6 +301,41 @@ def clean_row(row: dict) -> dict:
     «пустой sql_from» с внятным текстом, а не доезжать до ClickHouse.
     """
     return {k: clean_value(v) for k, v in row.items()}
+
+
+def parse_s3_target(path: str, conn_id: str, bucket: str, prefix: str) -> dict:
+    """🗺️ 'conn_id://bucket/dir' → {'conn_id', 'bucket', 'prefix'}; пусто — как настроено.
+
+    Формат тот же, что у `s3_path_parse` в plugins/s3_utils и у путей в tools-дагах:
+    слева от '://' стоит conn_id Airflow, а не протокол. Каталог необязателен —
+    's3-archive://bucket' положит файлы в корень бакета.
+
+    Разбираем сами, а не urlparse: по RFC 3986 в схеме допустимы только буквы, цифры,
+    '+', '-' и '.', поэтому на 's3_minio://bucket/key' urlparse молча отдаёт пустые
+    scheme и netloc — и дальше по коду улетает пустое имя бакета.
+    """
+    def _target(conn: str, buck: str, pref: str) -> dict:
+        # key_prefix — то, что приписывается к имени файла. Пустой каталог не должен
+        # давать ключ с ведущим слэшем: в S3 это объект с пустым первым сегментом пути.
+        return {'conn_id': conn, 'bucket': buck, 'prefix': pref,
+                'key_prefix': f"{pref}/" if pref else ''}
+
+    path = (path or '').strip().strip('/')
+    if not path:
+        return _target(conn_id, bucket, prefix)
+
+    head, sep, rest = path.partition('://')
+    if not sep or not head or not rest:
+        raise AirflowFailException(
+            f"Путь выгрузки '{path}' не разобран. Нужен вид conn_id://bucket/dir, "
+            f"например s3-archive://dataplatform-monitoring-dev/er_dump"
+        )
+
+    new_bucket, _, new_prefix = rest.partition('/')
+    if not new_bucket:
+        raise AirflowFailException(f"Путь выгрузки '{path}': не задан бакет")
+
+    return _target(head, new_bucket, new_prefix.strip('/'))
 
 
 def replica_full(replica: str) -> str:

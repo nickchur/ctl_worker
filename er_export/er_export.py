@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-14 11:25 MSK · v3.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-15 00:30 MSK · v3.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -35,13 +35,13 @@ try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
         build_sql, build_meta, ch_columns, check_fields, cols_from_fields, export_sql,
-        query_columns, unnamed_fields,
+        parse_s3_target, query_columns, unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
         build_sql, build_meta, ch_columns, check_fields, cols_from_fields, export_sql,
-        query_columns, unnamed_fields,
+        parse_s3_target, query_columns, unnamed_fields,
     )
 
 
@@ -542,6 +542,11 @@ def _er_pack_zip(cfg, **context):
     tg  = cfg['tg']
     ext = FORMAT_MAP[cfg['format']]['ext']
 
+    # Куда класть архивы: параметр запуска перебивает штатный путь ТФС. Читать части
+    # выгрузки надо ОТТУДА ЖЕ, куда их положил оператор, — он получил тот же параметр
+    # через шаблон, поэтому цель одна на весь пакет.
+    dst = parse_s3_target(context['params'].get('export_path'), S3_CONN, BUCKET, cfg['s3_prefix'])
+
     # s3_key_list пуст при нулевой дельте — это штатно. А вот row_count_list при непустом
     # списке ключей обязан быть: без него zip() молча даст TypeError вместо внятной ошибки.
     s3_keys = _xcom(context, tg, 'export_to_s3', key='s3_key_list',   required=False)
@@ -576,15 +581,16 @@ def _er_pack_zip(cfg, **context):
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
             (data_n, mtime, S_IFREG | 0o600, ZIP_32, [body]),
         ]
-        hook_e = S3Hook(aws_conn_id=S3_CONN)
-        hook_e.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
+        hook_e = S3Hook(aws_conn_id=dst['conn_id'])
+        hook_e.load_file_obj(_ZipReader(stream_zip(members)), key=f"{dst['key_prefix']}{zip_n}",
+                             bucket_name=dst['bucket'], replace=True)
         ti.xcom_push(key="zip_name_list",   value=[zip_n])
         ti.xcom_push(key="total_row_count", value=0)
         add_note({f"📦 pack_zip · {cfg['tbl']} (empty)": [zip_n]}, title="rows=0 send_empty=True",
                  level='task', context=context)
         return
 
-    hook, total = S3Hook(aws_conn_id=S3_CONN), len(s3_keys)
+    hook, total = S3Hook(aws_conn_id=dst['conn_id']), len(s3_keys)
     uploaded = []
 
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
@@ -593,14 +599,15 @@ def _er_pack_zip(cfg, **context):
         tkt_n  = f"{cfg['replica']}__{ts}.tkt".lower()
         zip_n  = f"{cfg['replica']}__{ts}__{cfg['tbl']}__{i+1}_{total}_{rows}.zip".lower()
 
-        s3_body = hook.get_key(key=key, bucket_name=BUCKET).get()["Body"]
+        s3_body = hook.get_key(key=key, bucket_name=dst['bucket']).get()["Body"]
         members = [
             (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{data_n};{rows}".encode()]),
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
             (data_n, mtime, S_IFREG | 0o600, ZIP_32, s3_body.iter_chunks(chunk_size=8*1024*1024)),
         ]
-        hook.load_file_obj(_ZipReader(stream_zip(members)), key=f"{cfg['s3_prefix']}/{zip_n}", bucket_name=BUCKET, replace=True)
-        hook.delete_objects(bucket=BUCKET, keys=[key])
+        hook.load_file_obj(_ZipReader(stream_zip(members)), key=f"{dst['key_prefix']}{zip_n}",
+                           bucket_name=dst['bucket'], replace=True)
+        hook.delete_objects(bucket=dst['bucket'], keys=[key])
         uploaded.append(zip_n)
 
     total_rows = sum(int(r) for r in counts)
@@ -638,9 +645,17 @@ def _er_make_summary(gcfg, **context):
 
     ts          = _run_ts(context).strftime("%Y%m%d%H%M%S")
     summary_tkt = f"{gcfg['replica']}__{ts}.tkt".lower()
-    S3Hook(aws_conn_id=S3_CONN).load_bytes(
-        "\n".join(zips).encode(), key=f"{gcfg['s3_prefix']}/{summary_tkt}", bucket_name=BUCKET, replace=True,
+    dst = parse_s3_target(context['params'].get('export_path'), S3_CONN, BUCKET, gcfg['s3_prefix'])
+    S3Hook(aws_conn_id=dst['conn_id']).load_bytes(
+        "\n".join(zips).encode(), key=f"{dst['key_prefix']}{summary_tkt}",
+        bucket_name=dst['bucket'], replace=True,
     )
+    if context['params'].get('export_path'):
+        # Не выключаем отправку и не трогаем дельту (осознанное решение), но предупреждаем:
+        # маршрут ТФС ждёт файлы строго по своему префиксу в своём бакете, и уведомление
+        # о файлах, лежащих в другом месте, он не подтвердит.
+        logger.warning("⚠️ Пакет выгружен в %s://%s/%s — не туда, где его ждёт ТФС (%s://%s/%s)",
+                       dst['conn_id'], dst['bucket'], dst['prefix'], S3_CONN, BUCKET, gcfg['s3_prefix'])
 
     # 📮 Ставим файлы в очередь отправки. RqUID генерируется ЗДЕСЬ и сохраняется: именно
     # по нему потом ищется обратная квитанция. Раньше он рождался внутри produce_msg
@@ -922,6 +937,18 @@ def _dag_params(gp: dict, tables: dict) -> dict:
         # по сравнению schema.type == "boolean" строкой, и с типом-списком поле выпадает
         # в обычный текстовый ввод. Поэтому «не переопределять» выражено снятой галкой,
         # а не пустым значением: срабатывает только True.
+        # ── Куда кладём ──────────────────────────────────────────────────────
+        'export_path': Param(
+            None, type=['string', 'null'], title='Путь выгрузки',
+            description=(
+                'Куда положить файлы пакета: conn_id://bucket/dir, например '
+                's3-archive://dataplatform-monitoring-dev/er_dump. Пусто — штатный путь '
+                'маршрута ТФС. Действует на весь пакет: и на выгрузку, и на ZIP, и на тикет. '
+                '⚠️ Уведомление в ТФС при этом всё равно уходит, а состояние дельты всё равно '
+                'сдвигается — маршрут ТФС ждёт файлы у себя и такой пакет не подтвердит. '
+                'Для разовой выгрузки на сторону снимайте «Notify Kafka» и задавайте период.'
+            ),
+        ),
         'is_current': Param(
             False, type='boolean', title='Пометить актуальным',
             description='Отметить — состояние считается актуальным и следующий цикл '
@@ -1045,6 +1072,13 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, *schemas],
         render_template_as_native_obj=True, is_paused_upon_creation=True,
         params=_dag_params(gp, {c['tg']: tk for tk, c in cfgs.items()}),
+        # Путь выгрузки задаётся параметром запуска, а поля оператора выставляются при
+        # РАЗБОРЕ файла — подменить их можно только шаблоном. Отсюда макрос: он зовёт тот же
+        # parse_s3_target, что и питоновские таски, поэтому цель у оператора, упаковки
+        # и тикета всегда одна.
+        user_defined_macros={
+            's3_target': lambda path, part, _p=prefix: parse_s3_target(path, S3_CONN, BUCKET, _p)[part],
+        },
     )
 
     def _make_pre_exp(tcfg):
@@ -1091,14 +1125,17 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
             with TaskGroup(group_id=tcfg['tg']):
                 t_init, t_meta = _er_init(cfg=tcfg), _er_build_meta(cfg=tcfg)
                 t_exp = HrpClickNativeToS3ListOperator(
-                    task_id='export_to_s3', s3_bucket=BUCKET,
+                    task_id='export_to_s3',
+                    s3_bucket="{{ s3_target(params.export_path, 'bucket') }}",
                     # Ключ обязан различать и таблицу, и группу: s3_prefix общий у всех групп
                     # одной базовой реплики, ts_nodash совпадает у пакетов на одном cron, а
                     # оператор лишь дописывает номер части. Только имени таблицы мало —
                     # одноимённые таблицы из разных баз (tg = db__tbl) или из разных групп
                     # писали бы в один ключ и затирали друг друга при replace=True.
-                    s3_key=f"{tcfg['s3_prefix']}/{tcfg['replica']}__{tcfg['tg']}__{{{{ ts_nodash }}}}.{fmt['ext']}",
-                    aws_conn_id=S3_CONN, clickhouse_conn_id=CH_ID,
+                    s3_key=("{{ s3_target(params.export_path, 'key_prefix') }}"
+                            f"{tcfg['replica']}__{tcfg['tg']}__{{{{ ts_nodash }}}}.{fmt['ext']}"),
+                    aws_conn_id="{{ s3_target(params.export_path, 'conn_id') }}",
+                    clickhouse_conn_id=CH_ID,
                     sql=tcfg['sql_export'], fmt=fmt['fmt'], header=fmt['header'],
                     compression=None, replace=True, post_file_check=False,
                     pre_execute=_make_pre_exp(tcfg),

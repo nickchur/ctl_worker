@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-13 17:26 MSK · v3.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 09:38 MSK · v3.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -9,7 +9,7 @@
   make_summary → notify_tfs → wait_confirm → save_status → schedule_next
 
 Метаданные выгрузок хранятся в Airflow Variable `datalab_er_wfs` (JSON-словарь),
-который синхронизируется DAG-ом export_er_sync из таблицы export.er_wf_meta.
+который синхронизируется DAG-ом export_er_setup из таблицы export.er_wf_meta.
 
 Поддерживаемые режимы выгрузки:
   📈 delta  — инкрементальный, окно [time_from, time_to] из export.extract_current_vw
@@ -34,9 +34,15 @@ from airflow.utils.task_group import TaskGroup
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
+        build_sql, build_meta, ch_columns, check_fields, cols_from_fields, export_sql,
+        query_columns, unnamed_fields,
     )
 except ImportError:
-    from er_export.er_config import get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base
+    from er_export.er_config import (
+        get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
+        build_sql, build_meta, ch_columns, check_fields, cols_from_fields, export_sql,
+        query_columns, unnamed_fields,
+    )
 
 
 def _tfs():
@@ -58,146 +64,16 @@ logger = logging.getLogger("airflow.task")
 
 # ── Configuration & Constants ────────────────────────────────────────────────
 
+# TYPE_MAP, EXTRA_PRE/SUF, LIMITS и ENV_STAND сюда больше не берутся: они нужны только
+# сборке запроса и .meta, а та переехала в er_config целиком.
 _cfg = get_config()
 CH_ID          = _cfg['CH_ID']
-TYPE_MAP       = _cfg['TYPE_MAP']
 DEF_ARGS       = _cfg['DEF_ARGS']
-ENV_STAND      = _cfg['ENV_STAND']
-EXTRA_PRE      = _cfg['EXTRA_PRE']
-EXTRA_SUF      = _cfg['EXTRA_SUF']
-LIMITS         = _cfg['LIMITS']
 BUCKET         = _cfg['BUCKET']
 TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
 VAR_NAME        = _cfg['VAR_NAME']
 FORMAT_MAP      = _cfg['FORMAT_MAP']
-
-# Hive keywords (all versions, reserved + non-reserved) — имена колонок из этого набора
-# получают суффикс '_' согласно требованиям KAP/TFS (раздел 11 документации ЕР).
-HIVE_RESERVED: frozenset = frozenset({
-    # 1.2 non-reserved
-    'add','admin','after','analyze','archive','asc','before','bucket','buckets','cascade',
-    'change','cluster','clustered','clusterstatus','collection','columns','comment','compact',
-    'compactions','compute','concatenate','continue','data','databases','datetime','day',
-    'dbproperties','deferred','defined','delimited','dependency','desc','directories',
-    'directory','disable','distribute','enable','escaped','exclusive','explain','export',
-    'fields','file','fileformat','first','format','formatted','functions','hold_ddltime',
-    'hour','idxproperties','ignore','index','indexes','inpath','inputdriver','inputformat',
-    'items','jar','keys','limit','lines','load','location','lock','locks','logical','long',
-    'mapjoin','materialized','metadata','minus','minute','month','msck','noscan','no_drop',
-    'offline','option','outputdriver','outputformat','overwrite','owner','partitioned',
-    'partitions','plus','pretty','principals','protection','purge','read','readonly',
-    'rebuild','recordreader','recordwriter','regexp','reload','rename','repair','replace',
-    'replication','restrict','rewrite','rlike','role','roles','schema','schemas','second',
-    'semi','serde','serdeproperties','server','sets','shared','show','show_database',
-    'skewed','sort','sorted','ssl','statistics','stored','streamtable','string','struct',
-    'tables','tblproperties','temporary','terminated','tinyint','touch','transactions',
-    'unarchive','undo','uniontype','unlock','unset','unsigned','uri','use','utc','view',
-    'while','year',
-    # 1.2 reserved
-    'all','alter','and','array','as','authorization','between','bigint','binary','boolean',
-    'both','by','case','cast','char','column','conf','create','cross','cube','current',
-    'current_date','current_timestamp','cursor','database','date','decimal','delete',
-    'describe','distinct','double','drop','else','end','exchange','exists','extended',
-    'external','false','fetch','float','following','for','from','full','function','grant',
-    'group','grouping','having','if','import','in','inner','insert','int','intersect',
-    'interval','into','is','join','lateral','left','less','like','local','macro','map',
-    'more','none','not','null','of','on','or','order','out','outer','over','partialscan',
-    'partition','percent','preceding','preserve','procedure','range','reads','reduce',
-    'revoke','right','rollup','row','rows','select','set','smallint','table','tablesample',
-    'then','timestamp','to','transform','trigger','true','truncate','unbounded','union',
-    'uniquejoin','update','user','using','utc_tmestamp','values','varchar','when','where',
-    'window','with',
-    # 2.0+
-    'autocommit','isolation','level','offset','snapshot','transaction','work','write',
-    'commit','only','rollback','start',
-    # 2.1+
-    'abort','key','last','norely','novalidate','nulls','rely','validate',
-    'cache','constraint','foreign','primary','references',
-    # 2.2+
-    'days','dayofweek','dump','hours','matched','merge','minutes','months','quarter',
-    'repl','seconds','status','views','week','weeks','years',
-    'except','extract','floor','integer','precision',
-    # 2.3+
-    'detail','expression','operator','summary','vectorization','wait',
-    # 3.0+
-    'activate','active','alloc_fraction','check','default','do','enforced','kill',
-    'management','mapping','move','path','plan','plans','pool','query',
-    'query_parallelism','reoptimization','resource','scheduling_policy','unmanaged',
-    'workload','zone',
-    'any','application','dec','numeric','sync','time','timestamplocaltz','unique',
-    # 4.0+
-    'ast','at','branch','cbo','cost','cron','dcproperties','debug','disabled',
-    'distributed','enabled','every','execute','executed','expire_snapshots','joincost',
-    'managed','managedlocation','optimize','remote','respect','retain','retention',
-    'scheduled','set_current_snapshot','snapshots','spec','system_time','system_version',
-    'tag','transactional','trim','type','unknown','url','within',
-    'compactionid','connector','connectors','convert','ddl','force','leading','older',
-    'pkfk_join','prepare','qualify','real','some','than','trailing',
-})
-
-# ── SQL Builders ──────────────────────────────────────────────────────────────
-
-def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
-    """Собирает SQL-запрос из словаря метаданных или возвращает строку как есть.
-
-    Поддерживаемые ключи словаря:
-      with     — CTE-блок (WITH ...)
-      fields   — list[str] или str; если не задан, используется '*'
-      from     — обязательный FROM-clause
-      joins    — JOIN-clause (опционально)
-      where    — WHERE-условие (опционально)
-      settings — SETTINGS-блок ClickHouse (опционально)
-    """
-    if not sql_meta: return ""
-    if isinstance(sql_meta, str): return sql_meta
-
-    parts = []
-    if sql_meta.get("with"): parts.append(sql_meta['with'])
-
-    fields = sql_meta.get("fields", [])
-    if isinstance(fields, list):
-        fields_str = f",\n{indent}".join(fields) if fields else "*"
-    else:
-        fields_str = fields or "*"
-    parts.append(f"SELECT\n{indent}{fields_str}\nFROM {sql_meta['from']}")
-
-    if sql_meta.get("joins"):    parts.append(sql_meta['joins'])
-    if sql_meta.get("where"):    parts.append(f"WHERE {sql_meta['where']}")
-    if sql_meta.get("settings"): parts.append(f"SETTINGS {sql_meta['settings']}")
-
-    return "\n".join(parts)
-
-
-def with_condition(where: str | None, full: bool = False, elsewhere: str = '') -> str:
-    """🕐 Дописывает окно дельты в WHERE, если его нет больше нигде в запросе.
-
-    При full=True (параметр таблицы full_export) окно не подставляется вовсе: условие
-    остаётся тем, что задано в sql_where, а пустое даёт запрос совсем без WHERE.
-    Так выгружается таблица, у которой поля времени нет в принципе.
-
-    Раньше плейсхолдер `{condition}` писали руками в поле sql_where таблицы. Забыл его —
-    и выгрузка молча уезжала таблицей целиком на каждом ране; заметно это становилось
-    только по объёму пакета. Теперь окно дописывается само, а в sql_where остаётся
-    только бизнес-фильтр.
-
-    Плейсхолдер сохраняется как отдушина: он нужен, когда окно надо положить внутрь CTE
-    или подзапроса — там это бывает на порядок быстрее внешнего WHERE.
-
-    elsewhere — остальные части запроса (sql_with, sql_from, sql_join) одной строкой.
-    Плейсхолдер в них считается таким же указанием «окно поставлено вручную», как и в самом
-    WHERE. Без этого окно, положенное только в CTE, дублировалось наружу: снаружи после
-    GROUP BY колонки времени уже нет, и запрос падал с UNKNOWN_IDENTIFIER — обойти это
-    удавалось лишь фиктивным упоминанием плейсхолдера в sql_where.
-    """
-    w = (where or '').strip()
-    if full:
-        return w
-    if '{condition}' in w or '{condition}' in (elsewhere or ''):
-        return w
-    if not w:
-        return '{condition}'
-    return '{condition} AND (' + w + ')'
 
 
 def sql_cur_delta(tbl: str) -> str:
@@ -338,102 +214,6 @@ def _format_cur_state(cur: dict) -> dict:
         'is_current':      'True' if cur.get('current_time') == cur.get('extract_time') else 'False',
         'recent_interval': str(cur.get('recent_interval', 0)),
     }
-
-
-def safe_name(name: str) -> str:
-    """Имя колонки для .meta: совпавшее с зарезервированным словом Hive получает суффикс '_'."""
-    return name + '_' if name.lower() in HIVE_RESERVED else name
-
-
-def field_name(expr: str) -> str | None:
-    """Сырое имя колонки, которое даст выражение из fields. None — если вывести его нельзя.
-
-    Надёжных случаев два: явный алиас в конце ('expr as name') и простая колонка, возможно
-    с квалификатором ('t1.col'). Всё остальное — выражение вроде cast(x as String): наивный
-    split по ' as ' дал бы 'String)', а ClickHouse назовёт колонку по-своему. Такие поля
-    честно помечаем неизвестными, иначе сверка в build_meta падала бы вечно и без шансов
-    на успешный ретрай.
-
-    Имя возвращается БЕЗ hive-суффикса: по нему ищут колонку в DESCRIBE TABLE, где имена
-    сырые. safe_name() навешивается уже на результат, при формировании .meta.
-    """
-    import re
-
-    expr = str(expr).strip()
-    alias = re.search(r'\sas\s+([A-Za-z_]\w*)\s*$', expr, re.I)
-    if alias:
-        return alias.group(1)
-    if re.fullmatch(r'[A-Za-z_]\w*(\.[A-Za-z_]\w*)*', expr):
-        return expr.rsplit('.', 1)[-1]
-    return None
-
-
-def cols_from_fields(fields: list, ch_cols: dict, describe_rows: list) -> list[dict]:
-    """Колонки .meta по списку fields — запасной путь, когда DESCRIBE запроса недоступен.
-
-    Работает, если sql_meta пуст (SQL задан строкой или со своим списком fields) либо если
-    DESCRIBE (<запрос>) упал. JOIN-ы и вычисляемые выражения тут не учитываются: имя каждой
-    колонки выводится из самого выражения.
-
-    Выражение, у которого имя не вывести (нет алиаса, не простая колонка), — ошибка.
-    Взять имя неоткуда, а .meta управляет загрузкой в КАП: молча уехавшее 'String)' вместо
-    имени колонки хуже падения, и сверка состава его не поймает — для таких выражений она
-    проверяет только количество.
-
-    ch_cols       — {имя колонки источника: описание} по DESCRIBE TABLE
-    describe_rows — сырые строки DESCRIBE TABLE, нужны для ветки «все колонки»
-    """
-    # 't1.*' — тот же «все колонки таблицы», что и '*', но с явным алиасом.
-    # Через синхронизацию сюда уже не попасть (fields обязателен и звёздочка запрещена),
-    # ветка оставлена для обратной совместимости со старыми записями Variable.
-    if not fields or fields in (['*'], '*') or all(str(f).strip().endswith('.*') for f in fields):
-        return [{**ch_cols[r[0]], "column_name": safe_name(r[0])} for r in describe_rows]
-
-    out = []
-    for f in fields:
-        name = field_name(f)
-        if name is None:
-            raise AirflowFailException(
-                f"Не удалось определить имя колонки для выражения '{f}'. "
-                "Схема строится по DESCRIBE TABLE источника (запрос разобрать не удалось "
-                "или он задан строкой), поэтому имя берётся из самого выражения. "
-                f"Добавьте алиас в fields: '{f} as <имя_колонки>'"
-            )
-        base = ch_cols.get(name, {
-            "column_name": name, "source_type": "STRING", "length": None,
-            "notnull": False, "precision": None, "scale": None,
-            "description": f"Calculated: {f}",
-        })
-        out.append({**base, "column_name": safe_name(base["column_name"])})
-    return out
-
-
-def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool, int | None, int | None, int | None]:
-    """Раскрывает обёртки LowCardinality/Nullable и маппирует базовый CH-тип в целевой.
-
-    Возвращает (target_type, notnull, length, precision, scale).
-    FixedString(N) → length=N; Decimal(P,S) → precision=P, scale=S, length=P.
-    Неизвестные базовые типы по умолчанию маппируются в STRING.
-    """
-    notnull = True
-    length = precision = scale = None
-    if ch_type.startswith("LowCardinality("): ch_type = ch_type[15:-1]
-    if ch_type.startswith("Nullable("):
-        ch_type = ch_type[9:-1]
-        notnull = False
-    base = ch_type.split("(")[0]
-    if "(" in ch_type:
-        args = [a.strip() for a in ch_type[len(base) + 1:-1].split(",")]
-        try:
-            if base == "FixedString":
-                length = int(args[0])
-            elif base == "Decimal" and len(args) == 2:
-                precision = int(args[0])
-                scale     = int(args[1])
-                length    = precision
-        except (ValueError, IndexError):
-            pass
-    return mapping.get(base, "STRING"), notnull, length, precision, scale
 
 
 def _pre_await(context):
@@ -683,43 +463,25 @@ def _er_build_meta(cfg, **context):
 
     Типы: parse_ch_type → TYPE_MAP; для FixedString/Decimal извлекаются
     length/precision/scale. UK передаётся плоским массивом: ['id'] (стандарт ЕР).
+
+    Сама сборка — в er_config: тем же кодом проверяет настройку даг export_er_setup.
     """
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = _xcom(context, cfg['tg'], 'init')
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
     rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
-
-    ch_cols = {}
-    for row in rows:
-        stype, notnull, length, precision, scale = parse_ch_type(row[1], TYPE_MAP)
-        comment = row[4] if len(row) > 4 else ""
-        ch_cols[row[0]] = {
-            "column_name": row[0], "source_type": stype, "length": length,
-            "notnull": notnull, "precision": precision, "scale": scale,
-            "description": comment or None,
-        }
+    ch_cols = ch_columns(rows)
 
     def _cols_from_query(sql: str) -> list[dict]:
         """Колонки по DESCRIBE итогового запроса — так же, как их видит TSVWithNames.
 
-        Единственный способ получить состав, совпадающий с заголовком CSV при JOIN,
-        алиасах и вычисляемых выражениях. Комментариев у результата подзапроса нет,
-        поэтому description подмешивается из DESCRIBE TABLE источника по имени колонки.
-        {condition} подставляем заведомо ложным: DESCRIBE запрос не выполняет, но разобрать
-        его обязан. Подстановка адресными replace, а не str.format: format спотыкается
-        о любую фигурную скобку в SQL — JSON-функции, map(), литерал '{}'.
+        DESCRIBE запрос не выполняет, но разобрать его обязан, поэтому окно дельты
+        и время подставляются заведомо безопасными значениями (probe_sql), а внешний
+        LIMIT 0 срезается: DESCRIBE его не примет.
         """
         q = sql.replace('{export_time}', 'now64(6)').replace('{condition}', '1=0')
         qrows, _ = hook.execute(f"DESCRIBE ({q})", with_column_types=True)
-        out = []
-        for r in qrows:
-            stype, notnull, length, precision, scale = parse_ch_type(r[1], TYPE_MAP)
-            out.append({
-                "column_name": safe_name(r[0]), "source_type": stype, "length": length,
-                "notnull": notnull, "precision": precision, "scale": scale,
-                "description": ch_cols.get(r[0], {}).get("description"),
-            })
-        return out
+        return query_columns(qrows, ch_cols)
 
     def _cols_from_table() -> list[dict]:
         """Запасной путь: колонки по DESCRIBE TABLE источника, без учёта JOIN и выражений."""
@@ -738,67 +500,20 @@ def _er_build_meta(cfg, **context):
     else:
         data_cols = _cols_from_table()
 
-    # 🔍 Состав колонок обязан совпадать с настройкой. Смысл всей проверки: новая колонка
-    # в источнике не должна доезжать до КАП сама — только через правку fields в er_wf_meta.
-    # Заодно ловится опечатка в выражении, у которого ClickHouse выведет неожиданное имя.
-    # actual уже с hive-суффиксами (safe_name при сборке), поэтому и ожидаемые имена
-    # приводим к тому же виду.
-    actual = [c['column_name'] for c in data_cols]
-    expected = [safe_name(n) if n is not None else None
-                for n in (field_name(f) for f in cfg['fields'])]
+    # 🔍 Состав колонок обязан совпадать с настройкой: новая колонка в источнике не должна
+    # доезжать до КАП сама, только через правку fields. Выгрузке нужен красный таск —
+    # ретраить тут нечего, от повтора настройка не изменится.
+    if errors := check_fields(cfg['fields'], [c['column_name'] for c in data_cols],
+                              f"{cfg['db']}.{cfg['tbl']}"):
+        raise AirflowFailException("\n".join(errors))
 
-    if len(actual) != len(expected):
-        raise AirflowFailException(
-            f"Состав колонок {cfg['db']}.{cfg['tbl']} разошёлся с настройкой fields: "
-            f"запрос вернул {len(actual)} колонок, в настройке {len(expected)}.\n"
-            f"  запрос:    {actual}\n"
-            f"  настройка: {cfg['fields']}\n"
-            "Если изменение источника ожидаемо — поправьте fields в export.er_wf_meta"
-        )
-
-    # Позиции с невыводимым именем (выражения без алиаса) сверяем только по количеству:
-    # имя такой колонки определяет ClickHouse, и предсказать его мы не берёмся.
-    mismatch = [(i, e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e is not None and e != a]
-    if mismatch:
-        # Точка в имени колонки запроса — почти всегда квалификатор таблицы, а не изменение
-        # источника, и совет «поправьте fields» тут уводит не туда: список полей верен,
-        # не хватает алиаса. Отдаём готовые строки замены, чтобы не разбираться заново.
-        dotted = [i for i, _, a in mismatch if '.' in a]
-        hint = ''
-        if dotted:
-            fixes = "\n".join(f"    '{cfg['fields'][i]} AS {field_name(cfg['fields'][i])}'"
-                              for i in dotted[:5])
-            hint = (
-                "\nВ именах колонок запроса остался квалификатор таблицы. При ДВУХ и более "
-                "JOIN-ах ClickHouse сохраняет префикс у колонки, чьё короткое имя есть ещё "
-                "в одной из соединяемых таблиц (с одним JOIN-ом префикс срезается — то есть "
-                "поведение меняется от добавления третьей таблицы). Точка уедет и в заголовок "
-                f"файла данных, и в .meta. Лечится алиасом в fields:\n{fixes}"
-            )
-        raise AirflowFailException(
-            f"Состав колонок {cfg['db']}.{cfg['tbl']} разошёлся с настройкой fields.\n"
-            + "\n".join(f"  позиция {i}: запрос '{a}', настройка '{e}'" for i, e, a in mismatch)
-            + hint
-            + "\nЕсли изменение источника ожидаемо — поправьте fields в export.er_wf_meta"
-        )
-
-    if unnamed := [f for f, e in zip(cfg['fields'], expected) if e is None]:
+    if unnamed := unnamed_fields(cfg['fields']):
         logger.warning(
             "Выражения без алиаса, имена колонок для них не проверены: %s. "
             "Добавьте 'as <имя>', чтобы сверка работала полностью", unnamed,
         )
 
-    meta = {
-        "mask_file":   None,
-        "schema_name": cfg['schema_name'],
-        "table_name":  cfg['tbl'],
-        "description": cfg.get('description') or None,
-        "strategy":    dp.get('strategy', cfg['strategy']),
-        "PK":          cfg['PK'],
-        "UK":          cfg['UK'] or [],
-        "params":      FORMAT_MAP[cfg['format']]['meta_params'],
-        "columns":     [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_PRE] + data_cols + [{k: v for k, v in c.items() if k != 'sql'} for c in EXTRA_SUF],
-    }
+    meta = build_meta(cfg, data_cols, strategy=dp.get('strategy', ''))
     context["ti"].xcom_push(key="meta_json", value=json.dumps(meta, ensure_ascii=False))
     add_note({f"🗂️ build_meta · {cfg['tbl']}": [c["column_name"] for c in meta["columns"]]},
              level='task', context=context)
@@ -1116,40 +831,11 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
             f"{table_key}: неизвестный формат '{p['format']}', допустимы {sorted(FORMAT_MAP)}"
         )
 
-    # Состав колонок задаётся только настройкой — иначе новая колонка источника уедет
-    # в выгрузку и в КАП сама, без единой правки er_wf_meta.
-    fields = entry.get("fields") or []
-    if not fields or any(str(f).strip() == '*' or str(f).strip().endswith('.*') for f in fields):
-        raise AirflowFailException(
-            f"{table_key}: fields должен быть явным списком колонок, '*' и 't1.*' запрещены"
-        )
-
-    def _prep_sql(key):
-        """Читает SQL-метадату по ключу, добавляет обязательные поля и окно дельты."""
-        m = entry.get(key)
-        if isinstance(m, dict) and "fields" not in m:
-            m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + fields + [c['sql'] for c in EXTRA_SUF]}
-        if isinstance(m, dict):
-            # Плейсхолдер ищем и в остальных частях запроса: окно, положенное внутрь CTE
-            # или подзапроса FROM, снаружи дописывать не надо. settings и fields сюда не
-            # входят — окну там не место.
-            rest = ' '.join(str(m.get(k) or '') for k in ('with', 'from', 'joins'))
-            m = {**m, "where": with_condition(m.get("where"), full=bool(p['full_export']),
-                                              elsewhere=rest)}
-        return build_sql(m)
-
-    def _prep_sql_data(key):
-        """Тот же запрос, но только с data-колонками — build_meta делает по нему DESCRIBE."""
-        m = entry.get(key)
-        return build_sql({**m, "fields": fields}) if isinstance(m, dict) and "fields" not in m else ""
-
-    sql_delta, sql_recent = _prep_sql('sql_stmt_export_delta'), _prep_sql('sql_stmt_export_recent')
-    if not (sql_delta or sql_recent) or (sql_delta and sql_recent):
-        raise AirflowFailException(f"{table_key}: нужен ровно один из delta/recent SQL-запросов")
-
-    sql_exp = sql_delta or sql_recent
-    if LIMITS.get(ENV_STAND, 0) > 0:
-        sql_exp = f"SELECT * FROM ({sql_exp}) LIMIT {LIMITS[ENV_STAND]}"
+    # Сборка запроса — в er_config: тем же кодом собирает проверку даг export_er_setup.
+    # Там же и запрет на '*' в fields: состав колонок задаётся только настройкой, иначе
+    # новая колонка источника уедет в выгрузку и в КАП сама, без единой правки er_wf_meta.
+    q = export_sql(entry, p, table_key)
+    is_delta = q['sql_key'] == 'sql_stmt_export_delta'
 
     if p['format'] != 'TSVWithNames' and (p['pg_array_format'] or p['xstream_sanitize']):
         logger.warning(
@@ -1166,12 +852,12 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         'replica':         replica,
         's3_prefix':       prefix,
         # ── SQL ──────────────────────────────────────────────────────────────
-        'sql_export':      sql_exp,
+        'sql_export':      q['sql_export'],
         # None → состояние дельты не читается: так работают recent и full_export
-        'sql_get_current': sql_cur_delta(tbl) if (sql_delta and not p['full_export']) else None,
-        'sql_meta':        _prep_sql_data('sql_stmt_export_delta') or _prep_sql_data('sql_stmt_export_recent'),
+        'sql_get_current': sql_cur_delta(tbl) if (is_delta and not p['full_export']) else None,
+        'sql_meta':        q['sql_meta'],
         # ── Схема ────────────────────────────────────────────────────────────
-        'fields':          fields,
+        'fields':          entry['fields'],
         'PK':              entry.get('PK', []),
         'UK':              entry.get('UK', []),
         'description':     entry.get('description', ''),
@@ -1200,7 +886,7 @@ def _dag_params(gp: dict, tables: dict) -> dict:
     """🎛️ DAG Params пакета.
 
     Состав намеренно скупой. Табличные настройки (формат, санитизация, стратегия слияния,
-    признак recent) живут в er_wf_meta и правятся дагом export_er_wf_edit — как параметр
+    признак recent) живут в er_wf_meta и правятся дагом export_er_setup — как параметр
     ПАКЕТА они применяли бы одно значение ко ВСЕМ таблицам сразу, то есть чинили одну
     поставку и молча ломали остальные. Рычаги правки состояния дельты (extract_time,
     condition, increment) убраны по той же причине, усиленной тем, что состояние у каждой
@@ -1446,7 +1132,7 @@ def _er_config_error(replica: str, errors: list, **context):
     raise AirflowFailException(
         f"Пакет {replica} не собран: {len(errors)} ошибок в настройке export.er_wf_meta.\n"
         + "\n".join(f"  • {e}" for e in errors)
-        + "\nПоправьте настройку и перезапустите export_er_sync"
+        + "\nПоправьте настройку и перезапустите export_er_setup"
     )
 
 
@@ -1465,7 +1151,7 @@ def create_broken_dag(replica: str, errors: list, schedule=None) -> tuple[str, D
             f"## ❌ Пакет `{replica}` не собран\n\n"
             f"Выгрузка не работает: в `export.er_wf_meta` {len(errors)} ошибок.\n\n"
             + "\n".join(f"- {e}" for e in errors)
-            + "\n\nПоправьте настройку и перезапустите `export_er_sync`."
+            + "\n\nПоправьте настройку и перезапустите `export_er_setup`."
         ),
         # Ретраить ошибку настройки бессмысленно; пул экспорта заглушке не нужен,
         # а on_failure_callback оставляем — он пишет штатную заметку о падении.

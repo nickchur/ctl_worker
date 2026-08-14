@@ -1,5 +1,5 @@
 # 📡 Тракт Kafka ↔ ТФС
-*2026-08-13 13:33 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 11:25 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Приём обратных квитанций и отправка уведомлений с соблюдением темпа. Общий контур:
 сейчас им пользуется ЕР, следующим переезжает xStream.
@@ -22,7 +22,13 @@
 
 ТФС отвечает на каждое уведомление обратной квитанцией, но кладёт её **в общий топик
 по всем маршрутам сразу** (сейчас `TFS.HRPLT.OUT`). Сопоставление — по `RqUID`, результат
-передачи — в `Status/StatusCode` (`0` = успех).
+передачи — в `File/Status/StatusCode` (`0` = успех), причина — в `File/Status/StatusDesc`.
+
+**Одна квитанция — несколько файлов.** По спеке `TransferFileCephRs` агрегат `File` идёт
+`[1-N]`, а `Status` лежит **внутри** `File`: статус у каждого файла свой. Поэтому
+`parse_receipt` возвращает список строк, по одной на файл, а ключ таблицы —
+`(rq_uid, file_name)`. Разбор «первый `Name`, первый `StatusCode`» на такой квитанции
+записал бы успех первого файла и потерял ошибку второго — пакет подтвердился бы, не доехав.
 
 Топиков может быть несколько: список в `KAFKA_RCV_TOPICS` (`plugins/tfs_utils.py`),
 на каждый заводится свой таск-сенсор. Из какого топика пришла квитанция, видно
@@ -106,7 +112,7 @@ ClickHouse и Postgres — зеркала: пишем в них, если зад
 Раскладка под `{логовый бакет}/tfs/`:
 
 ```
-receipts/{rq_uid}.json                                    квитанция целиком
+receipts/{rq_uid}.json                                    квитанция: список строк по файлам
 queue/pending/{rq_uid}.json                               ждёт отправки
 queue/sent/{YYYYMMDD}/{scenario}/{rq_uid}__{HHMMSS}.json  отправлено
 state/{YYYYMMDD}/{dag}__{task}__{run_id}.json             память сенсора за окно
@@ -179,11 +185,16 @@ PG 9.4) его нет. Дубли допускаются при записи и 
 ## Диагностика
 
 ```sql
--- неуспешные передачи за сутки
-SELECT rq_tm, scenario_id, file_name, status_code
+-- неуспешные передачи за сутки (status_desc — текст причины от ТФС)
+SELECT rq_tm, scenario_id, file_name, status_code, status_desc
 FROM export.tfs_receipts FINAL
 WHERE status_code != 0 AND received_at >= now() - INTERVAL 1 DAY
 ORDER BY received_at DESC;
+
+-- квитанции, в которых ТФС прислал несколько файлов сразу
+SELECT rq_uid, count() AS files, groupArray(file_name) AS names
+FROM export.tfs_receipts FINAL
+GROUP BY rq_uid HAVING files > 1 ORDER BY files DESC;
 
 -- сообщения, которые не разобрались
 SELECT received_at, kafka_partition, kafka_offset, substring(raw_xml, 1, 500)

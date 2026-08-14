@@ -1,9 +1,9 @@
 """📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
-*2026-08-13 13:33 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 11:25 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
-и сопоставляется с отправкой по `RqUID`. Результат передачи — в `Status/StatusCode`,
-где `0` означает успех.
+и сопоставляется с отправкой по `RqUID`. Результат передачи — в `File/Status/StatusCode`,
+где `0` означает успех, причина отказа — в `File/Status/StatusDesc`.
 
 Пример сообщения:
 
@@ -16,6 +16,10 @@
             <Status><StatusCode>0</StatusCode></Status>
         </File>
     </TransferFileCephRs>
+
+📄 **Файлов в квитанции может быть несколько.** По спеке `File` идёт `[1-N]`, а `Status`
+лежит ВНУТРИ `File` — статус у каждого файла свой. Одно сообщение Kafka поэтому даёт
+столько строк, сколько в нём файлов; ключ хранилища — `(rq_uid, file_name)`.
 
 📚 **Свой сенсор на каждый топик.** Список топиков — в `KAFKA_RCV_TOPICS`
 (`plugins/tfs_utils.py`), на каждый заводится отдельный таск. Добавление маршрута со
@@ -158,9 +162,12 @@ def tfs_kafka_rcv_dag():
                     continue
 
                 raw = msg.value().decode("utf-8", errors="replace")
-                row = parse_receipt(raw, msg.partition(), msg.offset())
-                row['kafka_topic'] = topic
-                rows.append(row)
+                # Одно сообщение — несколько строк: File у ТФС идёт [1-N], статус у каждого
+                # файла свой, и в хранилище они ложатся отдельными строками.
+                parsed = parse_receipt(raw, msg.partition(), msg.offset())
+                for row in parsed:
+                    row['kafka_topic'] = topic
+                rows.extend(parsed)
 
                 positions[msg.partition()] = max(positions.get(msg.partition(), -1), msg.offset())
                 idle_until = time.time() + IDLE_TIMEOUT  # пока идут сообщения — продолжаем

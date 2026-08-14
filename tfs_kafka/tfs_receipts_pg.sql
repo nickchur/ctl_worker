@@ -1,5 +1,5 @@
 -- DDL для export.tfs_receipts — вариант PostgreSQL / Greenplum
--- 2026-08-13 11:41 MSK · v1.1 · Чуркин Николай · nschurkin@sber.ru
+-- 2026-08-14 11:25 MSK · v1.2 · Чуркин Николай · nschurkin@sber.ru
 --
 -- Нужна, только если включено зеркало в Postgres — непустой PG_CONN в plugins/tfs_utils.py.
 -- Для зеркала в ClickHouse (непустой CH_ID) используйте tfs_receipts.sql.
@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS export.tfs_receipts
     rq_uid           text        NOT NULL,   -- RqUID из квитанции: ключ сопоставления с отправкой
     file_name        text        NOT NULL,   -- File/FileInfo/Name
     scenario_id      text,                   -- ScenarioInfo/ScenarioId: маршрут ТФС
-    status_code      integer     NOT NULL,   -- Status/StatusCode: 0 = успех; -1 = сообщение не разобрано
+    status_code      integer     NOT NULL,   -- File/Status/StatusCode: 0 = успех; -1 = сообщение не разобрано
+    status_desc      text        DEFAULT '', -- File/Status/StatusDesc: текст причины от ТФС (до 1000 символов)
     rq_tm            timestamptz,            -- RqTm из квитанции (время на стороне ТФС)
     received_at      timestamptz NOT NULL DEFAULT now(),  -- когда вычитали; по нему выбирается свежая версия
     raw_xml          text,                   -- исходное сообщение целиком — для разбора инцидентов
@@ -43,8 +44,15 @@ CREATE TABLE IF NOT EXISTS export.tfs_receipts
 DISTRIBUTED BY (rq_uid);   -- ← убрать для PostgreSQL
 
 -- Поиск идёт по rq_uid со свежестью по received_at — покрывающий индекс под DISTINCT ON.
+-- file_name в индексе потому, что под одним RqUID лежит по строке на файл: агрегат File
+-- в квитанции ТФС идёт [1-N], и свежая версия выбирается для каждого файла отдельно.
 CREATE INDEX IF NOT EXISTS tfs_receipts_rq_uid_idx
-    ON export.tfs_receipts (rq_uid, received_at DESC);
+    ON export.tfs_receipts (rq_uid, file_name, received_at DESC);
+
+-- 🔧 Миграция существующей таблицы (колонка status_desc добавлена 2026-08-14):
+--
+--   ALTER TABLE export.tfs_receipts ADD COLUMN IF NOT EXISTS status_desc text DEFAULT '';
+--   DROP INDEX IF EXISTS export.tfs_receipts_rq_uid_idx;   -- пересоздать с file_name
 
 
 -- ─────────────────────────────────────────────────────────────────────────────

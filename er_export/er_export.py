@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-14 09:38 MSK · v3.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 11:25 MSK · v3.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -689,14 +689,21 @@ def _er_wait_confirm(gcfg, **context):
 
         bad = [r for r in got if r['status_code'] != 0]
         if bad:
-            add_note({"❌ Квитанции с ошибкой": [f"{r['file_name']}: код {r['status_code']}" for r in bad]},
+            def _why(r):
+                """Код плюс описание из StatusDesc: без него причину пришлось бы искать
+                в raw_xml, а ТФС кладёт туда внятный текст (до 1000 символов)."""
+                desc = (r.get('status_desc') or '').strip()
+                return f"{r['file_name']}: StatusCode={r['status_code']}" + (f" — {desc}" if desc else "")
+
+            add_note({"❌ Квитанции с ошибкой": [_why(r) for r in bad]},
                      level='task,dag', context=context, title='📨 TFS confirm')
             raise AirflowFailException(
-                "ТФС отверг файлы пакета:\n"
-                + "\n".join(f"  • {r['file_name']}: StatusCode={r['status_code']}" for r in bad)
+                "ТФС отверг файлы пакета:\n" + "\n".join(f"  • {_why(r)}" for r in bad)
             )
 
-        if len(got) == len(rq_uids):
+        # Сравниваем ПО RqUID, а не по числу строк: в одной квитанции ТФС может прислать
+        # несколько File, и тогда строк придёт больше, чем отправленных файлов.
+        if not set(rq_uids) - {r['rq_uid'] for r in got}:
             add_note({"✅ Квитанции получены": [f"{r['file_name']} @ {r['rq_tm']}" for r in got]},
                      level='task,dag', context=context, title='📨 TFS confirm')
             return datetime.now(timezone.utc).isoformat()

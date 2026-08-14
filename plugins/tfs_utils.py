@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-13 13:33 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 11:25 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import timedelta
 
 # Общие хелперы Airflow берём из plugins.utils, а не держим свои копии: заметки и
@@ -116,21 +117,62 @@ def send_budget(counts: dict[str, int], limits: dict[str, int]) -> tuple[int, st
     return allowed, (window if allowed == 0 else '')
 
 
-def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> dict:
-    """📨 Разбирает XML обратной квитанции TransferFileCephRs.
+def parse_rq_tm(raw: str):
+    """🕐 RqTm квитанции → datetime. Пусто и неразбираемое → None.
 
-    Битый XML не роняет разбор: возвращается строка со status_code = -1 и текстом
+    Своя нормализация вместо голого fromisoformat, потому что `xsd:dateTime` шире того,
+    что понимает Python 3.9:
+
+      • смещение может быть записано как 'Z' — понимать его fromisoformat научился
+        только в 3.11;
+      • дробная часть секунд бывает любой длины, а 3.9 принимает ровно 3 или 6 знаков:
+        и '…:00.12+03:00', и '…:00.123456789+03:00' роняли разбор одинаково.
+
+    Цена ошибки тут не нулевая: метка времени квитанции терялась молча, оставаясь NULL
+    при живой в остальном строке.
+    """
+    from datetime import datetime
+
+    s = (raw or '').strip()
+    if not s:
+        return None
+
+    if s[-1] in 'Zz':
+        s = s[:-1] + '+00:00'
+
+    # Дробную часть приводим ровно к шести знакам: короткую дополняем, длинную режем.
+    # Наносекунды ТФС мы всё равно не храним — в колонке DateTime64(3).
+    frac = re.match(r'^(.*?)\.(\d+)(.*)$', s)
+    if frac:
+        s = f"{frac.group(1)}.{(frac.group(2) + '000000')[:6]}{frac.group(3)}"
+
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        logger.warning("⚠️ RqTm '%s' не разобран", raw)
+        return None
+
+
+def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> list[dict]:
+    """📨 Разбирает XML обратной квитанции TransferFileCephRs — по строке на файл.
+
+    Список, а не одна строка: по спеке ТФС агрегат `File` идёт `[1-N]`, а `Status`
+    лежит ВНУТРИ `File`, то есть статус у каждого файла свой. Прежний разбор брал первый
+    `Name` и первый `StatusCode` во всём документе — на квитанции с двумя файлами он
+    записал бы успех первого и потерял ошибку второго, а пакет подтвердился бы, не доехав.
+    Ключ таблицы квитанций — (rq_uid, file_name), несколько строк на один RqUID она держит.
+
+    Битый XML не роняет разбор: возвращается одна строка со status_code = -1 и текстом
     в raw_xml. Потерять квитанцию хуже, чем сохранить её неразобранной, а застрявшее
     сообщение заблокировало бы очередь.
 
-    findtext с '{*}' и без: у ТФС встречаются оба варианта — с неймспейсом и без.
+    findall/findtext с '{*}' и без: у ТФС встречаются оба варианта — с неймспейсом и без.
     """
     import xml.etree.ElementTree as ET
-    from datetime import datetime
 
-    row = {
+    base = {
         'rq_uid': '', 'file_name': '', 'scenario_id': '',
-        'status_code': -1, 'rq_tm': None, 'raw_xml': raw,
+        'status_code': -1, 'status_desc': '', 'rq_tm': None, 'raw_xml': raw,
         'kafka_partition': partition, 'kafka_offset': offset,
     }
 
@@ -138,30 +180,36 @@ def parse_receipt(raw: str, partition: int = -1, offset: int = -1) -> dict:
         root = ET.fromstring(raw)
     except ET.ParseError as err:
         logger.error("❌ Квитанция не разобрана как XML (%s): %.500s", err, raw)
-        return row
+        return [base]
 
-    def _text(tag: str) -> str:
-        return (root.findtext(f'.//{{*}}{tag}') or root.findtext(f'.//{tag}') or '').strip()
+    def _text(node, tag: str) -> str:
+        return (node.findtext(f'.//{{*}}{tag}') or node.findtext(f'.//{tag}') or '').strip()
 
-    row['rq_uid']      = _text('RqUID')
-    row['file_name']   = _text('Name')
-    row['scenario_id'] = _text('ScenarioId')
+    base['rq_uid']      = _text(root, 'RqUID')
+    base['scenario_id'] = _text(root, 'ScenarioId')
+    base['rq_tm']       = parse_rq_tm(_text(root, 'RqTm'))
 
-    code = _text('StatusCode')
-    try:
-        row['status_code'] = int(code)
-    except ValueError:
-        logger.error("❌ StatusCode '%s' не число, RqUID=%s", code, row['rq_uid'])
-        return row
+    files = root.findall('.//{*}File') or root.findall('.//File')
+    if not files:
+        # Квитанции без File по спеке не бывает, но терять сообщение из-за этого нельзя:
+        # разбираем документ целиком и берём статус там, где он найдётся.
+        logger.warning("⚠️ В квитанции нет ни одного File, RqUID=%s: %.300s", base['rq_uid'], raw)
+        files = [root]
 
-    rq_tm = _text('RqTm')
-    if rq_tm:
+    rows = []
+    for node in files:
+        # StatusDesc и StatusCode ищутся внутри своего File, а первым в порядке документа
+        # идёт Status — AdditionalStatus (тоже с парой code/desc) лежит после него.
+        row = {**base, 'file_name': _text(node, 'Name'), 'status_desc': _text(node, 'StatusDesc')}
+        code = _text(node, 'StatusCode')
         try:
-            row['rq_tm'] = datetime.fromisoformat(rq_tm)
+            row['status_code'] = int(code)
         except ValueError:
-            logger.warning("⚠️ RqTm '%s' не разобран, RqUID=%s", rq_tm, row['rq_uid'])
+            logger.error("❌ StatusCode '%s' не число, RqUID=%s, файл '%s'",
+                         code, base['rq_uid'], row['file_name'])
+        rows.append(row)
 
-    return row
+    return rows
 
 
 def build_message(scenario_id: str, rq_uid: str, file_name: str) -> str:
@@ -318,22 +366,22 @@ def _ch_hook():
 def _ch_save_receipts(rows: list[dict]) -> None:
     values = ", ".join(
         f"('{_sql_str(r['rq_uid'])}', '{_sql_str(r['file_name'])}', '{_sql_str(r['scenario_id'])}', "
-        f"{int(r['status_code'])}, "
+        f"{int(r['status_code'])}, '{_sql_str(r.get('status_desc', ''))}', "
         f"{'toDateTime64(' + chr(39) + _ts(r['rq_tm']) + chr(39) + ', 3)' if r.get('rq_tm') else 'NULL'}, "
         f"'{_sql_str(r['raw_xml'])}', '{_sql_str(r.get('kafka_topic', ''))}', "
         f"{int(r.get('kafka_partition', -1))}, {int(r.get('kafka_offset', -1))})"
         for r in rows
     )
     _ch_hook().execute(
-        f"INSERT INTO {RECEIPTS_TABLE} (rq_uid, file_name, scenario_id, status_code, rq_tm, "
-        f"raw_xml, kafka_topic, kafka_partition, kafka_offset) VALUES {values}"
+        f"INSERT INTO {RECEIPTS_TABLE} (rq_uid, file_name, scenario_id, status_code, status_desc, "
+        f"rq_tm, raw_xml, kafka_topic, kafka_partition, kafka_offset) VALUES {values}"
     )
 
 
 def _ch_find_receipts(rq_uids: list[str]) -> list[dict]:
     uids = ", ".join(f"'{_sql_str(u)}'" for u in rq_uids)
     return get_dict_from_ch(_ch_hook(), f"""
-        SELECT rq_uid, file_name, status_code, toString(rq_tm) AS rq_tm
+        SELECT rq_uid, file_name, status_code, status_desc, toString(rq_tm) AS rq_tm
         FROM {RECEIPTS_TABLE} FINAL WHERE rq_uid IN ({uids})
     """)
 
@@ -424,24 +472,25 @@ def _pg_exec(sql: str) -> None:
 def _pg_save_receipts(rows: list[dict]) -> None:
     values = ", ".join(
         f"('{_sql_str(r['rq_uid'])}', '{_sql_str(r['file_name'])}', '{_sql_str(r['scenario_id'])}', "
-        f"{int(r['status_code'])}, "
+        f"{int(r['status_code'])}, '{_sql_str(r.get('status_desc', ''))}', "
         f"{chr(39) + _ts(r['rq_tm']) + chr(39) if r.get('rq_tm') else 'NULL'}, "
         f"'{_sql_str(r['raw_xml'])}', '{_sql_str(r.get('kafka_topic', ''))}', "
         f"{int(r.get('kafka_partition', -1))}, {int(r.get('kafka_offset', -1))})"
         for r in rows
     )
     _pg_exec(
-        f"INSERT INTO {RECEIPTS_TABLE} (rq_uid, file_name, scenario_id, status_code, rq_tm, "
-        f"raw_xml, kafka_topic, kafka_partition, kafka_offset) VALUES {values}"
+        f"INSERT INTO {RECEIPTS_TABLE} (rq_uid, file_name, scenario_id, status_code, status_desc, "
+        f"rq_tm, raw_xml, kafka_topic, kafka_partition, kafka_offset) VALUES {values}"
     )
 
 
 def _pg_find_receipts(rq_uids: list[str]) -> list[dict]:
     uids = ", ".join(f"'{_sql_str(u)}'" for u in rq_uids)
     return query_to_dict(_pg_hook(), f"""
-        SELECT DISTINCT ON (rq_uid) rq_uid, file_name, status_code, rq_tm::text AS rq_tm
+        SELECT DISTINCT ON (rq_uid, file_name)
+               rq_uid, file_name, status_code, status_desc, rq_tm::text AS rq_tm
         FROM {RECEIPTS_TABLE} WHERE rq_uid IN ({uids})
-        ORDER BY rq_uid, received_at DESC
+        ORDER BY rq_uid, file_name, received_at DESC
     """)
 
 
@@ -553,23 +602,37 @@ def _s3_hook_key(path: str):
 
 
 def _s3_save_receipts(rows: list[dict]) -> None:
-    import json as _json
+    """Объект на RqUID, а внутри СПИСОК строк — по одной на файл квитанции.
 
+    Список, потому что File у ТФС идёт [1-N] и все файлы приходят под одним RqUID:
+    писали бы по объекту на RqUID из одной строки — второй файл затирал бы первый,
+    и ошибка одного из них исчезала бы вместе с ним.
+    """
+    import json as _json
+    from collections import defaultdict
+
+    by_uid: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
-        row = {**r, 'rq_tm': _ts(r['rq_tm']) if r.get('rq_tm') else None}
-        hook, bucket, key = _s3_hook_key(f"{s3_base()}/receipts/{r['rq_uid']}.json")
-        hook.load_string(string_data=_json.dumps(row, ensure_ascii=False),
+        by_uid[r['rq_uid']].append({**r, 'rq_tm': _ts(r['rq_tm']) if r.get('rq_tm') else None})
+
+    for uid, uid_rows in by_uid.items():
+        hook, bucket, key = _s3_hook_key(f"{s3_base()}/receipts/{uid}.json")
+        hook.load_string(string_data=_json.dumps(uid_rows, ensure_ascii=False),
                          key=key, bucket_name=bucket, replace=True)
 
 
 def _s3_find_receipts(rq_uids: list[str]) -> list[dict]:
+    """Читает объекты квитанций. Принимает обе формы: список строк и одиночную строку —
+    объекты, записанные до перехода на [1-N], остаются читаемыми."""
     import json as _json
 
     found = []
     for uid in rq_uids:
         hook, bucket, key = _s3_hook_key(f"{s3_base()}/receipts/{uid}.json")
-        if hook.check_for_key(key=key, bucket_name=bucket):
-            found.append(_json.loads(hook.read_key(key=key, bucket_name=bucket)))
+        if not hook.check_for_key(key=key, bucket_name=bucket):
+            continue
+        data = _json.loads(hook.read_key(key=key, bucket_name=bucket))
+        found.extend(data if isinstance(data, list) else [data])
     return found
 
 

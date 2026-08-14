@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-14 18:40 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 23:45 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -86,6 +86,14 @@ PG_CONN = ''
 
 # Префикс тракта внутри логового бакета.
 S3_PREFIX = 'tfs'
+
+# Класть тракт ВНУТРЬ префикса логов или в корень бакета.
+#   False — {бакет}/tfs/…                      (по умолчанию)
+#   True  — {бакет}/{префикс логов}/tfs/…      (как было до 2026-08-15)
+# Переключение меняет ПУТЬ К ДАННЫМ: очередь и квитанции, записанные при старом значении,
+# по новому пути не найдутся — файл не уедет, а wait_confirm провисит до таймаута.
+# Менять только на пустом тракте либо перенеся объекты (см. tfs_kafka/README.md).
+S3_UNDER_LOG_PREFIX = False
 
 # 🚦 Лимиты ТФС на маршрут: файлов в секунду / минуту / час / сутки.
 # ТФС отбивает лишние файлы, соблюдать темп должны мы сами. Значения задекларированы
@@ -846,17 +854,26 @@ def _pg_queue_state(rq_uids: list[str]) -> list[dict]:
 # объектов. Скользящее суточное окно живёт максимум в двух соседних датах.
 
 def s3_base() -> str:
-    """Корень тракта в S3 — рядом с логами, из airflow.cfg.
+    """Корень тракта в S3: {логовый бакет}/{S3_PREFIX}, соединение — из airflow.cfg.
 
-    remote_base_log_folder приходит как 's3://bucket/prefix', где 's3' — протокол,
-    а не conn_id. В репозитории принят вид 'conn_id://bucket/key' (его разбирает
+    Бакет и соединение берутся у логов (remote_base_log_folder, remote_log_conn_id):
+    так на каждом стенде они верные сами собой, без отдельной настройки и отдельных
+    ключей доступа. remote_base_log_folder приходит как 's3://bucket/prefix', где 's3' —
+    протокол, а не conn_id; в репозитории принят вид 'conn_id://bucket/key' (его разбирает
     s3_path_parse), поэтому схему подменяем на remote_log_conn_id.
+
+    Префикс логов (часть после бакета) при S3_UNDER_LOG_PREFIX = False отбрасывается:
+    тракт живёт в корне бакета, а не внутри папки логов. Так его видно с первого взгляда
+    и он не попадает под правила чистки, написанные для логов.
     """
     from airflow.configuration import conf
 
     base = conf.get('logging', 'remote_base_log_folder').rstrip('/')
     conn = conf.get('logging', 'remote_log_conn_id')
-    return f"{conn}://{base.split('://', 1)[1]}/{S3_PREFIX}"
+    path = base.split('://', 1)[1]
+    if not S3_UNDER_LOG_PREFIX:
+        path = path.split('/', 1)[0]
+    return f"{conn}://{path}/{S3_PREFIX}"
 
 
 def _s3_hook_key(path: str):
@@ -884,6 +901,9 @@ def _s3_save_receipts(rows: list[dict]) -> None:
         hook, bucket, key = _s3_hook_key(f"{s3_base()}/receipts/{uid}.json")
         hook.load_string(string_data=_json.dumps(uid_rows, ensure_ascii=False),
                          key=key, bucket_name=bucket, replace=True)
+        # Лог записи в ИСТОЧНИК ИСТИНЫ. Без него единственным следом квитанции в логах
+        # оставался INSERT зеркала: выключи ClickHouse — и в логе не видно вообще ничего.
+        logger.info("💾 %s → s3://%s/%s (строк: %d)", uid, bucket, key, len(uid_rows))
 
 
 def _s3_find_receipts(rq_uids: list[str]) -> list[dict]:

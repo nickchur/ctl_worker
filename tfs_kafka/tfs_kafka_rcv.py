@@ -1,5 +1,5 @@
 """📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
-*2026-08-14 11:25 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 23:30 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
 и сопоставляется с отправкой по `RqUID`. Результат передачи — в `File/Status/StatusCode`,
@@ -29,7 +29,7 @@
 (между опросами слот воркера свободен) и держит окно до конца — так квитанция, пришедшая
 на пятой минуте, не обрывает чтение на оставшиеся пятьдесят пять. В конце окна:
 
-* пришла хоть одна квитанция → таск **зелёный**, в XCom их число за окно;
+* пришла хоть одна квитанция → таск **зелёный**, в XCom по записи на квитанцию;
 * за час тишина → таск **скипнут** (`soft_fail`), и стартует следующий ран.
 
 Так пустой час и час с квитанциями видно в UI, не открывая логи.
@@ -54,6 +54,7 @@ Postgres зеркалом, если задан их conn_id. Даг об это�
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -87,8 +88,9 @@ POKE_EVERY = 15
 IDLE_TIMEOUT = 5
 # Потолок сообщений за один опрос: страховка от бесконечного цикла на большом отставании.
 MAX_MESSAGES = 5000
-# Ключ счётчика окна. Между опросами процесс умирает, память не годится, а обычный
-# xcom_push стирается перед каждым опросом — держим через run_state_* (см. tfs_utils).
+# Ключ накопленного за окно: список квитанций, а не счётчик, — из него собирается XCom
+# в конце окна. Между опросами процесс умирает, память не годится, а обычный xcom_push
+# стирается перед каждым опросом, поэтому держим через run_state_* (см. tfs_utils).
 SEEN_KEY = 'seen'
 
 
@@ -110,6 +112,16 @@ SEEN_KEY = 'seen'
 )
 def tfs_kafka_rcv_dag():
 
+    def _push_xcom(context, items: list) -> None:
+        """📤 Кладёт квитанции в XCom: ключ — метка времени, значение — JSON строки.
+
+        Запись на квитанцию, а не одна на окно: так в UI видно, что именно пришло и когда,
+        не дожидаясь конца часа и не открывая логи.
+        """
+        for item in items:
+            context['ti'].xcom_push(key=item['key'],
+                                    value=json.dumps(item['row'], ensure_ascii=False, default=str))
+
     def poke_topic(topic: str, **context) -> PokeReturnValue:
         """📥 Вычитывает квитанции топика и складывает их в хранилище тракта.
 
@@ -128,6 +140,13 @@ def tfs_kafka_rcv_dag():
         from confluent_kafka import OFFSET_STORED, Consumer, TopicPartition
 
         ensure_pools()
+
+        # 📤 XCom восстанавливаем ПЕРВЫМ делом. Airflow чистит XCom таска перед каждым
+        # исполнением (taskinstance.py: `if not self.next_method: self.clear_xcom_data()`),
+        # а в reschedule каждый опрос — отдельное исполнение. Разложи накопленное в конце
+        # опроса — и всё время, пока идёт чтение Kafka, в UI висел бы пустой XCom.
+        seen = list(run_state_get(context, SEEN_KEY) or [])
+        _push_xcom(context, seen)
 
         conn = BaseHook.get_connection(KAFKA_RCV_CONN)
         config = dict(conn.extra_dejson)  # extra_dejson = librdkafka config (контракт Kafka-провайдера)
@@ -183,31 +202,54 @@ def tfs_kafka_rcv_dag():
         finally:
             consumer.close()
 
-        seen = int(run_state_get(context, SEEN_KEY) or 0)
-
         if rows:
-            seen += len(rows)
+            # Что именно пришло — построчно и СВОИМ логом, не логом зеркала. Раньше
+            # единственным следом квитанции был INSERT в ClickHouse: выключено зеркало —
+            # и по логу не сказать, что вообще получено.
+            for r in rows:
+                logger.info("📥 %s | %s | StatusCode=%s%s | %s[%s]@%s",
+                            r['rq_uid'], r['file_name'], r['status_code'],
+                            f" ({r['status_desc']})" if r.get('status_desc') else '',
+                            r.get('kafka_topic', topic), r.get('kafka_partition'), r.get('kafka_offset'))
+
+            # Ключ XCom — метка времени квитанции (RqTm, а при её отсутствии время приёма)
+            # плюс порядковый номер: две строки одной мультифайловой квитанции приходят
+            # с одинаковым RqTm, и без номера вторая затёрла бы первую.
+            now_ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+            fresh = [
+                {'key': f"{str(r.get('rq_tm') or now_ts)[:23]}_{len(seen) + n:03d}",
+                 'row': {'rq_uid': r['rq_uid'], 'file_name': r['file_name'],
+                         'status_code': r['status_code'], 'status_desc': r.get('status_desc') or '',
+                         'scenario_id': r.get('scenario_id', ''), 'topic': r.get('kafka_topic', topic),
+                         'partition': r.get('kafka_partition'), 'offset': r.get('kafka_offset')}}
+                for n, r in enumerate(rows, start=1)
+            ]
+            seen += fresh
             run_state_set(context, SEEN_KEY, seen)
+            _push_xcom(context, fresh)   # пришедшее этим опросом — остальное уже разложено
 
             failed  = [r for r in rows if r['status_code'] > 0]
             unknown = [r for r in rows if r['status_code'] < 0]
             logger.info("📨 %s: квитанций %d (за окно %d), с ошибкой передачи: %d, неразобранных: %d",
-                        topic, len(rows), seen, len(failed), len(unknown))
+                        topic, len(rows), len(seen), len(failed), len(unknown))
 
             # Заметка короткая намеренно: за час опросов их накопится много, а add_note
-            # склеивает записи и режет всё вместе по MAX_NOTE_LEN.
-            line = f"+{len(rows)} (за окно {seen})"
+            # склеивает записи и режет всё вместе по MAX_NOTE_LEN. Уровень task,dag:
+            # в заметке DAG-а виден общий итог рана, в заметке таска — итог своего топика.
+            line = f"+{len(rows)} (за окно {len(seen)})"
             if failed:
                 line += f", ❌ StatusCode != 0: {len(failed)}"
             if unknown:
                 line += f", ⚠️ не разобрано: {len(unknown)}"
-            add_note({f"📨 {topic}": line}, level='dag', context=context, title='📨 tfs_kafka_rcv')
+            add_note({f"📨 {topic}": line}, level='task,dag', context=context, title='📨 tfs_kafka_rcv')
 
         # Окно считаем от старта рана: оно общее для всех топиков и переживает reschedule.
         elapsed = (datetime.now(timezone.utc) - context['dag_run'].start_date).total_seconds()
         if elapsed >= WINDOW and seen:
-            logger.info("✅ %s: окно закрыто, квитанций за час: %d", topic, seen)
-            return PokeReturnValue(is_done=True, xcom_value=seen)
+            logger.info("✅ %s: окно закрыто, квитанций за час: %d", topic, len(seen))
+            # return_value — итог окна одной записью, рядом с пофайловыми выше.
+            return PokeReturnValue(is_done=True, xcom_value={'topic': topic, 'count': len(seen),
+                                                             'receipts': [i['row'] for i in seen]})
 
         # Ложный ответ = ждём дальше. Когда окно выйдет, а seen так и останется нулём,
         # сенсор упрётся в timeout и при soft_fail пометит таск скипнутым.

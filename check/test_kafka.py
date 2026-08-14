@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-12 14:48 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 11:35 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
@@ -105,24 +105,26 @@ KAFKA_CONN_IDS = _kafka_conn_ids()
 # ── Kafka helpers ─────────────────────────────────────────────────────────────
 
 def produce_test_msg(scenario_id: str, file_names: list[str], throttle_delay: int = 1):
-    """Генератор Kafka-сообщений: одно XML-уведомление TransferFileCephRq на каждый файл."""
+    """Генератор Kafka-сообщений: одно XML-уведомление TransferFileCephRq на каждый файл.
+
+    Само сообщение собирает build_message из слоя тракта, своей копии шаблона здесь нет:
+    проверять надо тем же форматом, каким мы шлём в бою, иначе тест перестаёт быть тестом
+    ровно тогда, когда формат меняется. Имя файла тут приходит из параметра запуска,
+    то есть от человека, — экранирование в build_message как раз для таких случаев.
+    """
     import time
     import uuid
 
+    try:
+        from plugins.tfs_utils import build_message  # type: ignore
+    except ImportError:
+        from CI06932748.tools.tfs_utils import build_message  # type: ignore
+
     for file_name in file_names:
         time.sleep(throttle_delay)
-        rq_uuid = str(uuid.uuid4()).replace("-", "")
-        # isoformat(ms) даёт формат TFS 'YYYY-MM-DDTHH:mm:ss.SSSZ' (смещение с двоеточием, +03:00)
-        rq_tm = datetime.now().astimezone().isoformat(timespec="milliseconds")
-        message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<TransferFileCephRq>
-    <RqUID>{rq_uuid}</RqUID>
-    <RqTm>{rq_tm}</RqTm>
-    <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
-    <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
-</TransferFileCephRq>"""
+        rq_uuid = uuid.uuid4().hex
         logger.info("Kafka message prepared: %s", rq_uuid)
-        yield None, message
+        yield None, build_message(scenario_id, rq_uuid, file_name)
 
 
 def on_delivery(err: Exception | None, msg) -> None:

@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-14 11:25 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 11:35 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -218,19 +218,32 @@ def build_message(scenario_id: str, rq_uid: str, file_name: str) -> str:
     RqUID приходит из очереди, а не генерируется здесь: он записан при постановке
     в очередь, и именно по нему потом ищется обратная квитанция.
 
+    Файл в сообщении ровно один, хотя спека и допускает File [1-N]: свой RqUID на файл —
+    это то, что даёт сопоставление квитанции с конкретной отправкой. Пакетом ушла бы
+    одна квитанция на все файлы, и разбирать её пришлось бы по именам.
+
+    FolderSource и FolderTarget не заполняются намеренно: спека помечает их «НЕ заполнять!»,
+    они требуют отдельного согласования с командой ТФС.
+
     Живёт рядом с parse_receipt, а не в даге-отправителе: это формат тракта, и
     оба конца — что мы пишем, что нам отвечают — должны меняться в одном месте.
     """
     from datetime import datetime
+    from xml.sax.saxutils import escape
 
     # isoformat(ms) воспроизводит формат pendulum 'YYYY-MM-DDTHH:mm:ss.SSSZ' (смещение с двоеточием)
     rq_tm = datetime.now().astimezone().isoformat(timespec='milliseconds')
+
+    # Экранируем то, что пришло снаружи. Имена наших архивов безопасны по построению,
+    # но ручная досылка (enqueue_files) берёт имя из параметра запуска, а амперсанд
+    # в имени объекта S3 — законный символ. Неэкранированный, он даёт битый XML,
+    # и ТФС отвечает на него ошибкой разбора, а не отказом по файлу.
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <TransferFileCephRq>
-    <RqUID>{rq_uid}</RqUID>
+    <RqUID>{escape(rq_uid)}</RqUID>
     <RqTm>{rq_tm}</RqTm>
-    <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
-    <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
+    <ScenarioInfo><ScenarioId>{escape(scenario_id)}</ScenarioId></ScenarioInfo>
+    <File><FileInfo><Name>{escape(file_name)}</Name></FileInfo></File>
 </TransferFileCephRq>"""
 
 

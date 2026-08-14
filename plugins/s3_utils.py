@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-08-13 13:33 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 19:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -23,7 +23,13 @@ from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
 from stream_unzip import stream_unzip # type: ignore
 
-from  plugins.utils import readable_size, get_conns_by_type  # type: ignore
+# Фолбэк обязателен: на контуре модуль лежит не в plugins/, а в CI06932748/tools/,
+# и пакета plugins там нет. Без него ломался не только этот файл — tfs_utils, который
+# сам импортируется с фолбэком, падал на импорте s3_utils и уводил в Broken DAG весь тракт.
+try:
+    from plugins.utils import readable_size, get_conns_by_type  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import readable_size, get_conns_by_type  # type: ignore
 
 from fnmatch import fnmatch
 import time

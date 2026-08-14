@@ -1,5 +1,5 @@
 """📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
-*2026-08-14 23:30 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-15 00:05 MSK · v2.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
 и сопоставляется с отправкой по `RqUID`. Результат передачи — в `File/Status/StatusCode`,
@@ -54,7 +54,6 @@ Postgres зеркалом, если задан их conn_id. Даг об это�
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -113,14 +112,17 @@ SEEN_KEY = 'seen'
 def tfs_kafka_rcv_dag():
 
     def _push_xcom(context, items: list) -> None:
-        """📤 Кладёт квитанции в XCom: ключ — метка времени, значение — JSON строки.
+        """📤 Кладёт квитанции в XCom: ключ — метка времени, значение — сама строка.
 
         Запись на квитанцию, а не одна на окно: так в UI видно, что именно пришло и когда,
         не дожидаясь конца часа и не открывая логи.
+
+        Значение — словарь, а НЕ json.dumps от него: XCom сериализует в JSON сам, и строка
+        с JSON внутри давала двойное кодирование — в UI такая запись показывалась как
+        «Invalid input», потому что просмотрщик получал строку вместо объекта.
         """
         for item in items:
-            context['ti'].xcom_push(key=item['key'],
-                                    value=json.dumps(item['row'], ensure_ascii=False, default=str))
+            context['ti'].xcom_push(key=item['key'], value=item['row'])
 
     def poke_topic(topic: str, **context) -> PokeReturnValue:
         """📥 Вычитывает квитанции топика и складывает их в хранилище тракта.

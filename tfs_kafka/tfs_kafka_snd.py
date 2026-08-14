@@ -1,11 +1,11 @@
 """🚚 DAG отправки файлов в ТФС с соблюдением темпа маршрута.
-*2026-08-13 13:33 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 18:40 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Единственное место, откуда файлы ЕР уходят уведомлением в Kafka. Пакетные даги только
 ставят файлы в очередь, а разгребает её этот даг — в темпе, который декларирует ТФС.
 
 📊 **Зачем централизованно.** ТФС отбивает лишние файлы, а лимиты заданы на маршрут:
-файлов в секунду, минуту, час и сутки (см. `TFS_LIMITS` в `plugins/tfs_utils.py`).
+файлов в секунду, минуту, час и сутки (см. `TFS_ROUTES` в `plugins/tfs_utils.py`).
 Считать их можно только там, где видно все отправки сразу. Прежняя схема — `sleep 1`
 внутри `produce_msg` плюс 1-слотовый пул `tfs_{scenario}` — держала темп лишь внутри
 пакета: пул сериализовал соседние `notify_tfs`, но не разводил их по времени, а
@@ -24,18 +24,39 @@
 одного пакета, к следующему не переходим. Так выполняется требование ЕР «не передаётся
 несколько пакетов одновременно» — раньше его держали пулы `tfs_{scenario}`.
 
-🔒 **Пул `tfs_send` на 1 слот** остался, но с другой ролью: он больше не разводит пакеты
-(это делает сама очередь), а страхует от дагов, которые шлют в ТФС **мимо** очереди.
-Такой даг обязан брать тот же пул. В режиме `reschedule` слот занят только на время
-опроса, а не весь час: вхолостую очередь его больше не держит. Учёт лимитов пул всё
-равно не спасает — файлы мимо очереди не попадают в счётчики, поэтому правильный путь
-для нового отправителя не пул, а та же очередь.
+🧭 **Сценарий — свой таск.** На каждый сценарий заводится сенсор `snd_<ScenarioId>`,
+который везёт только свои файлы. Гранулярность не случайна: лимиты ТФС заданы на маршрут,
+и пул взаимного исключения на контуре тоже заведён на маршрут. Топик берётся из
+`TFS_ROUTES` (`plugins/tfs_utils.py`), а чего там нет — по умолчанию: топик контура
+и `TFS_LIMITS_DEFAULT`, так что новый маршрут работает без правки кода. Пакет не рвётся —
+`(replica, package_ts)` целиком принадлежит одному сценарию, то есть одному таску.
+
+📇 **Состав тасков — из реестра.** Список сценариев руками не ведут: таск `scan_queue`
+читает очередь и дописывает найденные сценарии в Variable `tfs_snd_scenarios`, а парсинг
+DAG-файла разворачивает `TFS_ROUTES ∪ реестр` в таски. Новый сценарий получает свой таск
+на следующем разборе файла (шедулер добавляет его и в уже идущий ран), поэтому файл
+уезжает в пределах того же часа.
+
+🗑️ **Выключатель — пул.** Удалили `tfs_<ScenarioId>` руками — `scan_queue` уберёт сценарий
+из реестра, и таск исчезнет на следующем разборе файла (в идущем ране Airflow пометит его
+`removed`). Сценарий из `TFS_ROUTES` так не выключить: его пул заводится заново из конфига.
+Не выключить и тот, чьи файлы ещё лежат в очереди, — следующий скан заведёт всё обратно,
+сначала надо разобрать очередь.
+
+🔒 **Пул `tfs_<ScenarioId>` на 1 слот.** Имя ровно такое, какое уже заведено на контуре
+(`tfs_HRPLATFORM-4000`, `tfs_KKA-407010`, …) и какое берёт `xs_export` — в этом и смысл:
+пул страхует от дагов, которые шлют по тому же маршруту **мимо** очереди. Пул с другим
+именем не пересекался бы с ними и не давал бы ничего. В режиме `reschedule` слот занят
+только на время опроса, а не весь час. Учёт лимитов пул всё равно не спасает — файлы мимо
+очереди не попадают в счётчики, поэтому правильный путь для нового отправителя не пул,
+а та же очередь.
 
 📮 **Ручная досылка** через параметры запуска не обходит очередь, а наполняет её
 (`enqueue_files` в `plugins/tfs_utils.py`): так досланный руками файл попадает в учёт
-лимитов и потом находится по RqUID вместе с остальными. Параметры разбираются ровно
-один раз за ран — на первом опросе, иначе за час окна те же файлы уехали бы в очередь
-двести сорок раз, каждый с новым RqUID.
+лимитов и потом находится по RqUID вместе с остальными. Разбирает их `scan_queue`, ровно
+один раз за ран, иначе за час окна те же файлы уехали бы в очередь шестьдесят раз, каждый
+с новым RqUID. Везёт досланное, как и всё остальное, таск того сценария, который указан
+в параметрах.
 
 ⏳ **Бюджет кончился** — файлы остаются в очереди и уедут, когда окно откроется. Если
 в конце окна самая старая строка ждёт дольше `TFS_QUEUE_ALERT_MIN`, таск падает: затор
@@ -53,23 +74,27 @@ from airflow.sensors.base import PokeReturnValue  # type: ignore
 
 try:
     from plugins.tfs_utils import (  # type: ignore
-        get_config, add_note, tfs_limits, send_budget, build_message, window_hits, WINDOWS,
-        enqueue_files, order_queue, pending, mark_sent, sent_counts,
-        run_state_get, run_state_set,
+        get_config, add_note, ensure_pool, tfs_limits, send_budget, build_message,
+        window_hits, WINDOWS, enqueue_files, order_queue, parse_ts, pending, mark_sent,
+        drop_unpooled_scenarios, remember_scenarios, route_topic, scenario_pool,
+        sent_counts, task_slug, tfs_route, run_state_get, run_state_set,
     )
 except ImportError:
     from CI06932748.tools.tfs_utils import (  # type: ignore
-        get_config, add_note, tfs_limits, send_budget, build_message, window_hits, WINDOWS,
-        enqueue_files, order_queue, pending, mark_sent, sent_counts,
-        run_state_get, run_state_set,
+        get_config, add_note, ensure_pool, tfs_limits, send_budget, build_message,
+        window_hits, WINDOWS, enqueue_files, order_queue, parse_ts, pending, mark_sent,
+        drop_unpooled_scenarios, remember_scenarios, route_topic, scenario_pool,
+        sent_counts, task_slug, tfs_route, run_state_get, run_state_set,
     )
 
 _cfg             = get_config()
 DEF_ARGS         = _cfg['DEF_ARGS']
 KAFKA_SND_CONN   = _cfg['KAFKA_SND_CONN']
-KAFKA_SND_TOPIC  = _cfg['KAFKA_SND_TOPIC']
 QUEUE_ALERT_MIN  = _cfg['TFS_QUEUE_ALERT_MIN']
-SEND_POOL        = _cfg['TFS_SEND_POOL']
+SEND_SLOTS       = _cfg['TFS_SEND_SLOTS']
+# Сценарии читаются НА ПАРСИНГЕ: из TFS_ROUTES и реестра-Variable, который наполняет
+# таск scan_queue по очереди отправки. Список задаёт состав тасков дага.
+SCENARIOS        = _cfg['SCENARIOS']
 
 logger = logging.getLogger("airflow.task")
 
@@ -77,11 +102,14 @@ logger = logging.getLogger("airflow.task")
 WINDOW = 60 * 60
 # Пауза между опросами. В reschedule на это время слот пула освобождается.
 POKE_EVERY = 15
+# Шаг сканирования очереди на новые сценарии: реестр меняется редко, торопиться некуда.
+SCAN_EVERY = 60
 # Бюджет одного опроса, сек: меньше шага цикла, чтобы опросы не наезжали друг на друга.
 POKE_BUDGET_SEC = 10
 # Ключи состояния окна. Между опросами процесс умирает, память не годится, а обычный
 # xcom_push стирается перед каждым опросом — держим через run_state_* (см. tfs_utils).
 SENT_KEY   = 'sent'
+SEEN_KEY   = 'new_scenarios'
 PARAMS_KEY = 'params_done'
 
 
@@ -119,9 +147,9 @@ def tfs_kafka_snd_dag():
     def _enqueue_params_once(context) -> None:
         """📮 Разбирает параметры запуска и ставит файлы в очередь — один раз за ран.
 
-        Признак «уже разобрали» лежит в XCom: сенсор опрашивает очередь каждые 15 секунд,
-        а enqueue_files каждый раз заводит новые RqUID, так что второй проход размножил бы
-        досылку. Ошибка настройки (файлы без маршрута) не должна ронять весь ран отправки —
+        Признак «уже разобрали» лежит в state-объекте: scan_queue опрашивает очередь
+        раз в минуту, а enqueue_files каждый раз заводит новые RqUID, так что второй
+        проход размножил бы досылку. Ошибка настройки не должна ронять весь ран отправки —
         она в лог и в заметку, очередь при этом разгребается дальше.
         """
         if run_state_get(context, PARAMS_KEY):
@@ -151,11 +179,14 @@ def tfs_kafka_snd_dag():
 
         logger.info("📮 Из параметров запуска в очередь добавлено файлов: %d", len(rows))
 
-    def poke_queue(**context) -> PokeReturnValue:
-        """🚚 Отправляет из очереди столько файлов, сколько позволяет бюджет маршрута.
+    def poke_queue(scenario: str, **context) -> PokeReturnValue:
+        """🚚 Отправляет файлы своего сценария в темпе, который декларирует ТФС.
 
-        Пул `tfs_send` на 1 слот удерживается на время опроса: пока очередь передаёт,
-        никто другой в ТФС не пишет. Даг, шлющий мимо очереди, обязан брать тот же пул.
+        Таск на сценарий, а не на всю очередь: лимиты заданы на маршрут, и пул
+        `tfs_<scenario>` на 1 слот удерживается на время опроса — пока таск передаёт,
+        по этому маршруту не пишет никто, включая дагов, которые шлют мимо очереди
+        (xs_export берёт этот же пул). Пакет при этом не рвётся: `(replica, package_ts)`
+        целиком принадлежит одному сценарию, то есть одному таску.
 
         ⚠️ Здесь нельзя кидать AirflowFailException: при soft_fail сенсор превращает его
         в скип (airflow/sensors/base.py), и затор о себе не заявит. Для этого AirflowException.
@@ -164,77 +195,77 @@ def tfs_kafka_snd_dag():
 
         from airflow.providers.apache.kafka.hooks.produce import KafkaProducerHook
 
-        _enqueue_params_once(context)
-
         total = int(run_state_get(context, SENT_KEY) or 0)
         # Окно считаем от старта рана: оно переживает reschedule, в отличие от таймеров опроса.
         elapsed = (datetime.now(timezone.utc) - context['dag_run'].start_date).total_seconds()
         last_poke = elapsed >= WINDOW
 
-        queued = pending()
+        queued = [r for r in pending() if r.get('scenario_id') == scenario]
         if not queued:
-            logger.info("📭 Очередь пуста")
-            return _finish(context, total, left=[], blocked={}, last_poke=last_poke)
+            logger.info("📭 %s: очередь пуста", scenario)
+            return _finish(context, scenario, total, left=[], blocked='', last_poke=last_poke)
 
         queue = order_queue(queued)
-        logger.info("📦 В очереди %d файлов, пакетов: %d",
-                    len(queue), len({(r['replica'], r['package_ts']) for r in queue}))
+        topic = route_topic(scenario)
+        limits = tfs_limits(scenario)
+        logger.info("📦 %s → %s: в очереди %d файлов, пакетов: %d, лимиты %s",
+                    scenario, topic, len(queue),
+                    len({(r['replica'], r['package_ts']) for r in queue}), limits)
+
+        # Предупреждаем один раз за опрос, а не в route_topic: там это четыре записи
+        # в минуту на файл. Видно сразу, что справочник маршрутов отстал.
+        planned = tfs_route(scenario).get('topic')
+        if planned != topic:
+            logger.warning("⚠️ %s: %s — файлы уходят в топик по умолчанию %s", scenario,
+                           f"маршрут ведёт в {planned}, которого нет на контуре" if planned
+                           else "не описан в TFS_ROUTES", topic)
 
         producer = KafkaProducerHook(kafka_config_id=KAFKA_SND_CONN).get_producer()
         deadline = time.time() + POKE_BUDGET_SEC
-        sent, blocked = [], {}
+        sent, blocked = [], ''
         # Расход лимитов: снимок из хранилища на начало опроса + времена собственных
-        # отправок. Хранилище опрашивается ОДИН раз на маршрут за опрос, а не на каждый
-        # файл: на S3-раскладке это листинг префикса, и в цикле он умножался на длину
-        # очереди. Свои отправки стареют сами — окна считает тот же window_hits.
-        snapshot: dict[str, dict] = {}
-        mine: dict[str, list] = {}
+        # отправок. Хранилище опрашивается ОДИН раз за опрос, а не на каждый файл:
+        # на S3-раскладке это листинг префикса, и в цикле он умножался на длину очереди.
+        # Свои отправки стареют сами — окна считает тот же window_hits.
+        snapshot = sent_counts(scenario)
+        mine: list = []
 
         for row in queue:
             if time.time() >= deadline:
                 logger.info("⏱️ Бюджет опроса вышел, остальное уедет следующим")
                 break
 
-            scenario = row['scenario_id']
-            if scenario in blocked:
-                continue  # маршрут упёрся в лимит, остальные его файлы ждут
-
-            limits = tfs_limits(scenario)
-            if scenario not in snapshot:
-                snapshot[scenario] = sent_counts(scenario)
-                mine[scenario] = []
-
             now_ = datetime.now(timezone.utc)
             # Через .get, а не копией: send_budget разрешает бэкенду вернуть неполный
             # словарь окон, и наши собственные отправки прибавляются к любому из них.
-            counts = {w: snapshot[scenario].get(w, 0) for w in WINDOWS}
-            for ts in mine[scenario]:
+            counts = {w: snapshot.get(w, 0) for w in WINDOWS}
+            for ts in mine:
                 for window in window_hits(ts, now_):
                     counts[window] += 1
 
             allowed, hit = send_budget(counts, limits)
             if not allowed:
-                blocked[scenario] = hit
+                blocked = hit
                 logger.warning("🚦 %s: упёрлись в лимит '%s' (%s), файлы ждут",
                                scenario, hit, limits[hit])
-                continue
+                break  # маршрут упёрся в лимит — весь остаток очереди этого таска ждёт
 
             # Секундный лимит выдерживаем паузой: это единственное окно, которое
             # закрывается достаточно быстро, чтобы его имело смысл переждать в опросе.
             gap = 1.0 / limits['sec']
-            if mine[scenario]:
-                since = (datetime.now(timezone.utc) - mine[scenario][-1]).total_seconds()
+            if mine:
+                since = (datetime.now(timezone.utc) - mine[-1]).total_seconds()
                 if since < gap:
                     time.sleep(gap - since)
 
-            producer.produce(KAFKA_SND_TOPIC, value=build_message(scenario, row['rq_uid'], row['file_name']))
+            producer.produce(topic, value=build_message(scenario, row['rq_uid'], row['file_name']))
             producer.flush()
 
             # Отметка отправки — только после подтверждения доставки
             mark_sent(row['rq_uid'])
-            mine[scenario].append(datetime.now(timezone.utc))
+            mine.append(datetime.now(timezone.utc))
             sent.append(row)
-            logger.info("📤 %s → %s (RqUID %s)", row['file_name'], scenario, row['rq_uid'])
+            logger.info("📤 %s → %s (RqUID %s)", row['file_name'], topic, row['rq_uid'])
 
         left = [r for r in queue if r not in sent]
 
@@ -245,14 +276,15 @@ def tfs_kafka_snd_dag():
             # склеивает записи и режет всё вместе по MAX_NOTE_LEN.
             line = f"📤 +{len(sent)} (за окно {total})"
             if blocked:
-                line += f", 🚦 лимит: {', '.join(blocked)}"
+                line += f", 🚦 лимит: {blocked}"
             if left:
                 line += f", ⏳ в очереди {len(left)}"
-            add_note({"🚚 Отправка": line}, level='dag', context=context, title='🚚 tfs_kafka_snd')
+            add_note({f"🚚 {scenario}": line}, level='dag', context=context, title='🚚 tfs_kafka_snd')
 
-        return _finish(context, total, left, blocked, last_poke)
+        return _finish(context, scenario, total, left, blocked, last_poke)
 
-    def _finish(context, total: int, left: list, blocked: dict, last_poke: bool) -> PokeReturnValue:
+    def _finish(context, scenario: str, total: int, left: list, blocked: str,
+                last_poke: bool) -> PokeReturnValue:
         """Итог опроса: ждать дальше, зеленеть или заявить о заторе.
 
         Затор проверяем ТОЛЬКО на последнем опросе окна: сработай он в середине —
@@ -261,35 +293,114 @@ def tfs_kafka_snd_dag():
         if not last_poke:
             return PokeReturnValue(is_done=False)
 
-        if left:
-            oldest = min(r['created_at'] for r in left)
-            waiting = (datetime.now(timezone.utc) - oldest.replace(tzinfo=timezone.utc)).total_seconds() / 60
+        # parse_ts, а не .replace(tzinfo=...): created_at приходит из S3 СТРОКОЙ,
+        # и на строке этот вызов падал TypeError вместо внятного сообщения о заторе.
+        waits = [ts for ts in (parse_ts(r.get('created_at')) for r in left) if ts]
+        if waits:
+            oldest = min(waits)
+            waiting = (datetime.now(timezone.utc) - oldest).total_seconds() / 60
             if waiting > QUEUE_ALERT_MIN:
                 raise AirflowException(
-                    f"🚦 Очередь отправки ТФС стоит {waiting:.0f} мин при пороге {QUEUE_ALERT_MIN}. "
-                    f"Ждут {len(left)} файлов, упёршиеся лимиты: {blocked or 'нет'}. "
-                    f"Самый старый файл в очереди с {oldest}"
+                    f"🚦 Очередь маршрута {scenario} стоит {waiting:.0f} мин при пороге "
+                    f"{QUEUE_ALERT_MIN}. Ждут {len(left)} файлов, упёршийся лимит: "
+                    f"{blocked or 'нет'}. Самый старый файл в очереди с {oldest:%Y-%m-%d %H:%M:%S} UTC"
                 )
 
         if total:
-            logger.info("✅ Окно закрыто, отправлено за час: %d", total)
+            logger.info("✅ %s: окно закрыто, отправлено за час: %d", scenario, total)
             return PokeReturnValue(is_done=True, xcom_value=total)
 
         # Ничего не ушло за весь час — сенсор упрётся в timeout и пометит таск скипнутым.
         return PokeReturnValue(is_done=False)
 
+    def poke_scan(**context) -> PokeReturnValue:
+        """🔎 Ищет в очереди сценарии, у которых ещё нет своего таска, и заводит их.
+
+        Отправкой не занимается: файлы маршрута везёт ТОЛЬКО его таск — тот, что держит
+        пул `tfs_<scenario>`. Возьмись за них кто-то ещё, он держал бы чужой пул, и
+        взаимное исключение с отправителем мимо очереди (xs_export) перестало бы работать.
+
+        Что делает за опрос: разбирает параметры запуска, читает очередь, дописывает
+        незнакомые сценарии в реестр (Variable) и сразу заводит их пулы — таск
+        с несуществующим пулом Airflow не поставит в очередь вовсе. И наоборот: сценарий,
+        у которого пул удалили руками, уходит из реестра вместе с таском — пул тут
+        выключатель маршрута.
+
+        Опрос раз в минуту, а не раз в 15 секунд: реестр меняется редко, а очередь этот
+        таск читает целиком. Найденный сценарий получает свой таск на следующем разборе
+        DAG-файла, и шедулер добавляет его в УЖЕ идущий ран (DagRun.verify_integrity),
+        так что файл уезжает в пределах того же часа.
+        """
+        _enqueue_params_once(context)
+
+        rows = pending()
+        found = sorted({r.get('scenario_id', '') for r in rows} - {''})
+        blank = [r for r in rows if not r.get('scenario_id')]
+        if blank:
+            logger.warning("⚠️ В очереди %d строк без scenario_id — их не увезёт никто: %s",
+                           len(blank), [r.get('file_name') for r in blank[:5]])
+
+        new = remember_scenarios(found)
+        for scenario in new:
+            ensure_pool(
+                scenario_pool(scenario), slots=SEND_SLOTS,
+                description=(f'TFS сценарий {scenario} — макс. {SEND_SLOTS} уведомление '
+                             'одновременно. Заведён автоматически по очереди отправки'),
+            )
+            logger.warning("🆕 Новый сценарий %s: пул %s заведён, таск появится после "
+                           "разбора DAG-файла", scenario, scenario_pool(scenario))
+
+        # ПОСЛЕ пополнения: у только что найденного сценария пул уже есть, и он не будет
+        # выброшен тем же опросом. Сценарий, чьи файлы ещё в очереди, вернётся сюда
+        # следующим сканом — выключатель работает по разобранной очереди.
+        gone = drop_unpooled_scenarios()
+        for scenario in gone:
+            logger.warning("🗑️ Сценарий %s убран из реестра: пула %s больше нет. Таск "
+                           "исчезнет после разбора DAG-файла", scenario, scenario_pool(scenario))
+
+        seen = set(run_state_get(context, SEEN_KEY) or []) | set(new)
+        if new or gone:
+            run_state_set(context, SEEN_KEY, sorted(seen))
+            note = {}
+            if new:
+                note["🆕 Новые сценарии"] = ", ".join(sorted(seen))
+            if gone:
+                note["🗑️ Убраны (нет пула)"] = ", ".join(sorted(gone))
+            add_note(note, level='dag', context=context, title='🚚 tfs_kafka_snd')
+
+        logger.info("🔎 В очереди %d файлов, сценариев %d: %s. С таском: %s",
+                    len(rows), len(found), found or '—', SCENARIOS)
+
+        elapsed = (datetime.now(timezone.utc) - context['dag_run'].start_date).total_seconds()
+        if elapsed >= WINDOW:
+            return PokeReturnValue(is_done=True, xcom_value=sorted(seen))
+
+        return PokeReturnValue(is_done=False)
+
     # timeout заведомо больше окна: сенсор проверяет его ТОЛЬКО после ложного ответа,
     # поэтому зелёный по концу окна успевает сработать первым, а скип по таймауту
     # достаётся ровно случаю «за час отправлять было нечего».
+    for _scen in SCENARIOS:
+        task.sensor(
+            task_id=f"snd_{task_slug(_scen)}",
+            mode='reschedule',
+            poke_interval=POKE_EVERY,
+            timeout=WINDOW + 2 * POKE_EVERY,
+            soft_fail=True,
+            pool=scenario_pool(_scen),
+            doc_md=f"Отправка файлов сценария `{_scen}` в темпе маршрута",
+        )(poke_queue)(scenario=_scen)
+
+    # Скипается (soft_fail по таймауту), когда за час новых сценариев не нашлось —
+    # ровно как отправители на пустой очереди.
     task.sensor(
-        task_id="send",
+        task_id="scan_queue",
         mode='reschedule',
-        poke_interval=POKE_EVERY,
-        timeout=WINDOW + 2 * POKE_EVERY,
+        poke_interval=SCAN_EVERY,
+        timeout=WINDOW + 2 * SCAN_EVERY,
         soft_fail=True,
-        pool=SEND_POOL,
-        doc_md="Разбор очереди отправки в ТФС в темпе маршрута",
-    )(poke_queue)()
+        doc_md="Реестр сценариев очереди: новым заводит пул, таск появится после разбора файла",
+    )(poke_scan)()
 
 
 tfs_kafka_snd_dag()  # вызов регистрирует DAG в globals() через декоратор @dag

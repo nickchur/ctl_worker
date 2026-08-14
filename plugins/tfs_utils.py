@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-14 12:05 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 18:40 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import timedelta
 
@@ -33,9 +34,28 @@ except ImportError:
 
 CH_ID = 'dlab-click'   # зеркало тракта в ClickHouse; пусто — выключено
 
+# 🌍 Контур. Платформа выставляет ENV_SPACE='alpha' в airflow_entrypoint.py:75, всё
+# остальное считаем sigma. ENV_STAND для этого не годится: DEV и PROM есть у обоих
+# контуров, и по нему альфу от сигмы не отличить.
+ENV_SPACE = 'alpha' if (os.getenv('ENV_SPACE') or '').strip().lower() == 'alpha' else 'sigma'
+
 # IN/OUT в conn_id и топиках — сторона ТФС: пишем мы в его вход, читаем из его выхода.
 KAFKA_SND_CONN  = 'tfs-kafka-in'
-KAFKA_SND_TOPIC = 'TFS.HRPLT.IN'
+
+# Топики отправки НА КОНТУР: на альфе маршрут ПКАП, на сигме — HRPLT. Список, а не
+# строка: на каждый топик в tfs_kafka_snd заводится свой таск-сенсор (как у приёмника),
+# и добавление маршрута сводится к строчке здесь. Какой файл в какой топик — решает
+# не этот список, а топик его сценария в TFS_ROUTES.
+SND_TOPICS_BY_SPACE = {
+    'alpha': ['TFS.PKAPHR.IN'],
+    'sigma': ['TFS.HRPLT.IN'],
+}
+KAFKA_SND_TOPICS = SND_TOPICS_BY_SPACE[ENV_SPACE]
+
+# Топик по умолчанию — первый в списке. В него уезжают файлы сценариев, которых нет
+# в TFS_ROUTES: маршрут может появиться раньше строчки в коде, и лучше отправить туда,
+# куда ходит весь контур, чем держать файл в очереди до разбирательства.
+DEFAULT_SND_TOPIC = KAFKA_SND_TOPICS[0]
 
 # Топики квитанций общие на ВСЕ маршруты ТФС, поэтому читает их ровно один потребитель —
 # даг tfs_kafka_rcv. Выгрузки сюда не ходят: они ждут строку в RECEIPTS_TABLE.
@@ -73,33 +93,164 @@ S3_PREFIX = 'tfs'
 # в Kafka — гипотеза не доказана, поэтому числа держим здесь и правим по факту.
 # Все окна скользящие: полночь суточный бюджет не обнуляет.
 TFS_LIMITS_DEFAULT = {'sec': 10, 'min': 200, 'hour': 500, 'day': 2000}
-TFS_LIMITS: dict[str, dict[str, int]] = {
-    'HRPLATFORM-2100': {'sec': 1, 'min': 15, 'hour': 100, 'day': 500},
+
+# 🗺️ Справочник маршрутов: всё про сценарий в одном месте — топик отправки и лимиты.
+# Топик здесь, а не у отправителя, потому что решение «в какой топик» принимается
+# по файлу в очереди, а у файла из всех признаков маршрута есть только scenario_id.
+TFS_ROUTES: dict[str, dict] = {
+    'HRPLATFORM-4000': {'topic': 'TFS.HRPLT.IN', 'limits': TFS_LIMITS_DEFAULT},
+    'HRPLATFORM-2100': {'topic': 'TFS.HRPLT.IN',
+                        'limits': {'sec': 1, 'min': 15, 'hour': 100, 'day': 500}},
+    # ПКАП (альфа, TFS.PKAPHR.IN): ScenarioId ещё не выдан. Пока строки нет, его файлы
+    # уедут в топик по умолчанию — с предупреждением в логе (route_topic).
 }
 
 # Очередь старше этого возраста (мин) роняет даг-отправитель: затор должен быть виден
 # в мониторинге, а не только в логе.
 TFS_QUEUE_ALERT_MIN = 60
 
-# 🔒 Пул на 1 слот: в ТФС пишет кто-то один. Его берёт tfs_kafka_snd и обязан брать любой
-# даг, который шлёт в ТФС МИМО очереди.
+# 🔒 Пул на 1 слот НА СЦЕНАРИЙ: файлы одного маршрута отправляет кто-то один. Пул своего
+# сценария берёт таск tfs_kafka_snd и обязан брать любой даг, который шлёт в ТФС МИМО
+# очереди — именно так делает xs_export (xs_common.py, tfs_out_pool).
+#
+# Имя ровно `tfs_<scenario_id>`: такие пулы уже заведены на контуре (tfs_HRPLATFORM-4000,
+# tfs_HRPLATFORM-2100, tfs_KKA-407010, tfs_27671910…). Совместимость тут и есть смысл —
+# пул с другим именем не пересекался бы с чужим отправителем того же маршрута, то есть
+# не давал бы ничего.
 #
 # Что даёт и чего не даёт: взаимное исключение — да, соблюдение лимитов — нет. Отправитель
 # мимо очереди не пишет в SENT_FILES_TABLE, поэтому его файлы не попадут в счётчики.
-#
-# Пул один общий, а не tfs_{scenario}: пул назначается таску при разборе файла, а
-# tfs_kafka_snd — один таск на все сценарии и заранее не знает, чьи файлы попадутся.
-TFS_SEND_POOL  = 'tfs_send'
+TFS_SEND_POOL_PREFIX = 'tfs_'
 TFS_SEND_SLOTS = 1
+
+# 📇 Реестр сценариев: {scenario_id: когда впервые увидели в очереди, ISO}. Пишет его
+# таск scan_queue, читает парсинг tfs_kafka_snd — по одному таску на сценарий.
+# Сценарии из TFS_ROUTES в реестре не нуждаются: они попадают в список и без него.
+SCENARIOS_VAR = 'tfs_snd_scenarios'
 
 # Пул приёмника — отдельный, чтобы чтение квитанций не ждало отправку.
 TFS_RCV_POOL   = 'default_pool'
 
 logger = logging.getLogger("airflow.task")
 
+def tfs_route(scenario_id: str) -> dict:
+    """🗺️ Запись маршрута из TFS_ROUTES; пустой словарь, если сценарий не описан."""
+    return TFS_ROUTES.get(scenario_id) or {}
+
+
 def tfs_limits(scenario_id: str) -> dict[str, int]:
-    """🚦 Лимиты маршрута: свои из TFS_LIMITS либо общие TFS_LIMITS_DEFAULT."""
-    return TFS_LIMITS.get(scenario_id, TFS_LIMITS_DEFAULT)
+    """🚦 Лимиты маршрута: свои из TFS_ROUTES либо общие TFS_LIMITS_DEFAULT."""
+    return tfs_route(scenario_id).get('limits') or TFS_LIMITS_DEFAULT
+
+
+def route_topic(scenario_id: str) -> str:
+    """📮 Топик отправки маршрута; иначе DEFAULT_SND_TOPIC.
+
+    Топик по умолчанию, а не отказ: иначе файл сценария, который ещё не завели
+    в TFS_ROUTES, лежал бы в очереди до правки кода.
+
+    Топик маршрута берётся, ТОЛЬКО если он есть на этом контуре. Иначе файл был бы ничьим
+    так же, как без маршрута вовсе: таски заводятся по KAFKA_SND_TOPICS, и строку с чужим
+    топиком не забрал бы ни один из них. Живой пример: на альфе HRPLATFORM-4000 указывает
+    на TFS.HRPLT.IN, которого там нет.
+
+    Функция намеренно молчит: её зовут на каждую строку очереди в каждом опросе, то есть
+    четыре раза в минуту на файл. О подмене предупреждает отправитель — один раз, в момент
+    отправки (`tfs_kafka_snd`), где это и видно в логе рядом с самим файлом.
+    """
+    topic = tfs_route(scenario_id).get('topic')
+    return topic if topic in KAFKA_SND_TOPICS else DEFAULT_SND_TOPIC
+
+
+def scenario_pool(scenario_id: str) -> str:
+    """🔒 Пул сценария: HRPLATFORM-4000 → tfs_HRPLATFORM-4000.
+
+    Имя не выдумано, а взято у уже существующих пулов контура — см. комментарий
+    к TFS_SEND_POOL_PREFIX.
+    """
+    return f"{TFS_SEND_POOL_PREFIX}{scenario_id}"
+
+
+def task_slug(scenario_id: str) -> str:
+    """scenario_id → безопасный кусок task_id.
+
+    Airflow допускает в task_id только [A-Za-z0-9_.-]; настоящие сценарии
+    (HRPLATFORM-4000, KKA-407010, 27671910) проходят как есть, но реестр наполняется
+    из очереди, а туда сценарий приходит извне — поэтому чужие символы заменяются.
+    """
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', scenario_id)
+
+
+def known_scenarios() -> list[str]:
+    """📇 Сценарии, на которые заводятся таски: TFS_ROUTES ∪ реестр из Variable.
+
+    Читается НА ПАРСИНГЕ DAG-файла, поэтому Variable берётся через try/except: без неё
+    остаются сценарии из конфига, а не Broken DAG. Сценарий из очереди попадает сюда
+    через scan_queue — своим таском он обзаведётся на следующем разборе файла.
+    """
+    from airflow.models import Variable
+
+    found = set(TFS_ROUTES)
+    try:
+        found |= set(Variable.get(SCENARIOS_VAR, deserialize_json=True, default_var=None) or {})
+    except Exception as exc:
+        logger.warning("⚠️ Реестр сценариев %s не прочитан (%s), берём только TFS_ROUTES",
+                       SCENARIOS_VAR, exc)
+    return sorted(s for s in found if s)
+
+
+def remember_scenarios(found: list[str]) -> list[str]:
+    """📇 Дописывает незнакомые сценарии в реестр; возвращает добавленные.
+
+    Существующие записи не трогаются: в них время ПЕРВОЙ встречи, по нему потом видно,
+    когда маршрут появился.
+    """
+    from datetime import datetime, timezone
+
+    from airflow.models import Variable
+
+    known = Variable.get(SCENARIOS_VAR, deserialize_json=True, default_var=None) or {}
+    new = [s for s in dict.fromkeys(found) if s and s not in known]
+    if not new:
+        return []
+
+    stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    known.update({s: stamp for s in new})
+    Variable.set(SCENARIOS_VAR, known, serialize_json=True)
+    return new
+
+
+def drop_unpooled_scenarios() -> list[str]:
+    """🗑️ Убирает из реестра сценарии, у которых удалили пул; возвращает убранные.
+
+    Пул — выключатель маршрута. Удалили `tfs_<scenario>` руками — значит сценарий больше
+    не нужен: он уходит из реестра, а его таск исчезает на следующем разборе DAG-файла
+    (в идущем ране Airflow пометит его `removed`). Другого способа убрать таск нет —
+    реестр наполняется автоматически, и сам по себе сценарий из него не выпадает.
+
+    Сценарии из TFS_ROUTES так не выключить: их пул заводится заново из конфига
+    (`ensure_pools`), да и таск у них есть и без реестра. Не сработает выключатель и на
+    сценарии, чьи файлы ещё лежат в очереди: следующий же скан увидит их и заведёт всё
+    обратно — сначала надо разобрать очередь.
+    """
+    from airflow.models import Pool, Variable
+    from airflow.utils.session import create_session
+
+    known = Variable.get(SCENARIOS_VAR, deserialize_json=True, default_var=None) or {}
+    if not known:
+        return []
+
+    with create_session() as session:
+        alive = {p.pool for p in session.query(Pool).all()}
+
+    gone = [s for s in known if scenario_pool(s) not in alive]
+    if not gone:
+        return []
+
+    for s in gone:
+        known.pop(s, None)
+    Variable.set(SCENARIOS_VAR, known, serialize_json=True)
+    return gone
 
 
 def send_budget(counts: dict[str, int], limits: dict[str, int]) -> tuple[int, str]:
@@ -335,15 +486,24 @@ def ensure_pools() -> None:
     но лишний SELECT на каждом обходе scheduler-ом всё равно ни к чему.
 
     Делает это приёмник — он опрашивает топики постоянно и сам сидит в default_pool, поэтому
-    создаст tfs_send до того, как отправителю понадобится слот: таск с несуществующим
+    создаст пулы до того, как отправителю понадобится слот: таск с несуществующим
     пулом Airflow просто не поставит в очередь.
+
+    Пул на каждый сценарий ИЗ КОНФИГА (см. комментарий к TFS_SEND_POOL_PREFIX). Сценарии
+    из реестра сюда намеренно не входят: их пул заводит scan_queue один раз, при находке,
+    и удаление такого пула руками выключает маршрут (drop_unpooled_scenarios). Заводи их
+    здесь — приёмник восстанавливал бы пул через полминуты и выключатель не работал бы.
+
+    Уже существующие пулы ensure_pool не трогает, поэтому руками выставленные слоты живы.
     """
-    ensure_pool(
-        TFS_SEND_POOL, slots=TFS_SEND_SLOTS,
-        description=('Отправка в ТФС: не больше одного отправителя одновременно. Берёт '
-                     'tfs_kafka_snd и обязан брать любой даг, шлющий в ТФС мимо очереди. '
-                     'Лимиты маршрута пул НЕ соблюдает — только взаимное исключение'),
-    )
+    for scenario in TFS_ROUTES:
+        ensure_pool(
+            scenario_pool(scenario), slots=TFS_SEND_SLOTS,
+            description=(f'TFS сценарий {scenario} — макс. {TFS_SEND_SLOTS} уведомление '
+                         'одновременно. Берёт tfs_kafka_snd и обязан брать любой даг, '
+                         'шлющий по этому маршруту мимо очереди. Лимиты маршрута пул '
+                         'НЕ соблюдает — только взаимное исключение'),
+        )
 
 
 # 🧠 Состояние сенсора между опросами.
@@ -438,6 +598,27 @@ def _sql_str(v) -> str:
 def _ts(dt) -> str:
     """datetime → литерал 'YYYY-MM-DD HH:MM:SS.mmm' для обеих СУБД."""
     return dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+
+def parse_ts(value):
+    """Метка времени строки очереди → aware datetime (UTC); пусто и мусор → None.
+
+    Читателю очереди приходится принимать обе формы: в S3 (источник истины) created_at
+    лежит СТРОКОЙ, записанной _ts, а из зеркал он пришёл бы datetime-ом. Наивное
+    значение считаем UTC — временем UTC его и записывали.
+    """
+    from datetime import datetime, timezone
+
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        logger.warning("⚠️ Метка времени не разобрана: %r", value)
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 # ── ClickHouse ────────────────────────────────────────────────────────────────
@@ -972,16 +1153,19 @@ def get_config() -> dict:
         'CH_ID':            CH_ID,
         'MIRRORS':          mirrors(),   # включённые зеркала; S3 обязателен и в список не входит
         'DEF_ARGS':         DEF_ARGS,
+        'ENV_SPACE':        ENV_SPACE,
         'KAFKA_SND_CONN':   KAFKA_SND_CONN,
-        'KAFKA_SND_TOPIC':  KAFKA_SND_TOPIC,
+        'KAFKA_SND_TOPICS': KAFKA_SND_TOPICS,
+        'DEFAULT_SND_TOPIC': DEFAULT_SND_TOPIC,
         'KAFKA_RCV_CONN':   KAFKA_RCV_CONN,
         'KAFKA_RCV_TOPICS': KAFKA_RCV_TOPICS,
         'RECEIPTS_TABLE':   RECEIPTS_TABLE,
         'SENT_FILES_TABLE': SENT_FILES_TABLE,
-        'TFS_LIMITS':       TFS_LIMITS,
+        'TFS_ROUTES':       TFS_ROUTES,
         'TFS_LIMITS_DEFAULT': TFS_LIMITS_DEFAULT,
         'TFS_QUEUE_ALERT_MIN': TFS_QUEUE_ALERT_MIN,
-        'TFS_SEND_POOL':    TFS_SEND_POOL,
+        'SCENARIOS_VAR':    SCENARIOS_VAR,
+        'SCENARIOS':        known_scenarios(),
         'TFS_SEND_SLOTS':   TFS_SEND_SLOTS,
         'TFS_RCV_POOL':     TFS_RCV_POOL,
     }

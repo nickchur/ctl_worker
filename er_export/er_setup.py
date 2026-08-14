@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-14 11:05 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 19:40 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -117,14 +117,14 @@ from airflow.models.param import Param
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
-        INHERITED, replica_full, parse_params, explicit_schedule, check_table,
+        INHERITED, replica_full, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_columns, check_fields, cols_from_fields,
         export_sql, probe_sql, query_columns, unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
-        INHERITED, replica_full, parse_params, explicit_schedule, check_table,
+        INHERITED, replica_full, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_columns, check_fields, cols_from_fields,
         export_sql, probe_sql, query_columns, unnamed_fields,
     )
@@ -192,13 +192,20 @@ def _q(v) -> str:
 
 
 def _literal(value) -> str:
-    """Значение колонки → литерал ClickHouse."""
+    """Значение колонки → литерал ClickHouse.
+
+    None даёт пустую строку, а не 'None': колонки таблицы String, NULL в них не бывает,
+    и через str(None) в настройку оседал литерал, который потом уезжал прямо в запрос
+    (`None SELECT … FROM t1 None`) и ронял выгрузку синтаксической ошибкой ClickHouse.
+    """
+    if value is None:
+        return "''"
     if isinstance(value, bool):
         return str(int(value))
     if isinstance(value, int):
         return str(value)
     if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(f"'{_q(v)}'" for v in value) + "]"
+        return "[" + ", ".join(f"'{_q(v)}'" for v in value if v is not None) + "]"
     return f"'{_q(value)}'"
 
 
@@ -283,7 +290,9 @@ def split_rows(rows: list[dict]) -> tuple[dict, list[dict], set[str]]:
     'hrplatform_datalab__0'. Копией, а не правкой на месте: исходные строки уходят
     в Variable для выпадающего списка, и там они обязаны совпадать с таблицей.
     """
-    rows     = [{**r, "replica": replica_full(r["replica"])} for r in rows]
+    # clean_row здесь же: строковые 'None' из таблицы должны исчезнуть ДО проверок,
+    # иначе 'None' в sql_from пройдёт как непустое значение и доедет до ClickHouse.
+    rows     = [{**clean_row(r), "replica": replica_full(r["replica"])} for r in rows]
     defaults = {r["replica"]: r for r in rows if not r["extract_name"]}
     off      = {rep for rep, r in defaults.items() if not r.get("is_active", 1)}
 
@@ -603,7 +612,7 @@ def er_setup_dag():
                     f"Запись '{record}' не найдена в {TABLE}. "
                     "Возможно, её удалили после последней синхронизации"
                 )
-            base = found[0]
+            base = clean_row(found[0])
 
         shown = base or dict(COLUMNS)
         context['ti'].xcom_push(key='before', value=_dump(shown))

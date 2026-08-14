@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-14 09:38 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 19:40 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -271,6 +271,38 @@ def key_to_where(key: str) -> tuple[str, str]:
 DEFAULT_GROUP = '0'
 
 
+# Строковые представления пустоты. Появляются, когда значение проходит через str(None)
+# по дороге в ClickHouse: колонки там String, NULL в них не бывает, и в таблице оседает
+# литерал 'None'. Для SQL-сборщика это обычный текст, поэтому запрос собирается вида
+# `None SELECT … FROM t1 None WHERE … SETTINGS None` и падает синтаксической ошибкой
+# уже в ClickHouse — с трассировкой, по которой причина не видна вовсе.
+NULLISH = {'none', 'null', 'nan'}
+
+
+def clean_value(value):
+    """Значение настройки: 'None'/'NULL'/'NaN' строкой → пусто, остальное как есть.
+
+    Числа, флаги и даты не трогаем: is_active = 0 после превращения в строку стал бы
+    истинным и включил бы выключенную поставку.
+    """
+    if value is None:
+        return ''
+    if isinstance(value, (list, tuple)):
+        return [v for v in (clean_value(x) for x in value) if v != '']
+    if isinstance(value, str):
+        return '' if value.strip().lower() in NULLISH else value
+    return value
+
+
+def clean_row(row: dict) -> dict:
+    """Строка er_wf_meta без строковых 'None' — применять сразу после чтения из таблицы.
+
+    Чистим на входе, а не при сборке SQL: 'None' в sql_from должен спотыкаться о проверку
+    «пустой sql_from» с внятным текстом, а не доезжать до ClickHouse.
+    """
+    return {k: clean_value(v) for k, v in row.items()}
+
+
 def replica_full(replica: str) -> str:
     """🔢 Реплика с обязательным суффиксом группы: без него подставляется DEFAULT_GROUP.
 
@@ -464,6 +496,10 @@ def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
     """
     if not sql_meta: return ""
     if isinstance(sql_meta, str): return sql_meta
+
+    # Части чистим и здесь, а не только на входе синка: фабрика собирает запрос
+    # по Variable, а та могла быть записана до чистки — тогда 'None' уехал бы в запрос.
+    sql_meta = {k: clean_value(v) if k != 'fields' else v for k, v in sql_meta.items()}
 
     parts = []
     if sql_meta.get("with"): parts.append(sql_meta['with'])
@@ -719,8 +755,8 @@ def build_meta(cfg: dict, data_cols: list[dict], strategy: str = '') -> dict:
         "table_name":  cfg['tbl'],
         "description": cfg.get('description') or None,
         "strategy":    strategy or cfg['strategy'],
-        "PK":          cfg['PK'],
-        "UK":          cfg['UK'] or [],
+        "PK":          clean_value(cfg['PK']),
+        "UK":          clean_value(cfg['UK'] or []),
         "params":      FORMAT_MAP[cfg['format']]['meta_params'],
         "columns":     _clean(EXTRA_PRE) + data_cols + _clean(EXTRA_SUF),
     }
@@ -737,7 +773,7 @@ def export_sql(entry: dict, params: dict, table_key: str = '') -> dict:
     sql_meta   — тот же запрос без служебных колонок; по нему build_meta делает DESCRIBE.
                  Пуст, если запрос задан строкой или со своим списком fields.
     """
-    fields = entry.get("fields") or []
+    fields = clean_value(entry.get("fields") or [])
     if not fields or any(str(f).strip() == '*' or str(f).strip().endswith('.*') for f in fields):
         raise AirflowFailException(
             f"{table_key}: fields должен быть явным списком колонок, '*' и 't1.*' запрещены"

@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-17 09:50 MSK · v3.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 10:20 MSK · v3.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -469,21 +469,21 @@ def _er_build_meta(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = _xcom(context, cfg['tg'], 'init')
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
+    # 💬 Комментарии колонок берутся по db_name.extract_name — но extract_name это ИМЯ
+    # ВЫГРУЗКИ, а не обязательно таблица: из одной таблицы делают несколько выгрузок
+    # с разными джойнами и условиями. Нет такой таблицы — .meta собирается без описаний,
+    # а не падает: состав колонок всё равно приходит из DESCRIBE по самому запросу.
+    # 60 = UNKNOWN_TABLE, 81 = UNKNOWN_DATABASE; прочие ошибки (недоступный ClickHouse,
+    # таймаут) прокидываем — их лечит повтор.
+    rows: list = []
     try:
         rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
     except Exception as err:
-        # 60 = UNKNOWN_TABLE, 81 = UNKNOWN_DATABASE. Это ошибка НАСТРОЙКИ, а не сбой:
-        # за пять минут таблица не появится, и три ретрая только растягивают падение
-        # на двадцать минут, пряча причину в четвёртой попытке. Остальные ошибки
-        # (недоступный ClickHouse, таймаут) прокидываем как есть — их повтор лечит.
         if getattr(err, 'code', None) not in (60, 81):
             raise
-        raise AirflowFailException(
-            f"{cfg['db']}.{cfg['tbl']}: источника нет в ClickHouse — {ch_error(err)}. "
-            f"Поправьте db_name/extract_name записи дагом export_er_setup: "
-            f"по этой таблице берутся комментарии колонок для .meta"
-        ) from err
-    ch_cols = ch_columns(rows)
+        logger.info("💬 %s.%s — не таблица, описания колонок в .meta не попадут: %s",
+                    cfg['db'], cfg['tbl'], ch_error(err))
+    ch_cols = ch_columns(rows) if rows else {}
 
     def _cols_from_query(sql: str) -> list[dict]:
         """Колонки по DESCRIBE итогового запроса — так же, как их видит TSVWithNames.
@@ -497,7 +497,18 @@ def _er_build_meta(cfg, **context):
         return query_columns(qrows, ch_cols)
 
     def _cols_from_table() -> list[dict]:
-        """Запасной путь: колонки по DESCRIBE TABLE источника, без учёта JOIN и выражений."""
+        """Запасной путь: колонки по DESCRIBE TABLE источника, без учёта JOIN и выражений.
+
+        Работает, только если db_name.extract_name — настоящая таблица. Для выгрузки,
+        имя которой таблице не соответствует, запасного пути нет: состав колонок берётся
+        из DESCRIBE по запросу, и если не вышло и это, честнее упасть с внятным текстом.
+        """
+        if not rows:
+            raise AirflowFailException(
+                f"{cfg['db']}.{cfg['tbl']}: состав колонок .meta взять неоткуда — "
+                f"DESCRIBE по запросу не удался, а таблицы с именем выгрузки нет. "
+                f"Проверьте запрос дагом export_er_setup"
+            )
         return cols_from_fields(cfg.get('fields', ['*']), ch_cols, rows)
 
     sql_meta = cfg.get('sql_meta')

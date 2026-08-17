@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-17 09:50 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 10:20 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -359,14 +359,12 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
     }
 
 
-def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict,
-              known_tables: set | None = None) -> tuple[dict, list[str], list[str]]:
+def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[dict, list[str], list[str]]:
     """🧬 Раскладывает строки er_wf_meta по группам, разрешая наследование от строк-дефолтов.
 
-    tables       — строки-поставки (extract_name непустой)
-    defaults     — {replica: строка-дефолт группы}
-    ch_comments  — {(db, table): комментарий} для строк без description
-    known_tables — {(db, table)} существующие в ClickHouse; None — не проверять
+    tables      — строки-поставки (extract_name непустой)
+    defaults    — {replica: строка-дефолт группы}
+    ch_comments — {(db, table): комментарий} для строк без description
 
     Возвращает (структура для Variable, ошибки, предупреждения).
 
@@ -415,15 +413,6 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict,
 
         if not check_table(info['row'], info['key'],
                            errors.setdefault(replica, []), info['params']):
-            continue
-
-        # Источника нет — дальше пропускать нельзя: build_meta делает по нему DESCRIBE TABLE
-        # ради комментариев колонок, и пакет падал бы каждую ночь по расписанию. Ошибка
-        # настройки должна всплывать здесь, а не в три часа ночи на четвёртом ретрае.
-        if known_tables is not None and (row["db_name"], row["extract_name"]) not in known_tables:
-            errors.setdefault(replica, []).append(
-                f"{info['key']}: таблицы нет в ClickHouse — проверьте db_name и extract_name"
-            )
             continue
 
         group = wfs.setdefault(replica, {
@@ -737,21 +726,14 @@ def er_setup_dag():
                         f"DESCRIBE TABLE {info['key']}", with_column_types=True)
                     ch_cols = ch_columns(describe_rows)
                 except Exception as err:
-                    # 60 = UNKNOWN_TABLE, 81 = UNKNOWN_DATABASE. Это НЕ «поставка из CTE»,
-                    # а ошибка настройки: выгрузка делает ровно этот DESCRIBE и запасного
-                    # пути у неё нет — пакет свалится ночью по расписанию. Проверка обязана
-                    # краснеть здесь. Прочие сбои (нет прав, таймаут) остаются
-                    # предупреждением: они про доступ, а не про запись.
-                    if getattr(err, 'code', None) in (60, 81):
-                        errors.append(
-                            f"{info['key']}: источника нет в ClickHouse — {ch_error(err)}. "
-                            "Проверьте db_name и extract_name"
-                        )
-                    else:
-                        warnings.append(
-                            f"DESCRIBE TABLE {info['key']} не прошёл ({ch_error(err)}) — "
-                            ".meta соберётся без описаний колонок"
-                        )
+                    # Это предупреждение, а не ошибка: extract_name — имя ВЫГРУЗКИ, и
+                    # таблицы с таким именем может не быть вовсе (из одной таблицы делают
+                    # несколько выгрузок с разными джойнами и условиями). Состав колонок
+                    # берётся из DESCRIBE по запросу, страдают только описания колонок.
+                    warnings.append(
+                        f"DESCRIBE TABLE {info['key']} не прошёл ({ch_error(err)}) — "
+                        ".meta соберётся без описаний колонок"
+                    )
 
                 # Состав .meta считаем по запросу БЕЗ служебных колонок — ровно так же,
                 # как это делает build_meta в выгрузке.
@@ -877,18 +859,19 @@ def er_setup_dag():
         if off:
             logger.info("⏸️ Группы выключены строкой-дефолтом (is_active=0): %s", ", ".join(sorted(off)))
 
-        # 💬 Комментарии таблиц из system.tables одним батч-запросом, чтобы не делать
-        # N отдельных DESCRIBE. Спрашиваем про ВСЕ поставки, а не только про строки без
-        # description: тем же ответом проверяется, что источник вообще существует —
-        # запись на несуществующую таблицу иначе всплывает ночью падением build_meta.
-        pairs = ", ".join(f"('{_q(r['db_name'])}', '{_q(r['extract_name'])}')" for r in tables)
-        ch_tables = get_dict_from_ch(
-            hook, f"SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})"
-        ) if tables else []
-        ch_comments   = {(r["database"], r["name"]): r["comment"] for r in ch_tables}
-        known_tables  = set(ch_comments)
+        # 💬 Для строк без явного description подтягиваем комментарий таблицы из system.tables
+        # одним батч-запросом, чтобы не делать N отдельных DESCRIBE. Таблицы может не быть:
+        # extract_name — имя выгрузки, а не обязательно таблицы, — тогда описания просто нет.
+        no_desc = [(r["db_name"], r["extract_name"]) for r in tables if not r["description"]]
+        ch_comments: dict[tuple[str, str], str] = {}
+        if no_desc:
+            pairs = ", ".join(f"('{_q(db)}', '{_q(tbl)}')" for db, tbl in no_desc)
+            ch_comments = {
+                (r["database"], r["name"]): r["comment"]
+                for r in get_dict_from_ch(hook, f"SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})")
+            }
 
-        wfs, errors, warnings = build_wfs(tables, defaults, ch_comments, known_tables)
+        wfs, errors, warnings = build_wfs(tables, defaults, ch_comments)
 
         if not wfs:
             raise ValueError(

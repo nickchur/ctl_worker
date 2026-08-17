@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-17 11:00 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 12:10 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -118,15 +118,17 @@ try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
-        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments, check_fields,
-        cols_from_fields, export_sql, probe_sql, query_columns, sql_sources, unnamed_fields,
+        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
+        check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
+        merge_params, probe_sql, query_columns, sql_sources, unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
-        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments, check_fields,
-        cols_from_fields, export_sql, probe_sql, query_columns, sql_sources, unnamed_fields,
+        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
+        check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
+        merge_params, probe_sql, query_columns, sql_sources, unnamed_fields,
     )
 
 _cfg           = get_config()
@@ -326,6 +328,13 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
     grp_params = parse_params(grp_row.get("params", ""), f"группа {row['replica']}")
     tbl_params = parse_params(row.get("params", ""), table_key)
 
+    # Групповые описания колонок достаются всем поставкам пакета, а колонка есть не у
+    # каждой: оставляем только подходящие. Свои описания поставки не трогаем — лишнее
+    # имя там опечатка, и её ловит check_descriptions.
+    if grp_params.get('descriptions'):
+        grp_params = {**grp_params,
+                      'descriptions': fit_descriptions(grp_params['descriptions'], row.get('fields'))}
+
     # 🔀 is_recent определяет ключ SQL-запроса: фабрика проверяет наличие одного из двух
     sql_key = "sql_stmt_export_recent" if row.get("is_recent") else "sql_stmt_export_delta"
     sql_val = {"from": row["sql_from"]}
@@ -340,7 +349,7 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
         "UK":      list(row.get("uk") or []),
         "fields":  list(row.get("fields") or []),
         # Параметры кладём уже разрешёнными — фабрика про наследование не знает
-        "params":  json.dumps({**grp_params, **tbl_params}, ensure_ascii=False),
+        "params":  json.dumps(merge_params({}, grp_params, tbl_params), ensure_ascii=False),
         sql_key:   sql_val,
     }
 
@@ -354,7 +363,7 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
         'key':          table_key,
         'row':          row,
         'entry':        entry,
-        'params':       {**DEFAULT_PARAMS, **grp_params, **tbl_params},
+        'params':       merge_params(DEFAULT_PARAMS, grp_params, tbl_params),
         'group_params': grp_params,
     }
 
@@ -749,8 +758,12 @@ def er_setup_dag():
                     data_cols = []
 
                 if data_cols:
-                    errors += check_fields(info['entry']['fields'],
-                                           [c['column_name'] for c in data_cols], info['key'])
+                    names = [c['column_name'] for c in data_cols]
+                    errors += check_fields(info['entry']['fields'], names, info['key'])
+                    # Описание колонки с опечаткой молча не доедет до КАП — ловим здесь же,
+                    # рядом со сверкой состава: причина у них одна.
+                    errors += check_descriptions(info['params'].get('descriptions'),
+                                                 names, info['key'])
                     if unnamed := unnamed_fields(info['entry']['fields']):
                         warnings.append(
                             f"выражения без алиаса, имена колонок для них не проверены: {unnamed}"
@@ -760,7 +773,8 @@ def er_setup_dag():
                         {'schema_name': info['entry']['schema'], 'tbl': merged['extract_name'],
                          'description': info['entry'].get('description', ''),
                          'strategy': info['params']['strategy'], 'PK': info['entry']['PK'],
-                         'UK': info['entry']['UK'], 'format': info['params']['format']},
+                         'UK': info['entry']['UK'], 'format': info['params']['format'],
+                         'descriptions': info['params'].get('descriptions')},
                         data_cols,
                     )
 

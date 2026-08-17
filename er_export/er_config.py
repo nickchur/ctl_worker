@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-17 11:00 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 12:10 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -215,6 +215,14 @@ TABLE_PARAMS: dict = {
     'xstream_sanitize':  0,            # 1 = экранировать спецсимволы XStream
     'sanitize_array':    0,            # 1 = санитизировать CH-массивы в строки
     'sanitize_list':     '',           # список колонок для санитизации (через запятую)
+
+    # ── Описания для .meta ───────────────────────────────────────────────────
+    # {колонка: описание}. Задаётся частично: что указано — перебивает комментарий
+    # колонки источника, остальное берётся оттуда же, откуда и раньше. Единственный
+    # словарный параметр, и сливается он ПО КЛЮЧАМ (см. merge_params): общие колонки
+    # описываются раз в строке-дефолте группы, поставка добавляет свои.
+    # Описание самой таблицы сюда не входит — для него у поставки есть колонка description.
+    'descriptions':      {},
 }
 
 DEFAULT_PARAMS: dict = {**GROUP_PARAMS, **TABLE_PARAMS}
@@ -368,6 +376,26 @@ def replica_base(replica: str) -> str:
     return replica.split('__', 1)[0]
 
 
+# Параметры-словари, которые сливаются ПО КЛЮЧАМ, а не заменяются целиком.
+DEEP_PARAMS = ('descriptions',)
+
+
+def merge_params(base: dict, *overrides: dict) -> dict:
+    """🔧 Слияние параметров: обычный ключ перебивается, словарь из DEEP_PARAMS сливается.
+
+    Замена целиком годится для скаляров, но не для descriptions: групповое описание общих
+    колонок исчезло бы, стоит поставке описать хоть одну свою.
+    """
+    out = dict(base)
+    for over in overrides:
+        for key, value in (over or {}).items():
+            if key in DEEP_PARAMS and isinstance(value, dict) and isinstance(out.get(key), dict):
+                out[key] = {**out[key], **value}
+            else:
+                out[key] = value
+    return out
+
+
 def get_params(row: dict, group: dict | None = None) -> dict:
     """🔧 Собирает итоговые параметры: DEFAULT_PARAMS → params группы → params строки.
 
@@ -375,7 +403,7 @@ def get_params(row: dict, group: dict | None = None) -> dict:
     group — параметры строки-дефолта группы; уже разрешённый dict либо None
     """
     overrides = json.loads(row.get('params') or '{}')
-    return {**DEFAULT_PARAMS, **(group or {}), **overrides}
+    return merge_params(DEFAULT_PARAMS, group or {}, overrides)
 
 
 # 🧬 Поля строки-дефолта группы, наследуемые поставками. SQL и ключи (pk, uk, fields,
@@ -890,6 +918,49 @@ def unnamed_fields(fields: list) -> list:
     return [f for f in fields if field_name(f) is None]
 
 
+def fit_descriptions(descriptions: dict, fields: list) -> dict:
+    """✂️ Оставляет из словаря описаний только колонки, которые есть в этой выгрузке.
+
+    Нужна для ГРУППОВЫХ описаний: словарь строки-дефолта достаётся всем поставкам пакета,
+    и общая колонка (person_uuid, extract_time) есть не у каждой. Без отсева строгая
+    проверка check_descriptions роняла бы такие поставки — проверено живьём на стенде:
+    групповой словарь из двух колонок положил поставку, где нет ни одной из них.
+
+    Описания самой поставки не фильтруются: там лишнее имя — это опечатка, и она обязана
+    всплыть ошибкой.
+    """
+    if not descriptions:
+        return {}
+    known = {safe_name(n) for n in (field_name(f) for f in fields or []) if n}
+    known |= {c['column_name'] for c in EXTRA_PRE + EXTRA_SUF}
+    return {k: v for k, v in descriptions.items() if safe_name(k) in known}
+
+
+def check_descriptions(descriptions: dict, actual: list[str], key: str) -> list[str]:
+    """🔍 Колонки из params.descriptions, которых в выгрузке нет. Возвращает список ошибок.
+
+    Ошибка, а не предупреждение: описание, написанное для колонки с опечаткой, молча
+    не доедет до КАП, и заметить это можно только глазами в готовом .meta.
+
+    actual — колонки данных; служебные (export_time, ctl_action, ctl_validfrom) добавляются
+    здесь же: их в .meta тоже можно описать, а вызывающему знать про них незачем.
+
+    Сравниваем через safe_name: в настройке пишут имя как в fields, а в .meta оно уже
+    приведено (Hive-слова получают суффикс '_').
+    """
+    if not descriptions:
+        return []
+
+    known = set(actual) | {c['column_name'] for c in EXTRA_PRE + EXTRA_SUF}
+    unknown = [name for name in descriptions if safe_name(name) not in known]
+    if not unknown:
+        return []
+    return [
+        f"{key}: в params.descriptions описаны колонки, которых нет в выгрузке: {unknown}.\n"
+        f"  колонки выгрузки: {actual}"
+    ]
+
+
 def build_meta(cfg: dict, data_cols: list[dict], strategy: str = '') -> dict:
     """🗂️ Готовый .meta для ЕР/TFS.
 
@@ -901,6 +972,14 @@ def build_meta(cfg: dict, data_cols: list[dict], strategy: str = '') -> dict:
     def _clean(cols):
         return [{k: v for k, v in c.items() if k != 'sql'} for c in cols]
 
+    # 📝 Описания из настройки перебивают комментарии источника — но только там, где заданы.
+    # Служебные колонки (export_time, ctl_action, ctl_validfrom) описать тоже можно:
+    # накладываем на итоговый список, а не на data_cols.
+    columns = _clean(EXTRA_PRE) + data_cols + _clean(EXTRA_SUF)
+    if own := {safe_name(k): v for k, v in (cfg.get('descriptions') or {}).items()}:
+        columns = [{**c, "description": own.get(c['column_name'], c['description'])}
+                   for c in columns]
+
     return {
         "mask_file":   None,
         "schema_name": cfg['schema_name'],
@@ -910,7 +989,7 @@ def build_meta(cfg: dict, data_cols: list[dict], strategy: str = '') -> dict:
         "PK":          clean_value(cfg['PK']),
         "UK":          clean_value(cfg['UK'] or []),
         "params":      FORMAT_MAP[cfg['format']]['meta_params'],
-        "columns":     _clean(EXTRA_PRE) + data_cols + _clean(EXTRA_SUF),
+        "columns":     columns,
     }
 
 

@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-17 11:00 MSK · v3.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 12:10 MSK · v3.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -34,14 +34,16 @@ from airflow.utils.task_group import TaskGroup
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
-        build_sql, build_meta, ch_source_columns, check_fields, cols_from_fields,
-        export_sql, parse_s3_target, query_columns, sql_sources, unnamed_fields,
+        build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
+        cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,
+        unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
-        build_sql, build_meta, ch_source_columns, check_fields, cols_from_fields,
-        export_sql, parse_s3_target, query_columns, sql_sources, unnamed_fields,
+        build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
+        cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,
+        unnamed_fields,
     )
 
 
@@ -529,8 +531,12 @@ def _er_build_meta(cfg, **context):
     # 🔍 Состав колонок обязан совпадать с настройкой: новая колонка в источнике не должна
     # доезжать до КАП сама, только через правку fields. Выгрузке нужен красный таск —
     # ретраить тут нечего, от повтора настройка не изменится.
-    if errors := check_fields(cfg['fields'], [c['column_name'] for c in data_cols],
-                              f"{cfg['db']}.{cfg['tbl']}"):
+    key = f"{cfg['db']}.{cfg['tbl']}"
+    names = [c['column_name'] for c in data_cols]
+    # Обе сверки — про одно: настройка разошлась с тем, что уедет. Ретраить нечего,
+    # поэтому ошибки собираются вместе и падают одним внятным сообщением.
+    if errors := check_fields(cfg['fields'], names, key) + \
+            check_descriptions(cfg.get('descriptions'), names, key):
         raise AirflowFailException("\n".join(errors))
 
     if unnamed := unnamed_fields(cfg['fields']):
@@ -913,6 +919,8 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         'PK':              entry.get('PK', []),
         'UK':              entry.get('UK', []),
         'description':     entry.get('description', ''),
+        # Описания колонок из настройки: перебивают комментарии источника в build_meta
+        'descriptions':    p['descriptions'],
         # ── Параметры таблицы ────────────────────────────────────────────────
         'format':          p['format'],
         'strategy':        p['strategy'],

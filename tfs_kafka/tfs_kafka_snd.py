@@ -1,5 +1,5 @@
 """🚚 DAG отправки файлов в ТФС с соблюдением темпа маршрута.
-*2026-08-14 18:40 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 15:20 MSK · v2.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Единственное место, откуда файлы ЕР уходят уведомлением в Kafka. Пакетные даги только
 ставят файлы в очередь, а разгребает её этот даг — в темпе, который декларирует ТФС.
@@ -17,7 +17,8 @@
 ⏱️ **Ран живёт час.** Сенсор разгребает очередь раз в 15 секунд в режиме `reschedule`
 (между опросами слот свободен) и держит окно до конца. В конце окна:
 
-* ушёл хоть один файл → таск **зелёный**, в XCom их число за окно;
+* ушёл хоть один файл → таск **зелёный**, отправленное в XCom записью на пакет,
+  итоги окна по пакетам — в `return_value`;
 * очередь весь час была пуста → таск **скипнут** (`soft_fail`), стартует следующий ран.
 
 📦 **Пакет уезжает целиком.** Очередь разбирается по `package_ts`: пока не ушли все файлы
@@ -179,6 +180,32 @@ def tfs_kafka_snd_dag():
 
         logger.info("📮 Из параметров запуска в очередь добавлено файлов: %d", len(rows))
 
+    def _package_key(row: dict) -> str:
+        """Имя пакета: replica + метка пакета — то же, из чего строится имя тикета.
+
+        Ключ XCom — пакет, а не файл: в один ран сценария их уезжает несколько, и по такому
+        ключу видно, что именно доехало целиком, а что застряло наполовину.
+        """
+        digits = ''.join(c for c in str(row.get('package_ts') or '') if c.isdigit())
+        return f"{row.get('replica', '')}__{digits[:14]}"
+
+    def _push_xcom(context, items: list) -> None:
+        """📤 Отправленное — записью на ПАКЕТ, внутри {метка отправки: файл}.
+
+        Устроено как у приёмника (tfs_kafka_rcv) и по той же причине: отдельная запись
+        XCom на файл в UI Airflow 2.10 показывается как «Invalid input», хотя данные целы.
+        Метка времени поэтому живёт ключом внутреннего словаря.
+
+        Раскладывается ВЕСЬ накопленный список на каждом опросе: Airflow чистит XCom таска
+        перед каждым исполнением, а в reschedule опрос — отдельное исполнение.
+        """
+        by_package: dict[str, dict] = {}
+        for item in items:
+            by_package.setdefault(item['package'], {})[item['key']] = item['row']
+
+        for package, files in by_package.items():
+            context['ti'].xcom_push(key=package, value=files)
+
     def poke_queue(scenario: str, **context) -> PokeReturnValue:
         """🚚 Отправляет файлы своего сценария в темпе, который декларирует ТФС.
 
@@ -195,7 +222,10 @@ def tfs_kafka_snd_dag():
 
         from airflow.providers.apache.kafka.hooks.produce import KafkaProducerHook
 
-        total = int(run_state_get(context, SENT_KEY) or 0)
+        # В состоянии список отправленного, а не счётчик: из него на каждом опросе
+        # заново раскладывается XCom (Airflow чистит его перед каждым исполнением).
+        sent_state = list(run_state_get(context, SENT_KEY) or [])
+        _push_xcom(context, sent_state)
         # Окно считаем от старта рана: оно переживает reschedule, в отличие от таймеров опроса.
         elapsed = (datetime.now(timezone.utc) - context['dag_run'].start_date).total_seconds()
         last_poke = elapsed >= WINDOW
@@ -203,7 +233,7 @@ def tfs_kafka_snd_dag():
         queued = [r for r in pending() if r.get('scenario_id') == scenario]
         if not queued:
             logger.info("📭 %s: очередь пуста", scenario)
-            return _finish(context, scenario, total, left=[], blocked='', last_poke=last_poke)
+            return _finish(context, scenario, sent_state, left=[], blocked='', last_poke=last_poke)
 
         queue = order_queue(queued)
         topic = route_topic(scenario)
@@ -270,20 +300,31 @@ def tfs_kafka_snd_dag():
         left = [r for r in queue if r not in sent]
 
         if sent:
-            total += len(sent)
-            run_state_set(context, SENT_KEY, total)
+            now_ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            fresh = [
+                {'package': _package_key(r),
+                 'key': f"{now_ts}_{len(sent_state) + n:03d}",
+                 'row': {'rq_uid': r['rq_uid'], 'file_name': r['file_name'],
+                         'scenario_id': scenario, 'topic': topic,
+                         'replica': r.get('replica'), 'package_ts': str(r.get('package_ts'))}}
+                for n, r in enumerate(sent, start=1)
+            ]
+            sent_state += fresh
+            run_state_set(context, SENT_KEY, sent_state)
+            _push_xcom(context, sent_state)
+
             # Заметка короткая намеренно: за час опросов их накопится много, а add_note
             # склеивает записи и режет всё вместе по MAX_NOTE_LEN.
-            line = f"📤 +{len(sent)} (за окно {total})"
+            line = f"📤 +{len(sent)} (за окно {len(sent_state)})"
             if blocked:
                 line += f", 🚦 лимит: {blocked}"
             if left:
                 line += f", ⏳ в очереди {len(left)}"
             add_note({f"🚚 {scenario}": line}, level='dag', context=context, title='🚚 tfs_kafka_snd')
 
-        return _finish(context, scenario, total, left, blocked, last_poke)
+        return _finish(context, scenario, sent_state, left, blocked, last_poke)
 
-    def _finish(context, scenario: str, total: int, left: list, blocked: str,
+    def _finish(context, scenario: str, sent_state: list, left: list, blocked: str,
                 last_poke: bool) -> PokeReturnValue:
         """Итог опроса: ждать дальше, зеленеть или заявить о заторе.
 
@@ -306,9 +347,18 @@ def tfs_kafka_snd_dag():
                     f"{blocked or 'нет'}. Самый старый файл в очереди с {oldest:%Y-%m-%d %H:%M:%S} UTC"
                 )
 
-        if total:
-            logger.info("✅ %s: окно закрыто, отправлено за час: %d", scenario, total)
-            return PokeReturnValue(is_done=True, xcom_value=total)
+        if sent_state:
+            logger.info("✅ %s: окно закрыто, отправлено за час: %d", scenario, len(sent_state))
+            # return_value — только ИТОГИ, с разбивкой по пакетам: сами файлы лежат рядом,
+            # записями XCom на пакет, и дублировать их списком значит хранить дважды.
+            packages: dict[str, int] = {}
+            for item in sent_state:
+                packages[item['package']] = packages.get(item['package'], 0) + 1
+            return PokeReturnValue(is_done=True, xcom_value={
+                'scenario': scenario,
+                'count':    len(sent_state),
+                'packages': packages,
+            })
 
         # Ничего не ушло за весь час — сенсор упрётся в timeout и пометит таск скипнутым.
         return PokeReturnValue(is_done=False)

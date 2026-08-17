@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-14 23:45 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 15:20 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -1134,16 +1134,25 @@ def order_queue(rows: list[dict]) -> list[dict]:
     Пакеты — по времени появления (package_ts, затем created_at первого файла), внутри
     пакета — по created_at. Разрывать пакет чужими файлами нельзя: ЕР не принимает
     несколько пакетов одновременно.
+
+    🎫 Тикет пакета уходит ПОСЛЕДНИМ. Он перечисляет архивы пакета, то есть объявляет
+    его полным: приди он первым — принимающая сторона увидела бы список файлов, которых
+    ещё нет. Ставится в очередь тикет вместе с архивами (make_summary), поэтому порядок
+    задаётся здесь, а не временем постановки.
     """
     packages: dict = {}
     for row in rows:
         packages.setdefault((row['replica'], row['package_ts']), []).append(row)
 
+    def _order(row: dict) -> tuple:
+        return (str(row.get('file_name', '')).lower().endswith('.tkt'),
+                str(row.get('created_at', '')))
+
     ordered = []
     # get, а не [], намеренно: строка без created_at не должна ронять всю отправку —
     # она просто встанет первой в своём пакете.
     for key in sorted(packages, key=lambda k: (k[1], min(str(r.get('created_at', '')) for r in packages[k]))):
-        ordered.extend(sorted(packages[key], key=lambda r: str(r.get('created_at', ''))))
+        ordered.extend(sorted(packages[key], key=_order))
     return ordered
 
 

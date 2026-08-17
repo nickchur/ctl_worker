@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-17 09:20 MSK · v3.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 09:50 MSK · v3.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -34,14 +34,14 @@ from airflow.utils.task_group import TaskGroup
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
-        build_sql, build_meta, ch_columns, check_fields, cols_from_fields, export_sql,
-        parse_s3_target, query_columns, unnamed_fields,
+        build_sql, build_meta, ch_columns, ch_error, check_fields, cols_from_fields,
+        export_sql, parse_s3_target, query_columns, unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
-        build_sql, build_meta, ch_columns, check_fields, cols_from_fields, export_sql,
-        parse_s3_target, query_columns, unnamed_fields,
+        build_sql, build_meta, ch_columns, ch_error, check_fields, cols_from_fields,
+        export_sql, parse_s3_target, query_columns, unnamed_fields,
     )
 
 
@@ -479,7 +479,7 @@ def _er_build_meta(cfg, **context):
         if getattr(err, 'code', None) not in (60, 81):
             raise
         raise AirflowFailException(
-            f"{cfg['db']}.{cfg['tbl']}: источника нет в ClickHouse — {err}. "
+            f"{cfg['db']}.{cfg['tbl']}: источника нет в ClickHouse — {ch_error(err)}. "
             f"Поправьте db_name/extract_name записи дагом export_er_setup: "
             f"по этой таблице берутся комментарии колонок для .meta"
         ) from err

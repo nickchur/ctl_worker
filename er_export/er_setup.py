@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-17 09:20 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 09:50 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -117,14 +117,14 @@ from airflow.models.param import Param
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
-        INHERITED, replica_full, clean_row, parse_params, explicit_schedule, check_table,
+        INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_columns, check_fields, cols_from_fields,
         export_sql, probe_sql, query_columns, unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
-        INHERITED, replica_full, clean_row, parse_params, explicit_schedule, check_table,
+        INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_columns, check_fields, cols_from_fields,
         export_sql, probe_sql, query_columns, unnamed_fields,
     )
@@ -723,7 +723,7 @@ def er_setup_dag():
                                             settings={'max_execution_time': PROBE_TIMEOUT})
                     result['columns'] = [f"{n} {t}" for n, t in qcols]
                 except Exception as err:
-                    errors.append(f"запрос выгрузки не выполнился: {err}")
+                    errors.append(f"запрос выгрузки не выполнился: {ch_error(err)}")
 
             # .meta собираем, только если сам запрос выполнился: строить схему по запросу,
             # который не разбирается, нечем, а вторая та же ошибка в отчёте лишняя.
@@ -737,10 +737,21 @@ def er_setup_dag():
                         f"DESCRIBE TABLE {info['key']}", with_column_types=True)
                     ch_cols = ch_columns(describe_rows)
                 except Exception as err:
-                    warnings.append(
-                        f"DESCRIBE TABLE {info['key']} не прошёл ({err}) — "
-                        ".meta соберётся без описаний колонок"
-                    )
+                    # 60 = UNKNOWN_TABLE, 81 = UNKNOWN_DATABASE. Это НЕ «поставка из CTE»,
+                    # а ошибка настройки: выгрузка делает ровно этот DESCRIBE и запасного
+                    # пути у неё нет — пакет свалится ночью по расписанию. Проверка обязана
+                    # краснеть здесь. Прочие сбои (нет прав, таймаут) остаются
+                    # предупреждением: они про доступ, а не про запись.
+                    if getattr(err, 'code', None) in (60, 81):
+                        errors.append(
+                            f"{info['key']}: источника нет в ClickHouse — {ch_error(err)}. "
+                            "Проверьте db_name и extract_name"
+                        )
+                    else:
+                        warnings.append(
+                            f"DESCRIBE TABLE {info['key']} не прошёл ({ch_error(err)}) — "
+                            ".meta соберётся без описаний колонок"
+                        )
 
                 # Состав .meta считаем по запросу БЕЗ служебных колонок — ровно так же,
                 # как это делает build_meta в выгрузке.
@@ -752,7 +763,7 @@ def er_setup_dag():
                     else:
                         data_cols = cols_from_fields(info['entry']['fields'], ch_cols, describe_rows)
                 except Exception as err:
-                    errors.append(f"состав колонок .meta не собрался: {err}")
+                    errors.append(f"состав колонок .meta не собрался: {ch_error(err)}")
                     data_cols = []
 
                 if data_cols:

@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-15 00:30 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 09:50 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -301,6 +301,15 @@ def clean_row(row: dict) -> dict:
     «пустой sql_from» с внятным текстом, а не доезжать до ClickHouse.
     """
     return {k: clean_value(v) for k, v in row.items()}
+
+
+def ch_error(err) -> str:
+    """Сообщение ClickHouse без стека: до 'Stack trace:'.
+
+    Стек из двух десятков адресов в ошибке настройки не помогает никому, зато в заметке
+    (add_note режет по MAX_NOTE_LEN) вытесняет собой текст самой причины.
+    """
+    return str(err).split('Stack trace:')[0].strip().rstrip('.')
 
 
 def parse_s3_target(path: str, conn_id: str, bucket: str, prefix: str) -> dict:

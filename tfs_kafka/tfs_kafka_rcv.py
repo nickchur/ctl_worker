@@ -1,5 +1,5 @@
 """📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
-*2026-08-15 00:05 MSK · v2.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 14:10 MSK · v2.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
 и сопоставляется с отправкой по `RqUID`. Результат передачи — в `File/Status/StatusCode`,
@@ -29,7 +29,7 @@
 (между опросами слот воркера свободен) и держит окно до конца — так квитанция, пришедшая
 на пятой минуте, не обрывает чтение на оставшиеся пятьдесят пять. В конце окна:
 
-* пришла хоть одна квитанция → таск **зелёный**, в XCom по записи на квитанцию;
+* пришла хоть одна квитанция → таск **зелёный**, сами квитанции в XCom `receipts`, итоги окна в `return_value`;
 * за час тишина → таск **скипнут** (`soft_fail`), и стартует следующий ран.
 
 Так пустой час и час с квитанциями видно в UI, не открывая логи.
@@ -112,17 +112,19 @@ SEEN_KEY = 'seen'
 def tfs_kafka_rcv_dag():
 
     def _push_xcom(context, items: list) -> None:
-        """📤 Кладёт квитанции в XCom: ключ — метка времени, значение — сама строка.
+        """📤 Все квитанции окна — ОДНОЙ записью XCom: {метка времени: квитанция}.
 
-        Запись на квитанцию, а не одна на окно: так в UI видно, что именно пришло и когда,
-        не дожидаясь конца часа и не открывая логи.
+        Раньше на каждую квитанцию заводилась своя запись с меткой времени в ключе. UI
+        Airflow 2.10 показывал такие записи как «Invalid input», хотя данные были целы:
+        API отдаёт значение питоновским repr словаря — и для них, и для return_value,
+        который рисуется деревом (проверено curl-ом на стенде, ключ с пробелом читается
+        и отвечает 200). Спорить с просмотрщиком дешевле формой записи, чем содержимым.
 
-        Значение — словарь, а НЕ json.dumps от него: XCom сериализует в JSON сам, и строка
-        с JSON внутри давала двойное кодирование — в UI такая запись показывалась как
-        «Invalid input», потому что просмотрщик получал строку вместо объекта.
+        Метка времени переехала внутрь — ключом словаря, порядок сохраняется. Запись
+        обновляется на КАЖДОМ опросе: XCom таска Airflow чистит перед каждым исполнением,
+        а в reschedule опрос — отдельное исполнение.
         """
-        for item in items:
-            context['ti'].xcom_push(key=item['key'], value=item['row'])
+        context['ti'].xcom_push(key='receipts', value={i['key']: i['row'] for i in items})
 
     def poke_topic(topic: str, **context) -> PokeReturnValue:
         """📥 Вычитывает квитанции топика и складывает их в хранилище тракта.
@@ -148,7 +150,8 @@ def tfs_kafka_rcv_dag():
         # а в reschedule каждый опрос — отдельное исполнение. Разложи накопленное в конце
         # опроса — и всё время, пока идёт чтение Kafka, в UI висел бы пустой XCom.
         seen = list(run_state_get(context, SEEN_KEY) or [])
-        _push_xcom(context, seen)
+        if seen:
+            _push_xcom(context, seen)
 
         conn = BaseHook.get_connection(KAFKA_RCV_CONN)
         config = dict(conn.extra_dejson)  # extra_dejson = librdkafka config (контракт Kafka-провайдера)
@@ -228,7 +231,7 @@ def tfs_kafka_rcv_dag():
             ]
             seen += fresh
             run_state_set(context, SEEN_KEY, seen)
-            _push_xcom(context, fresh)   # пришедшее этим опросом — остальное уже разложено
+            _push_xcom(context, seen)   # запись одна: кладём весь накопленный словарь
 
             failed  = [r for r in rows if r['status_code'] > 0]
             unknown = [r for r in rows if r['status_code'] < 0]
@@ -249,9 +252,15 @@ def tfs_kafka_rcv_dag():
         elapsed = (datetime.now(timezone.utc) - context['dag_run'].start_date).total_seconds()
         if elapsed >= WINDOW and seen:
             logger.info("✅ %s: окно закрыто, квитанций за час: %d", topic, len(seen))
-            # return_value — итог окна одной записью, рядом с пофайловыми выше.
-            return PokeReturnValue(is_done=True, xcom_value={'topic': topic, 'count': len(seen),
-                                                             'receipts': [i['row'] for i in seen]})
+            # return_value — только ИТОГИ: сами квитанции лежат рядом, в записи 'receipts',
+            # и дублировать их списком значит хранить одно и то же дважды.
+            rows = [i['row'] for i in seen]
+            return PokeReturnValue(is_done=True, xcom_value={
+                'topic':   topic,
+                'count':   len(rows),
+                'failed':  sum(1 for r in rows if r['status_code'] > 0),
+                'unknown': sum(1 for r in rows if r['status_code'] < 0),
+            })
 
         # Ложный ответ = ждём дальше. Когда окно выйдет, а seen так и останется нулём,
         # сенсор упрётся в timeout и при soft_fail пометит таск скипнутым.

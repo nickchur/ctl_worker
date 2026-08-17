@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-15 00:30 MSK · v3.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 09:20 MSK · v3.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -469,7 +469,20 @@ def _er_build_meta(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = _xcom(context, cfg['tg'], 'init')
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-    rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
+    try:
+        rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
+    except Exception as err:
+        # 60 = UNKNOWN_TABLE, 81 = UNKNOWN_DATABASE. Это ошибка НАСТРОЙКИ, а не сбой:
+        # за пять минут таблица не появится, и три ретрая только растягивают падение
+        # на двадцать минут, пряча причину в четвёртой попытке. Остальные ошибки
+        # (недоступный ClickHouse, таймаут) прокидываем как есть — их повтор лечит.
+        if getattr(err, 'code', None) not in (60, 81):
+            raise
+        raise AirflowFailException(
+            f"{cfg['db']}.{cfg['tbl']}: источника нет в ClickHouse — {err}. "
+            f"Поправьте db_name/extract_name записи дагом export_er_setup: "
+            f"по этой таблице берутся комментарии колонок для .meta"
+        ) from err
     ch_cols = ch_columns(rows)
 
     def _cols_from_query(sql: str) -> list[dict]:

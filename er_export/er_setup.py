@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-14 19:40 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 09:20 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -359,12 +359,14 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
     }
 
 
-def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[dict, list[str], list[str]]:
+def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict,
+              known_tables: set | None = None) -> tuple[dict, list[str], list[str]]:
     """🧬 Раскладывает строки er_wf_meta по группам, разрешая наследование от строк-дефолтов.
 
-    tables      — строки-поставки (extract_name непустой)
-    defaults    — {replica: строка-дефолт группы}
-    ch_comments — {(db, table): комментарий} для строк без description
+    tables       — строки-поставки (extract_name непустой)
+    defaults     — {replica: строка-дефолт группы}
+    ch_comments  — {(db, table): комментарий} для строк без description
+    known_tables — {(db, table)} существующие в ClickHouse; None — не проверять
 
     Возвращает (структура для Variable, ошибки, предупреждения).
 
@@ -413,6 +415,15 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
 
         if not check_table(info['row'], info['key'],
                            errors.setdefault(replica, []), info['params']):
+            continue
+
+        # Источника нет — дальше пропускать нельзя: build_meta делает по нему DESCRIBE TABLE
+        # ради комментариев колонок, и пакет падал бы каждую ночь по расписанию. Ошибка
+        # настройки должна всплывать здесь, а не в три часа ночи на четвёртом ретрае.
+        if known_tables is not None and (row["db_name"], row["extract_name"]) not in known_tables:
+            errors.setdefault(replica, []).append(
+                f"{info['key']}: таблицы нет в ClickHouse — проверьте db_name и extract_name"
+            )
             continue
 
         group = wfs.setdefault(replica, {
@@ -855,18 +866,18 @@ def er_setup_dag():
         if off:
             logger.info("⏸️ Группы выключены строкой-дефолтом (is_active=0): %s", ", ".join(sorted(off)))
 
-        # 💬 Для строк без явного description подтягиваем комментарий таблицы из system.tables
-        # одним батч-запросом, чтобы не делать N отдельных DESCRIBE.
-        no_desc = [(r["db_name"], r["extract_name"]) for r in tables if not r["description"]]
-        ch_comments: dict[tuple[str, str], str] = {}
-        if no_desc:
-            pairs = ", ".join(f"('{_q(db)}', '{_q(tbl)}')" for db, tbl in no_desc)
-            ch_comments = {
-                (r["database"], r["name"]): r["comment"]
-                for r in get_dict_from_ch(hook, f"SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})")
-            }
+        # 💬 Комментарии таблиц из system.tables одним батч-запросом, чтобы не делать
+        # N отдельных DESCRIBE. Спрашиваем про ВСЕ поставки, а не только про строки без
+        # description: тем же ответом проверяется, что источник вообще существует —
+        # запись на несуществующую таблицу иначе всплывает ночью падением build_meta.
+        pairs = ", ".join(f"('{_q(r['db_name'])}', '{_q(r['extract_name'])}')" for r in tables)
+        ch_tables = get_dict_from_ch(
+            hook, f"SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})"
+        ) if tables else []
+        ch_comments   = {(r["database"], r["name"]): r["comment"] for r in ch_tables}
+        known_tables  = set(ch_comments)
 
-        wfs, errors, warnings = build_wfs(tables, defaults, ch_comments)
+        wfs, errors, warnings = build_wfs(tables, defaults, ch_comments, known_tables)
 
         if not wfs:
             raise ValueError(

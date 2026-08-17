@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-17 09:50 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 11:00 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -684,6 +684,114 @@ def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool, int | None, i
         except (ValueError, IndexError):
             pass
     return mapping.get(base, "STRING"), notnull, length, precision, scale
+
+
+# Маска квалифицированного имени: db.table. Ловит и алиасы колонок (t1.person_uuid) —
+# отсеются проверкой в ClickHouse, зато не нужен разбор SQL.
+_QUALIFIED = re.compile(r'\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b')
+# Первое слово FROM-части: имя без базы достраивается db_name записи.
+_FIRST_WORD = re.compile(r'^\s*([A-Za-z_]\w*)')
+
+
+def _quote(value) -> str:
+    """Строковый литерал ClickHouse."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def sql_sources(parts: dict, db_name: str = '', extract_name: str = '') -> list[tuple[str, str]]:
+    """🔎 Таблицы, к которым обращается запрос, в порядке приоритета: from → with → joins.
+
+    Приоритет решает, чьё описание достанется колонке, встречающейся в нескольких
+    таблицах: побеждает основная, из FROM.
+
+    Имена ищутся маской `db.table`; в FROM имя без базы достраивается db_name записи —
+    там первое слово это гарантированно таблица, а в JOIN-ах и CTE так гадать нельзя.
+    Хвостом идёт (db_name, extract_name): у выгрузки, названной по своей таблице, это
+    та же таблица, а у прочих пара просто не найдётся.
+
+    Мусорные пары (алиасы вида t1.person_uuid) не отсеиваем: разбирать SQL ради этого
+    дороже, чем проверить кандидатов одним запросом в system.columns.
+
+    where и settings не смотрим: таблиц там не бывает, а условия дают ложные пары.
+    """
+    out: list[tuple[str, str]] = []
+
+    def _add(db: str, table: str) -> None:
+        if db and table and (db, table) not in out:
+            out.append((db, table))
+
+    for key in ('from', 'with', 'joins'):
+        text = str(parts.get(key) or '').strip()
+        if not text:
+            continue
+        if key == 'from' and '.' not in text.split()[0]:
+            if first := _FIRST_WORD.match(text):
+                _add(db_name, first.group(1))
+        for db, table in _QUALIFIED.findall(text):
+            _add(db, table)
+
+    _add(db_name, extract_name)
+    return out
+
+
+def ch_source_columns(hook, sources: list) -> tuple[dict, list]:
+    """💬 {имя колонки: описание} по таблицам-источникам плюс список найденных таблиц.
+
+    ОДИН запрос в system.columns на всех кандидатов сразу, а не DESCRIBE на каждого:
+    половина кандидатов таблицами не является (это алиасы), и падающий запрос на каждого
+    засорял бы лог. Строки приводятся к форме DESCRIBE, поэтому разбор остаётся общий —
+    ch_columns(). Мержим по приоритету источников: первый выигрывает.
+    """
+    if not sources:
+        return {}, []
+
+    pairs = ", ".join(f"({_quote(db)}, {_quote(tbl)})" for db, tbl in sources)
+    rows = get_dict_from_ch(hook, f"""
+        SELECT database, table, name, type, comment
+        FROM system.columns
+        WHERE (database, table) IN ({pairs})
+        ORDER BY database, table, position
+    """)
+
+    by_table: dict[tuple[str, str], list] = {}
+    for r in rows:
+        # (имя, тип, default_kind, default_expr, комментарий) — как отдаёт DESCRIBE TABLE
+        by_table.setdefault((r['database'], r['table']), []).append(
+            (r['name'], r['type'], '', '', r['comment'])
+        )
+
+    merged: dict = {}
+    found: list = []
+    for src in sources:
+        if not (tbl_rows := by_table.get(src)):
+            continue
+        found.append(src)
+        for name, col in ch_columns(tbl_rows).items():
+            merged.setdefault(name, col)
+    return merged, found
+
+
+def ch_table_comments(hook, sources_by_key: dict) -> dict:
+    """💬 {ключ записи: комментарий первой найденной таблицы} — батчем на все записи.
+
+    Комментарий берётся у той же таблицы, что дала описания колонок, а не у
+    db_name.extract_name: имя выгрузки таблице соответствовать не обязано.
+    """
+    all_pairs = {src for sources in sources_by_key.values() for src in sources}
+    if not all_pairs:
+        return {}
+
+    pairs = ", ".join(f"({_quote(db)}, {_quote(tbl)})" for db, tbl in sorted(all_pairs))
+    comments = {
+        (r['database'], r['name']): r['comment']
+        for r in get_dict_from_ch(hook, f"""
+            SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})
+        """)
+    }
+    return {
+        key: next((comments[src] for src in sources if comments.get(src)), '')
+        for key, sources in sources_by_key.items()
+    }
 
 
 def ch_columns(describe_rows: list) -> dict:

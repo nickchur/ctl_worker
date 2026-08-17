@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-17 10:20 MSK · v3.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 11:00 MSK · v3.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -34,14 +34,14 @@ from airflow.utils.task_group import TaskGroup
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
-        build_sql, build_meta, ch_columns, ch_error, check_fields, cols_from_fields,
-        export_sql, parse_s3_target, query_columns, unnamed_fields,
+        build_sql, build_meta, ch_source_columns, check_fields, cols_from_fields,
+        export_sql, parse_s3_target, query_columns, sql_sources, unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
-        build_sql, build_meta, ch_columns, ch_error, check_fields, cols_from_fields,
-        export_sql, parse_s3_target, query_columns, unnamed_fields,
+        build_sql, build_meta, ch_source_columns, check_fields, cols_from_fields,
+        export_sql, parse_s3_target, query_columns, sql_sources, unnamed_fields,
     )
 
 
@@ -469,21 +469,19 @@ def _er_build_meta(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
     dp = _xcom(context, cfg['tg'], 'init')
     hook = ClickHouseHook(clickhouse_conn_id=CH_ID)
-    # 💬 Комментарии колонок берутся по db_name.extract_name — но extract_name это ИМЯ
-    # ВЫГРУЗКИ, а не обязательно таблица: из одной таблицы делают несколько выгрузок
-    # с разными джойнами и условиями. Нет такой таблицы — .meta собирается без описаний,
-    # а не падает: состав колонок всё равно приходит из DESCRIBE по самому запросу.
-    # 60 = UNKNOWN_TABLE, 81 = UNKNOWN_DATABASE; прочие ошибки (недоступный ClickHouse,
-    # таймаут) прокидываем — их лечит повтор.
-    rows: list = []
-    try:
-        rows, _ = hook.execute(f"DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}", with_column_types=True)
-    except Exception as err:
-        if getattr(err, 'code', None) not in (60, 81):
-            raise
-        logger.info("💬 %s.%s — не таблица, описания колонок в .meta не попадут: %s",
-                    cfg['db'], cfg['tbl'], ch_error(err))
-    ch_cols = ch_columns(rows) if rows else {}
+    # 💬 Описания колонок берём у таблиц, к которым обращается САМ ЗАПРОС: from → with →
+    # joins. Имя выгрузки для этого не годится — из одной таблицы делают несколько выгрузок
+    # с разными джойнами, и таблицы с именем выгрузки может не быть вовсе.
+    sources        = sql_sources(cfg.get('sql_parts') or {}, cfg['db'], cfg['tbl'])
+    ch_cols, found = ch_source_columns(hook, sources)
+    if found:
+        logger.info("💬 Описания колонок из %s (описано %d из %d)",
+                    ", ".join(f"{db}.{t}" for db, t in found),
+                    sum(1 for c in ch_cols.values() if c['description']), len(ch_cols))
+    else:
+        logger.warning("⚠️ Ни одной таблицы-источника не нашлось (кандидаты: %s) — "
+                       ".meta соберётся без описаний колонок",
+                       ", ".join(f"{db}.{t}" for db, t in sources) or "нет")
 
     def _cols_from_query(sql: str) -> list[dict]:
         """Колонки по DESCRIBE итогового запроса — так же, как их видит TSVWithNames.
@@ -497,19 +495,23 @@ def _er_build_meta(cfg, **context):
         return query_columns(qrows, ch_cols)
 
     def _cols_from_table() -> list[dict]:
-        """Запасной путь: колонки по DESCRIBE TABLE источника, без учёта JOIN и выражений.
+        """Запасной путь: колонки по первой таблице-источнику, без учёта JOIN и выражений.
 
-        Работает, только если db_name.extract_name — настоящая таблица. Для выгрузки,
-        имя которой таблице не соответствует, запасного пути нет: состав колонок берётся
-        из DESCRIBE по запросу, и если не вышло и это, честнее упасть с внятным текстом.
+        Не нашлось ни одной — брать состав неоткуда, и честнее упасть с внятным текстом,
+        чем отдать в КАП .meta, собранный неизвестно из чего.
         """
-        if not rows:
+        if not found:
             raise AirflowFailException(
                 f"{cfg['db']}.{cfg['tbl']}: состав колонок .meta взять неоткуда — "
-                f"DESCRIBE по запросу не удался, а таблицы с именем выгрузки нет. "
+                f"DESCRIBE по запросу не удался, а таблиц-источников не нашлось "
+                f"(кандидаты: {', '.join(f'{db}.{t}' for db, t in sources) or 'нет'}). "
                 f"Проверьте запрос дагом export_er_setup"
             )
-        return cols_from_fields(cfg.get('fields', ['*']), ch_cols, rows)
+        # Только первая таблица: у запасного пути состав колонок берётся из ОДНОГО
+        # источника, иначе в .meta уехали бы колонки, которых в выгрузке нет.
+        first, _ = ch_source_columns(hook, found[:1])
+        # Псевдострок DESCRIBE достаточно: cols_from_fields смотрит в них только имя.
+        return cols_from_fields(cfg.get('fields', ['*']), first, [(name,) for name in first])
 
     sql_meta = cfg.get('sql_meta')
     if sql_meta:
@@ -902,6 +904,10 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         # None → состояние дельты не читается: так работают recent и full_export
         'sql_get_current': sql_cur_delta(tbl) if (is_delta and not p['full_export']) else None,
         'sql_meta':        q['sql_meta'],
+        # Части запроса как есть — из них build_meta достаёт таблицы-источники, чтобы
+        # взять описания колонок. Имя выгрузки для этого не годится: таблицы с таким
+        # именем может не быть вовсе.
+        'sql_parts':       entry.get(q['sql_key']) if isinstance(entry.get(q['sql_key']), dict) else {},
         # ── Схема ────────────────────────────────────────────────────────────
         'fields':          entry['fields'],
         'PK':              entry.get('PK', []),

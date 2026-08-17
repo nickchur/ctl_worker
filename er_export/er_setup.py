@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-17 10:20 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 11:00 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -118,15 +118,15 @@ try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
-        raw_key, key_to_where, build_meta, ch_columns, check_fields, cols_from_fields,
-        export_sql, probe_sql, query_columns, unnamed_fields,
+        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments, check_fields,
+        cols_from_fields, export_sql, probe_sql, query_columns, sql_sources, unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
-        raw_key, key_to_where, build_meta, ch_columns, check_fields, cols_from_fields,
-        export_sql, probe_sql, query_columns, unnamed_fields,
+        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments, check_fields,
+        cols_from_fields, export_sql, probe_sql, query_columns, sql_sources, unnamed_fields,
     )
 
 _cfg           = get_config()
@@ -364,7 +364,7 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
 
     tables      — строки-поставки (extract_name непустой)
     defaults    — {replica: строка-дефолт группы}
-    ch_comments — {(db, table): комментарий} для строк без description
+    ch_comments — {(db_name, extract_name): комментарий таблицы-источника}
 
     Возвращает (структура для Variable, ошибки, предупреждения).
 
@@ -717,22 +717,22 @@ def er_setup_dag():
             # .meta собираем, только если сам запрос выполнился: строить схему по запросу,
             # который не разбирается, нечем, а вторая та же ошибка в отчёте лишняя.
             if not errors:
-                # Комментарии колонок — из источника; у результата подзапроса их нет.
-                # Источника может и не быть (поставка собрана из CTE) — тогда .meta
-                # останется без описаний, но собраться обязана.
-                ch_cols, describe_rows = {}, []
-                try:
-                    describe_rows, _ = hook.execute(
-                        f"DESCRIBE TABLE {info['key']}", with_column_types=True)
-                    ch_cols = ch_columns(describe_rows)
-                except Exception as err:
-                    # Это предупреждение, а не ошибка: extract_name — имя ВЫГРУЗКИ, и
-                    # таблицы с таким именем может не быть вовсе (из одной таблицы делают
-                    # несколько выгрузок с разными джойнами и условиями). Состав колонок
-                    # берётся из DESCRIBE по запросу, страдают только описания колонок.
+                # Комментарии колонок — из таблиц, к которым обращается запрос
+                # (from → with → joins); у результата подзапроса комментариев нет.
+                # Ни одной таблицы не нашлось — .meta соберётся без описаний.
+                sql_parts = info['entry'].get(q['sql_key'])
+                sources = sql_sources(sql_parts if isinstance(sql_parts, dict) else {},
+                                      merged['db_name'], merged['extract_name'])
+                ch_cols, found = ch_source_columns(hook, sources)
+                result['sources'] = [f"{db}.{t}" for db, t in found]
+                if not found:
+                    # Предупреждение, а не ошибка: описания колонок — приятное дополнение,
+                    # а не условие выгрузки. Ошибкой это было бы, будь имя выгрузки
+                    # обязано быть таблицей, — оно не обязано.
                     warnings.append(
-                        f"DESCRIBE TABLE {info['key']} не прошёл ({ch_error(err)}) — "
-                        ".meta соберётся без описаний колонок"
+                        "таблиц-источников не нашлось (кандидаты: "
+                        + (", ".join(f"{db}.{t}" for db, t in sources) or "нет")
+                        + ") — .meta соберётся без описаний колонок"
                     )
 
                 # Состав .meta считаем по запросу БЕЗ служебных колонок — ровно так же,
@@ -743,7 +743,7 @@ def er_setup_dag():
                                                 settings={'max_execution_time': PROBE_TIMEOUT})
                         data_cols = query_columns(mcols, ch_cols)
                     else:
-                        data_cols = cols_from_fields(info['entry']['fields'], ch_cols, describe_rows)
+                        data_cols = cols_from_fields(info['entry']['fields'], ch_cols, [(n,) for n in ch_cols])
                 except Exception as err:
                     errors.append(f"состав колонок .meta не собрался: {ch_error(err)}")
                     data_cols = []
@@ -859,17 +859,17 @@ def er_setup_dag():
         if off:
             logger.info("⏸️ Группы выключены строкой-дефолтом (is_active=0): %s", ", ".join(sorted(off)))
 
-        # 💬 Для строк без явного description подтягиваем комментарий таблицы из system.tables
-        # одним батч-запросом, чтобы не делать N отдельных DESCRIBE. Таблицы может не быть:
-        # extract_name — имя выгрузки, а не обязательно таблицы, — тогда описания просто нет.
-        no_desc = [(r["db_name"], r["extract_name"]) for r in tables if not r["description"]]
-        ch_comments: dict[tuple[str, str], str] = {}
-        if no_desc:
-            pairs = ", ".join(f"('{_q(db)}', '{_q(tbl)}')" for db, tbl in no_desc)
-            ch_comments = {
-                (r["database"], r["name"]): r["comment"]
-                for r in get_dict_from_ch(hook, f"SELECT database, name, comment FROM system.tables WHERE (database, name) IN ({pairs})")
-            }
+        # 💬 Для строк без явного description подтягиваем комментарий ТАБЛИЦЫ-ИСТОЧНИКА
+        # (первой из sql_from), а не таблицы с именем выгрузки: имя выгрузки таблице
+        # соответствовать не обязано. Один батч-запрос на все записи.
+        sources_by_key = {
+            (r["db_name"], r["extract_name"]): sql_sources(
+                {'from': r.get("sql_from"), 'with': r.get("sql_with"), 'joins': r.get("sql_join")},
+                r["db_name"], r["extract_name"],
+            )
+            for r in tables if not r["description"]
+        }
+        ch_comments = ch_table_comments(hook, sources_by_key) if sources_by_key else {}
 
         wfs, errors, warnings = build_wfs(tables, defaults, ch_comments)
 

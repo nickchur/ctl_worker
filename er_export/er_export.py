@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-17 12:10 MSK · v3.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 13:30 MSK · v3.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -39,7 +39,7 @@ try:
         unnamed_fields,
     )
 except ImportError:
-    from er_export.er_config import (
+    from er_export.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
         build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
         cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,

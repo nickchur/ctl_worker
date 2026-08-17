@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-17 12:10 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-17 13:30 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -123,7 +123,7 @@ try:
         merge_params, probe_sql, query_columns, sql_sources, unnamed_fields,
     )
 except ImportError:
-    from er_export.er_config import (
+    from er_export.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,

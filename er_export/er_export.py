@@ -1,12 +1,16 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-17 13:30 MSK · v3.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-19 14:20 MSK · v3.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
 
-  <db>__<tbl>: init → [build_meta, export_to_s3] → pack_zip
-                                                      ↓
-  make_summary → notify_tfs → wait_confirm → save_status → schedule_next
+  make_ts → <db>__<tbl>: init → [build_meta, export_to_s3] → pack_zip
+                                                                ↓
+  make_summary → wait_confirm → save_status → schedule_next
+
+Имена файлов пакета: `[базовая реплика]__[ts]__[группа]__[таблица]__[часть]_[всего]_[строк].zip`
+и `[базовая реплика]__[ts].tkt` — суффикс группы стоит за меткой времени, а в тикете его нет
+вовсе. Метку выдаёт make_ts, по одному таску за раз на базовую реплику (пул на один слот).
 
 Метаданные выгрузок хранятся в Airflow Variable `datalab_er_wfs` (JSON-словарь),
 который синхронизируется DAG-ом export_er_setup из таблицы export.er_wf_meta.
@@ -33,14 +37,16 @@ from airflow.utils.task_group import TaskGroup
 
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
-        get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
+        get_config, get_dict_from_ch, obj_load, add_note, get_params,
+        replica_base, replica_group, ts_pool,
         build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
         cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,
         unnamed_fields,
     )
 except ImportError:
     from er_export.er_config import (  # type: ignore
-        get_config, get_dict_from_ch, obj_load, add_note, get_params, replica_base,
+        get_config, get_dict_from_ch, obj_load, add_note, get_params,
+        replica_base, replica_group, ts_pool,
         build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
         cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,
         unnamed_fields,
@@ -125,22 +131,21 @@ def _ch_ts(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
 
-def _run_ts(context) -> datetime:
-    """🕐 Единая точка отсчёта пакета — logical_date рана.
+def _pkg_ts(context) -> datetime:
+    """🕐 Единая точка отсчёта пакета — метка времени из XCom таска make_ts.
 
     От неё строятся имена ВСЕХ файлов пакета: и архивов по каждой таблице, и общего тикета,
-    а ЕР требует у них одинаковый ts. Поэтому значение обязано быть неизменным.
+    а ЕР требует у них одинаковый ts. Поэтому значение обязано быть неизменным — его и
+    считает один-единственный таск в начале рана, а все остальные только читают.
 
-    Именно logical_date, а не dag_run.start_date: последний перештамповывается при каждом
-    переходе рана в RUNNING, то есть после clear упавшей таблицы её архивы получили бы новое
-    время, а тикет — третье, и пакет развалился бы на разные метки. logical_date у рана одна
-    навсегда. Она же стоит в ключе промежуточного файла ({{ ts_nodash }}), так что имена
-    сходятся на всех этапах.
+    Не logical_date, хотя она у рана неизменна: суффикс группы из имени тикета убран, а
+    logical_date у групп одной реплики на общем cron совпадает до секунды — тикеты получили
+    бы одно имя и затёрли друг друга в S3. Подробности — в docstring _er_make_ts.
+
+    Пусто = падаем. Молчаливый откат на logical_date вернул бы ровно то совпадение имён,
+    ради которого make_ts и заведён.
     """
-    ts = context.get('logical_date') or getattr(context.get('dag_run'), 'logical_date', None)
-    if ts is None:  # ручной вызов вне контекста рана — лучше отдать хоть что-то, чем упасть
-        ts = getattr(context.get('dag_run'), 'start_date', None) or datetime.now(timezone.utc)
-    return ts.astimezone(timezone.utc)
+    return datetime.fromisoformat(_xcom(context, '', 'make_ts', key='package_ts'))
 
 
 def _enqueue_files(gcfg: dict, files: list[str], context) -> list[dict]:
@@ -156,7 +161,7 @@ def _enqueue_files(gcfg: dict, files: list[str], context) -> list[dict]:
     """
     import uuid
 
-    package_ts = _run_ts(context).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    package_ts = _pkg_ts(context).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
     run_id     = getattr(context.get('dag_run'), 'run_id', '') or ''
 
     rows = [{
@@ -551,14 +556,52 @@ def _er_build_meta(cfg, **context):
              level='task', context=context)
 
 
+@task(task_id='make_ts')
+def _er_make_ts(gcfg, **context):
+    """🕐 Выдаёт пакету метку времени — от неё строятся имена ВСЕХ его файлов.
+
+    Раньше меткой служила logical_date рана, и этого хватало, пока суффикс группы стоял
+    в имени тикета. Теперь тикет называется `[базовая реплика]__[ts].tkt`, а logical_date
+    у групп одной реплики на общем cron совпадает до секунды — два пакета получили бы
+    один тикет и затёрли друг друга в S3 (replace=True).
+
+    Развести их и обязан этот таск. Он сидит в пуле ts_pool(replica) — одном на всю
+    базовую реплику и ровно на ОДИН слот, — так что группы проходят его по очереди,
+    а секундная пауза в конце гарантирует, что следующая возьмёт другое значение now():
+    слот освобождается только по концу таска.
+
+    Порядок «сначала запомнить, потом поспать» не декоративный: метка обязана быть той,
+    что взята на входе, иначе пауза не даёт ничего.
+
+    Метка живёт в XCom, поэтому clear одной таблицы или make_summary имена не меняет.
+    А вот clear всего рана перезапустит и этот таск: пакет поедет с новой меткой, а архивы
+    прошлой попытки останутся в S3 сиротами — раньше они перезаписывались.
+    """
+    import time
+
+    ts = datetime.now(timezone.utc)
+    context['ti'].xcom_push(key='package_ts', value=ts.isoformat())
+    logger.info("🕐 Метка времени пакета %s: %s", gcfg['replica'], ts.strftime('%Y%m%d%H%M%S'))
+    add_note(f"🕐 метка времени пакета: {ts.strftime('%Y%m%d%H%M%S')}",
+             level='task,dag', context=context)
+
+    # Пауза под удерживаемым слотом пула: соседняя группа стартует не раньше чем через
+    # секунду и получит другую метку. Секунды хватает — в имени файла она младший разряд.
+    time.sleep(1)
+
+
 @task(task_id='pack_zip')
 def _er_pack_zip(cfg, **context):
     """📦 Упаковывает выгруженные файлы одной таблицы в ZIP-архивы формата ЕР.
 
     Каждый файл данных оборачивается в отдельный ZIP (стриминг, без буферизации в памяти):
-      [replica]__[ts].tkt      — `filename;rowcount` (TKT внутри архива, стандарт ЕР)
+      [база]__[ts].tkt      — `filename;rowcount` (TKT внутри архива, стандарт ЕР)
       [schema]__[table]__[ts].meta        — JSON-схема колонок
       [schema]__[table]__[ts].csv|.json   — данные из S3, расширение по формату выгрузки
+
+    Сам архив — [база]__[ts]__[группа]__[table]__[часть]_[всего]_[строк].zip. Базовая
+    реплика первой, суффикс группы ЗА меткой времени; в тикете суффикса нет вовсе,
+    его пакеты разводит по именам сама метка (см. _er_make_ts).
 
     Имена файлов — строго нижний регистр, расширение архива .zip (стандарт ЕР).
     После упаковки исходные файлы удаляются из S3.
@@ -585,7 +628,7 @@ def _er_pack_zip(cfg, **context):
     counts  = _xcom(context, tg, 'export_to_s3', key='row_count_list', required=bool(s3_keys))
     meta_s  = _xcom(context, tg, 'build_meta',   key='meta_json')
 
-    base_ts = _run_ts(context)
+    base_ts = _pkg_ts(context)
     ts      = base_ts.strftime("%Y%m%d%H%M%S")
     mtime   = base_ts.replace(tzinfo=None)
 
@@ -606,8 +649,9 @@ def _er_pack_zip(cfg, **context):
                    if FORMAT_MAP[cfg['format']]['header'] else b""
         data_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__0_1_0.{ext}".lower()
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__0_1_0.meta".lower()
-        tkt_n  = f"{cfg['replica']}__{ts}.tkt".lower()
-        zip_n  = f"{cfg['replica']}__{ts}__{cfg['tbl']}__0_1_0.zip".lower()
+        tkt_n  = f"{cfg['replica_base']}__{ts}.tkt".lower()
+        zip_n  = (f"{cfg['replica_base']}__{ts}__{cfg['replica_group']}__"
+                  f"{cfg['tbl']}__0_1_0.zip").lower()
         members = [
             (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{data_n};0".encode()]),
             (meta_n, mtime, S_IFREG | 0o600, ZIP_32, [meta_s.encode()]),
@@ -628,8 +672,9 @@ def _er_pack_zip(cfg, **context):
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
         data_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.{ext}".lower()
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.meta".lower()
-        tkt_n  = f"{cfg['replica']}__{ts}.tkt".lower()
-        zip_n  = f"{cfg['replica']}__{ts}__{cfg['tbl']}__{i+1}_{total}_{rows}.zip".lower()
+        tkt_n  = f"{cfg['replica_base']}__{ts}.tkt".lower()
+        zip_n  = (f"{cfg['replica_base']}__{ts}__{cfg['replica_group']}__"
+                  f"{cfg['tbl']}__{i+1}_{total}_{rows}.zip").lower()
 
         s3_body = hook.get_key(key=key, bucket_name=dst['bucket']).get()["Body"]
         members = [
@@ -653,9 +698,10 @@ def _er_pack_zip(cfg, **context):
 def _er_make_summary(gcfg, **context):
     """🧾 Собирает общий тикет пакета — один .tkt на все архивы группы.
 
-    Тикет `[replica]__[ts].tkt` перечисляет ZIP-файлы всех таблиц пакета, по имени в строке.
-    Его имя уникально по построению: replica включает суффикс группы, а внутри группы
-    max_active_runs=1 не даёт двум пакетам родиться одновременно.
+    Тикет `[база]__[ts].tkt` перечисляет ZIP-файлы всех таблиц пакета, по имени в строке.
+    Суффикса группы в его имени нет (требование ЕР), поэтому уникальность держится
+    на метке времени: её выдаёт make_ts, по одному таску за раз на базовую реплику.
+    Внутри группы двум пакетам не дают родиться одновременно ещё и max_active_runs=1.
 
     trigger_rule=none_failed: падение любой таблицы блокирует пакет целиком — тикет
     на неполный список архивов ушёл бы в ЕР как полноценная поставка.
@@ -675,8 +721,8 @@ def _er_make_summary(gcfg, **context):
                  level='task,dag', context=context, title='🧾 make_summary')
         return
 
-    ts          = _run_ts(context).strftime("%Y%m%d%H%M%S")
-    summary_tkt = f"{gcfg['replica']}__{ts}.tkt".lower()
+    ts          = _pkg_ts(context).strftime("%Y%m%d%H%M%S")
+    summary_tkt = f"{gcfg['replica_base']}__{ts}.tkt".lower()
     dst = parse_s3_target(context['params'].get('export_path'), S3_CONN, BUCKET, gcfg['s3_prefix'])
     S3Hook(aws_conn_id=dst['conn_id']).load_bytes(
         "\n".join(zips).encode(), key=f"{dst['key_prefix']}{summary_tkt}",
@@ -904,6 +950,10 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         'tbl':             tbl,
         'schema_name':     entry['schema'],
         'replica':         replica,
+        # Части replica считаем здесь, а не в тасках: правило имени файла (база первой,
+        # суффикс группы — за меткой времени) должно жить в одном месте.
+        'replica_base':    replica_base(replica),
+        'replica_group':   replica_group(replica),
         's3_prefix':       prefix,
         # ── SQL ──────────────────────────────────────────────────────────────
         'sql_export':      q['sql_export'],
@@ -1079,6 +1129,8 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
     gcfg = {
         'dag_id':          dag_id,
         'replica':         replica,
+        'replica_base':    base,
+        'replica_group':   replica_group(replica),
         'scenario':        scen,
         's3_prefix':       prefix,
         'confirm_timeout': gp['confirm_timeout'],
@@ -1157,6 +1209,10 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
         return _pre_exp
 
     with dag:
+        # Метка времени пакета — первым делом и на весь ран: имена файлов строятся от неё,
+        # а пул на базовую реплику разводит по секундам пакеты разных групп.
+        t_ts = _er_make_ts.override(pool=ts_pool(replica))(gcfg=gcfg)
+
         packed = []
         for table_key, tcfg in cfgs.items():
             fmt = FORMAT_MAP[tcfg['format']]
@@ -1180,7 +1236,7 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
                     execution_timeout=timedelta(minutes=tcfg['export_timeout']),
                 )
                 t_zip = _er_pack_zip(cfg=tcfg)
-                t_init >> [t_meta, t_exp] >> t_zip
+                t_ts >> t_init >> [t_meta, t_exp] >> t_zip
                 packed.append(t_zip)
 
         # Отправки здесь нет: make_summary только ставит файлы в очередь, а шлёт их

@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-17 13:30 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-19 14:20 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -117,7 +117,8 @@ from airflow.models.param import Param
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
-        INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
+        INHERITED, replica_full, replica_base, ts_pool,
+        ch_error, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
         check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
         merge_params, probe_sql, query_columns, sql_sources, unnamed_fields,
@@ -125,7 +126,8 @@ try:
 except ImportError:
     from er_export.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
-        INHERITED, replica_full, ch_error, clean_row, parse_params, explicit_schedule, check_table,
+        INHERITED, replica_full, replica_base, ts_pool,
+        ch_error, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
         check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
         merge_params, probe_sql, query_columns, sql_sources, unnamed_fields,
@@ -139,6 +141,7 @@ RAW_VAR_NAME   = _cfg['RAW_VAR_NAME']
 CKSUM_VAR_NAME = _cfg['CKSUM_VAR_NAME']
 POOL_NAME      = _cfg['POOL_NAME']
 POOL_SLOTS     = _cfg['POOL_SLOTS']
+TS_POOL_SLOTS  = _cfg['TS_POOL_SLOTS']
 TFS_MAP        = _cfg['TFS_MAP']
 DEFAULT_PARAMS = _cfg['DEFAULT_PARAMS']
 GROUP_PARAMS   = _cfg['GROUP_PARAMS']
@@ -489,8 +492,18 @@ def wf_checksum(rows: list[dict]) -> str:
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()
 
 
-def _ensure_pool() -> None:
-    """🏊 Создаёт Airflow Pool для ER-выгрузок, если его ещё нет.
+def _ensure_pool(replicas=()) -> None:
+    """🏊 Создаёт Airflow Pool-ы для ER-выгрузок, если их ещё нет.
+
+    Общий пул выгрузок — всегда, пулы метки времени — на каждую базовую реплику из
+    переданных: у make_ts ровно один слот на реплику, и без пула таски разных групп
+    взяли бы одну и ту же секунду, а тикеты пакетов совпали бы именем.
+
+    Заводить их именно здесь можно потому, что DAG группы не существует, пока sync
+    не записал её в Variable, — пул всегда появляется раньше своего таска. Обратная
+    сторона: пересоздали метабазу — пулы вернёт только прогон с «force_sync»
+    (обычный уйдёт в скип по контрольной сумме), а до тех пор make_ts будет молча
+    стоять в очереди.
 
     Вызывается внутри таска, а не при разборе DAG: ensure_pool кэширует результат
     на процесс, но лишний SELECT на каждом обходе scheduler-ом всё равно не нужен.
@@ -498,6 +511,9 @@ def _ensure_pool() -> None:
     Пулы тракта ТФС здесь не заводятся — их создаёт tfs_kafka (ensure_pools в приёмнике).
     """
     ensure_pool(POOL_NAME, slots=POOL_SLOTS, description='Пул для ER-выгрузок')
+    for base in sorted({replica_base(r) for r in replicas}):
+        ensure_pool(ts_pool(base), slots=TS_POOL_SLOTS,
+                    description=f'ER: метка времени пакета, реплика {base}')
 
 
 def _hook():
@@ -901,6 +917,10 @@ def er_setup_dag():
         # 💾 Сохраняем ДО падения: опечатка в одной строке не должна замораживать правки
         # по всем остальным пакетам. obj_save пропускает запись, если данные не изменились.
         obj_save(VAR_NAME, wfs)
+
+        # Пулы метки времени — после сборки wfs: только здесь известен полный список
+        # реплик, а новая группа приносит с собой и новую базовую реплику.
+        _ensure_pool(wfs)
 
         # Сырые строки — для выпадающего списка записей: он строится при разборе файла
         # и в ClickHouse ходить не может. Пишем ВСЕ строки, включая выключенные:

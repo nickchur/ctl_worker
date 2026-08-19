@@ -1,5 +1,5 @@
 """### 📦 Тестовый пакет для единого репликатора / TFS
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-19 14:20 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает тестовые ZIP-пакеты в S3 с актуальными таймштампами.
 По умолчанию используются встроенные тестовые данные (3 части, 36/37/38 строк).
@@ -7,7 +7,8 @@
 
 | Параметр       | Описание                                                                          |
 |----------------|-----------------------------------------------------------------------------------|
-| `prefix`       | Префикс имени файла *(default: `hrplatform_datalab`)*                             |
+| `prefix`       | Префикс имени файла — базовая реплика *(default: `hrplatform_datalab`)*           |
+| `group`        | Суффикс группы поставок, в архиве стоит за таймштампом *(default: `0`)*           |
 | `table_name`   | Таблица в формате `schema__table` *(default: `learning__lc_items_opened`)*        |
 | `s3_prefix`    | Папка в бакете, без слэша в конце *(default: пусто — корень бакета)*              |
 | `bucket`       | S3 бакет *(зависит от стенда)*                                                    |
@@ -57,7 +58,8 @@ else:
     max_active_runs=1,
     schedule_interval=None,
     params={
-        "prefix": Param("hrplatform_datalab", type="string", description="Префикс имени файла"),
+        "prefix": Param("hrplatform_datalab", type="string", description="Префикс имени файла (базовая реплика)"),
+        "group": Param("0", type="string", description="Суффикс группы поставок — в имени архива стоит за таймштампом"),
         "table_name": Param("learning__lc_items_opened", type="string", description="Таблица в формате schema__table"),
         "s3_prefix": Param("", type=["string", "null"], description="Папка в бакете (без слэша в конце)"),
         "bucket": Param(def_bucket, type="string", description="S3 бакет"),
@@ -76,6 +78,7 @@ def tools_test_package():
     def upload(**context):
         p = context["params"]
         prefix = p["prefix"]
+        group = p["group"]
         full_table = p["table_name"]
         schema, _, table_name = full_table.partition("__")
         s3_prefix = (p["s3_prefix"] or "").rstrip("/")
@@ -137,7 +140,9 @@ def tools_test_package():
             meta_name = f"{schema}__{table_name}__{inner_ts}__{part}_{total}_{rows}.meta"
             tkt_name  = f"{prefix}__{tkt_ts}.tkt"
             tkt_bytes = f"{csv_name};{rows}".encode()
-            zip_name  = f"{prefix}__{outer_ts}__{table_name}__{part}_{total}_{rows}.csv.zip"
+            # Суффикс группы — за таймштампом и только в архиве: тикет пакета его не несёт.
+            # Тот же порядок, что и у боевой выгрузки (ctl/er_export/er_export.py).
+            zip_name  = f"{prefix}__{outer_ts}__{group}__{table_name}__{part}_{total}_{rows}.csv.zip"
 
             buf = BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:

@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-19 14:20 MSK · v3.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-20 22:15 MSK · v3.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -1111,7 +1111,7 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
 
     Возвращает (dag_id, dag) для регистрации в globals().
     """
-    from hrp_operators import HrpClickNativeToS3ListOperator # type: ignore
+    from hrp_operators.clickhouse_to_s3 import HrpClickNativeToS3ListOperator # type: ignore
 
     base = replica_base(replica)
     if base not in TFS_MAP:

@@ -1,5 +1,5 @@
 """### 📦 DAG: Копирование между S3-бакетами
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-20 22:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Копирует объект из одного S3-бакета в другой с опциональным сжатием.
 
@@ -21,7 +21,7 @@ from airflow.models import Param, Connection
 from airflow.configuration import get_custom_secret_backend
 from airflow.decorators import dag
 
-from hrp_operators import HrpS3ToS3Operator  # type: ignore
+from hrp_operators.s3_to_s3 import HrpS3ToS3Operator  # type: ignore
 from plugins.utils import add_note
 
 from logging import getLogger

@@ -17,7 +17,7 @@ from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseOperator
 from airflow_clickhouse_plugin.operators.clickhouse_dbapi import ClickHouseBranchSQLOperator
 
 from CI06932748.analytics.datalab.default_default_args import DEFAULT_DEFAULT_ARGS
-from hrp_operators import HrpClickNativeToS3Operator, HrpClickNativeToS3ListOperator
+from hrp_operators.clickhouse_to_s3 import HrpClickNativeToS3Operator, HrpClickNativeToS3ListOperator
 
 logger = logging.getLogger(__name__)
 

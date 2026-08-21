@@ -1,5 +1,5 @@
 # 📡 Тракт Kafka ↔ ТФС
-*2026-08-17 15:35 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 17:20 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Приём обратных квитанций и отправка уведомлений с соблюдением темпа. Общий контур:
 сейчас им пользуется ЕР, следующим переезжает xStream.
@@ -305,8 +305,8 @@ WHERE status_code = -1 ORDER BY received_at DESC;
 
 ```sql
 SELECT s.file_name, s.notified_at
-FROM export.er_sent_files FINAL AS s
-LEFT ANTI JOIN export.tfs_receipts FINAL AS r USING (rq_uid)
+FROM export.er_sent_files AS s FINAL
+LEFT ANTI JOIN export.tfs_receipts AS r FINAL USING (rq_uid)
 WHERE s.notified_at > toDateTime64(0, 3)
   AND s.notified_at < now() - INTERVAL 1 HOUR;
 ```

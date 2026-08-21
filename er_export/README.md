@@ -1,5 +1,5 @@
 # 🚀 ER Export Framework
-*2026-08-19 14:20 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 17:20 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Фреймворк на базе Airflow для автоматизированной выгрузки данных из **ClickHouse** в **S3** с последующей нотификацией системы **TFS** через **Kafka**.
 
@@ -181,8 +181,8 @@ ClickHouse (`CH_ID`) и PostgreSQL/Greenplum (`PG_CONN`) подключаютс�
 
 ```sql
 SELECT s.file_name, s.notified_at, r.status_code, r.rq_tm
-FROM export.er_sent_files FINAL AS s
-LEFT JOIN export.tfs_receipts FINAL AS r USING (rq_uid)
+FROM export.er_sent_files AS s FINAL
+LEFT JOIN export.tfs_receipts AS r FINAL USING (rq_uid)
 WHERE s.replica = 'hrplatform_datalab__1'
 ORDER BY s.package_ts DESC, s.file_name;
 ```

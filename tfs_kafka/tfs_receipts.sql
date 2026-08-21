@@ -85,8 +85,8 @@ TTL toDateTime(received_at) + INTERVAL 90 DAY;
 
 -- Отправлено, но квитанции нет (по данным ER):
 --   SELECT s.file_name, s.notified_at
---   FROM export.er_sent_files FINAL AS s
---   LEFT ANTI JOIN export.tfs_receipts FINAL AS r USING (rq_uid)
+--   FROM export.er_sent_files AS s FINAL
+--   LEFT ANTI JOIN export.tfs_receipts AS r FINAL USING (rq_uid)
 --   WHERE s.notified_at > toDateTime64(0, 3)
 --     AND s.notified_at < now() - INTERVAL 1 HOUR;
 

@@ -72,7 +72,7 @@ ORDER BY (rq_uid);
 
 -- Судьба одного пакета: что отправлено и что подтверждено:
 --   SELECT s.file_name, s.notified_at, r.status_code, r.rq_tm
---   FROM export.er_sent_files FINAL AS s
---   LEFT JOIN export.tfs_receipts FINAL AS r USING (rq_uid)
+--   FROM export.er_sent_files AS s FINAL
+--   LEFT JOIN export.tfs_receipts AS r FINAL USING (rq_uid)
 --   WHERE s.replica = 'hrplatform_datalab__1'
 --   ORDER BY s.package_ts DESC, s.file_name;

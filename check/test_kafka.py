@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-21 15:10 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 16:05 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
@@ -222,7 +222,7 @@ _DEF_ARGS = {
     "on_failure_callback": on_callback,
     "on_success_callback": on_callback,
 }
-_TAGS = ["DataLab", "tools", "Kafka", "AutoQA"]
+_TAGS = ["DataLab", "tools", "kafka", "AutoQA"]
 
 
 # ── DAG: tools_test_kafka_snd ───────────────────────────────────────────────

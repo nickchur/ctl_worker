@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-08-06 19:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 16:40 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -258,7 +258,7 @@ def tfs_copy(path: str, **context):
 
 # Основная логика DAG
 with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
-    tags=['CTL', get_config()['profile'], 'CTL_agent', 'tfs_sensor'],
+    tags=['CTL', get_config()['profile'], 'CTL_agent', 'TFS', 'tfs_sensor'],
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=tfs_interval,
     default_args={ 
@@ -354,7 +354,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
 
 # ── Kafka-triggered DAG ──────────────────────────────────────────────────────
 with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
-    tags=['CTL', get_config()['profile'], 'CTL_agent', 'tfs_kafka'],
+    tags=['CTL', get_config()['profile'], 'CTL_agent', 'TFS', 'tfs_kafka'],
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule=None,
     default_args={

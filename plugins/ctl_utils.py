@@ -41,7 +41,7 @@ from psycopg2 import OperationalError, InterfaceError, DatabaseError
 from sqlalchemy import text
 
 from plugins.utils import query_to_dict, add_note, readable_size, pool_slots # type: ignore #, on_callback
-from plugins.s3_utils import s3_IterStream
+from plugins.s3_utils import s3_IterStream  # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")

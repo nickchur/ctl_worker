@@ -16,7 +16,7 @@ from airflow.utils.task_group import TaskGroup
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseOperator
 from airflow_clickhouse_plugin.operators.clickhouse_dbapi import ClickHouseBranchSQLOperator
 
-from CI06932748.analytics.datalab.default_default_args import DEFAULT_DEFAULT_ARGS
+from CI06932748.analytics.datalab.default_default_args import DEFAULT_DEFAULT_ARGS  # type: ignore
 from hrp_operators import HrpClickNativeToS3Operator, HrpClickNativeToS3ListOperator
 
 logger = logging.getLogger(__name__)
@@ -235,7 +235,12 @@ def make_xs_export_task_group(
     s3_list: bool = True,  # Качать с clickhouse в список S3 файлов
 ):
 
-    now_dt = pendulum.now('Europe/Moscow').strftime('%Y%m%d_%H%M%S')
+    # Метка времени рендерится в рантайме, а не при разборе файла. Вычисленная при
+    # парсинге, она меняла s3_key на каждом перепарсинге: сериализованный DAG переписывался,
+    # два рана между перепарсингами писали в один ключ и затирали друг друга (replace=True),
+    # а ретрай после перепарсинга уезжал под новым именем. logical_date уникальна для рана
+    # и переживает ретраи; формат имени и часовой пояс прежние.
+    now_dt = "{{ logical_date.in_timezone('Europe/Moscow').strftime('%Y%m%d_%H%M%S') }}"
 
     # формат выгрузки в файл
     # export_format = params.get("format", "TSVWithNames")

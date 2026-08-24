@@ -1,4 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
+*2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 ---
 

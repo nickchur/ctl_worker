@@ -1,4 +1,5 @@
 # 🛠️ Tools — Служебные DAG'и
+*2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Инструменты для администрирования и отладки. Все DAG'и запускаются вручную (`schedule=None`).
 

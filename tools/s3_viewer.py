@@ -18,7 +18,7 @@ from airflow.models import Param
 from airflow.decorators import task, dag
 
 from hrp_operators import HrpS3ListKeysOperator, HrpS3FileReadOperator  # type: ignore
-from plugins.utils import add_note, on_callback
+from plugins.utils import add_note, on_callback  # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")

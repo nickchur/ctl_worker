@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 13:40 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -168,26 +168,28 @@ with DAG(f'CTL.{config["profile"]}.config',
         add_note(msg, context, 'DAG,Task')
         
         
-        s3_id = config.get('conns',{}).get('s3',{}).get('conn_id')
-        bucket = config.get('ctl_bucket')
-        ttl = config.get('ctl_ttl')
-        if s3_id and bucket:
+        # Бакеты и сроки хранения. Создание бакета оставлено без перехвата: без него
+        # загрузкам некуда писать, и об этом надо знать сразу. А вот lifecycle-правило
+        # к моменту вызова уже ничего не решает — конфигурация сохранена выше, и ронять
+        # из-за него таск незачем: красный таск после успешного сохранения сбивает с толку.
+        for name, bucket_key, ttl_key in (('s3', 'ctl_bucket', 'ctl_ttl'),
+                                          ('files', 'files_bucket', 'files_ttl')):
+            s3_id = config.get('conns',{}).get(name,{}).get('conn_id')
+            bucket = config.get(bucket_key)
+            ttl = config.get(ttl_key)
+            if not (s3_id and bucket):
+                continue
+
             s3_create_bucket(s3_id, bucket)
-            
-            if ttl:
-                response = s3_set_ttl(s3_id, bucket, days=ttl, prefix='')
-                logger.info(response)
-        
-        
-        s3_id = config.get('conns',{}).get('files',{}).get('conn_id')
-        bucket = config.get('files_bucket')
-        ttl = config.get('files_ttl')
-        if s3_id and bucket:
-            s3_create_bucket(s3_id, bucket)
-            
-            if ttl:
-                response = s3_set_ttl(s3_id, bucket, days=ttl, prefix='')
-                logger.info(response)
+
+            if not ttl:
+                continue
+            try:
+                logger.info(s3_set_ttl(s3_id, bucket, days=ttl, prefix=''))
+                add_note(f"⏱️ TTL {ttl}д на {bucket}", context, 'Task')
+            except Exception as err:
+                logger.warning("⚠️ TTL на %s не выставлен: %s", bucket, err, exc_info=True)
+                add_note(f"⚠️ TTL на {bucket} не выставлен: {err}", context, 'Task')
         
         # conn = get_conn('ctl')
         # add_note(conn)

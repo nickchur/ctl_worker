@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-08-14 19:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-25 13:38 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -32,6 +32,8 @@ except ImportError:
     from CI06932748.tools.utils import readable_size, get_conns_by_type  # type: ignore
 
 from fnmatch import fnmatch
+import base64
+import hashlib
 import time
 import io
 import os
@@ -42,11 +44,34 @@ logger = getLogger("airflow.task")
 
 
 
+def _md5_instead_of_checksum(request, **kwargs):
+    """Возвращает Content-MD5 вместо контрольной суммы botocore.
+
+    PutBucketLifecycleConfiguration — операция с requestChecksumRequired, и до
+    botocore 1.36 SDK считал для неё Content-MD5. Потом его заменили на «гибкие
+    контрольные суммы»: уходят x-amz-checksum-crc32 и x-amz-sdk-checksum-algorithm,
+    а Content-MD5 не уходит вовсе. Наш шлюз знает только старый заголовок и отвечает
+    "Missing required header for this request: Content-MD5" — правило не ставится.
+
+    Считаем MD5 сами и убираем новые заголовки, чтобы запрос выглядел ровно так,
+    как выглядел до замены. Хук стоит на before-sign, поэтому заголовок попадает
+    в подпись SigV4, а не приезжает неподписанным довеском.
+    """
+    for name in [h for h in request.headers if h.lower().startswith(('x-amz-checksum-', 'x-amz-sdk-checksum-'))]:
+        del request.headers[name]
+
+    body = request.body or b''
+    if isinstance(body, str):
+        body = body.encode()
+    request.headers['Content-MD5'] = base64.b64encode(hashlib.md5(body).digest()).decode()
+
+
 def s3_set_ttl(conn, bucket, days, prefix='', status='Enabled'):
     """Создаёт или обновляет lifecycle-правило '{prefix}DeleteAfter' на удаление объектов через days дней."""
 
     hook = S3Hook(aws_conn_id=conn)
     client = hook.get_conn()
+    client.meta.events.register('before-sign.s3.PutBucketLifecycleConfiguration', _md5_instead_of_checksum)
     
     # 1. Пытаемся получить текущие правила
     try:

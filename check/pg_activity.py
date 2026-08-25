@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-08-21 12:30 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-25 17:59 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -236,8 +236,12 @@ def tools_pg_activity():
             by_pid.setdefault(ti['pid'], []).append(ti)
 
         # Кто кого блокирует: строим по blocking_pids, чтобы в отчёте виновник стоял рядом
-        # с пострадавшим, а не искался глазами по списку.
-        blockers = {b for r in rows for b in (r.get('blocking_pids') or [])}
+        # с пострадавшим, а не искался глазами по списку. Порог тот же, что и у самого
+        # пострадавшего: иначе в отчёт попадает виновник без жертвы — мгновенные блокировки
+        # шедулера ловятся постоянно и читаются как ложное срабатывание.
+        blockers = {b for r in rows
+                    if r.get('blocking_pids') and _age(r, 'state_age') >= p['lock_wait_sec']
+                    for b in r['blocking_pids']}
 
         findings = []
         for r in rows:

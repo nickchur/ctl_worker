@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-25 14:14 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
 Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
@@ -18,7 +18,7 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task, dag
 
 try:
-    from CI06932748.analytics.datalab.tools.utils import (  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size,
     )
 except ImportError:

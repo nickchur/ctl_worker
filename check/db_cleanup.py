@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-08-25 13:02 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-25 14:14 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -42,7 +42,7 @@ import time
 import logging
 
 try:
-    from CI06932748.analytics.datalab.tools.utils import (  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
     )
 except ImportError:

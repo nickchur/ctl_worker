@@ -22,7 +22,7 @@ from airflow.configuration import get_custom_secret_backend
 from airflow.decorators import dag
 
 from hrp_operators.s3_to_s3 import HrpS3ToS3Operator  # type: ignore
-from plugins.utils import add_note
+from plugins.utils import add_note  # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")

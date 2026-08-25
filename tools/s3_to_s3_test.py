@@ -25,8 +25,8 @@ from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.sensors.base import PokeReturnValue
 from airflow.datasets import DatasetAlias, Dataset
 
-from plugins.utils import readable_size, add_note, on_callback, get_conns_by_type
-from plugins.s3_utils import s3_to_s3, s3_move_s3, s3_delete, s3_path_parse, s3_from_zip, s3_keys, s3_get_buckets
+from plugins.utils import readable_size, add_note, on_callback, get_conns_by_type  # type: ignore
+from plugins.s3_utils import s3_to_s3, s3_move_s3, s3_delete, s3_path_parse, s3_from_zip, s3_keys, s3_get_buckets  # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")

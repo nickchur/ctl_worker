@@ -1,7 +1,7 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-07-29 16:46 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-25 13:38 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Расширенные функции для работы с S3 в системе CTL.
+Расширенные функции для работы с S3.
 
 | Функция | Описание |
 |---|---|
@@ -21,12 +21,19 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
-from urllib.parse import urlparse
 from stream_unzip import stream_unzip # type: ignore
 
-from  plugins.utils import readable_size, get_conns_by_type
+# Фолбэк обязателен: на контуре модуль лежит не в plugins/, а в CI06932748/tools/,
+# и пакета plugins там нет. Без него ломался не только этот файл — tfs_utils, который
+# сам импортируется с фолбэком, падал на импорте s3_utils и уводил в Broken DAG весь тракт.
+try:
+    from plugins.utils import readable_size, get_conns_by_type  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import readable_size, get_conns_by_type  # type: ignore
 
 from fnmatch import fnmatch
+import base64
+import hashlib
 import time
 import io
 import os
@@ -37,11 +44,34 @@ logger = getLogger("airflow.task")
 
 
 
+def _md5_instead_of_checksum(request, **kwargs):
+    """Возвращает Content-MD5 вместо контрольной суммы botocore.
+
+    PutBucketLifecycleConfiguration — операция с requestChecksumRequired, и до
+    botocore 1.36 SDK считал для неё Content-MD5. Потом его заменили на «гибкие
+    контрольные суммы»: уходят x-amz-checksum-crc32 и x-amz-sdk-checksum-algorithm,
+    а Content-MD5 не уходит вовсе. Наш шлюз знает только старый заголовок и отвечает
+    "Missing required header for this request: Content-MD5" — правило не ставится.
+
+    Считаем MD5 сами и убираем новые заголовки, чтобы запрос выглядел ровно так,
+    как выглядел до замены. Хук стоит на before-sign, поэтому заголовок попадает
+    в подпись SigV4, а не приезжает неподписанным довеском.
+    """
+    for name in [h for h in request.headers if h.lower().startswith(('x-amz-checksum-', 'x-amz-sdk-checksum-'))]:
+        del request.headers[name]
+
+    body = request.body or b''
+    if isinstance(body, str):
+        body = body.encode()
+    request.headers['Content-MD5'] = base64.b64encode(hashlib.md5(body).digest()).decode()
+
+
 def s3_set_ttl(conn, bucket, days, prefix='', status='Enabled'):
     """Создаёт или обновляет lifecycle-правило '{prefix}DeleteAfter' на удаление объектов через days дней."""
 
     hook = S3Hook(aws_conn_id=conn)
     client = hook.get_conn()
+    client.meta.events.register('before-sign.s3.PutBucketLifecycleConfiguration', _md5_instead_of_checksum)
     
     # 1. Пытаемся получить текущие правила
     try:
@@ -181,11 +211,18 @@ def s3_get_pages(conn, bucket, prefix='', page_size=1000, max_items=10000):
 def s3_path_parse(path: str) -> dict:
     """
     Разбирает S3 путь на составляющие и определяет наличие маски.
+
+    Схему режем вручную, а не urlparse: в нашем формате слева от '://' стоит conn_id,
+    а он не обязан быть валидной URL-схемой. RFC 3986 разрешает в схеме только буквы,
+    цифры, '+', '-' и '.', поэтому на 's3_minio://bucket/key' urlparse молча отдаёт
+    пустые scheme и netloc — и дальше по коду улетает пустое имя бакета.
     """
-    parsed = urlparse(path)
-    conn_id = parsed.scheme
-    bucket = parsed.netloc
-    full_path = parsed.path.lstrip('/')
+    head, sep, rest = path.partition('://')
+    if sep:
+        conn_id = head
+        bucket, _, full_path = rest.partition('/')
+    else:
+        conn_id, bucket, full_path = '', '', path.lstrip('/')
     
     # Поиск спецсимволов
     star_pos = full_path.find('*')

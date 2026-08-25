@@ -14,7 +14,7 @@ from airflow.exceptions import AirflowFailException, AirflowSkipException, Airfl
 # from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from plugins.utils import add_note, on_callback, get_current_load, str2timedelta  # type: ignore
 from plugins.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
-from plugins.ctl_core import chk_any_conn 
+from plugins.ctl_core import chk_any_conn  # type: ignore
 
 import random
 import pendulum

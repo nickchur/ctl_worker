@@ -1,7 +1,7 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-08-07 13:14 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-12 14:48 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Вспомогательные функции, используемые во всех DAG'ах CTL.
+Вспомогательные функции, используемые во всех DAG'ах.
 
 | Функция | Описание |
 |---|---|
@@ -362,6 +362,19 @@ def query_to_dict(gp_hook, sql, timeout=300):
             cols = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
     return [dict(zip(cols, row)) for row in rows]
+
+def get_dict_from_ch(ch_hook, sql):
+    """Выполняет SQL в ClickHouse и возвращает результат списком словарей {колонка: значение}.
+
+    Отдельно от query_to_dict: та работает через DB-API курсор Greenplum, а ClickHouseHook
+    отдаёт данные и описание колонок одним вызовом execute(with_column_types=True).
+    """
+    res, cols = ch_hook.execute(sql, with_column_types=True)
+    if res:
+        cols = [col[0] for col in cols]
+        return [dict(zip(cols, row)) for row in res]
+    return []
+
 
 def get_conns_by_type(conn_type='aws'):
     from airflow.configuration import get_custom_secret_backend

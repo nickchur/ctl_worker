@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-25 13:02 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -12,8 +12,14 @@
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
 | 🔁 `reindex`        | `True` — REINDEX SCHEMA CONCURRENTLY после вакуума *(default)*, `False` — пропустить      |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
+| 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
+
+Значения по умолчанию берутся из переменной `tools_db_cleanup_params`, если она задана,
+иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
+разовый эксперимент в UI расписание не меняет, а осознанная правка меняет, без выкладки.
 
 **Таски:**
+- **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
 - **reindex** — REINDEX SCHEMA CONCURRENTLY main одной командой (админский коннект из Vault)
@@ -235,43 +241,77 @@ def _fmt_ts(ts):
     return ts.strftime('%H:%M:%S') if ts else '—'
 
 
+# Значения по умолчанию для формы запуска: код задаёт запасной вариант, переменная —
+# рабочий. Пишет переменную только запуск с save_params=True, см. таск params.
+PARAMS_VAR = 'tools_db_cleanup_params'
+
+
+def _saved_params() -> dict:
+    """📥 Сохранённые значения по умолчанию из переменной Airflow.
+
+    Читается на парсинге DAG-а, поэтому недоступная метабаза не должна ронять парсинг:
+    иначе DAG пропадёт из UI ровно тогда, когда он нужнее всего. При любой ошибке
+    возвращаем пусто — значения по умолчанию берутся из кода.
+    """
+    from airflow.models import Variable
+    try:
+        return Variable.get(PARAMS_VAR, default_var={}, deserialize_json=True) or {}
+    except Exception as e:
+        logger.warning(f"⚠️ {PARAMS_VAR}: {e} — беру значения по умолчанию из кода")
+        return {}
+
+
+SAVED = _saved_params()
+
+
+def _param(key, default, **kwargs):
+    """Param со значением по умолчанию из переменной, если оно там есть."""
+    return Param(SAVED.get(key, default), **kwargs)
+
+
 params = {
-    'retention_days': Param(
-        180,
+    'retention_days': _param(
+        'retention_days', 180,
         type='integer',
         minimum=30,
         description='Хранить записи не старше N дней (минимум 30)',
     ),
-    'dry_run': Param(
-        False,
+    'dry_run': _param(
+        'dry_run', False,
         type='boolean',
         description='True — только подсчёт, False — реальное удаление',
     ),
-    'vacuum': Param(
-        True,
+    'vacuum': _param(
+        'vacuum', True,
         type='boolean',
         description='True — VACUUM ANALYZE, False — пропустить',
     ),
-    'reindex': Param(
-        True,
+    'reindex': _param(
+        'reindex', True,
         type='boolean',
         description='True — REINDEX SCHEMA CONCURRENTLY main после вакуума, False — пропустить',
     ),
-    'custom': Param(
-        False,
+    'custom': _param(
+        'custom', False,
         type='boolean',
         description='True — включить dag_code и dag_pickle, False — только стандартные таблицы',
     ),
-    'batch_size': Param(
-        BATCH_SIZE,
+    'batch_size': _param(
+        'batch_size', BATCH_SIZE,
         type='integer',
         minimum=1000,
         description='Максимальный размер порции при удалении (строк)',
     ),
-    'lock_timeout': Param(
-        '10min',
+    'lock_timeout': _param(
+        'lock_timeout', '10min',
         type='string',
         description='Таймаут ожидания блокировки (например: 10min, 30s)',
+    ),
+    # Разовое действие, а не настройка: в переменную не сохраняется и берётся всегда из кода
+    'save_params': Param(
+        False,
+        type='boolean',
+        description='True — сохранить параметры этого запуска как значения по умолчанию',
     ),
 }
 
@@ -295,6 +335,32 @@ params = {
     params=params,
 )
 def tools_db_cleanup():
+
+    @task(task_id='params')
+    def save_params(**context):
+        """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
+        from airflow.exceptions import AirflowSkipException
+        from airflow.models import Variable
+
+        p = dict(context['params'])
+        if not p.pop('save_params', False):
+            raise AirflowSkipException('save_params=False — параметры не сохраняем')
+
+        changed = {k: (SAVED.get(k, '—'), v) for k, v in p.items() if k not in SAVED or SAVED[k] != v}
+        if not changed:
+            raise AirflowSkipException(f'{PARAMS_VAR}: значения те же — записи нет')
+
+        # MSK круглый год UTC+3, отдельная зависимость ради этого не нужна
+        ts = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')
+        Variable.set(PARAMS_VAR, p, description=f"{ts} MSK · {context['dag_run'].run_id}", serialize_json=True)
+        logger.info(f"💾 {PARAMS_VAR}: {p}")
+
+        lines = ['| Параметр | Было | Стало |', '|----------|------|-------|'] + [
+            f"| `{k}` | {was} | **{now}** |" for k, (was, now) in changed.items()
+        ]
+        add_note('\n'.join(lines), context=context, level='Task', title='💾 params')
+        add_note(f"{PARAMS_VAR}: {', '.join(f'{k}={now}' for k, (_, now) in changed.items())}",
+                 context=context, level='DAG', title='💾 params')
 
     @task(task_id='clean')
     def clean(**context):
@@ -706,6 +772,6 @@ def tools_db_cleanup():
 
         return data
 
-    clean() >> vacuum() >> reindex() >> report()
+    save_params() >> clean() >> vacuum() >> reindex() >> report()
 
 tools_db_cleanup()

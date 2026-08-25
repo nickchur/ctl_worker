@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-08-25 14:14 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-25 14:31 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -362,7 +362,9 @@ def tools_db_cleanup():
         add_note(f"{PARAMS_VAR}: {', '.join(f'{k}={now}' for k, (_, now) in changed.items())}",
                  context=context, level='DAG', title='💾 params')
 
-    @task(task_id='clean')
+    # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
+    # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку
+    @task(task_id='clean', trigger_rule=TriggerRule.NONE_FAILED)
     def clean(**context):
         from airflow.exceptions import AirflowFailException
         from airflow.utils.db_cleanup import config_dict as _cleanup_config

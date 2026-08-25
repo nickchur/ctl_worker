@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-08-06 19:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 16:40 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -53,8 +53,8 @@ from airflow.utils.session import create_session
 from airflow.models import TaskInstance, Variable
 from airflow.utils.state import State
 
-from plugins.utils import readable_size, add_note, on_callback, str2timedelta
-from plugins.s3_utils import s3_move_s3, s3_path_parse, s3_from_zip, s3_keys
+from plugins.utils import readable_size, add_note, on_callback, str2timedelta  # type: ignore
+from plugins.s3_utils import s3_move_s3, s3_path_parse, s3_from_zip, s3_keys  # type: ignore
 from plugins.ctl_utils import get_config   # type: ignore
 
 import xml.etree.ElementTree as ET
@@ -258,7 +258,7 @@ def tfs_copy(path: str, **context):
 
 # Основная логика DAG
 with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
-    tags=['CTL', get_config()['profile'], 'CTL_agent', 'tfs_sensor'],
+    tags=['CTL', get_config()['profile'], 'CTL_agent', 'TFS', 'tfs_sensor'],
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule_interval=tfs_interval,
     default_args={ 
@@ -354,7 +354,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
 
 # ── Kafka-triggered DAG ──────────────────────────────────────────────────────
 with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
-    tags=['CTL', get_config()['profile'], 'CTL_agent', 'tfs_kafka'],
+    tags=['CTL', get_config()['profile'], 'CTL_agent', 'TFS', 'tfs_kafka'],
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     schedule=None,
     default_args={

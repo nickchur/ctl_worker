@@ -1,10 +1,17 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-07 12:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 16:05 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
 
-  📤 tools_test_kafka_snd — шлёт одно XML-сообщение `TransferFileCephRq` в топик.
+  📤 tools_test_kafka_snd — шлёт в топик одно произвольное сообщение; по умолчанию
+     в поле лежит готовый `TransferFileCephRq`, собранный тем же `build_message`,
+     каким тракт шлёт в бою.
+     ⚠️ При отправке в боевой топик ТФС идёт **мимо очереди** `export.er_sent_files`:
+     файл не попадёт в счётчики лимитов маршрута, а пул `tfs_<ScenarioId>` этот таск не берёт
+     (он живёт в `TOOLS_POOL`, а двух пулов у таска не бывает) — то есть возможна
+     отправка одновременно с `tfs_kafka_snd`. Для разовой проверки это допустимо,
+     для регулярной отправки нужен не этот даг, а очередь.
   📥 tools_test_kafka_rcv — показывает сообщения из топика.
 
 Имена топиков TFS даны с его стороны, поэтому наши направления зеркальны:
@@ -16,14 +23,18 @@
 
 Дефолты параметров расставлены по этой таблице; на запуске переопределяются.
 
+⚠️ **Топики зависят от контура**: в таблице — сигма, на альфе маршрут ПКАП
+(`TFS.PKAPHR.IN` / `TFS.PKAPHR.OUT`). Из `KAFKA_SND_TOPICS` их сюда не подставить —
+этот даг выкладывается на оба контура, а `plugins/tfs_utils.py` живёт вместе с ЕР,
+и жёсткий импорт сломал бы даг там, где тракта нет. На альфе топик задаётся руками.
+
 Оба DAG-а параметризуются на запуске:
 
 | Параметр   | Описание |
 |---|---|
 | `conn_id`  | Airflow Kafka conn_id (kafka_config_id); выпадающий список — kafka-коннекты из Variable `local_connections`, её наполняет `tools_show_connections` |
 | `topic`    | Имя топика |
-| `scenario` | Только write: ScenarioId в XML |
-| `filename` | Только write: имя файла в XML (`Name`) |
+| `message`  | Только write: текст сообщения, уходит как есть. Маркеры `{RqUID}` и `{RqTm}` заменяются при отправке; по умолчанию — `TransferFileCephRq` |
 | `mode`     | Только read: `read_last` / `wait` |
 | `timeout`  | Только read: сколько ждать сообщение, сек (окно read_last / poll_timeout) |
 | `max_messages` | Только read: сколько последних сообщений читать в `read_last` |
@@ -35,9 +46,13 @@
   • `wait` — `ConsumeFromTopicOperator`: синхронно опрашивает топик на воркере, triggerer
     не требуется. Ловит только сообщения, опубликованные ПОСЛЕ старта опроса (consumer group,
     auto.offset.reset=latest), в пределах `timeout` секунд.
-    ⚠️ Работает в consumer group коннекта, а у `tfs-kafka-out` она общая с `wait_confirm`
-    боевого `er_export`: сообщение, доставшееся тесту, до сенсора уже не дойдёт. Для
-    `TFS.HRPLT.OUT` запускать только при простое ER-выгрузок.
+    ⚠️ Работает в consumer group коннекта, а у `tfs-kafka-out` она общая с боевым дагом
+    `tfs_kafka_rcv` — единственным штатным потребителем этого топика. Сообщение,
+    доставшееся тесту, до него уже не дойдёт, а значит и до выгрузки, которая ждёт
+    квитанцию: топик `TFS.HRPLT.OUT` общий на все маршруты ТФС. Запускать здесь режим
+    `wait` можно только при остановленном `tfs_kafka_rcv`.
+    Прочитанные им квитанции лежат в `export.tfs_receipts` — обычно смотреть надо туда,
+    а не в топик.
 
 Запускать вручную (schedule=None). Для сквозной проверки: обоим DAG-ам поставить один топик
 (`TFS.HRPLT.IN` — туда пишем мы, чужих слушателей там нет), и в режиме `wait` сначала
@@ -47,6 +62,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
@@ -73,6 +89,48 @@ RCV_CONN  = "tfs-kafka-out"
 RCV_TOPIC = "TFS.HRPLT.OUT"
 
 
+# 🧾 Заготовка для поля Message. Маркеры заменяются на отправке, всё остальное
+# уходит в топик буквально — включая ScenarioId и имя файла.
+DEF_SCENARIO = "HRPLATFORM-4000"
+DEF_FILENAME = "test.zip"
+RQ_UID_MARK  = "{RqUID}"
+RQ_TM_MARK   = "{RqTm}"
+
+# Запасной шаблон на случай, когда слоя тракта рядом нет (альфа): даг выкладывается
+# на оба контура, и Broken DAG из-за отсутствующего импорта там недопустим.
+FALLBACK_MESSAGE = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<TransferFileCephRq>
+    <RqUID>{RQ_UID_MARK}</RqUID>
+    <RqTm>{RQ_TM_MARK}</RqTm>
+    <ScenarioInfo><ScenarioId>{DEF_SCENARIO}</ScenarioId></ScenarioInfo>
+    <File><FileInfo><Name>{DEF_FILENAME}</Name></FileInfo></File>
+</TransferFileCephRq>"""
+
+
+def _default_message() -> str:
+    """Текст, который лежит в поле Message по умолчанию.
+
+    Собирается тем же build_message, каким тракт шлёт в бою: тест должен проверять
+    боевой формат, а не свою копию, иначе он перестаёт быть тестом ровно тогда, когда
+    формат меняется. RqUID отдаём маркером, а сгенерированный RqTm меняем на маркер —
+    оба значения должны быть свежими на каждой отправке, а не на разборе файла.
+    """
+    try:
+        from plugins.tfs_utils import build_message  # type: ignore
+    except ImportError:
+        try:
+            from CI06932748.tools.tfs_utils import build_message  # type: ignore
+        except ImportError:
+            logger.info("Слой тракта ТФС недоступен, поле Message заполняем своим шаблоном")
+            return FALLBACK_MESSAGE
+
+    message = build_message(DEF_SCENARIO, RQ_UID_MARK, DEF_FILENAME)
+    return re.sub(r"<RqTm>.*?</RqTm>", f"<RqTm>{RQ_TM_MARK}</RqTm>", message, count=1)
+
+
+DEFAULT_MESSAGE = _default_message()
+
+
 def _kafka_conn_ids() -> list[str]:
     """conn_id всех kafka-соединений из Variable `local_connections` — для выпадающего списка.
 
@@ -95,25 +153,37 @@ KAFKA_CONN_IDS = _kafka_conn_ids()
 
 # ── Kafka helpers ─────────────────────────────────────────────────────────────
 
-def produce_test_msg(scenario_id: str, file_names: list[str], throttle_delay: int = 1):
-    """Генератор Kafka-сообщений: одно XML-уведомление TransferFileCephRq на каждый файл."""
-    import time
+def produce_test_msg():
+    """Генератор Kafka-сообщений: одно сообщение из параметра `message`.
+
+    Текст читаем из контекста, а не через шаблон в producer_function_args: у дага
+    включён render_template_as_native_obj, а нативный рендер прогоняет результат через
+    literal_eval. XML это переживёт, а сообщение вида {"a": 1} превратилось бы в питоновский
+    dict и уехало в топик в неузнаваемом виде.
+
+    Подстановка через str.replace, а не str.format: в произвольном сообщении бывают свои
+    фигурные скобки, и format на них падает. Нет маркеров — текст уходит нетронутым.
+    """
     import uuid
 
-    for file_name in file_names:
-        time.sleep(throttle_delay)
-        rq_uuid = str(uuid.uuid4()).replace("-", "")
-        # isoformat(ms) даёт формат TFS 'YYYY-MM-DDTHH:mm:ss.SSSZ' (смещение с двоеточием, +03:00)
-        rq_tm = datetime.now().astimezone().isoformat(timespec="milliseconds")
-        message = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<TransferFileCephRq>
-    <RqUID>{rq_uuid}</RqUID>
-    <RqTm>{rq_tm}</RqTm>
-    <ScenarioInfo><ScenarioId>{scenario_id}</ScenarioId></ScenarioInfo>
-    <File><FileInfo><Name>{file_name}</Name></FileInfo></File>
-</TransferFileCephRq>"""
-        logger.info("Kafka message prepared: %s", rq_uuid)
-        yield None, message
+    from airflow.operators.python import get_current_context
+
+    context = get_current_context()
+    message = context["params"]["message"]
+
+    if not (message or "").strip():
+        # Пустое сообщение — почти наверняка промах, но и оно бывает предметом проверки,
+        # поэтому предупреждаем, а не роняем.
+        logger.warning("⚠️ Сообщение пустое, уйдёт как есть")
+
+    rq_uid = uuid.uuid4().hex
+    # isoformat(ms) даёт формат ТФС 'YYYY-MM-DDTHH:mm:ss.SSS+03:00'
+    rq_tm = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    message = message.replace(RQ_UID_MARK, rq_uid).replace(RQ_TM_MARK, rq_tm)
+
+    logger.info("Kafka message to send:\n%s", message)
+    add_note(f"```\n{message}\n```", context, level="DAG", title="📤 Kafka message")
+    yield None, message
 
 
 def on_delivery(err: Exception | None, msg) -> None:
@@ -152,7 +222,7 @@ _DEF_ARGS = {
     "on_failure_callback": on_callback,
     "on_success_callback": on_callback,
 }
-_TAGS = ["DataLab", "tools", "Kafka", "AutoQA"]
+_TAGS = ["DataLab", "tools", "kafka", "AutoQA"]
 
 
 # ── DAG: tools_test_kafka_snd ───────────────────────────────────────────────
@@ -171,8 +241,11 @@ _TAGS = ["DataLab", "tools", "Kafka", "AutoQA"]
     params={
         "conn_id":  Param(SND_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
         "topic":    Param(SND_TOPIC, type="string", title="Topic"),
-        "scenario": Param("HRPLATFORM-4000", type="string", title="Scenario ID"),
-        "filename": Param("test.zip", type="string", title="File name"),
+        "message":  Param(
+            DEFAULT_MESSAGE, type="string", format="multiline", title="Message",
+            description="Уходит в топик как есть. Маркеры {RqUID} и {RqTm} заменяются "
+                        "при отправке на свежий идентификатор и время; остальное — что напишете.",
+        ),
     },
 )
 def tools_test_kafka_snd():
@@ -181,7 +254,6 @@ def tools_test_kafka_snd():
         kafka_config_id="{{ params.conn_id }}",
         topic="{{ params.topic }}",
         producer_function=produce_test_msg,
-        producer_function_args=["{{ params.scenario }}", ["{{ params.filename }}"]],
         delivery_callback=ON_DELIVERY,
         execution_timeout=timedelta(minutes=5),
     )

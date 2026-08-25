@@ -1,40 +1,67 @@
 {
-  "evolution.lc_items_opened": {
-    "replica": "hrplatform_datalab",
-    "schema": "learning",
+  "hrplatform_datalab__1": {
     "schedule": "55 0 * * *",
-    "PK": [],
-    "UK": ["person_uuid", "item_id"],
-    "params": "{\"selfrun_timeout\": 10}",
-    "fields": [
-      "insert_time",
-      "header_id",
-      "header_person_id",
-      "header_event_type",
-      "header_created_dt",
-      "item_id",
-      "person_uuid",
-      "tenant",
-      "company"
-    ],
-    "description": "Открытые элементы обучения из Evolution",
-    "sql_stmt_export_delta": {
-      "from": "evolution.lc_items_opened",
-      "where": "{condition}"
+    "description": "Пакет 1: справочники обучения",
+    "params": "{\"notify_kafka\": 1, \"auto_confirm\": 0, \"confirm_timeout\": 90, \"notify_timeout\": 30, \"selfrun_timeout\": 10, \"max_active_tasks\": 2}",
+    "tables": {
+      "evolution.lc_items_opened": {
+        "schema": "learning",
+        "PK": [],
+        "UK": ["person_uuid", "item_id"],
+        "fields": [
+          "insert_time",
+          "header_id",
+          "header_person_id",
+          "header_event_type",
+          "header_created_dt",
+          "item_id",
+          "person_uuid",
+          "tenant",
+          "company"
+        ],
+        "params": "{\"selfrun_timeout\": 10}",
+        "description": "Открытые элементы обучения из Evolution",
+        "sql_stmt_export_delta": {
+          "from": "evolution.lc_items_opened"
+        }
+      },
+      "evolution.lc_items_meta": {
+        "schema": "learning",
+        "PK": [],
+        "UK": ["item_id"],
+        "fields": ["item_id", "title", "tags"],
+        "params": "{\"selfrun_timeout\": 10, \"format\": \"JSONEachRow\"}",
+        "description": "Карточки элементов обучения, выгрузка построчным JSON",
+        "sql_stmt_export_delta": {
+          "from": "evolution.lc_items_meta"
+        }
+      }
     }
   },
-  "evolution.lc_courses_activity": {
-    "replica": "hrplatform_datalab",
-    "schema": "learning",
+  "hrplatform_datalab__broken": {
+    "schedule": "0 4 * * *",
+    "errors": [
+      "evolution.lc_orphan: пустой fields — состав колонок надо задать явно",
+      "evolution.lc_orphan: пустой schema_name — задайте его в строке-дефолте группы или в поставке"
+    ],
+    "tables": {}
+  },
+  "hrplatform_datalab__2": {
     "schedule": "*/15 * * * *",
-    "PK": [],
-    "UK": ["course_id", "person_uuid"],
-    "params": "{\"recent_interval\": 30, \"notify_kafka\": 0}",
-    "fields": [],
-    "description": "Активность по курсам (recent, скользящее окно 30 мин)",
-    "sql_stmt_export_recent": {
-      "from": "evolution.lc_courses_activity",
-      "where": "{condition}"
+    "description": "Пакет 2: активность (recent)",
+    "params": "{\"notify_kafka\": 0, \"auto_confirm\": 1, \"confirm_timeout\": 60, \"notify_timeout\": 30, \"selfrun_timeout\": 60, \"max_active_tasks\": 4}",
+    "tables": {
+      "evolution.lc_courses_activity": {
+        "schema": "learning",
+        "PK": [],
+        "UK": ["course_id", "person_uuid"],
+        "fields": ["course_id", "person_uuid", "progress", "updated_at"],
+        "params": "{\"recent_interval\": 30}",
+        "description": "Активность по курсам (recent, скользящее окно 30 мин)",
+        "sql_stmt_export_recent": {
+          "from": "evolution.lc_courses_activity"
+        }
+      }
     }
   }
 }

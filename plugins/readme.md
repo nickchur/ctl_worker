@@ -1,4 +1,5 @@
 # 🛠️ CTL Plugins для Apache Airflow
+*2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Этот модуль содержит набор плагинов для интеграции Apache Airflow с системой CTL (Control Layer) и управления ETL-процессами.
 

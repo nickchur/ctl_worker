@@ -18,8 +18,8 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.models import Variable, Param
 
-from plugins.utils import on_callback, add_note, default_args, str2timedelta, get_conns_by_type, get_conn 
-from plugins.s3_utils import s3_set_ttl, s3_create_bucket
+from plugins.utils import on_callback, add_note, default_args, str2timedelta, get_conns_by_type, get_conn  # type: ignore
+from plugins.s3_utils import s3_set_ttl, s3_create_bucket  # type: ignore
 import os
 import base64
 import json

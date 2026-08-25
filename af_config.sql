@@ -1,3 +1,4 @@
+-- 2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
 create schema if not exists main;
 
 SET search_path = main;

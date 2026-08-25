@@ -7,8 +7,8 @@
 from datetime import datetime, timedelta, timezone
 from airflow.decorators import task, dag
 
-from plugins.utils import get_conns_by_type, add_note, on_callback, readable_size
-from plugins.s3_utils import s3_bucket_size, s3_get_ttl
+from plugins.utils import get_conns_by_type, add_note, on_callback, readable_size  # type: ignore
+from plugins.s3_utils import s3_bucket_size, s3_get_ttl  # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")

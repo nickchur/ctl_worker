@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-08-07 13:45 MSK · v2.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-14 13:45 MSK · v2.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -13,7 +13,7 @@
 | **tfs** | `tfs` в ID **и** тип `aws` | Проверка S3-бакетов через `list_buckets()` |
 | **s3** | тип `aws` (без tfs) | Проверка прав доступа к объектному хранилищу |
 | **postgres** | тип `postgres` | `SELECT current_user, current_database()` |
-| **ctl** | тип `http` или `ctl*` | Вызов `GET /v5/api/info` (Kerberos Auth) |
+| **ctl** | тип `http`, `ctl*` или FQDN | Вызов `GET /v5/api/info` (Kerberos Auth) |
 | **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
 | **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
 | **trino** | тип `trino` | Валидация сессии через `TrinoHook`; нерезолвящийся хост → `☮️` |
@@ -32,6 +32,7 @@ import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
+from typing import Optional
 
 from airflow.decorators import dag, task
 from airflow.models import Connection, Variable
@@ -79,6 +80,26 @@ _GROUP_TOOLTIP: dict[str, str] = {
 }
 
 
+def _map_type(conn_type: str) -> Optional[str]:
+    """conn_type Airflow → тип проверки; None, если проверять нечем.
+
+    Общая функция, а не два похожих условия в разных местах: группировка в UI и выбор
+    проверки обязаны решать одинаково, иначе соединение попадает в группу `ctl`, но
+    проверяется как «не реализовано».
+
+    HTTP-подключения из vault приезжают с ХОСТОМ в `conn_type`: `parse_http_connections`
+    в `hrp_secret_backend` кладёт туда `host`, а не `"http"` (у `prepare_http_connection`
+    в том же файле — честный `"http"`). У conn `ctl` тип получается
+    `psi-ctlcom.psidf.sbrf.ru`, и прежнее правило `startswith("ctl")` мимо него
+    промахивалось — оно писалось под контур, где хост начинался прямо с `ctl`.
+    Точка в типе — надёжный признак FQDN: ни один штатный тип Airflow её не содержит.
+    """
+    chk = _CONN_CONFIG.get(conn_type)
+    if chk is None and ("ctl" in conn_type or "." in conn_type):
+        chk = "KerberosHttp"
+    return chk
+
+
 # ---------------------------------------------------------------------------
 # Parse-time: читаем и группируем соединения из secret backend
 # ---------------------------------------------------------------------------
@@ -116,13 +137,14 @@ def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connectio
         if cid in tfs_group:
             continue
         group = conn.conn_type
+        chk = _map_type(group)
         if group == "sqlite":
             group = "clickhouse"
         elif group == "aws":
             group = "s3"
-        elif group == "http" or group.startswith("ctl"):
+        elif chk == "KerberosHttp":
             group = "ctl"
-        elif group not in _CONN_CONFIG:
+        elif chk is None:
             group = "other"
         type_groups[group][cid] = conn
 
@@ -271,10 +293,9 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     ts = time.time()
 
     # 1. Маппинг типа
-    chk_type = _CONN_CONFIG.get(conn_type)
-    if chk_type is None and conn_type.startswith("ctl"):
-        chk_type = "KerberosHttp"
-        logger.info("Connection '%s' has ctl-like type '%s', mapping to 'KerberosHttp'", conn_id, conn_type)
+    chk_type = _map_type(conn_type)
+    if chk_type is not None and conn_type not in _CONN_CONFIG:
+        logger.info("Connection '%s' has host-like type '%s', mapping to '%s'", conn_id, conn_type, chk_type)
 
     if chk_type is None:
         msg = f"☮️ conn_type='{conn_type}' — проверка не реализована"

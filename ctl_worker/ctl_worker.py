@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-08-04 17:40 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:48 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -46,7 +46,7 @@ from pprint import PrettyPrinter
 from plugins.utils import add_note, on_callback, str2timedelta, update_dag_pause, safe_eval, readable  # type: ignore
 from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
-from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons,  # type: ignore
+from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
                               ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed)
 
 from logging import  getLogger
@@ -522,7 +522,8 @@ def build_worker_dag(w):
                 # wid = int(params['wf_id'])
                 
                 # Проверяем статус загрузки
-                ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='WAIT-AF')
+                st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='WAIT-AF')
+                raise_status(st, ld_sts)
                 ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
                 
                 retry = ctl_get_retry(params=params, wf=wf)
@@ -561,7 +562,8 @@ def build_worker_dag(w):
                 
                 
                 # Проверяем события на expire
-                ctl_chk_expire(wf, params, context)
+                st, res_exp = ctl_chk_expire(wf, params, context)
+                raise_status(st, res_exp)
                 
             # Статистика по сущностям
             eids = ctl_get_eids(wid, params)
@@ -630,7 +632,8 @@ def build_worker_dag(w):
                     ctl_set_completed(lid, 'completed') # Completed/Aborted
                     raise AirflowSkipException(msg)
                 # Проверяем статус загрузки
-                ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='TFS')
+                st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='TFS')
+                raise_status(st, ld_sts)
                 ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
                 
                 if '/.done' in path:
@@ -726,7 +729,8 @@ def build_worker_dag(w):
             exe = wf_prm.get('wf_exe', wf_prm.get('wf_exec')) or f'pr_{wf_name}()'
             
             # Проверяем статус загрузки
-            ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            raise_status(st, ld_sts)
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
 
             # TEST !!!
@@ -810,7 +814,8 @@ def build_worker_dag(w):
             add_note(eids, context, level='task', title='Entities')
 
             lid = wf_prm.get('loading_id', 0)
-            ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            raise_status(st, ld_sts)
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
 
             msg = _emit_datasets(lid, eids, result, context)

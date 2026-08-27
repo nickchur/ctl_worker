@@ -1,5 +1,5 @@
 """### 📡 DAG: Сенсор CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:48 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
 
@@ -20,7 +20,7 @@ from airflow.exceptions import AirflowSkipException, AirflowFailException
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load  # type: ignore
 from plugins.ctl_utils import get_config, ctl_api, ctl_obj_load, ctl_obj_save # type: ignore 
-from plugins.ctl_core import chk_any_conn, ctl_loading_load, ctl_chk_new, ctl_chk_expire, ctl_chk_wait, ctl_set_status, ctl_get_retry # type: ignore
+from plugins.ctl_core import chk_any_conn, ctl_loading_load, ctl_chk_new, ctl_chk_expire, ctl_chk_wait, ctl_set_status, ctl_get_retry, raise_status # type: ignore
 
 # from datetime import timedelta
 from psycopg2 import errors
@@ -316,17 +316,21 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
 
         # Проверка на новый запуск и времени повторного запуска 
         # retry, is_new = ctl_chk_new(wf, params, context)
-        retry, is_new = ctl_chk_new(lid, wf_name, status, log, context)
+        st, res_new = ctl_chk_new(lid, wf_name, status, log, context)
+        raise_status(st, res_new)
+        retry, is_new = res_new
         retry = retry if retry else ctl_get_retry(wf=wf, params=params)
         
         # Проверка условия запуска на событие EVENT-WAIT
-        ctl_chk_expire(wf, params, context)
+        st, res_exp = ctl_chk_expire(wf, params, context)
+        raise_status(st, res_exp)
         
         # Отложенный запуск (wf_wait)
         if ( is_new and params.get('wf_wait')
             and run_type == 'EVENT-WAIT'
         ):
-            ctl_chk_wait(wf, params, context)
+            st, res_wait = ctl_chk_wait(wf, params, context)
+            raise_status(st, res_wait)
             
         # af_sdt = str(ti.start_date)
 

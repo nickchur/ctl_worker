@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-07-30 22:12 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:48 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -13,6 +13,12 @@
 | `ctl_wf_norm` / `ctl_get_eids` | Нормализация workflow, список участвующих сущностей |
 | `ctl_send_html` | Потоковая отправка HTML-отчётов в CTL |
 | `chk_any_conn` | Проверка доступности Postgres / S3 / KerberosHttp |
+| `raise_status` | Превращает статус решателя (`ctl_chk_*`) в исключение Airflow |
+
+Решатели `ctl_chk_*` сами таск не останавливают: они возвращают `('ok'|'skip'|'fail',
+payload)`, а решение принимает вызывающий таск — обычно одной строкой `raise_status()`.
+Остальные функции ядра и `ctl_utils` (`ctl_api`, `gp_exe`, `chk_any_conn`) по-прежнему
+бросают исключения сами: они отдают данные, и «ошибка → исключение» для них уместнее.
 """
 
 from airflow.exceptions import AirflowSkipException, AirflowFailException
@@ -121,11 +127,40 @@ def ctl_get_status(ld):
     }
 
 
+def raise_status(status, payload):
+    """⤴️ Превращает статус решателя в исключение Airflow.
+
+    Решатели (`ctl_chk_*`) таск не останавливают — они возвращают
+    ``('ok'|'skip'|'fail', payload)``, а решение остаётся за таском. Эта функция —
+    стандартный способ его принять::
+
+        st, ld_sts = ctl_chk_status(lid, wf['name'], step='RUN')
+        raise_status(st, ld_sts)
+
+    Таск, который её зовёт, должен помнить: ``'skip'`` даёт штатный пропуск, поэтому
+    у следующего таска в цепочке нужен ``trigger_rule=NONE_FAILED`` — иначе пропуск
+    утянет в skip всю цепочку.
+
+    Args:
+        status: ``'ok'`` — ничего не делаем, ``'skip'`` — AirflowSkipException,
+            ``'fail'`` — AirflowFailException.
+        payload: Что положить в исключение (текст расхождения или dict решателя).
+    """
+    if status == 'skip':
+        raise AirflowSkipException(payload)
+    if status == 'fail':
+        raise AirflowFailException(payload)
+
+
 def ctl_chk_status(lid, wf_name, alive=None, status=None, step=None, log_empty=None, save=True):
     """Проверяет, что загрузка lid находится в ожидаемых alive/status/step/log_empty.
 
-    Нормализует и сохраняет загрузку в S3. При несоответствии — AirflowSkipException.
-    Возвращает ld_sts (результат ctl_get_status) при успешной проверке.
+    Нормализует и сохраняет загрузку в S3.
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — payload это ld_sts (результат
+        ctl_get_status); ``'skip'`` — загрузка не в ожидаемом состоянии, payload —
+        текст расхождения. Решение принимает таск, обычно через raise_status().
     """
     
     lid = int(lid)
@@ -161,9 +196,9 @@ def ctl_chk_status(lid, wf_name, alive=None, status=None, step=None, log_empty=N
     if msg:
         # msg += f" {lid}"
         add_note(ld_sts, level='Task,DAG', title=msg)
-        raise AirflowSkipException(msg)
+        return 'skip', msg
 
-    return ld_sts
+    return 'ok', ld_sts
 
 
 def ctl_get_retry(params=None, wf=None, logs=None, retry=None):
@@ -231,7 +266,12 @@ def ctl_get_retry(params=None, wf=None, logs=None, retry=None):
 
 
 def ctl_chk_wait(wf, params, context):
-    """Отложенный запуск по `wf_wait`."""
+    """Отложенный запуск по `wf_wait`.
+
+    Returns:
+        Всегда ``('skip', ret)``: загрузка переведена в TIME-WAIT, этот запуск дальше
+        не идёт.
+    """
     lid = params['loading_id']
     sdt = params['af_sdt'][:19]
     pause = params['wf_wait']
@@ -245,11 +285,17 @@ def ctl_chk_wait(wf, params, context):
     ret = {"action": "⌚ wf_wait", "id": lid, "name": wf['name'], "msg": f"TIME-WAIT {new_time}"}
     context['task_instance'].xcom_push(key='result', value=ret)
     add_note(ret, context, level='Task', title='⌚ WF-WAIT')
-    raise AirflowSkipException(ret)
+    return 'skip', ret
 
 
 def ctl_chk_new(lid, wf_name, status, log, context):
-    """Проверяет, можно ли запустить задачу (новая или TIME-WAIT истек)."""
+    """Проверяет, можно ли запустить задачу (новая или TIME-WAIT истек).
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — payload это пара ``(retry, is_new)``;
+        ``'skip'`` — время TIME-WAIT ещё не пришло; ``'fail'`` — не разобрали лог
+        TIME-WAIT.
+    """
     now = datetime.now(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S')
     # lid = params['loading_id']
     # status = params['wfp_status']
@@ -261,7 +307,7 @@ def ctl_chk_new(lid, wf_name, status, log, context):
             r = ast.literal_eval(log)
         except Exception as err:
             logging(f"Ошибка при парсинге TIME-WAIT: {err}", action='error', obj=lid)
-            raise AirflowFailException(err)
+            return 'fail', f"Ошибка при парсинге TIME-WAIT: {err}"
         
         sdt = r['time']
         if sdt <= now:
@@ -269,16 +315,16 @@ def ctl_chk_new(lid, wf_name, status, log, context):
             if retry:
                 retry['try'] = retry.get('try', 1) + 1
                 retry['left'] = max(0, retry.get('left', 0) - 1)
-            return retry, False
+            return 'ok', (retry, False)
         else:
             ret = {"action": "⏳ time-wait", "id": lid, "name": wf_name, "msg": f"{sdt} > {now}"}
             context['task_instance'].xcom_push(key='result', value=ret)
             add_note(ret, context, level='Task', title='⏳ TIME-WAIT')
-            raise AirflowSkipException(ret)
+            return 'skip', ret
         
 
     # retry = ctl_get_retry(wf=wf, params=params)
-    return {}, True
+    return 'ok', ({}, True)
 
 
 def ctl_send_html(html_content, lid, eid):
@@ -551,7 +597,13 @@ def ctl_wf_norm(wf, connectedEntities=None):
 
 
 def ctl_chk_expire(wf, params, context):
-    """Проверка выполнения всех событий (EVENT-WAIT)"""
+    """Проверка выполнения всех событий (EVENT-WAIT).
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — payload это dict событий (пустой,
+        если проверка не применима); ``'skip'`` — ждём события (EVENT-WAIT) или срок
+        вышел и загрузка отменена.
+    """
     ti = context['task_instance']
     lid = params['loading_id']
     sdt = params['af_sdt'][:19]
@@ -565,7 +617,7 @@ def ctl_chk_expire(wf, params, context):
         # and len(wf.get('wf_event_sched', [])) > 1
     ):
         logger.info(f"🚀 {run_type}: {wf.get('eventAwaitStrategy')} {wf_expire}")
-        return {}
+        return 'ok', {}
 
     event = {}
     exp = False
@@ -596,7 +648,7 @@ def ctl_chk_expire(wf, params, context):
         ret = {"action": "🔔 event-wait", "id": lid, "name": wf['name'], "msg": event}
         ti.xcom_push(key='result', value=ret)
         add_note(ret, context, level='Task', title='🔔 EVENT-WAIT')
-        raise AirflowSkipException(ret)
+        return 'skip', ret
     
     elif exp and not ready:
         ctl_set_status(lid, 'ERROR', {"msg":"💀 expired", **event, "res": -99})
@@ -606,11 +658,11 @@ def ctl_chk_expire(wf, params, context):
         add_note(ret , context, level='Task,DAG', title='💀 EXPIRED')
 
         ctl_api(f'v4/api/loading/{lid}/aborted', 'put') # Completed/Aborted
-        raise AirflowSkipException(ret)
+        return 'skip', ret
     
     else:
         add_note(event, context, level='Task', title='🚀 READY')
-        return event
+        return 'ok', event
             
 
 

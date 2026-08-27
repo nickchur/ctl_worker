@@ -9,6 +9,7 @@ from datetime import timedelta, datetime, timezone
 from airflow import DAG
 from airflow.decorators import task, task_group
 from airflow.sensors.base import PokeReturnValue # type: ignore
+from airflow.exceptions import AirflowFailException, AirflowSkipException
 
 from plugins.utils import  on_callback, default_args, str2timedelta # type: ignore
 from plugins.ctl_utils import get_config, add_note # type: ignore 
@@ -58,7 +59,11 @@ with DAG(
 
     def chk_any(id, data=None, **context):
         try:
-            ret = chk_any_conn(id, data, **context)
+            status, ret = chk_any_conn(id, data, **context)
+            if status == 'skip':
+                raise AirflowSkipException(ret)
+            if status == 'fail':
+                raise AirflowFailException(ret)
             return PokeReturnValue(is_done=False, xcom_value=ret)
         except Exception as e:
             # return PokeReturnValue(is_done=True, xcom_value=str(e))

@@ -13,7 +13,7 @@
 from airflow import DAG, Dataset
 from airflow.datasets import DatasetAlias
 from airflow.decorators import task
-# from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.sensors.base import PokeReturnValue
 
 from plugins.utils import add_note, on_callback, str2timedelta  # type: ignore
@@ -117,7 +117,10 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
                 continue
             
             try:
-                last = ctl_api(f"/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}")
+                status, last = ctl_api(f"/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}")
+                if status != 'ok':
+                    logger.warning(f"⚠️ {evn}: {last}")
+                    continue
             except:
                 continue
 
@@ -166,7 +169,11 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
             if len(ret) < MAX_EVENTS:
                 if lid:
                     new[f"{ind}/url"] = f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}"
-                    stats = ctl_api(f"/v4/api/loading/{lid}/statvals")
+                    status, stats = ctl_api(f"/v4/api/loading/{lid}/statvals")
+                    if status == 'skip':
+                        raise AirflowSkipException(stats)
+                    if status == 'fail':
+                        raise AirflowFailException(stats)
                     for s in stats:
                         if prf == s['profile'] and int(eid) == s['entity_id']:
                             stat = f"{s['loading_id']}/{s['profile']}/{s['entity_id']}/{s['stat_id']}"

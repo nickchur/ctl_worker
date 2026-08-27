@@ -161,7 +161,11 @@ with DAG(
         logger.info(f"🔍 CTL API {method} {url} {data}")
         
         try:
-            ret = ctl_api(url=url, method=method, json=data)
+            status, ret = ctl_api(url=url, method=method, json=data)
+            if status != 'ok':
+                raise AirflowSkipException(str(ret))
+        except AirflowSkipException:
+            raise
         except Exception as e:
             raise AirflowSkipException(str(e))
         

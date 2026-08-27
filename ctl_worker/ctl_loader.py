@@ -76,7 +76,12 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
     
     @task(pool='ctl_pool')
     def chk_ctl():
-        return chk_any_conn('ctl')
+        status, res = chk_any_conn('ctl')
+        if status == 'skip':
+            raise AirflowSkipException(res)
+        if status == 'fail':
+            raise AirflowFailException(res)
+        return res
    
     
     # @task_group
@@ -93,7 +98,11 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         **Источник:** `/v4/api/profile/name/{profile_name}`  
         **Сохранение:** `ctl_profile` 
         """            
-        data = ctl_api(f'/v4/api/profile/name/{get_config()["profile"]}')
+        status, data = ctl_api(f'/v4/api/profile/name/{get_config()["profile"]}')
+        if status == 'skip':
+            raise AirflowSkipException(data)
+        if status == 'fail':
+            raise AirflowFailException(data)
         
         # Сохраняем в S3
         load_obj_save('ctl_profile', data, var=True, skip=True)
@@ -108,7 +117,12 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         # Entities
         # data = ctl_api(f'/v5/api/entity/child/c/{config["root_entity"]}/export')['entityExt']
         # data = ctl_api(f'/v4/api/entity/{config["root_entity"]}/child')
-        data = ctl_api(f'/v4/api/entity/tree?search={get_config()["root_entity"]}&offset=0&limit={get_config().get("ctl_limit", 10000)}')[1]
+        status, tree = ctl_api(f'/v4/api/entity/tree?search={get_config()["root_entity"]}&offset=0&limit={get_config().get("ctl_limit", 10000)}')
+        if status == 'skip':
+            raise AirflowSkipException(tree)
+        if status == 'fail':
+            raise AirflowFailException(tree)
+        data = tree[1]
         eids = {}
         entity_kids(data, eids)  
         
@@ -135,7 +149,11 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         **Сохранение:** `ctl_categories`, `ctl_ue_category`
         """            
         # all_cats = ctl_api('/v5/api/category/m')
-        all_cats = ctl_api('/v4/api/category')
+        status, all_cats = ctl_api('/v4/api/category')
+        if status == 'skip':
+            raise AirflowSkipException(all_cats)
+        if status == 'fail':
+            raise AirflowFailException(all_cats)
         categories = {}
 
         # Три прохода для построения дерева (на случай, что родители идут после детей)
@@ -198,7 +216,11 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
             raise Exception(msg)
 
         ids = ','.join(category_ids.keys())
-        data = ctl_api('/v5/api/wf/extended', 'get', {'category_ids': f'[{ids}]' })
+        status, data = ctl_api('/v5/api/wf/extended', 'get', {'category_ids': f'[{ids}]' })
+        if status == 'skip':
+            raise AirflowSkipException(data)
+        if status == 'fail':
+            raise AirflowFailException(data)
         md5  = md5_hash(data)
         wfs = {j['wf']['id']: ctl_wf_norm(j['wf'], j.get('connectedEntities', [])) for j in data}
 
@@ -233,13 +255,18 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         wfs ={}
         change = False
         for c in category_ids.keys():
-            data = ctl_api(f'/v4/api/wf?category_id={c}', skip=False)
+            status, data = ctl_api(f'/v4/api/wf?category_id={c}', skip=False)
+            if status != 'ok':
+                raise AirflowFailException(data)
             for j in data:
                 if j.get('deleted'): continue
                 
                 wid = j['id']
                 
-                wfExt = ctl_api(f'/v4/api/wf/{wid}/export', skip=False) or []
+                status, wfExt = ctl_api(f'/v4/api/wf/{wid}/export', skip=False)
+                if status != 'ok':
+                    raise AirflowFailException(wfExt)
+                wfExt = wfExt or []
                 # con = ctl_api(f'/v4/api/wf/{wid}/entity') or []
                 hash = wfs_old.get(str(wid), {}).get('hash')
                 if wfExt['hash'] == hash:
@@ -286,7 +313,11 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
 
         eids = { int(k):v for k,v in (ctl_obj_load('ctl_entities') or {}).items() }
                 
-        data = ctl_api(f'/v4/api/entity')
+        status, data = ctl_api(f'/v4/api/entity')
+        if status == 'skip':
+            raise AirflowSkipException(data)
+        if status == 'fail':
+            raise AirflowFailException(data)
         # Сохраняем в S3
         load_obj_save('ctl_entities_all', data, var=False)
             
@@ -341,7 +372,11 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         if get_config().get('ctl_days') > 0:
             prm['start'] =  pendulum.now(get_config()['tz']).subtract(days=get_config()['ctl_days']).start_of('day').int_timestamp * 1000
 
-        data = ctl_loading_load(prm, save=False)
+        status, data = ctl_loading_load(prm, save=False)
+        if status == 'skip':
+            raise AirflowSkipException(data)
+        if status == 'fail':
+            raise AirflowFailException(data)
         # Сохраняем в S3
         load_obj_save('ctl_ue_events', data, var=False, skip=True)
 
@@ -372,7 +407,11 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         if get_config().get('ctl_days') > 0:
             prm['start'] = pendulum.now(get_config()['tz']).subtract(days=get_config()['ctl_days']).start_of('day').int_timestamp * 1000
 
-        data = ctl_loading_load(prm, save=False)
+        status, data = ctl_loading_load(prm, save=False)
+        if status == 'skip':
+            raise AirflowSkipException(data)
+        if status == 'fail':
+            raise AirflowFailException(data)
         # Сохраняем в S3
         load_obj_save('ctl_prf_events', data, var=False, skip=True)
 

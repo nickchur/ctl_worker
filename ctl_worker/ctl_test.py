@@ -61,7 +61,11 @@ with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
     @task(pool='ctl_pool')
     def test_events(**context): 
         
-        chk_any_conn('ctl')
+        status, res = chk_any_conn('ctl')
+        if status == 'skip':
+            raise AirflowSkipException(res)
+        if status == 'fail':
+            raise AirflowFailException(res)
         
         # TEST !!!
         test_mode = get_config().get('test_mode', False)
@@ -93,7 +97,10 @@ with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
                 evn = random.choice(events)
                 prf, eid, sid = evn.split('/')
                 try:
-                    ctl_api(f'/v4/api/entity/{eid}/stat/{sid}/profile/{prf}/statval', 'POST', json=["1"])
+                    status, res = ctl_api(f'/v4/api/entity/{eid}/stat/{sid}/profile/{prf}/statval', 'POST', json=["1"])
+                    if status != 'ok':
+                        logger.warning(f"⚠️ {evn}: {res}")
+                        continue
                 except Exception as e:
                     continue
                 ret.append(evn)

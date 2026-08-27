@@ -11,6 +11,7 @@
 
 from airflow import DAG
 from airflow.operators.python import task
+from airflow.exceptions import AirflowFailException, AirflowSkipException
 
 from plugins.utils import add_note, default_args # type: ignore
 from plugins.ctl_utils import get_config, ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
@@ -226,7 +227,11 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
 
         # res = req('/wf/extended', 'get', {'category_ids': f'{[*cats]}'})
         ids = ','.join(cats.keys())
-        res = ctl_api('/v5/api/wf/extended', 'get', {'category_ids': f'[{ids}]' })
+        status, res = ctl_api('/v5/api/wf/extended', 'get', {'category_ids': f'[{ids}]' })
+        if status == 'skip':
+            raise AirflowSkipException(res)
+        if status == 'fail':
+            raise AirflowFailException(res)
 
         # used = dict()
         # used_eids = dict()

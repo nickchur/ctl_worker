@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-08-27 10:22 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 10:34 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -12,14 +12,14 @@
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
 | 🔁 `reindex`        | `True` — REINDEX SCHEMA CONCURRENTLY после вакуума *(default)*, `False` — пропустить      |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
-| ⏰ `schedule_interval` | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 2 * * *`)* |
+| ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 2 * * *`)* |
 | 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
 Значения по умолчанию берутся из переменной `tools_db_cleanup_params`, если она задана,
 иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
 разовый эксперимент в UI расписание не меняет, а осознанная правка меняет, без выкладки.
 
-`schedule_interval` — такой же сохраняемый параметр: сам запуск идёт по старому расписанию,
+`schedule` — такой же сохраняемый параметр: сам запуск идёт по старому расписанию,
 новое подхватывается со следующего парсинга DAG-а. Негодное значение таск `params` не
 записывает (падает), а уже записанное битым — игнорируется на парсинге в пользу кода.
 
@@ -300,7 +300,7 @@ def valid_schedule(value) -> bool:
 
 def _schedule():
     """Расписание DAG-а: из переменной, если оно осмысленное, иначе из кода."""
-    value = SAVED.get('schedule_interval', DEFAULT_SCHEDULE)
+    value = SAVED.get('schedule', DEFAULT_SCHEDULE)
     if not valid_schedule(value):
         logger.warning(f"⚠️ {PARAMS_VAR}: расписание '{value}' не разобрано — беру {DEFAULT_SCHEDULE}")
         return DEFAULT_SCHEDULE
@@ -345,8 +345,8 @@ params = {
         type='string',
         description='Таймаут ожидания блокировки (например: 10min, 30s)',
     ),
-    'schedule_interval': _param(
-        'schedule_interval', DEFAULT_SCHEDULE,
+    'schedule': _param(
+        'schedule', DEFAULT_SCHEDULE,
         type='string',
         description='Расписание: cron или пресет @daily; пусто — только вручную. Применяется со следующего парсинга',
     ),
@@ -373,7 +373,7 @@ params = {
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
-    schedule_interval=_schedule(),
+    schedule=_schedule(),
     on_failure_callback=on_callback,
     params=params,
 )
@@ -389,9 +389,9 @@ def tools_db_cleanup():
         if not p.pop('save_params', False):
             raise AirflowSkipException('save_params=False — параметры не сохраняем')
 
-        if not valid_schedule(p.get('schedule_interval')):
+        if not valid_schedule(p.get('schedule')):
             raise AirflowFailException(
-                f"schedule_interval={p['schedule_interval']!r} — не cron и не пресет Airflow, переменную не трогаю"
+                f"schedule={p['schedule']!r} — не cron и не пресет Airflow, переменную не трогаю"
             )
 
         changed = {k: (SAVED.get(k, '—'), v) for k, v in p.items() if k not in SAVED or SAVED[k] != v}

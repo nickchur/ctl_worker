@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-07-30 22:12 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:19 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -15,7 +15,6 @@
 | `chk_any_conn` | Проверка доступности Postgres / S3 / KerberosHttp |
 """
 
-from airflow.exceptions import AirflowSkipException, AirflowFailException
 from airflow.decorators import task, task_group
 from airflow.operators.python import get_current_context
 
@@ -71,13 +70,21 @@ step_icons = {
 }
 
 def ctl_set_status(lid, status, log=''):
-    """Устанавливает статус загрузки lid через PUT /v4/api/loading/{lid}/status."""
+    """Устанавливает статус загрузки lid через PUT /v4/api/loading/{lid}/status.
+
+    Returns:
+        Кортеж ``(status, payload)`` от ctl_api.
+    """
     lid = int(lid)
     data = {'loading_id': lid, 'status': status, 'log': str(log)}
     return ctl_api(f'/v4/api/loading/{lid}/status', 'put', json=data)
 
 def ctl_set_completed(lid, action=None, completed=True):
-    """Завершает загрузку lid: PUT /v4/api/loading/{lid}/completed (или aborted/другой action)."""
+    """Завершает загрузку lid: PUT /v4/api/loading/{lid}/completed (или aborted/другой action).
+
+    Returns:
+        Кортеж ``(status, payload)`` от ctl_api.
+    """
     if not action:
         action = 'completed' if completed else 'aborted'
     return ctl_api(f'v4/api/loading/{lid}/{action.lower()}', 'put') # Completed/Aborted
@@ -124,8 +131,12 @@ def ctl_get_status(ld):
 def ctl_chk_status(lid, wf_name, alive=None, status=None, step=None, log_empty=None, save=True):
     """Проверяет, что загрузка lid находится в ожидаемых alive/status/step/log_empty.
 
-    Нормализует и сохраняет загрузку в S3. При несоответствии — AirflowSkipException.
-    Возвращает ld_sts (результат ctl_get_status) при успешной проверке.
+    Нормализует и сохраняет загрузку в S3.
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — payload это ld_sts (результат
+        ctl_get_status); ``'skip'`` — загрузка не в ожидаемом состоянии, payload —
+        текст расхождения; иначе статус ctl_api как есть.
     """
     
     lid = int(lid)
@@ -133,7 +144,9 @@ def ctl_chk_status(lid, wf_name, alive=None, status=None, step=None, log_empty=N
     if isinstance(status, str): status = [status]
     if isinstance(step, str): step = [step]
     
-    ld = ctl_api(f"/v4/api/loading/{lid}")
+    api_status, ld = ctl_api(f"/v4/api/loading/{lid}")
+    if api_status != 'ok':
+        return api_status, ld
     ld = ctl_loading_norm(wf_name, ld)
     if save: ctl_obj_save(f"ctl_working/{lid}", ld, var=False)
     ld_sts = ctl_get_status(ld)
@@ -161,9 +174,9 @@ def ctl_chk_status(lid, wf_name, alive=None, status=None, step=None, log_empty=N
     if msg:
         # msg += f" {lid}"
         add_note(ld_sts, level='Task,DAG', title=msg)
-        raise AirflowSkipException(msg)
+        return 'skip', msg
 
-    return ld_sts
+    return 'ok', ld_sts
 
 
 def ctl_get_retry(params=None, wf=None, logs=None, retry=None):
@@ -231,7 +244,12 @@ def ctl_get_retry(params=None, wf=None, logs=None, retry=None):
 
 
 def ctl_chk_wait(wf, params, context):
-    """Отложенный запуск по `wf_wait`."""
+    """Отложенный запуск по `wf_wait`.
+
+    Returns:
+        Всегда ``('skip', ret)``: загрузка переведена в TIME-WAIT, этот запуск дальше
+        не идёт.
+    """
     lid = params['loading_id']
     sdt = params['af_sdt'][:19]
     pause = params['wf_wait']
@@ -240,16 +258,24 @@ def ctl_chk_wait(wf, params, context):
     # data = {'loading_id': lid, 'status': 'TIME-WAIT', 'log': str({'time': new_time, 'wait': pause})}
     # ctl_api(f'/v4/api/loading/{lid}/status', 'put', json=data)
     # logging(f"{wf['name']} wait: {new_time}", action='wait', obj=lid)
-    ctl_set_status(lid, 'TIME-WAIT', {'time': new_time, 'wait': pause})
+    set_status, set_res = ctl_set_status(lid, 'TIME-WAIT', {'time': new_time, 'wait': pause})
+    if set_status != 'ok':
+        return 'fail', f"не выставился TIME-WAIT для {lid}: {set_res}"
 
     ret = {"action": "⌚ wf_wait", "id": lid, "name": wf['name'], "msg": f"TIME-WAIT {new_time}"}
     context['task_instance'].xcom_push(key='result', value=ret)
     add_note(ret, context, level='Task', title='⌚ WF-WAIT')
-    raise AirflowSkipException(ret)
+    return 'skip', ret
 
 
 def ctl_chk_new(lid, wf_name, status, log, context):
-    """Проверяет, можно ли запустить задачу (новая или TIME-WAIT истек)."""
+    """Проверяет, можно ли запустить задачу (новая или TIME-WAIT истек).
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — payload это пара ``(retry, is_new)``;
+        ``'skip'`` — время TIME-WAIT ещё не пришло; ``'fail'`` — не разобрали лог
+        TIME-WAIT.
+    """
     now = datetime.now(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S')
     # lid = params['loading_id']
     # status = params['wfp_status']
@@ -261,7 +287,7 @@ def ctl_chk_new(lid, wf_name, status, log, context):
             r = ast.literal_eval(log)
         except Exception as err:
             logging(f"Ошибка при парсинге TIME-WAIT: {err}", action='error', obj=lid)
-            raise AirflowFailException(err)
+            return 'fail', f"Ошибка при парсинге TIME-WAIT: {err}"
         
         sdt = r['time']
         if sdt <= now:
@@ -269,16 +295,16 @@ def ctl_chk_new(lid, wf_name, status, log, context):
             if retry:
                 retry['try'] = retry.get('try', 1) + 1
                 retry['left'] = max(0, retry.get('left', 0) - 1)
-            return retry, False
+            return 'ok', (retry, False)
         else:
             ret = {"action": "⏳ time-wait", "id": lid, "name": wf_name, "msg": f"{sdt} > {now}"}
             context['task_instance'].xcom_push(key='result', value=ret)
             add_note(ret, context, level='Task', title='⏳ TIME-WAIT')
-            raise AirflowSkipException(ret)
+            return 'skip', ret
         
 
     # retry = ctl_get_retry(wf=wf, params=params)
-    return {}, True
+    return 'ok', ({}, True)
 
 
 def ctl_send_html(html_content, lid, eid):
@@ -295,6 +321,11 @@ def ctl_send_html(html_content, lid, eid):
     - Если сообщение ≤ MAX_HTML — отправляется целиком.
     - Если > MAX_HTML и ≤ MAX_HTML * 10 — разбивается с сохранением <tr>.
     - Очень длинные (> MAX_HTML * 10) — пропускаются.
+
+    Returns:
+        Кортеж ``(status, payload)``: при ``'ok'`` payload — число отправленных
+        фрагментов; первый неудачный вызов CTL прерывает отправку и возвращается
+        как есть.
     """
 
     max_len = get_config().get('max_html', MAX_HTML)
@@ -309,6 +340,7 @@ def ctl_send_html(html_content, lid, eid):
         else:
             messages = html_content
 
+        sent = 0
         for n, msg in enumerate(messages):
             msg = str(msg)
             length = len(msg)
@@ -317,7 +349,10 @@ def ctl_send_html(html_content, lid, eid):
             if length <= max_len:
                 url = f'/v4/api/loading/{lid}/entity/{eid}/stat/{stat_id}/statval?profile={profile}'
                 jsn = [f"{n:3}{length:6} {msg}"]
-                ctl_api(url, 'post', json=jsn)
+                status, res = ctl_api(url, 'post', json=jsn)
+                if status != 'ok':
+                    return status, res
+                sent += 1
 
             # Если длиннее, но не слишком — разбиваем с учётом HTML
             elif length <= max_total:
@@ -333,7 +368,10 @@ def ctl_send_html(html_content, lid, eid):
                         s = hd + chunk
                         url = f'/v4/api/loading/{lid}/entity/{eid}/stat/{stat_id}/statval?profile={profile}'
                         jsn = [f"{n:3}{(pos - len(hd)):6}{len(s):6} {s}"]
-                        ctl_api(url, 'post', json=jsn)
+                        status, res = ctl_api(url, 'post', json=jsn)
+                        if status != 'ok':
+                            return status, res
+                        sent += 1
                         break
 
                     # Ищем последнее закрытие строки для "красивого" разрыва
@@ -349,7 +387,10 @@ def ctl_send_html(html_content, lid, eid):
 
                     url = f'/v4/api/loading/{lid}/entity/{eid}/stat/{stat_id}/statval?profile={profile}'
                     jsn = [f"{n:3}{(pos - len(hd)):6}{len(s):6} {s}{ft}"]
-                    ctl_api(url, 'post', json=jsn)
+                    status, res = ctl_api(url, 'post', json=jsn)
+                    if status != 'ok':
+                        return status, res
+                    sent += 1
 
                     hd = '</td></tr>' if ft else ''
                     pos += cut_pos
@@ -357,6 +398,8 @@ def ctl_send_html(html_content, lid, eid):
             # Сообщения длиннее max_total — пропускаем
             else:
                 continue
+
+        return 'ok', sent
 
     except Exception as err:
         logger.error(f"[ERROR] Failed to send HTML to statval: {err}")
@@ -414,12 +457,18 @@ def ctl_loading_norm(wf_name, data):
 def ctl_loading_load(prm, save=True):
     """Запрашивает загрузки через /v5/api/loading/extended, нормализует каждую и опционально сохраняет в S3.
 
-    Применяет ctl_limit из конфига. Возвращает список нормализованных dict-загрузок.
+    Применяет ctl_limit из конфига.
+
+    Returns:
+        Кортеж ``(status, payload)``: при ``'ok'`` payload — список нормализованных
+        dict-загрузок; иначе статус ctl_api как есть.
     """
     if get_config().get('ctl_limit') > 0:
         prm['limit'] = get_config()['ctl_limit']
 
-    data = ctl_api("/v5/api/loading/extended", data=prm)
+    status, data = ctl_api("/v5/api/loading/extended", data=prm)
+    if status != 'ok':
+        return status, data
     logger.info(f"🔍 Load Loading: {len(data)}")
 
     wfs_dict = ctl_obj_load('ctl_workflows')
@@ -430,14 +479,19 @@ def ctl_loading_load(prm, save=True):
         lids.append(j)
         if save:
             ctl_obj_save(f"ctl_loadings/{j['profile']}/{j['id']}", j, var=False)
-    return lids
+    return 'ok', lids
 
 
 def chk_any_conn(id, data=None, **context):
     """Проверяет доступность соединения id (Postgres / S3 / KerberosHttp).
 
     data — dict с type/conn_id/pool_slots; при отсутствии берётся из get_config()['conns'][id].
-    При успехе обновляет pool_slots и пишет заметку в Airflow. При ошибке — обнуляет слоты и пробрасывает исключение.
+    При успехе обновляет pool_slots и пишет заметку в Airflow, при ошибке — обнуляет слоты.
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — payload это ответ проверки (для
+        Postgres/S3 может быть None); ``'skip'`` — провайдер не установлен;
+        ``'fail'`` — соединение недоступно, payload — текст ошибки.
     """
     
     data = data if data else get_config().get('conns', {}).get(id, {})
@@ -500,15 +554,13 @@ def chk_any_conn(id, data=None, **context):
         logger.info(f"🔍 {result}")       
         msg = f"✅ {time.time()-ts:.2f} sec chk_{id}_conn"
         add_note({'try':try_number, 'sdt':sdt}, context, title=msg)
-        
-    except AirflowSkipException:
-        raise
+        return 'ok', result
 
     except ImportError as err:
         msg = f"☮️ {id}: провайдер не установлен — {err}"
         add_note(msg, context, level='task', title=f"☮️ {id}")
         logger.warning(msg)
-        raise AirflowSkipException(msg) from err
+        return 'skip', msg
         
     except Exception as err:
         if data.get('pool_slots') and not data.get('default', False):
@@ -518,7 +570,7 @@ def chk_any_conn(id, data=None, **context):
         logger.error(response)      
         msg = f"❌ {time.time()-ts:.2f} sec chk_{id}_conn ERROR Try {try_number} {sdt}"
         add_note(err, context, level='Task,DAG', title=msg)
-        raise AirflowFailException(f"{msg}: {err}") from err
+        return 'fail', f"{msg}: {err}"
 
         
 def ctl_wf_norm(wf, connectedEntities=None):
@@ -530,8 +582,11 @@ def ctl_wf_norm(wf, connectedEntities=None):
     wf['statusNotifications'] = {p['status']: p.get('emails') for p in wf.get('statusNotifications', [])}
     wf.pop('param', None)
     
-    eids = ctl_get_eids(wf['id'], wf['params'], connectedEntities)
-    if eids: 
+    eids_status, eids = ctl_get_eids(wf['id'], wf['params'], connectedEntities)
+    if eids_status != 'ok':
+        # Сущности — обогащение, а не условие работы: без них wf_entity просто не проставим
+        logger.warning(f"⚠️ Не получили сущности для wf {wf['id']}: {eids}")
+    elif eids:
         wf['params']['wf_entity'] = ','.join(map(str, sorted(eids)))
     
     events = wf.get('wf_event_sched', [])
@@ -551,7 +606,13 @@ def ctl_wf_norm(wf, connectedEntities=None):
 
 
 def ctl_chk_expire(wf, params, context):
-    """Проверка выполнения всех событий (EVENT-WAIT)"""
+    """Проверка выполнения всех событий (EVENT-WAIT).
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — payload это dict событий (пустой,
+        если проверка не применима); ``'skip'`` — ждём события (EVENT-WAIT) или
+        срок вышел и загрузка отменена; иначе статус ctl_api как есть.
+    """
     ti = context['task_instance']
     lid = params['loading_id']
     sdt = params['af_sdt'][:19]
@@ -565,7 +626,7 @@ def ctl_chk_expire(wf, params, context):
         # and len(wf.get('wf_event_sched', [])) > 1
     ):
         logger.info(f"🚀 {run_type}: {wf.get('eventAwaitStrategy')} {wf_expire}")
-        return {}
+        return 'ok', {}
 
     event = {}
     exp = False
@@ -577,7 +638,9 @@ def ctl_chk_expire(wf, params, context):
             event[eid] = 'Off'
             continue
         
-        last = ctl_api(f'/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}')
+        api_status, last = ctl_api(f'/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}')
+        if api_status != 'ok':
+            return api_status, last
         last_dt = (last[0] or {}).get('published_dttm', '') if last else ''
             
         if not last_dt or last_dt < eval_delta(sdt, wf_expire):
@@ -591,26 +654,32 @@ def ctl_chk_expire(wf, params, context):
     event['and'] = wf_expire
 
     if exp and ready:
-        ctl_set_status(lid, 'EVENT-WAIT', event)
+        set_status, set_res = ctl_set_status(lid, 'EVENT-WAIT', event)
+        if set_status != 'ok':
+            return 'fail', f"не выставился EVENT-WAIT для {lid}: {set_res}"
         
         ret = {"action": "🔔 event-wait", "id": lid, "name": wf['name'], "msg": event}
         ti.xcom_push(key='result', value=ret)
         add_note(ret, context, level='Task', title='🔔 EVENT-WAIT')
-        raise AirflowSkipException(ret)
+        return 'skip', ret
     
     elif exp and not ready:
-        ctl_set_status(lid, 'ERROR', {"msg":"💀 expired", **event, "res": -99})
+        set_status, set_res = ctl_set_status(lid, 'ERROR', {"msg":"💀 expired", **event, "res": -99})
+        if set_status != 'ok':
+            logger.error(f"❌ Не выставился ERROR для {lid}: {set_res}")
         
         ret = {"action": "💀 expired", "id": lid, "name": wf['name'], "msg": event}
         ti.xcom_push(key='result', value=ret)
         add_note(ret , context, level='Task,DAG', title='💀 EXPIRED')
 
-        ctl_api(f'v4/api/loading/{lid}/aborted', 'put') # Completed/Aborted
-        raise AirflowSkipException(ret)
+        abort_status, abort_res = ctl_api(f'v4/api/loading/{lid}/aborted', 'put') # Completed/Aborted
+        if abort_status != 'ok':
+            logger.error(f"❌ Не удалось отменить загрузку {lid}: {abort_res}")
+        return 'skip', ret
     
     else:
         add_note(event, context, level='Task', title='🚀 READY')
-        return event
+        return 'ok', event
             
 
 
@@ -620,13 +689,17 @@ def ctl_events_mon(sdt, wf, now):
     Мониторинг событий в CTL.
     is_and = False (OR): Ждем хотя бы одно событие >= sdt.
     is_and = True (AND): Ждем, пока ВСЕ события станут >= sdt.
+
+    Returns:
+        Кортеж ``(status, payload)``: при ``'ok'`` payload — dict с ключом 'chk'
+        (True — ждём дальше); иначе статус ctl_api как есть.
     """
     # sdt = wf['start_dttm'][:19]
     name = wf['name']
     
     events = wf.get('wf_event_sched', [])
     if not events:
-        return {'chk': True}
+        return 'ok', {'chk': True}
     is_and = wf.get('eventAwaitStrategy') == 'and'
     
     # sdt должен быть строкой в формате ISO или сопоставимым типом
@@ -643,7 +716,9 @@ def ctl_events_mon(sdt, wf, now):
         
         # Получаем последнее значение статистики
         prf, eid, sid = event.split('/')
-        last_data = ctl_api(f'/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}')
+        api_status, last_data = ctl_api(f'/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}')
+        if api_status != 'ok':
+            return api_status, last_data
         
         # Безопасно извлекаем дату публикации (API обычно возвращает список)
         last_item = last_data[0] if isinstance(last_data, list) and last_data else {}
@@ -651,21 +726,21 @@ def ctl_events_mon(sdt, wf, now):
         chk[event] = last_dt[:19]
         
         if last_dt and now - datetime.strptime(last_dt[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=now.tzinfo) < timedelta(minutes=30):
-            return {**last_item, 'chk': True, 'icon': '🔁'}
+            return 'ok', {**last_item, 'chk': True, 'icon': '🔁'}
 
         if is_and:
             # Если стратегия AND и хотя бы одно событие ЕЩЕ НЕ наступило
             if not last_dt or last_dt < sdt:
                 # logger.info(f"⏳ {name} Event {eid} {prf} {sid} not ready (AND strategy). Last: {last_dt} < {sdt}")
-                return {**last_item, 'chk': True, 'icon': '⏳'} # Не готово, продолжаем ждать
+                return 'ok', {**last_item, 'chk': True, 'icon': '⏳'} # Не готово, продолжаем ждать
         else:
             # Если стратегия OR и хотя бы одно событие наступило
             if last_dt and last_dt >= sdt:
                 # logger.info(f"✅ {name} Event {eid} {prf} {sid} found (OR strategy). DT: {last_dt} >= {sdt}")
-                return {**last_item, 'chk': False, 'icon': '✅'} # Найдено, выходим из цикла
+                return 'ok', {**last_item, 'chk': False, 'icon': '✅'} # Найдено, выходим из цикла
 
     if empty:
-        return {'chk': True}
+        return 'ok', {'chk': True}
     
     # Финальный результат:
     # При AND: если дошли сюда, все события подошли -> возвращаем False (ожидание окончено)
@@ -676,13 +751,16 @@ def ctl_events_mon(sdt, wf, now):
     else:
         chk['icon'] ='⏳'
 
-    return {**chk, 'chk': not is_and}
+    return 'ok', {**chk, 'chk': not is_and}
 
 
 def ctl_get_eids(wid, wf_prm, connected=None):
     """Собирает entity_id для workflow wid: из wf_prm['wf_entity'], либо из /v4/api/wf/{wid}/entity.
 
-    Возвращает set[int]. connected — опциональный список entity_id из connectedEntities.
+    connected — опциональный список entity_id из connectedEntities.
+
+    Returns:
+        Кортеж ``(status, payload)``: при ``'ok'`` payload — set[int].
     """
     wid = int(wid)
     
@@ -695,12 +773,14 @@ def ctl_get_eids(wid, wf_prm, connected=None):
     
     if not prm_eids:
         # 2. Получаем данные из API в set
-        api_data = ctl_api(f'/v4/api/wf/{wid}/entity') or []
-        api_eids = {int(i['id']) for i in api_data if 'id' in i}
+        status, api_data = ctl_api(f'/v4/api/wf/{wid}/entity')
+        if status != 'ok':
+            return status, api_data
+        api_eids = {int(i['id']) for i in (api_data or []) if 'id' in i}
         eids = api_eids  | prm_eids
     else:
         eids = prm_eids
     # if eids:
     #     wfs[wid]['entity'] = ','.join(map(str, sorted(eids)))
-    return eids
+    return 'ok', eids
 

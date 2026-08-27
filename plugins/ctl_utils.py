@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-06-19 14:44 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:17 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -19,7 +19,6 @@
 > Импортируйте `get_config`, а не `config` напрямую.
 """
 
-from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models import Variable, Pool
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -201,10 +200,15 @@ def rate_limit(pool_name='ctl_pool', ctl_api_calls=100):
 def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, check_response=False, skip=True):
     """HTTP-клиент к CTL API через KerberosHttpHook с rate-limiting и retry.
 
-    4xx → AirflowSkipException (skip=True) или AirflowFailException (skip=False).
-    5xx / таймаут → retry tenacity (до 3 раз, пауза 1–5 сек).
+    5xx / таймаут → retry tenacity (до 3 раз, пауза 1–5 сек); сетевые ошибки летят
+    исключением наружу, иначе tenacity про них не узнает.
     GET-запросы (кроме /statval, /tmpl) логируются в Greenplum через pr_log_ctl.
-    Возвращает распарсенный JSON или текст ответа.
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — распарсенный JSON или текст ответа;
+        ``'skip'`` — 4xx при skip=True; ``'fail'`` — 4xx при skip=False. Что делать
+        со статусом, решает вызывающий: таск бросает исключение, библиотечная
+        функция пробрасывает статус дальше.
     """
     
     con_id = get_config().get('conns', {}).get('ctl', {}).get('conn_id', 'ctl')
@@ -236,10 +240,7 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         # Если это ошибка клиента (4xx, кроме таймаутов 408/429), повторы не помогут
         if resp_text.startswith('4') or 300 <= status_code < 500:
             add_note(error_msg, level='Task,DAG', title='Ошибка API')
-            if skip:
-                raise AirflowSkipException(error_msg)
-            else:
-                raise AirflowFailException(error_msg)
+            return ('skip' if skip else 'fail'), error_msg
         else:
             # Для остальных случаев (5xx или таймаут) кидаем исключение, чтобы Tenacity сделал retry
             raise e # Пробрасываем исключение дальше для Tenacity
@@ -256,14 +257,18 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
             url = url[7:] if url.startswith('/v5/api') or url.startswith('/v4/api') else url
             try:
                 import json
-                gp_exe(f"select pr_log_ctl('{url}', $jsn${json.dumps(out)}$jsn$)")
-                logger.debug(f"{time.time()-ts:.2f} sec ✅ Записан лог в GP")
+                # Лог в GP — побочная задача: не вышло, значит не вышло, запрос уже отработал
+                log_status, log_res = gp_exe(f"select pr_log_ctl('{url}', $jsn${json.dumps(out)}$jsn$)")
+                if log_status == 'ok':
+                    logger.debug(f"{time.time()-ts:.2f} sec ✅ Записан лог в GP")
+                else:
+                    logger.error(f"{time.time()-ts:.2f} sec ❌ Ошибка записи лога в GP: {log_res}")
             except Exception as e:
                 logger.error(f"{time.time()-ts:.2f} sec ❌ Ошибка записи лога в GP: {str(e)}")
         else:
             logger.debug(f"✅ Запрос к API без логирования")
 
-    return out
+    return 'ok', out
 
 
 @retry(
@@ -276,11 +281,16 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
     reraise=True
 )
 def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
-    """Выполняет SQL в Greenplum и возвращает первое значение первой строки (или None).
+    """Выполняет SQL в Greenplum.
 
     Устанавливает statement_timeout и search_path на уровне сессии.
     Если передан ti — пушит gp_pid в XCom для возможного pg_cancel_backend.
-    Retry на OperationalError/InterfaceError; DatabaseError → AirflowFailException.
+    OperationalError/InterfaceError летят исключением — их ловит tenacity и повторяет.
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — первое значение первой строки
+        (или None); ``'fail'`` — DatabaseError, то есть синтаксис или права,
+        повтор тут не поможет.
     """
     
     # if not gp_hook:
@@ -313,7 +323,7 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
                 duration = time.time() - ts_start
                 logger.debug(f"✅ SQL выполнен успешно за {duration:.2f} сек.")
                 
-                return res[0] if res else None
+                return 'ok', (res[0] if res else None)
 
     except (OperationalError, InterfaceError) as e:
         # Эти ошибки перехватит tenacity и сделает retry
@@ -322,7 +332,7 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
     except DatabaseError as e:
         # Ошибки синтаксиса или прав (SQL Error) — ретрай тут не поможет
         logger.error(f"❌ Критическая ошибка SQL (ретрай пропущен): {str(e)}")
-        raise AirflowFailException(f"GP SQL Error: {e}")
+        return 'fail', f"GP SQL Error: {e}"
     except Exception as e:
         logger.error(f"💥 Непредвиденная ошибка в gp_exe: {str(e)}")
         raise
@@ -340,6 +350,10 @@ def gp_upload_s3_csv(table, key, options=None, gp_schema=None, truncate=False, t
 
     ZIP-архивы распаковываются через stream_unzip (cp866), GZ — через gzip.GzipFile.
     Диск не используется. Retry на сетевые ошибки (до 3 раз, пауза 5–30 сек).
+
+    Returns:
+        Кортеж ``(status, payload)`` от gp_from_stream: у ZIP — по файлу на архив,
+        первый неудачный прерывает загрузку и возвращается как есть.
     """
     from contextlib import closing
     
@@ -367,6 +381,7 @@ def gp_upload_s3_csv(table, key, options=None, gp_schema=None, truncate=False, t
         if key.lower().endswith(".zip"):
             from stream_unzip import stream_unzip # type: ignore
 
+            loaded = []
             for f_name_byte, f_size, chunks in stream_unzip(body):
                 f_name = f_name_byte.decode('cp866', errors='replace').strip('/')
                 if not f_name or f_name.endswith('/'): 
@@ -374,15 +389,19 @@ def gp_upload_s3_csv(table, key, options=None, gp_schema=None, truncate=False, t
                 add_note(f"📥 Файл из архива {f_name} ({readable_size(f_size)})")
 
                 csv_stream = s3_IterStream(chunks)
-                gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, truncate, timeout )
+                status, res = gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, truncate, timeout )
+                if status != 'ok':
+                    return status, res
+                loaded.append(f"{f_name}: {res}")
+            return 'ok', ', '.join(loaded)
 
         elif key.lower().endswith(".gz"):
             import gzip
             csv_stream = gzip.GzipFile(fileobj=body, mode="rb")
-            gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, truncate, timeout )
+            return gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, truncate, timeout )
         else:
             csv_stream = body
-            gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, truncate, timeout )
+            return gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, truncate, timeout )
 
 
 def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, truncate=False, timeout=None):
@@ -390,6 +409,10 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
 
     При truncate=True предварительно очищает таблицу. Логирует количество строк и время.
     OperationalError/InterfaceError пробрасывается для retry в вызывающей функции.
+
+    Returns:
+        Кортеж ``(status, payload)``: ``'ok'`` — число загруженных строк строкой;
+        ``'fail'`` — текст ошибки загрузки.
     """
     ts_start = time.time()
     try:
@@ -413,16 +436,16 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
                 duration = time.time() - ts_start
                 add_note(f"✅ Загрузка завершена успешно {rows} за {duration:.2f} сек.", level='Task')
                 
-                return rows
+                return 'ok', rows
 
     except (OperationalError, InterfaceError) as e:
         add_note(f"📡 Сетевая ошибка Greenplum (будет ретрай): {str(e)}", level='Task,DAG')
         raise e # Tenacity поймает это
     except Exception as e:
-        # Для AirflowFailException ретраи не делаются, задача сразу падает в Fail
+        # Ошибка загрузки — статус наружу; повтор тут не поможет
         msg = f"❌ GP Upload Error: {e}"
         add_note(msg, level='Task,DAG')
-        raise AirflowFailException(msg)
+        return 'fail', msg
 
 
 @retry(

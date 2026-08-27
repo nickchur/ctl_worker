@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-08-27 10:47 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 11:39 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
 Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
@@ -35,10 +35,12 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, valid_schedule,
     )
 except ImportError:
-    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, valid_schedule,
+    )
 
 logger = logging.getLogger("airflow.task")
 
@@ -68,54 +70,16 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
 
 # Значения по умолчанию для формы запуска: код задаёт запасной вариант, переменная —
 # рабочий. Пишет переменную только запуск с save_params=True, см. таск params.
-# Механика повторяет db_cleanup.py — общий модуль не заводим, чтобы правка одного
-# DAG-а не требовала выкладки utils.py вместе со всеми, кто его импортирует.
+# Механика повторяет db_cleanup.py; общее на два DAG-а — чтение переменной
+# (utils.saved_params) и проверка расписания (utils.valid_schedule).
 PARAMS_VAR = 'tools_log_cleanup_params'
 DEFAULT_SCHEDULE = '17 5 * * *'
-# Пресеты Airflow: cron-парсер их не понимает, поэтому проверяем списком
-_SCHEDULE_PRESETS = {'@once', '@continuous', '@hourly', '@daily', '@weekly', '@monthly', '@yearly', '@annually'}
-
-
-def _saved_params() -> dict:
-    """📥 Сохранённые значения по умолчанию из переменной Airflow.
-
-    Читается на парсинге DAG-а, поэтому недоступная метабаза не должна ронять парсинг:
-    иначе DAG пропадёт из UI ровно тогда, когда он нужнее всего. При любой ошибке
-    возвращаем пусто — значения по умолчанию берутся из кода.
-    """
-    from airflow.models import Variable
-    try:
-        return Variable.get(PARAMS_VAR, default_var={}, deserialize_json=True) or {}
-    except Exception as e:
-        logger.warning(f"⚠️ {PARAMS_VAR}: {e} — беру значения по умолчанию из кода")
-        return {}
-
-
-SAVED = _saved_params()
+SAVED = saved_params(PARAMS_VAR)
 
 
 def _param(key, default, **kwargs):
     """Param со значением по умолчанию из переменной, если оно там есть."""
     return Param(SAVED.get(key, default), **kwargs)
-
-
-def valid_schedule(value) -> bool:
-    """⏰ Годится ли значение как расписание: пресет, пустота (только вручную) или cron.
-
-    Проверяется дважды: таском params перед записью в переменную и на парсинге DAG-а —
-    записать битое расписание в переменную можно и мимо формы, а падение парсинга
-    из-за него убрало бы DAG из UI вместе со способом это починить.
-    """
-    if value in (None, '', 'None'):
-        return True
-    value = str(value).strip()
-    if value in _SCHEDULE_PRESETS:
-        return True
-    try:
-        from croniter import croniter
-        return croniter.is_valid(value)
-    except ImportError:                     # croniter приезжает с Airflow, но не будем на это закладываться
-        return len(value.split()) == 5
 
 
 def _schedule():
@@ -173,33 +137,7 @@ def tools_log_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
-        from airflow.models import Variable
-
-        p = dict(context['params'])
-        if not p.pop('save_params', False):
-            raise AirflowSkipException('save_params=False — параметры не сохраняем')
-
-        if not valid_schedule(p.get('schedule')):
-            raise AirflowFailException(
-                f"schedule={p['schedule']!r} — не cron и не пресет Airflow, переменную не трогаю"
-            )
-
-        changed = {k: (SAVED.get(k, '—'), v) for k, v in p.items() if k not in SAVED or SAVED[k] != v}
-        if not changed:
-            raise AirflowSkipException(f'{PARAMS_VAR}: значения те же — записи нет')
-
-        # MSK круглый год UTC+3, отдельная зависимость ради этого не нужна
-        ts = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')
-        Variable.set(PARAMS_VAR, p, description=f"{ts} MSK · {context['dag_run'].run_id}", serialize_json=True)
-        logger.info(f"💾 {PARAMS_VAR}: {p}")
-
-        lines = ['| Параметр | Было | Стало |', '|----------|------|-------|'] + [
-            f"| `{k}` | {was} | **{now}** |" for k, (was, now) in changed.items()
-        ]
-        add_note('\n'.join(lines), context=context, level='Task', title='💾 params')
-        add_note(f"{PARAMS_VAR}: {', '.join(f'{k}={now}' for k, (_, now) in changed.items())}",
-                 context=context, level='DAG', title='💾 params')
+        store_params(PARAMS_VAR, SAVED, context)
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку

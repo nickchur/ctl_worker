@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-08-27 10:00 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 11:33 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -13,6 +13,9 @@
 | `md5_hash()` | Хеш JSON-совместимых структур |
 | `readable_size()` / `readable()` | Форматирование байтов, datetime, timedelta |
 | `str2timedelta()` | Парсинг строки в timedelta (`'minutes=5'`) |
+| `valid_schedule()` | Проверка расписания DAG-а (cron, пресет или пусто) валидатором Airflow |
+| `saved_params()` | Значения по умолчанию для формы запуска из переменной Airflow |
+| `store_params()` | Запись параметров запуска в переменную (пара к `saved_params()`) |
 | `safe_eval()` | Безопасное вычисление математических выражений |
 | `get_conns_by_type()` / `get_conn()` | Получение соединений по типу |
 | `query_to_dict()` | SQL → список словарей (Greenplum) |
@@ -482,6 +485,103 @@ def str2timedelta(delta):
         res += timedelta(**{k:v})
     
     return res
+
+
+def valid_schedule(value) -> bool:
+    """⏰ Годится ли значение как расписание DAG-а: спрашиваем сам Airflow.
+
+    Пресеты (@daily, @quarterly) CronTriggerTimetable переводит сам через cron_presets,
+    поэтому своего списка не держим — он с Airflow расходится. Отдельно проверяем только
+    то, что не cron по смыслу: пустота (запуск руками), @once и @continuous.
+
+    Годность даёт именно validate(): конструктор битое выражение глотает — ловит
+    CroniterBadCronError, когда строит человекочитаемое описание, и оставляет описание
+    пустым. Любая ошибка здесь означает «не годится»: вызывающий откатится на расписание
+    из кода, а сорванный импорт не должен ронять парсинг DAG-а.
+    """
+    if value in (None, '', 'None', '@once', '@continuous'):
+        return True
+    try:
+        from airflow.timetables.trigger import CronTriggerTimetable
+        CronTriggerTimetable(str(value).strip(), timezone='Europe/Moscow').validate()
+    except Exception as e:
+        logger.warning(f"⚠️ расписание {value!r}: {e}")
+        return False
+    return True
+
+
+def saved_params(var_name) -> dict:
+    """📥 Сохранённые значения по умолчанию из переменной Airflow.
+
+    Пара к форме запуска DAG-а: код задаёт запасной вариант, переменная — рабочий.
+    Читается на парсинге, поэтому недоступная метабаза не должна ронять парсинг:
+    иначе DAG пропадёт из UI ровно тогда, когда он нужнее всего. При любой ошибке
+    возвращаем пусто — значения по умолчанию берутся из кода.
+
+    Args:
+        var_name: Имя переменной Airflow с JSON-словарём параметров.
+    """
+    from airflow.models import Variable
+    try:
+        return Variable.get(var_name, default_var={}, deserialize_json=True) or {}
+    except Exception as e:
+        logger.warning(f"⚠️ {var_name}: {e} — беру значения по умолчанию из кода")
+        return {}
+
+
+def store_params(var_name, saved, context=None, flag='save_params'):
+    """💾 Записывает параметры запуска в переменную как новые значения по умолчанию.
+
+    Пара к saved_params(). Зовётся из отдельного таска в начале DAG-а — тогда в переменную
+    уезжает ровно то, с чем этот запуск пошёл работать. Ключ-галочка flag разовый, в
+    переменную не попадает.
+
+    Таск пропускает себя (☮️ в UI), если галочка не стоит или значения не изменились:
+    лишняя запись в метабазу ни к чему. Ключ 'schedule', если он есть в форме, проверяется
+    valid_schedule() — битое расписание уронило бы парсинг DAG-а, то есть убрало бы из UI
+    саму форму, через которую его можно починить.
+
+    Args:
+        var_name: Имя переменной Airflow с JSON-словарём параметров.
+        saved: Что лежало в переменной на парсинге — с ним сравниваем «было → стало».
+        context: Контекст таска; по умолчанию берётся текущий.
+        flag: Ключ-галочка «сохранить», в переменную не попадает.
+
+    Returns:
+        Изменившиеся параметры: ``{ключ: (было, стало)}``.
+
+    Raises:
+        AirflowSkipException: Галочка не стоит или значения те же.
+        AirflowFailException: В форме негодное расписание — переменную не трогаем.
+    """
+    from airflow.exceptions import AirflowFailException, AirflowSkipException
+    from airflow.models import Variable
+
+    context = context or get_current_context()
+    p = dict(context['params'])
+    if not p.pop(flag, False):
+        raise AirflowSkipException(f'{flag}=False — параметры не сохраняем')
+
+    if 'schedule' in p and not valid_schedule(p['schedule']):
+        raise AirflowFailException(f"schedule={p['schedule']!r} — не cron и не пресет Airflow, переменную не трогаю")
+
+    changed = {k: (saved.get(k, '—'), v) for k, v in p.items() if k not in saved or saved[k] != v}
+    if not changed:
+        raise AirflowSkipException(f'{var_name}: значения те же — записи нет')
+
+    # MSK круглый год UTC+3, отдельная зависимость ради этого не нужна
+    ts = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')
+    Variable.set(var_name, p, description=f"{ts} MSK · {context['dag_run'].run_id}", serialize_json=True)
+    logger.info(f"💾 {var_name}: {p}")
+
+    lines = ['| Параметр | Было | Стало |', '|----------|------|-------|'] + [
+        f"| `{k}` | {was} | **{now}** |" for k, (was, now) in changed.items()
+    ]
+    add_note('\n'.join(lines), context=context, level='Task', title='💾 params')
+    add_note(f"{var_name}: {', '.join(f'{k}={now}' for k, (_, now) in changed.items())}",
+             context=context, level='DAG', title='💾 params')
+    return changed
+
 
 @provide_session
 def update_dag_pause(dag_id, paused=True, session=None):

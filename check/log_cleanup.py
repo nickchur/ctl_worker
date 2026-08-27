@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-08-27 10:35 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 10:47 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
 Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
@@ -7,15 +7,31 @@
 
 | Параметр | Описание |
 |---|---|
-| `days` | Возраст объектов для удаления (дни, default: `30`) |
+| 📅 `days`        | Возраст объектов для удаления (дни, default: `30`) |
+| ⏰ `schedule`    | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `17 5 * * *`)* |
+| 💾 `save_params` | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
+
+Значения по умолчанию берутся из переменной `tools_log_cleanup_params`, если она задана,
+иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
+разовый эксперимент в UI ночное окно не двигает, а осознанная правка двигает, без выкладки.
+Новое расписание подхватывается со следующего парсинга DAG-а; негодное значение таск
+`params` не записывает (падает), а уже записанное битым — игнорируется в пользу кода.
+
+**Таски:**
+- **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
+- **create_bucket** — создание бакета, если его нет
+- **clean_logs** — удаление объектов старше `days`
+- **show_bucket_size** — объём и число объектов после чистки
 """
 
 from datetime import datetime, timedelta, timezone
+import logging
 
 from airflow.configuration import conf
 from airflow.models import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task, dag
+from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from CI06932748.tools.utils import (  # type: ignore
@@ -23,6 +39,8 @@ try:
     )
 except ImportError:
     from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size  # type: ignore
+
+logger = logging.getLogger("airflow.task")
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
@@ -48,6 +66,88 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
     )
 
 
+# Значения по умолчанию для формы запуска: код задаёт запасной вариант, переменная —
+# рабочий. Пишет переменную только запуск с save_params=True, см. таск params.
+# Механика повторяет db_cleanup.py — общий модуль не заводим, чтобы правка одного
+# DAG-а не требовала выкладки utils.py вместе со всеми, кто его импортирует.
+PARAMS_VAR = 'tools_log_cleanup_params'
+DEFAULT_SCHEDULE = '17 5 * * *'
+# Пресеты Airflow: cron-парсер их не понимает, поэтому проверяем списком
+_SCHEDULE_PRESETS = {'@once', '@continuous', '@hourly', '@daily', '@weekly', '@monthly', '@yearly', '@annually'}
+
+
+def _saved_params() -> dict:
+    """📥 Сохранённые значения по умолчанию из переменной Airflow.
+
+    Читается на парсинге DAG-а, поэтому недоступная метабаза не должна ронять парсинг:
+    иначе DAG пропадёт из UI ровно тогда, когда он нужнее всего. При любой ошибке
+    возвращаем пусто — значения по умолчанию берутся из кода.
+    """
+    from airflow.models import Variable
+    try:
+        return Variable.get(PARAMS_VAR, default_var={}, deserialize_json=True) or {}
+    except Exception as e:
+        logger.warning(f"⚠️ {PARAMS_VAR}: {e} — беру значения по умолчанию из кода")
+        return {}
+
+
+SAVED = _saved_params()
+
+
+def _param(key, default, **kwargs):
+    """Param со значением по умолчанию из переменной, если оно там есть."""
+    return Param(SAVED.get(key, default), **kwargs)
+
+
+def valid_schedule(value) -> bool:
+    """⏰ Годится ли значение как расписание: пресет, пустота (только вручную) или cron.
+
+    Проверяется дважды: таском params перед записью в переменную и на парсинге DAG-а —
+    записать битое расписание в переменную можно и мимо формы, а падение парсинга
+    из-за него убрало бы DAG из UI вместе со способом это починить.
+    """
+    if value in (None, '', 'None'):
+        return True
+    value = str(value).strip()
+    if value in _SCHEDULE_PRESETS:
+        return True
+    try:
+        from croniter import croniter
+        return croniter.is_valid(value)
+    except ImportError:                     # croniter приезжает с Airflow, но не будем на это закладываться
+        return len(value.split()) == 5
+
+
+def _schedule():
+    """Расписание DAG-а: из переменной, если оно осмысленное, иначе из кода."""
+    value = SAVED.get('schedule', DEFAULT_SCHEDULE)
+    if not valid_schedule(value):
+        logger.warning(f"⚠️ {PARAMS_VAR}: расписание '{value}' не разобрано — беру {DEFAULT_SCHEDULE}")
+        return DEFAULT_SCHEDULE
+    return None if value in (None, '', 'None') else str(value).strip()
+
+
+params = {
+    'days': _param(
+        'days', 30,
+        type='integer',
+        minimum=1,
+        description='Возраст объектов для удаления (дни)',
+    ),
+    'schedule': _param(
+        'schedule', DEFAULT_SCHEDULE,
+        type='string',
+        description='Расписание: cron или пресет @daily; пусто — только вручную. Применяется со следующего парсинга',
+    ),
+    # Разовое действие, а не настройка: в переменную не сохраняется и берётся всегда из кода
+    'save_params': Param(
+        False,
+        type='boolean',
+        description='True — сохранить параметры этого запуска как значения по умолчанию',
+    ),
+}
+
+
 @dag(
     doc_md=__doc__,
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
@@ -59,20 +159,51 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
-    schedule='17 5 * * *',
+    schedule=_schedule(),
     tags=['DataLab', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
     max_active_tasks=1,
     on_failure_callback=on_callback,
-    params={
-        'days': Param(30, type='integer', minimum=1, description='Возраст объектов для удаления (дни)'),
-    },
+    params=params,
 )
 def tools_log_cleanup():
 
-    @task
+    @task(task_id='params')
+    def save_params(**context):
+        """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
+        from airflow.models import Variable
+
+        p = dict(context['params'])
+        if not p.pop('save_params', False):
+            raise AirflowSkipException('save_params=False — параметры не сохраняем')
+
+        if not valid_schedule(p.get('schedule')):
+            raise AirflowFailException(
+                f"schedule={p['schedule']!r} — не cron и не пресет Airflow, переменную не трогаю"
+            )
+
+        changed = {k: (SAVED.get(k, '—'), v) for k, v in p.items() if k not in SAVED or SAVED[k] != v}
+        if not changed:
+            raise AirflowSkipException(f'{PARAMS_VAR}: значения те же — записи нет')
+
+        # MSK круглый год UTC+3, отдельная зависимость ради этого не нужна
+        ts = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')
+        Variable.set(PARAMS_VAR, p, description=f"{ts} MSK · {context['dag_run'].run_id}", serialize_json=True)
+        logger.info(f"💾 {PARAMS_VAR}: {p}")
+
+        lines = ['| Параметр | Было | Стало |', '|----------|------|-------|'] + [
+            f"| `{k}` | {was} | **{now}** |" for k, (was, now) in changed.items()
+        ]
+        add_note('\n'.join(lines), context=context, level='Task', title='💾 params')
+        add_note(f"{PARAMS_VAR}: {', '.join(f'{k}={now}' for k, (_, now) in changed.items())}",
+                 context=context, level='DAG', title='💾 params')
+
+    # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
+    # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку
+    @task(trigger_rule=TriggerRule.NONE_FAILED)
     def create_bucket(**context):
         s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
         if not s3_hook.check_for_bucket(BUCKET_NAME):
@@ -113,7 +244,7 @@ def tools_log_cleanup():
         add_note(msg, context)
         return msg
 
-    create_bucket() >> clean_logs() >> show_bucket_size()
+    save_params() >> create_bucket() >> clean_logs() >> show_bucket_size()
 
 
 tools_log_cleanup()

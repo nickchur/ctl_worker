@@ -1,5 +1,5 @@
 """### 🪣 DAG: Просмотр бакетов S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-20 22:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список бакетов для выбранного S3-подключения.
 
@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from airflow.models import Param
 from airflow.decorators import dag
 
-from hrp_operators import HrpS3BucketViewerOperator  # type: ignore
+from hrp_operators.s3_viewer_operator import HrpS3BucketViewerOperator  # type: ignore
 from plugins.utils import get_conns_by_type  # type: ignore
 
 

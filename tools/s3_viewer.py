@@ -1,5 +1,5 @@
 """### 🗂️ DAG: Просмотрщик S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-20 22:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список ключей из S3-бакета и читает содержимое файлов.
 
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from airflow.models import Param
 from airflow.decorators import task, dag
 
-from hrp_operators import HrpS3ListKeysOperator, HrpS3FileReadOperator  # type: ignore
+from hrp_operators.s3_viewer_operator import HrpS3ListKeysOperator, HrpS3FileReadOperator  # type: ignore
 from plugins.utils import add_note, on_callback  # type: ignore
 
 from logging import getLogger

@@ -85,7 +85,13 @@ def statval(data, log=False, logs=None):
     eid = data.get('entity_id')
     sid = data.get('stat_id')
     url = f'/v4/api/loading/{lid}/entity/{eid}/stat/{sid}/statval?profile={profile}'
-    return ctl_api(url, 'post', json=data['avalue'])
+    st, res = ctl_api(url, 'post', json=data['avalue'])
+    # Статистика загрузки — часть её результата, молча терять публикацию нельзя
+    if st == 'skip':
+        raise AirflowSkipException(res)
+    if st == 'fail':
+        raise AirflowFailException(res)
+    return res
 
 def get_params(context):
     ti = context['task_instance']

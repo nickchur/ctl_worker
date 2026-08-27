@@ -69,7 +69,12 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         if not url.startswith('/v'):
             url = '/v5/api' + url
 
-        return ctl_api(url, method, json=data)
+        st, res = ctl_api(url, method, json=data)
+        if st == 'skip':
+            raise AirflowSkipException(res)
+        if st == 'fail':
+            raise AirflowFailException(res)
+        return res
 
     def save_category(cats):
         yaml_data = dict()

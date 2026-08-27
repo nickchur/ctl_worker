@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-08-25 14:31 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 10:22 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -12,11 +12,16 @@
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
 | 🔁 `reindex`        | `True` — REINDEX SCHEMA CONCURRENTLY после вакуума *(default)*, `False` — пропустить      |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
+| ⏰ `schedule_interval` | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 2 * * *`)* |
 | 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
 Значения по умолчанию берутся из переменной `tools_db_cleanup_params`, если она задана,
 иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
 разовый эксперимент в UI расписание не меняет, а осознанная правка меняет, без выкладки.
+
+`schedule_interval` — такой же сохраняемый параметр: сам запуск идёт по старому расписанию,
+новое подхватывается со следующего парсинга DAG-а. Негодное значение таск `params` не
+записывает (падает), а уже записанное битым — игнорируется на парсинге в пользу кода.
 
 **Таски:**
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
@@ -269,6 +274,39 @@ def _param(key, default, **kwargs):
     return Param(SAVED.get(key, default), **kwargs)
 
 
+DEFAULT_SCHEDULE = '0 2 * * *'
+# Пресеты Airflow: cron-парсер их не понимает, поэтому проверяем списком
+_SCHEDULE_PRESETS = {'@once', '@continuous', '@hourly', '@daily', '@weekly', '@monthly', '@yearly', '@annually'}
+
+
+def valid_schedule(value) -> bool:
+    """⏰ Годится ли значение как расписание: пресет, пустота (только вручную) или cron.
+
+    Проверяется дважды: таском params перед записью в переменную и на парсинге DAG-а —
+    записать битое расписание в переменную можно и мимо формы, а падение парсинга
+    из-за него убрало бы DAG из UI вместе со способом это починить.
+    """
+    if value in (None, '', 'None'):
+        return True
+    value = str(value).strip()
+    if value in _SCHEDULE_PRESETS:
+        return True
+    try:
+        from croniter import croniter
+        return croniter.is_valid(value)
+    except ImportError:                     # croniter приезжает с Airflow, но не будем на это закладываться
+        return len(value.split()) == 5
+
+
+def _schedule():
+    """Расписание DAG-а: из переменной, если оно осмысленное, иначе из кода."""
+    value = SAVED.get('schedule_interval', DEFAULT_SCHEDULE)
+    if not valid_schedule(value):
+        logger.warning(f"⚠️ {PARAMS_VAR}: расписание '{value}' не разобрано — беру {DEFAULT_SCHEDULE}")
+        return DEFAULT_SCHEDULE
+    return None if value in (None, '', 'None') else str(value).strip()
+
+
 params = {
     'retention_days': _param(
         'retention_days', 180,
@@ -307,6 +345,11 @@ params = {
         type='string',
         description='Таймаут ожидания блокировки (например: 10min, 30s)',
     ),
+    'schedule_interval': _param(
+        'schedule_interval', DEFAULT_SCHEDULE,
+        type='string',
+        description='Расписание: cron или пресет @daily; пусто — только вручную. Применяется со следующего парсинга',
+    ),
     # Разовое действие, а не настройка: в переменную не сохраняется и берётся всегда из кода
     'save_params': Param(
         False,
@@ -330,7 +373,7 @@ params = {
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
-    schedule_interval='0 2 * * *',
+    schedule_interval=_schedule(),
     on_failure_callback=on_callback,
     params=params,
 )
@@ -339,12 +382,17 @@ def tools_db_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        from airflow.exceptions import AirflowSkipException
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
         from airflow.models import Variable
 
         p = dict(context['params'])
         if not p.pop('save_params', False):
             raise AirflowSkipException('save_params=False — параметры не сохраняем')
+
+        if not valid_schedule(p.get('schedule_interval')):
+            raise AirflowFailException(
+                f"schedule_interval={p['schedule_interval']!r} — не cron и не пресет Airflow, переменную не трогаю"
+            )
 
         changed = {k: (SAVED.get(k, '—'), v) for k, v in p.items() if k not in SAVED or SAVED[k] != v}
         if not changed:

@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-08-27 11:39 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 12:00 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -346,7 +346,14 @@ def tools_db_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        store_params(PARAMS_VAR, SAVED, context)
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+        status, msg = store_params(PARAMS_VAR, SAVED, context)
+        if status == 'skip':
+            raise AirflowSkipException(msg)
+        if status == 'fail':
+            raise AirflowFailException(msg)
+        return msg
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку

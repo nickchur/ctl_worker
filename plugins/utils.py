@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-08-27 11:33 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 12:00 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -548,26 +548,26 @@ def store_params(var_name, saved, context=None, flag='save_params'):
         flag: Ключ-галочка «сохранить», в переменную не попадает.
 
     Returns:
-        Изменившиеся параметры: ``{ключ: (было, стало)}``.
-
-    Raises:
-        AirflowSkipException: Галочка не стоит или значения те же.
-        AirflowFailException: В форме негодное расписание — переменную не трогаем.
+        Кортеж ``(status, message)``: ``'ok'`` — записали, ``'skip'`` — галочка не стоит
+        или значения те же, ``'fail'`` — в форме негодное расписание, переменную не
+        трогали. Решение, что с этим делать, принимает таск: там же, где стоит
+        ``trigger_rule`` следующего таска, — а он **обязан** быть ``NONE_FAILED``,
+        если ``'skip'`` превращается в ``AirflowSkipException``, иначе штатный пропуск
+        утянет в skip всю цепочку.
     """
-    from airflow.exceptions import AirflowFailException, AirflowSkipException
     from airflow.models import Variable
 
     context = context or get_current_context()
     p = dict(context['params'])
     if not p.pop(flag, False):
-        raise AirflowSkipException(f'{flag}=False — параметры не сохраняем')
+        return 'skip', f'{flag}=False — параметры не сохраняем'
 
     if 'schedule' in p and not valid_schedule(p['schedule']):
-        raise AirflowFailException(f"schedule={p['schedule']!r} — не cron и не пресет Airflow, переменную не трогаю")
+        return 'fail', f"schedule={p['schedule']!r} — не cron и не пресет Airflow, переменную не трогаю"
 
     changed = {k: (saved.get(k, '—'), v) for k, v in p.items() if k not in saved or saved[k] != v}
     if not changed:
-        raise AirflowSkipException(f'{var_name}: значения те же — записи нет')
+        return 'skip', f'{var_name}: значения те же — записи нет'
 
     # MSK круглый год UTC+3, отдельная зависимость ради этого не нужна
     ts = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')
@@ -578,9 +578,9 @@ def store_params(var_name, saved, context=None, flag='save_params'):
         f"| `{k}` | {was} | **{now}** |" for k, (was, now) in changed.items()
     ]
     add_note('\n'.join(lines), context=context, level='Task', title='💾 params')
-    add_note(f"{var_name}: {', '.join(f'{k}={now}' for k, (_, now) in changed.items())}",
-             context=context, level='DAG', title='💾 params')
-    return changed
+    msg = f"{var_name}: {', '.join(f'{k}={now}' for k, (_, now) in changed.items())}"
+    add_note(msg, context=context, level='DAG', title='💾 params')
+    return 'ok', msg
 
 
 @provide_session

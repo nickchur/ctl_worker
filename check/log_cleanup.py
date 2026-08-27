@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-08-27 11:39 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 12:00 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
 Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
@@ -137,7 +137,14 @@ def tools_log_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        store_params(PARAMS_VAR, SAVED, context)
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+        status, msg = store_params(PARAMS_VAR, SAVED, context)
+        if status == 'skip':
+            raise AirflowSkipException(msg)
+        if status == 'fail':
+            raise AirflowFailException(msg)
+        return msg
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку

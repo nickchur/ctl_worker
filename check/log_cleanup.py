@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-08-25 14:14 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 10:35 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
 Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
@@ -59,7 +59,7 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
-    schedule_interval='17 5 * * *',
+    schedule='17 5 * * *',
     tags=['DataLab', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,

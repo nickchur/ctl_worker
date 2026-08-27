@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:26 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -94,7 +94,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         Возвращает PokeReturnValue(is_done=True, xcom_value={lid: r}) при наличии загрузок для обработки,
         иначе is_done=False (продолжает опрос).
         """
-        chk_any_conn('ctl', **context)
+        status, res = chk_any_conn('ctl', **context)
+        if status == 'skip':
+            raise AirflowSkipException(res)
+        if status == 'fail':
+            raise AirflowFailException(res)
         ti = context['ti']
 
         cl = get_current_load('gp_pool')
@@ -122,7 +126,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     # 'category_ids': str(category_ids),
                     # 'status': '["SUCCESS","ERROR","LOCK","RUNNING","TIME-WAIT","EVENT-WAIT"]',
             }
-            tsk = ctl_loading_load(data, save=False)
+            ld_status, tsk = ctl_loading_load(data, save=False)
+            if ld_status == 'skip':
+                raise AirflowSkipException(tsk)
+            if ld_status == 'fail':
+                raise AirflowFailException(tsk)
             
             for ld in sorted(tsk, key=lambda x: int(x['id'])):
                 
@@ -133,7 +141,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 prm = ld.get('params', {})
                 wfn = ld.get('wf_name','unknown')
                 # wf = wfs[wid]
-                wf = ctl_api(f'/v4/api/wf/{wid}')
+                wf_status, wf = ctl_api(f'/v4/api/wf/{wid}')
+                if wf_status == 'skip':
+                    raise AirflowSkipException(wf)
+                if wf_status == 'fail':
+                    raise AirflowFailException(wf)
                 wf = ctl_wf_norm(wf, None)
 
                 # ctl_obj_save(f"ctl_working/{lid}", jsn, var=False)
@@ -229,7 +241,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                             action = 'Aborted'
 
                     elif sts == 'EVENT-WAIT' and not running:
-                        chk = ctl_events_mon(sdt, wf, now)
+                        evt_status, chk = ctl_events_mon(sdt, wf, now)
+                        if evt_status == 'skip':
+                            raise AirflowSkipException(chk)
+                        if evt_status == 'fail':
+                            raise AirflowFailException(chk)
                         
                         if not chk['chk']:
                             add_note(chk, context, level='Task', title=f'reStarted {lid}')
@@ -243,7 +259,12 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     action = 'notFound'
                     
                 if action in ['Skipped']:
-                    wf_interval = gp_exe(None, f"SELECT '{sla}'::interval") if sla else timedelta(days=1)
+                    if sla:
+                        gp_status, wf_interval = gp_exe(None, f"SELECT '{sla}'::interval")
+                        if gp_status != 'ok':
+                            raise AirflowFailException(wf_interval)
+                    else:
+                        wf_interval = timedelta(days=1)
                     # wf_interval = timedelta(hours=6)
                     tst = pendulum.parse(sdt, tz=get_config()['tz']) + wf_interval 
                     if tst <= now:
@@ -278,7 +299,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         if sla_notes:
             add_note(sla_notes, context, level='Task', title='SLA')
 
-        chk_any_conn('ctl', **context)
+        status, chk = chk_any_conn('ctl', **context)
+        if status == 'skip':
+            raise AirflowSkipException(chk)
+        if status == 'fail':
+            raise AirflowFailException(chk)
         
         if res:
             return PokeReturnValue(is_done=True, xcom_value=res)
@@ -296,7 +321,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         - reStarted/Stopped → удаляет расписание, завершает, создаёт новую загрузку;
         - scheduled → ставит в расписание.
         """
-        chk_any_conn('ctl', **context)
+        status, chk = chk_any_conn('ctl', **context)
+        if status == 'skip':
+            raise AirflowSkipException(chk)
+        if status == 'fail':
+            raise AirflowFailException(chk)
         
         active = True
         
@@ -318,28 +347,46 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             try:
                 # Status ABORTING
                 if action not in ['Completed']:
-                    if active: ctl_set_status(lid, 'ABORTING', f'{action} {r}')
+                    if active:
+                        act_status, act_res = ctl_set_status(lid, 'ABORTING', f'{action} {r}')
+                        if act_status != 'ok':
+                            raise RuntimeError(act_res)
 
                 # Status RUNNING
                 if action in ['reRunned',]:
-                    if active: ctl_set_status(lid, 'RUNNING', '')
+                    if active:
+                        act_status, act_res = ctl_set_status(lid, 'RUNNING', '')
+                        if act_status != 'ok':
+                            raise RuntimeError(act_res)
                     continue
 
                 # Schedule delete
                 if scheduled:
-                    if active: ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                    if active:
+                        act_status, act_res = ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                        if act_status != 'ok':
+                            raise RuntimeError(act_res)
 
                 # Close Completed/Aborted
-                if active: ctl_api(f"/v4/api/loading/{lid}/{'completed' if action=='Completed' else 'aborted'}", 'put')
+                if active:
+                    act_status, act_res = ctl_api(f"/v4/api/loading/{lid}/{'completed' if action=='Completed' else 'aborted'}", 'put')
+                    if act_status != 'ok':
+                        raise RuntimeError(act_res)
 
                 # Start and Schedule
                 if action in ['reStarted', 'Stopped']:
                     prm = { k:str(v) for k,v in r.items() if k.startswith('wf') }
-                    if active: ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={scheduled}", "post", json=prm)
+                    if active:
+                        act_status, act_res = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={scheduled}", "post", json=prm)
+                        if act_status != 'ok':
+                            raise RuntimeError(act_res)
 
                 # Schedule start
                 elif scheduled:
-                    if active: ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+                    if active:
+                        act_status, act_res = ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+                        if act_status != 'ok':
+                            raise RuntimeError(act_res)
 
             except Exception as e:
                 logger.error(f"ctl_action failed for lid={lid} action={action}: {e}")

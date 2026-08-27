@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка подключений CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:26 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Непрерывный сенсор (каждую минуту, `reschedule`) — проверяет доступность всех соединений из `get_config()['conns']`.
 Поддерживает типы: `Postgres`, `S3`, `KerberosHttp`. При сбое — экспоненциальный retry (до 1000 попыток).

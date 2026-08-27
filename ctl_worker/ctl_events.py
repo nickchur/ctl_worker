@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Dataset
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:26 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
 
@@ -119,7 +119,7 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
             try:
                 status, last = ctl_api(f"/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}")
                 if status != 'ok':
-                    logger.warning(f"⚠️ {evn}: {last}")
+                    logger.warning(f"⚠️ {prf}/{eid}/{sid}: {last}")
                     continue
             except:
                 continue

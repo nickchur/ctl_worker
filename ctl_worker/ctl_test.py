@@ -1,5 +1,5 @@
 """### 🧪 DAG: Тестирование CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:26 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Симулирует запуск workflow'ов в тестовом режиме (`test_mode=True`) без влияния на продакшн.
 Случайно выбирает workflow'ы и запускает их с уникальным `run_id`. Активен только при `get_config()['test_mode'] = True`.

@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-08-04 17:40 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:26 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -236,7 +236,11 @@ def _publish_stats(lid, eid, result):
 def _emit_datasets(lid, eids, result, context):
     res = int(result['res']) if result.get('res') is not None else -99
     if result.get('html') and eids:
-        ctl_send_html(result['html'], lid, int(eids[0].split('/')[0]))
+        st, res_html = ctl_send_html(result['html'], lid, int(eids[0].split('/')[0]))
+        if st == 'skip':
+            raise AirflowSkipException(res_html)
+        if st == 'fail':
+            raise AirflowFailException(res_html)
         result['html'] = ''
     msg = {}
     for eid_str in eids:
@@ -274,11 +278,24 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
     retry = wf_prm.get('wfp_retry', {})
     res = int(result['res']) if result.get('res') is not None else -99
 
-    tmpl = ctl_api(f'/v4/api/wf/{wid}/tmpl') or {}
+    st, tmpl = ctl_api(f'/v4/api/wf/{wid}/tmpl')
+    if st == 'skip':
+        raise AirflowSkipException(tmpl)
+    if st == 'fail':
+        raise AirflowFailException(tmpl)
+    tmpl = tmpl or {}
     if tmpl.get('id') != 2:
         if tmpl.get('id'):
-            ctl_api(f'/v4/api/wf/{wid}/tmpl/{tmpl["id"]}', 'delete')
-        ctl_api(f'/v4/api/wf/{wid}/tmpl/2', 'put')
+            st, res_tmpl = ctl_api(f'/v4/api/wf/{wid}/tmpl/{tmpl["id"]}', 'delete')
+            if st == 'skip':
+                raise AirflowSkipException(res_tmpl)
+            if st == 'fail':
+                raise AirflowFailException(res_tmpl)
+        st, res_tmpl = ctl_api(f'/v4/api/wf/{wid}/tmpl/2', 'put')
+        if st == 'skip':
+            raise AirflowSkipException(res_tmpl)
+        if st == 'fail':
+            raise AirflowFailException(res_tmpl)
 
     if res > 0:
         res_msg, res_icon = 'ok', '✅'
@@ -295,14 +312,22 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
         status, action = 'ERRORCHECK', 'retry'
     else:
         if retry.get('try', 0) > 0:
-            ctl_set_status(lid, 'RUNNING', f"END {retry}")
+            st, res_sts = ctl_set_status(lid, 'RUNNING', f"END {retry}")
+            if st == 'skip':
+                raise AirflowSkipException(res_sts)
+            if st == 'fail':
+                raise AirflowFailException(res_sts)
         if retry.get('ok', 0) > 0 or retry.get('no', 0) > 0:
             status, action = 'SUCCESS', 'Completed'
         else:
             status = 'ERROR'
             action = 'Aborted' if wf.get('faultTolerance', {}).get('abortOnFailure', False) else 'Completed'
 
-    ctl_set_status(lid, status, result)
+    st, res_sts = ctl_set_status(lid, status, result)
+    if st == 'skip':
+        raise AirflowSkipException(res_sts)
+    if st == 'fail':
+        raise AirflowFailException(res_sts)
 
     if action == 'retry':
         retry.setdefault('try', 1)
@@ -310,9 +335,17 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
         new_time = eval_delta(now, retry.get('delay'))
         for _ in range(1, retry.get('try')):
             new_time = eval_delta(new_time, retry.get('add'))
-        ctl_set_status(lid, 'TIME-WAIT', dict(time=new_time, retry=retry))
+        st, res_sts = ctl_set_status(lid, 'TIME-WAIT', dict(time=new_time, retry=retry))
+        if st == 'skip':
+            raise AirflowSkipException(res_sts)
+        if st == 'fail':
+            raise AirflowFailException(res_sts)
     else:
-        ctl_set_completed(lid, action)
+        st, res_cmp = ctl_set_completed(lid, action)
+        if st == 'skip':
+            raise AirflowSkipException(res_cmp)
+        if st == 'fail':
+            raise AirflowFailException(res_cmp)
 
     data = {
         'wf': wf['name'],
@@ -439,7 +472,11 @@ def build_worker_dag(w):
             - Поддерживает `scheduleAfterStart` — перевод в режим расписания.
             - Автоматически удаляет расписание, если `!singleLoading`.
             """
-            chk_any_conn('ctl')
+            st, res_conn = chk_any_conn('ctl')
+            if st == 'skip':
+                raise AirflowSkipException(res_conn)
+            if st == 'fail':
+                raise AirflowFailException(res_conn)
             ti = context['task_instance']
             set_pause(wf['name'], wf['category'])
 
@@ -453,8 +490,16 @@ def build_worker_dag(w):
                     { "param": k, "prior_value": str(v) } 
                     for k,v in params.items() if k.startswith('wf')
                 ]
-                res['del'] = ctl_api(f"/v4/api/wf/{wid}/params", "delete")
-                res['new'] = ctl_api(f"/v4/api/wf/{wid}/params", "post", json=new_prm)
+                st, res['del'] = ctl_api(f"/v4/api/wf/{wid}/params", "delete")
+                if st == 'skip':
+                    raise AirflowSkipException(res['del'])
+                if st == 'fail':
+                    raise AirflowFailException(res['del'])
+                st, res['new'] = ctl_api(f"/v4/api/wf/{wid}/params", "post", json=new_prm)
+                if st == 'skip':
+                    raise AirflowSkipException(res['new'])
+                if st == 'fail':
+                    raise AirflowFailException(res['new'])
                 res['prm'] = new_prm
                 
                 msg = '⚙️ Параметры были сохранены.'
@@ -463,10 +508,18 @@ def build_worker_dag(w):
             if not params.get('start_wf'):
                 msg = '⚠️ Задание не запущено.'
                 if schedule_wf and not wf['scheduled']: 
-                    ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+                    st, res_sch = ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+                    if st == 'skip':
+                        raise AirflowSkipException(res_sch)
+                    if st == 'fail':
+                        raise AirflowFailException(res_sch)
                     msg += ' ⏰ Задание поставлено на расписание.'
                 elif not schedule_wf and wf['scheduled']: 
-                    ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                    st, res_sch = ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                    if st == 'skip':
+                        raise AirflowSkipException(res_sch)
+                    if st == 'fail':
+                        raise AirflowFailException(res_sch)
                     msg += ' 💀 Задание снято с расписания.'
 
                 add_note('', context, level='task,DAG', title=msg)
@@ -522,7 +575,11 @@ def build_worker_dag(w):
                 # wid = int(params['wf_id'])
                 
                 # Проверяем статус загрузки
-                ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='WAIT-AF')
+                st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='WAIT-AF')
+                if st == 'skip':
+                    raise AirflowSkipException(ld_sts)
+                if st == 'fail':
+                    raise AirflowFailException(ld_sts)
                 ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
                 
                 retry = ctl_get_retry(params=params, wf=wf)
@@ -534,15 +591,27 @@ def build_worker_dag(w):
                 # wid = int(params.get('wf_id', wf.get('id', 0)))
                 # if wf['scheduled'] and wf['singleLoading']: 
                 if wf['scheduled']: 
-                    ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                    st, res_sch = ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
+                    if st == 'skip':
+                        raise AirflowSkipException(res_sch)
+                    if st == 'fail':
+                        raise AirflowFailException(res_sch)
                     
                 prm = { k:str(v) for k,v in params.items() if k.startswith('wf') }  
                 prm['wfp_run_type'] = run_type
                 # ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
 
-                new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={schedule_wf}", "post", json=prm)
+                st, new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={schedule_wf}", "post", json=prm)
+                if st == 'skip':
+                    raise AirflowSkipException(new_lid)
+                if st == 'fail':
+                    raise AirflowFailException(new_lid)
                 lid = int(new_lid['loadingId'])
-                ctl_set_status(lid, 'RUNNING', 'NEW-AF ' + context['dag_run'].run_id)
+                st, res_sts = ctl_set_status(lid, 'RUNNING', 'NEW-AF ' + context['dag_run'].run_id)
+                if st == 'skip':
+                    raise AirflowSkipException(res_sts)
+                if st == 'fail':
+                    raise AirflowFailException(res_sts)
                 
                 retry = ctl_get_retry(params=params, wf=wf)
                 wfp_name = params.get('wfp_name', wf.get('name', ''))
@@ -561,10 +630,18 @@ def build_worker_dag(w):
                 
                 
                 # Проверяем события на expire
-                ctl_chk_expire(wf, params, context)
+                st, res_exp = ctl_chk_expire(wf, params, context)
+                if st == 'skip':
+                    raise AirflowSkipException(res_exp)
+                if st == 'fail':
+                    raise AirflowFailException(res_exp)
                 
             # Статистика по сущностям
-            eids = ctl_get_eids(wid, params)
+            st, eids = ctl_get_eids(wid, params)
+            if st == 'skip':
+                raise AirflowSkipException(eids)
+            if st == 'fail':
+                raise AirflowFailException(eids)
             eids = [f"{e}/{enames.get(e, str(e))}" for e in eids]
             ti.xcom_push(key='eids', value=eids)
             add_note(eids, context, level='task,DAG',title=f"🔍 Entities")
@@ -576,9 +653,17 @@ def build_worker_dag(w):
                 tfs_mask = params.get('wf_tfs_mask', '*').strip(' ')
                 tfs_table = params.get('wf_tfs_table','')
                 tfs_schema = params.get('wf_tfs_schema','dia')
-                ctl_set_status(lid, 'RUNNING', f"TFS 🔍 {tfs}/{tfs_mask} -> {tfs_schema}.{tfs_table}")
+                st, res_sts = ctl_set_status(lid, 'RUNNING', f"TFS 🔍 {tfs}/{tfs_mask} -> {tfs_schema}.{tfs_table}")
+                if st == 'skip':
+                    raise AirflowSkipException(res_sts)
+                if st == 'fail':
+                    raise AirflowFailException(res_sts)
             else:
-                ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
+                st, res_sts = ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
+                if st == 'skip':
+                    raise AirflowSkipException(res_sts)
+                if st == 'fail':
+                    raise AirflowFailException(res_sts)
 
             add_note(params, context, level='task', title='Params')
             ti.xcom_push(key='params', value=params)
@@ -626,11 +711,19 @@ def build_worker_dag(w):
                 if not wf_prm.get('wf_tfs_in', '').strip():
                     msg = f"✳️ TFS files are not required."
                     add_note(msg, context, level='task,DAG')
-                    ctl_set_status(lid, 'ERRORCHECK', msg)
-                    ctl_set_completed(lid, 'completed') # Completed/Aborted
+                    st, res_sts = ctl_set_status(lid, 'ERRORCHECK', msg)
+                    if st != 'ok':
+                        logger.error(f"❌ Не выставился ERRORCHECK для {lid}: {res_sts}")
+                    st, res_cmp = ctl_set_completed(lid, 'completed') # Completed/Aborted
+                    if st != 'ok':
+                        logger.error(f"❌ Не завершилась загрузка {lid}: {res_cmp}")
                     raise AirflowSkipException(msg)
                 # Проверяем статус загрузки
-                ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='TFS')
+                st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='TFS')
+                if st == 'skip':
+                    raise AirflowSkipException(ld_sts)
+                if st == 'fail':
+                    raise AirflowFailException(ld_sts)
                 ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
                 
                 if '/.done' in path:
@@ -650,8 +743,12 @@ def build_worker_dag(w):
                 if len(keys) == 0:
                     msg = '⚠️ No new TFS files'
                     add_note(msg, context, level='task,DAG')
-                    ctl_set_status(lid, 'ERRORCHECK', msg)
-                    ctl_set_completed(lid, 'completed') # Completed/Aborted
+                    st, res_sts = ctl_set_status(lid, 'ERRORCHECK', msg)
+                    if st != 'ok':
+                        logger.error(f"❌ Не выставился ERRORCHECK для {lid}: {res_sts}")
+                    st, res_cmp = ctl_set_completed(lid, 'completed') # Completed/Aborted
+                    if st != 'ok':
+                        logger.error(f"❌ Не завершилась загрузка {lid}: {res_cmp}")
                     raise AirflowSkipException(msg)
 
                 for key, value in keys.items():
@@ -663,7 +760,7 @@ def build_worker_dag(w):
                         for s in [" ", "'", '"', ":", ";", "."]:
                             key_tbl = key_tbl.split(s)[0]
                             
-                        rows = gp_upload_s3_csv(
+                        st, rows = gp_upload_s3_csv(
                             table=table or key_tbl, 
                             key=key, 
                             options=options, 
@@ -671,9 +768,13 @@ def build_worker_dag(w):
                             truncate=truncate,
                             timeout=int(wf_timeout.total_seconds()), 
                         )
+                        if st != 'ok':
+                            raise RuntimeError(rows)
                         
                         msg = f"✅ {value}: {readable(rows, 1000)}"
-                        ctl_set_status(lid, 'RUNNING', f'TFS-OK {msg}')
+                        st, res_sts = ctl_set_status(lid, 'RUNNING', f'TFS-OK {msg}')
+                        if st != 'ok':
+                            raise RuntimeError(res_sts)
                         add_note(msg, context, level='task,DAG', title=f"✅ {key}")
                         s3_move_s3(new_path, arc_path)
                     except Exception as e:
@@ -682,8 +783,12 @@ def build_worker_dag(w):
                         except Exception as move_err:
                             logger.warning("Failed to move %s to err_path: %s", key, move_err)
                         add_note(str(e), context, level='task,DAG', title='❌ Error')
-                        ctl_set_status(lid, 'ERROR', str(e))
-                        ctl_set_completed(lid, 'completed') # Completed/Aborted
+                        st, res_sts = ctl_set_status(lid, 'ERROR', str(e))
+                        if st != 'ok':
+                            logger.error(f"❌ Не выставился ERROR для {lid}: {res_sts}")
+                        st, res_cmp = ctl_set_completed(lid, 'completed') # Completed/Aborted
+                        if st != 'ok':
+                            logger.error(f"❌ Не завершилась загрузка {lid}: {res_cmp}")
                         raise AirflowFailException(str(e)) from e
                 
                 if len(done_keys) > 0:
@@ -695,7 +800,11 @@ def build_worker_dag(w):
                 
                 # retry = ctl_get_retry(params=wf_prm, wf=wf)
                 retry = ctl_get_retry(params=wf_prm)
-                ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
+                st, res_sts = ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
+                if st == 'skip':
+                    raise AirflowSkipException(res_sts)
+                if st == 'fail':
+                    raise AirflowFailException(res_sts)
                 
 
         @task(pool='gp_pool', sla=sla_time, retries=0) # execution_timeout=exe_task_to,)  retries=0: pr_swf_start_ctl неидемпотентна — ретрай = повторный ETL (повторы делает CTL через TIME-WAIT)
@@ -714,7 +823,11 @@ def build_worker_dag(w):
             - Использует `PostgresHook` для подключения к Greenplum.
             - Логирует PID и время начала.
             """     
-            chk_any_conn('gp')
+            st, res_conn = chk_any_conn('gp')
+            if st == 'skip':
+                raise AirflowSkipException(res_conn)
+            if st == 'fail':
+                raise AirflowFailException(res_conn)
             ti = context['task_instance']
             wf_prm = get_params(context)
             
@@ -726,7 +839,11 @@ def build_worker_dag(w):
             exe = wf_prm.get('wf_exe', wf_prm.get('wf_exec')) or f'pr_{wf_name}()'
             
             # Проверяем статус загрузки
-            ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            if st == 'skip':
+                raise AirflowSkipException(ld_sts)
+            if st == 'fail':
+                raise AirflowFailException(ld_sts)
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
 
             # TEST !!!
@@ -775,7 +892,11 @@ def build_worker_dag(w):
             
             # EXECUTE !!!
             ts = time.time()
-            res = gp_exe(sql=sql, ti=ti, timeout=int(wf_timeout.total_seconds())) 
+            st, res = gp_exe(sql=sql, ti=ti, timeout=int(wf_timeout.total_seconds()))
+            if st == 'skip':
+                raise AirflowSkipException(res)
+            if st == 'fail':
+                raise AirflowFailException(res)
             # res['ts'] = pendulum.duration(seconds= int(time.time() - ts)).in_words()
             res['ts'] = str(timedelta(seconds=int(time.time() - ts)))
 
@@ -798,7 +919,11 @@ def build_worker_dag(w):
         @task(outlets=outlets,)
         def run_end(wf, **context):
             ti = context['task_instance']
-            chk_any_conn('ctl')
+            st, res_conn = chk_any_conn('ctl')
+            if st == 'skip':
+                raise AirflowSkipException(res_conn)
+            if st == 'fail':
+                raise AirflowFailException(res_conn)
             wf_prm = get_params(context)
 
             result = ti.xcom_pull(key='result', task_ids='run_exe')
@@ -810,7 +935,11 @@ def build_worker_dag(w):
             add_note(eids, context, level='task', title='Entities')
 
             lid = wf_prm.get('loading_id', 0)
-            ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+            if st == 'skip':
+                raise AirflowSkipException(ld_sts)
+            if st == 'fail':
+                raise AirflowFailException(ld_sts)
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
 
             msg = _emit_datasets(lid, eids, result, context)

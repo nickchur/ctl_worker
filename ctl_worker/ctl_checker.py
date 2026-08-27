@@ -1,5 +1,5 @@
 """### 🔍 DAG: Проверка API CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:26 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск HTTP-запроса к CTL API для диагностики и отладки.
 

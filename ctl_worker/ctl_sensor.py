@@ -1,5 +1,5 @@
 """### 📡 DAG: Сенсор CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 13:26 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
 
@@ -175,8 +175,12 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
             'status': '["RUNNING","TIME-WAIT","EVENT-WAIT"]',
         }
         try:
-            ctl_api()
-            tsk = ctl_loading_load(data, save=False)
+            api_status, api_res = ctl_api()
+            if api_status != 'ok':
+                raise RuntimeError(api_res)
+            ld_status, tsk = ctl_loading_load(data, save=False)
+            if ld_status != 'ok':
+                raise RuntimeError(tsk)
         except Exception as e:
             raise AirflowFailException(f"CTL API недоступен: {e}") from e
 
@@ -316,17 +320,30 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
 
         # Проверка на новый запуск и времени повторного запуска 
         # retry, is_new = ctl_chk_new(wf, params, context)
-        retry, is_new = ctl_chk_new(lid, wf_name, status, log, context)
+        new_status, new_res = ctl_chk_new(lid, wf_name, status, log, context)
+        if new_status == 'skip':
+            raise AirflowSkipException(new_res)
+        if new_status == 'fail':
+            raise AirflowFailException(new_res)
+        retry, is_new = new_res
         retry = retry if retry else ctl_get_retry(wf=wf, params=params)
         
         # Проверка условия запуска на событие EVENT-WAIT
-        ctl_chk_expire(wf, params, context)
+        exp_status, exp_res = ctl_chk_expire(wf, params, context)
+        if exp_status == 'skip':
+            raise AirflowSkipException(exp_res)
+        if exp_status == 'fail':
+            raise AirflowFailException(exp_res)
         
         # Отложенный запуск (wf_wait)
         if ( is_new and params.get('wf_wait')
             and run_type == 'EVENT-WAIT'
         ):
-            ctl_chk_wait(wf, params, context)
+            wait_status, wait_res = ctl_chk_wait(wf, params, context)
+            if wait_status == 'skip':
+                raise AirflowSkipException(wait_res)
+            if wait_status == 'fail':
+                raise AirflowFailException(wait_res)
             
         # af_sdt = str(ti.start_date)
 
@@ -357,7 +374,9 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         # Установка статуса
         status = 'RUNNING'
         log ='WAIT-AF ' + (ds if get_config().get('dug_run')=='dataset' else run_id)
-        ctl_set_status(lid, status, log)
+        set_status, set_res = ctl_set_status(lid, status, log)
+        if set_status != 'ok':
+            raise AirflowFailException(f"не выставился {status} для {lid}: {set_res}")
         
         ret = {
             "action": "🚀 start",

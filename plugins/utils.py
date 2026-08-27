@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-08-12 14:48 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-27 10:00 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -590,9 +590,10 @@ def get_af_conn():
         'conn_type': 'postgres',
         'host':      host,
         'port':      port,
-        # Приоритет — админская учётка (DB_ADM_*); если её нет, обычная (DB_*_1_2).
-        'login':     _b64(secrets.get('DB_ADM_USER_1_1', '')) or _b64(secrets.get('DB_USER_1_2', '')),
-        'password':  _b64(secrets.get('DB_ADM_PASS_1_1', '')) or _b64(secrets.get('DB_PASS_1_2', '')),
+        # Приоритет: админская учётка (DB_ADM_*), затем владелец схемы (DB_*_OWNER_1),
+        # затем обычная (DB_*_1_2) — у последней прав на VACUUM/REINDEX чужих таблиц нет.
+        'login':     _b64(secrets.get('DB_ADM_USER_1_1', '')) or _b64(secrets.get('DB_USER_OWNER_1', '')) or _b64(secrets.get('DB_USER_1_2', '')),
+        'password':  _b64(secrets.get('DB_ADM_PASS_1_1', '')) or _b64(secrets.get('DB_PASS_OWNER_1', '')) or _b64(secrets.get('DB_PASS_1_2', '')),
         # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;
         # 'main' — схема внутри airflowdb, и в SQL она указана явно (main.<table>).
         'schema':    _b64(secrets['DB_NAME_1']),

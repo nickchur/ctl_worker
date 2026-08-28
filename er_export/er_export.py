@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-20 22:15 MSK · v3.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 12:35 MSK · v3.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
 значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
@@ -84,8 +84,14 @@ VAR_NAME        = _cfg['VAR_NAME']
 FORMAT_MAP      = _cfg['FORMAT_MAP']
 
 
-def sql_cur_delta(tbl: str) -> str:
+def sql_cur_delta(replica: str, tbl: str) -> str:
     """SQL для получения текущего состояния дельты из export.extract_current_vw.
+
+    Ключ состояния — ПАРА (replica, extract_name), а не одно имя выгрузки: с ключом
+    er_wf_meta (replica, extract_name) одна и та же таблица может входить в разные группы
+    (например, старая и новая версия пакета), и по одному имени они делили бы одно окно
+    дельты — вторая группа выгружала бы пустоту, а её save_status переписывал бы чужую
+    историю.
 
     Все значения возвращаются как строки-SQL-литералы ('2024-01-01' или null),
     чтобы их можно было подставлять напрямую в шаблонные SQL-запросы через str.format().
@@ -107,7 +113,8 @@ def sql_cur_delta(tbl: str) -> str:
             "if(a.current_time = a.extract_time, 'True', 'False') as is_current",
             "toString(0) as recent_interval",
         ],
-        "from": f"(SELECT * FROM export.extract_current_vw WHERE extract_name = '{tbl}') as a",
+        "from": ("(SELECT * FROM export.extract_current_vw "
+                 f"WHERE replica = '{replica}' AND extract_name = '{tbl}') as a"),
     })
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -823,7 +830,9 @@ def _er_wait_confirm(gcfg, **context):
 def _er_save_status(gcfg, **context):
     """💾 Записывает результат по каждой таблице пакета в export.extract_history.
 
-    Одна вставка на весь пакет: строк столько, сколько таблиц отработало.
+    Одна вставка на весь пакет: строк столько, сколько таблиц отработало. Реплика пишется
+    в каждую строку — состояние дельты ключуется парой (replica, extract_name), иначе две
+    группы с одной и той же таблицей переписывали бы историю друг другу.
     trigger_rule=none_failed: запускается при успехе или при skipped-тасках
     (wait_confirm пропускается при auto_confirm=True или отсутствии данных).
     confirmed — время квитанции ТФС из wait_confirm; null, если ждать не стали
@@ -862,6 +871,7 @@ def _er_save_status(gcfg, **context):
         # оттого и не всплывало.
         selects.append(f"""
             SELECT
+                '{_sql_str(gcfg['replica'])}' AS replica,
                 '{tbl}' AS extract_name, {dp['extract_time']} AS extract_time,
                 {rows} AS extract_count, now() AS loaded, now() AS sent, {confirmed} AS confirmed,
                 {dp['increment']} AS increment, {dp['overlap']} AS overlap,
@@ -874,7 +884,7 @@ def _er_save_status(gcfg, **context):
     if selects:
         ClickHouseHook(clickhouse_conn_id=CH_ID).execute(f"""
             INSERT INTO export.extract_history (
-                extract_name, extract_time, extract_count, loaded, sent, confirmed,
+                replica, extract_name, extract_time, extract_count, loaded, sent, confirmed,
                 increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
             ) {' UNION ALL '.join(selects)}
         """)
@@ -916,15 +926,22 @@ def _er_schedule_next(gcfg, **context):
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────
 
-def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
+def _table_cfg(extract_name: str, entry: dict, replica: str, prefix: str) -> dict:
     """🗂️ Конфиг одной поставки внутри пакета.
 
-    entry — запись из Variable: schema, PK, UK, fields, params (уже разрешённые
-    наследованием от строки-дефолта группы) и ровно один из sql_stmt_export_delta /
-    sql_stmt_export_recent.
+    extract_name — ключ поставки внутри группы; в пакете он уникален по построению
+                   (ключ er_wf_meta — пара (replica, extract_name))
+    entry        — запись из Variable: schema, db, PK, UK, fields, params (уже разрешённые
+                   наследованием от строки-дефолта группы) и ровно один из
+                   sql_stmt_export_delta / sql_stmt_export_recent.
+
+    База источника берётся из самой записи ('db'), а не из ключа: ключом до 2026-08-28
+    была строка 'db.table', и её резали пополам. Реплика в ключ не входит — она одна
+    на весь пакет и повторять её в каждой поставке незачем.
     """
     p = get_params(entry)
-    db, tbl = table_key.split(".", maxsplit=1)
+    db, tbl   = entry.get('db', ''), extract_name
+    table_key = f"{replica}/{extract_name}"
 
     if p['format'] not in FORMAT_MAP:
         raise AirflowFailException(
@@ -945,7 +962,10 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
 
     return {
         # ── Идентификация ────────────────────────────────────────────────────
-        'tg':              table_key.replace('.', '__'),   # id TaskGroup, он же префикс XCom
+        # id TaskGroup, он же префикс XCom и хвост имени параметра формы 'tbl_<tg>'.
+        # Собирается из базы и имени выгрузки, а не из ключа записи: имена тасков должны
+        # пережить смену ключа, иначе история ранов и снятые флаги таблиц потерялись бы.
+        'tg':              f"{db}__{tbl}",
         'db':              db,
         'tbl':             tbl,
         'schema_name':     entry['schema'],
@@ -958,7 +978,7 @@ def _table_cfg(table_key: str, entry: dict, replica: str, prefix: str) -> dict:
         # ── SQL ──────────────────────────────────────────────────────────────
         'sql_export':      q['sql_export'],
         # None → состояние дельты не читается: так работают recent и full_export
-        'sql_get_current': sql_cur_delta(tbl) if (is_delta and not p['full_export']) else None,
+        'sql_get_current': sql_cur_delta(replica, tbl) if (is_delta and not p['full_export']) else None,
         'sql_meta':        q['sql_meta'],
         # Части запроса как есть — из них build_meta достаёт таблицы-источники, чтобы
         # взять описания колонок. Имя выгрузки для этого не годится: таблицы с таким
@@ -1107,7 +1127,7 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
 
     replica — ключ группы из Variable, он же имя в архивах и тикете
               ('hrplatform_datalab__1'); маршрут в TFS ищется по части до первого '__'
-    group   — {schedule, description, params (групповые), tables: {"db.tbl": entry}}
+    group   — {schedule, description, params (групповые), tables: {extract_name: entry}}
 
     Возвращает (dag_id, dag) для регистрации в globals().
     """

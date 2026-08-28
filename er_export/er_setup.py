@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-19 14:20 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 12:10 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -21,32 +21,34 @@
 | выбран | пуст | **просмотр**: запись + проверка её SQL и `.meta`, в таблицу ничего не пишется |
 | выбран | заполнен | состояние **до** → проверка → запись → состояние **после** → синхронизация |
 
-Пример правки расписания у группы:
+Пример правки расписания у группы — расписание живёт в `params` строки-дефолта:
 
-    {"schedule": "30 2 * * *"}
+    {"params": "{\\"schedule\\": \\"30 2 * * *\\"}"}
 
 Пример новой поставки:
 
     {
-      "extract_name": "lc_items_opened", "db_name": "evolution",
-      "replica": "hrplatform_datalab__1", "schema_name": "learning",
+      "replica": "hrplatform_datalab__1", "extract_name": "lc_items_opened",
+      "schema_name": "learning", "db_name": "evolution",
       "uk": ["item_id"], "fields": ["item_id", "title"],
       "sql_from": "evolution.lc_items_opened",
       "params": "{\\"selfrun_timeout\\": 10}"
     }
 
-Пример новой строки-дефолта группы — `extract_name` пуст, а **`db_name` равен `replica`**:
+Пример новой строки-дефолта группы — у неё пуст `extract_name`, и это её единственный
+признак:
 
     {
-      "replica": "hrplatform_datalab__2", "db_name": "hrplatform_datalab__2",
-      "schema_name": "learning", "schedule": "30 2 * * *",
-      "params": "{\\"notify_kafka\\": 0}"
+      "replica": "hrplatform_datalab__2", "schema_name": "learning",
+      "params": "{\\"schedule\\": \\"30 2 * * *\\", \\"notify_kafka\\": 0}"
     }
 
-⚠️ Пустым `db_name` у дефолта быть не может. Ключ таблицы — `(db_name, extract_name)`,
-`extract_name` у дефолтов пуст, и с пустым `db_name` дефолты **всех** групп получили бы
-один ключ `('', '')`: фоновый MERGE оставил бы от них одну строку, а остальные пакеты
-разом потеряли бы свои параметры. Проверка это ловит и записать такую строку не даёт.
+🔑 Ключ таблицы — `(replica, extract_name)`, и ключ записи в форме выглядит так же:
+`hrplatform_datalab__1/lc_items_opened`. Отсюда два следствия: `db_name` у строки-дефолта
+не нужен вовсе (раньше он был обязан равняться `replica`, чтобы дефолты групп не схлопнулись),
+а одна и та же таблица может входить в РАЗНЫЕ группы — например, старая и новая версия
+пакета живут рядом. Состояние дельты у них тоже разное: оно ключуется парой
+`(replica, extract_name)`.
 
 **Удаление** отдельной кнопкой не сделано и не нужно: `{"is_active": 0}` выключает
 запись, а у строки-дефолта группы — весь пакет.
@@ -86,7 +88,7 @@
 В заметках только короткие итоги: `add_note` режет их до 1000 символов.
 
 Правка существующей записи — это **вставка новой версии**: `ReplacingMergeTree` схлопнет
-её по `(db_name, extract_name)` при фоновом MERGE, читать до того — с `FINAL`.
+её по `(replica, extract_name)` при фоновом MERGE, читать до того — с `FINAL`.
 
 ## Чего ждать от формы
 
@@ -121,7 +123,7 @@ try:
         ch_error, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
         check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
-        merge_params, probe_sql, query_columns, sql_sources, unnamed_fields,
+        merge_params, probe_sql, query_columns, sql_sources, unnamed_fields, valid_schedule,
     )
 except ImportError:
     from er_export.er_config import (  # type: ignore
@@ -130,7 +132,7 @@ except ImportError:
         ch_error, clean_row, parse_params, explicit_schedule, check_table,
         raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
         check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
-        merge_params, probe_sql, query_columns, sql_sources, unnamed_fields,
+        merge_params, probe_sql, query_columns, sql_sources, unnamed_fields, valid_schedule,
     )
 
 _cfg           = get_config()
@@ -171,10 +173,10 @@ _doc_cfg = {k: v for k, v in _cfg.items() if k not in _HIDDEN_CFG_KEYS}
 # патча (опечатку ловим по нему), умолчаниями для новой записи и порядком колонок INSERT.
 # updated_at сюда не входит — его проставляет сама вставка.
 COLUMNS: dict = {
-    'extract_name': '',
-    'db_name':      '',
     'replica':      '',
+    'extract_name': '',
     'schema_name':  '',
+    'db_name':      '',
     'pk':           [],
     'uk':           [],
     'fields':       [],
@@ -185,9 +187,15 @@ COLUMNS: dict = {
     'sql_settings': '',
     'params':       '{}',
     'description':  '',
-    'schedule':     '',
-    'is_recent':    0,
     'is_active':    1,
+}
+
+# 🚚 Колонки, которых больше нет: их значения переехали в params. Держим списком, чтобы
+# патч со старым именем отвечал «переехало туда-то», а не сухим «неизвестное поле» —
+# по старым инструкциям и заметкам эти имена будут писать ещё долго.
+MOVED_TO_PARAMS: dict = {
+    'schedule':  'params строки-дефолта группы: {"params": "{\\"schedule\\": \\"30 2 * * *\\"}"}',
+    'is_recent': 'params поставки: {"params": "{\\"is_recent\\": 1}"}',
 }
 
 
@@ -262,6 +270,11 @@ def merge_patch(base: dict, patch: dict) -> dict:
     Опечатка в имени поля иначе прошла бы молча: запись сохранилась бы без правки,
     а автор был бы уверен, что поменял. Поэтому неизвестный ключ — ошибка.
     """
+    if moved := [k for k in patch if k in MOVED_TO_PARAMS]:
+        raise AirflowFailException(
+            "Эти поля больше не колонки таблицы:\n"
+            + "\n".join(f"  • {k} → {MOVED_TO_PARAMS[k]}" for k in moved)
+        )
     unknown = [k for k in patch if k not in COLUMNS]
     if unknown:
         raise AirflowFailException(
@@ -313,7 +326,7 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
     """🧬 Строка таблицы + строка-дефолт группы → запись Variable.
 
     Возвращает {'key', 'row', 'entry', 'params', 'group_params'}:
-      key          — 'db_name.extract_name'
+      key          — 'replica/extract_name' (raw_key), он же ключ выпадающего списка
       row          — строка после наследования (schema_name из группы, если своего нет)
       entry        — запись в том виде, в каком её читает фабрика er_export
       params       — слитые параметры: умолчания → группа → таблица
@@ -322,7 +335,7 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
     Тем же кодом пользуются синхронизация всего пакета и проверка одной записи: собери
     проверка запись по-своему — она проверяла бы не то, что потом уедет.
     """
-    table_key = f"{row['db_name']}.{row['extract_name']}"
+    table_key = raw_key(row)
     own_desc  = row.get("description") or ''
 
     # Наследование: непустое значение поставки перебивает дефолт группы.
@@ -338,8 +351,11 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
         grp_params = {**grp_params,
                       'descriptions': fit_descriptions(grp_params['descriptions'], row.get('fields'))}
 
-    # 🔀 is_recent определяет ключ SQL-запроса: фабрика проверяет наличие одного из двух
-    sql_key = "sql_stmt_export_recent" if row.get("is_recent") else "sql_stmt_export_delta"
+    # 🔀 Режим выгрузки определяет ключ SQL-запроса: фабрика проверяет наличие одного из
+    # двух. Берём его из УЖЕ слитых параметров — с 2026-08-28 is_recent живёт в params
+    # и потому наследуется от строки-дефолта группы, как и остальные настройки.
+    params  = merge_params(DEFAULT_PARAMS, grp_params, tbl_params)
+    sql_key = "sql_stmt_export_recent" if params.get("is_recent") else "sql_stmt_export_delta"
     sql_val = {"from": row["sql_from"]}
     if row.get("sql_with"):     sql_val["with"]     = row["sql_with"]
     if row.get("sql_join"):     sql_val["joins"]    = row["sql_join"]
@@ -348,6 +364,9 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
 
     entry = {
         "schema":  row["schema_name"],
+        # База источника — в самой записи: ключ группы теперь 'extract_name', и достать
+        # её из ключа, как раньше ('db.table'), фабрика больше не может.
+        "db":      row["db_name"],
         "PK":      list(row.get("pk") or []),
         "UK":      list(row.get("uk") or []),
         "fields":  list(row.get("fields") or []),
@@ -366,7 +385,7 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
         'key':          table_key,
         'row':          row,
         'entry':        entry,
-        'params':       merge_params(DEFAULT_PARAMS, grp_params, tbl_params),
+        'params':       params,
         'group_params': grp_params,
     }
 
@@ -388,40 +407,46 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
     errors: dict[str, list[str]] = {}   # {replica: причины}, копим по группам
     warnings: list[str] = []
 
-    # Ключ таблицы — (db_name, extract_name), у строк-дефолтов extract_name пуст. Пустой
-    # db_name сделал бы ключ ('', '') общим для дефолтов ВСЕХ групп, и фоновый MERGE оставил
-    # бы одну строку на все пакеты. Такой дефолт отбрасываем: молча раздать группе чужие
-    # параметры хуже, чем не раздать никаких.
-    defaults = dict(defaults)
-    for rep in [rep for rep, row in defaults.items() if not row.get("db_name")]:
-        errors.setdefault(rep, []).append(
-            f"группа {rep}: у строки-дефолта пустой db_name — проставьте db_name = replica, "
-            "иначе дефолты разных групп схлопнутся в одну строку по ключу (db_name, extract_name)"
-        )
-        del defaults[rep]
-
-    # Расписание пакета считаем до цикла: оно одно на группу, и определять его первой
-    # попавшейся строкой нельзя — порядок строк не гарантирует, что она осмысленная.
-    # Умолчания у cron нет намеренно: пакет, поехавший не в своё окно, хуже непоехавшего,
-    # а «55 0 * * *» из ниоткуда — ровно такой сюрприз.
-    schedules = {}
+    # Расписание пакета считаем до цикла: оно одно на группу и берётся ТОЛЬКО из
+    # строки-дефолта. Прежний фолбэк «иначе первое непустое среди поставок» убран: какая
+    # именно строка победит, зависело от того, у кого поле заполнено, и одно и то же
+    # расписание жило в трёх местах. Умолчания у cron нет намеренно — пакет, поехавший
+    # не в своё окно, хуже непоехавшего, а «55 0 * * *» из ниоткуда ровно такой сюрприз.
+    #
+    # Заглушке сломанной группы расписание всё же ищем и среди поставок: без cron она
+    # не поедет вовсе и перестанет краснеть в том ритме, ради которого заведена.
+    schedules, fallbacks = {}, {}
     for replica in {r["replica"] for r in tables}:
-        own = [explicit_schedule(r) for r in tables if r["replica"] == replica]
-        schedules[replica] = (
-            explicit_schedule(defaults.get(replica, {}))
-            or next((s for s in own if s), '')
+        grp_row = defaults.get(replica)
+        fallbacks[replica] = next(
+            (s for s in (explicit_schedule(r) for r in tables if r["replica"] == replica) if s), ''
         )
-        if not schedules[replica]:
+        schedules[replica] = explicit_schedule(grp_row or {})
+
+        if grp_row is None:
             errors.setdefault(replica, []).append(
-                f"группа {replica}: не задано расписание — проставьте cron в поле schedule "
-                "строки-дефолта группы; умолчания у него нет"
+                f"группа {replica}: нет строки-дефолта — заведите её (extract_name пуст) "
+                'патчем {"replica": "' + replica + '", "params": "{\\"schedule\\": '
+                '\\"30 2 * * *\\"}"}. Расписание и групповые параметры берутся только оттуда'
             )
+        elif not schedules[replica]:
+            errors.setdefault(replica, []).append(
+                f"группа {replica}: не задано расписание — проставьте cron ключом schedule "
+                "в params строки-дефолта группы; умолчания у него нет"
+            )
+        elif not valid_schedule(schedules[replica]):
+            # Битый cron доезжает до DAG(schedule_interval=…) в фабрике и роняет разбор
+            # ФАЙЛА, то есть все пакеты ЕР разом. Ловим здесь, пока это одна группа.
+            errors.setdefault(replica, []).append(
+                f"группа {replica}: расписание '{schedules[replica]}' — не cron и не пресет "
+                "Airflow; такое значение уронило бы разбор файла и вместе с ним все пакеты ЕР"
+            )
+            schedules[replica] = ''
 
     for row in tables:
         replica = row["replica"]
         grp_row = defaults.get(replica, {})
-        info    = wf_entry(row, grp_row,
-                           ch_comments.get((row["db_name"], row["extract_name"]), ""))
+        info    = wf_entry(row, grp_row, ch_comments.get(raw_key(row), ""))
 
         if not check_table(info['row'], info['key'],
                            errors.setdefault(replica, []), info['params']):
@@ -436,16 +461,27 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
         if grp_row.get("description"):
             group["description"] = grp_row["description"]
 
-        # Cron у пакета один — пакет уезжает целиком. Расхождение не отбрасывает поставку
-        # (потерять таблицу из-за косметики хуже), но должно быть видно в логе и заметке.
-        own_sched = explicit_schedule(row)
-        if own_sched and own_sched != group["schedule"]:
+        # Cron у пакета один — пакет уезжает целиком, и берётся он только из строки-дефолта.
+        # Расписание, написанное в поставке, поставку не отбрасывает (потерять таблицу
+        # из-за косметики хуже), но должно быть видно в логе и заметке.
+        if own_sched := explicit_schedule(row):
             warnings.append(
-                f"{info['key']}: schedule '{own_sched}' расходится с расписанием группы "
-                f"'{group['schedule']}' — у пакета расписание одно, взято групповое"
+                f"{info['key']}: schedule '{own_sched}' в params поставки игнорируется — "
+                f"расписание пакета берётся из строки-дефолта группы ('{group['schedule']}')"
             )
 
-        group["tables"][info['key']] = info['entry']
+        # Групповые ключи в params поставки применились бы только к ней, а выглядят как
+        # настройка пакета: confirm_timeout одной таблицы не значит ничего — ждут пакет.
+        if stray := sorted(set(parse_params(row.get("params", ""), info['key'])) & set(GROUP_PARAMS)
+                           - {'schedule'}):
+            warnings.append(
+                f"{info['key']}: групповые параметры {stray} в params поставки игнорируются — "
+                "задавайте их в строке-дефолте группы"
+            )
+
+        # Ключ внутри группы — имя выгрузки: по новому ключу таблицы (replica, extract_name)
+        # оно уникально в пределах пакета, а реплика в ключе была бы повторением имени группы.
+        group["tables"][row["extract_name"]] = info['entry']
 
     # 💥 Любая ошибка ломает ВЕСЬ пакет, а не одну поставку: тикет в ЕР один на группу,
     # и уехавший неполный состав — это расхождение данных на стороне КАП. Такая группа
@@ -454,10 +490,13 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
     for rep, msgs in errors.items():
         if not msgs:
             continue
+        # Расписание группы могло и не найтись — тогда берём то, что написано в поставке:
+        # заглушка обязана краснеть в том же ритме, в каком должен был ходить пакет.
+        # Не нашлось нигде или не разбирается — пусто: заглушка не поедет вовсе, и это
+        # честнее и выдуманного времени, и битого cron, который уронит разбор файла.
+        sched = schedules.get(rep) or fallbacks.get(rep, '')
         wfs[rep] = {
-            # Расписание могло и не найтись — тогда его отсутствие и есть причина ошибки.
-            # Заглушка без cron не поедет вовсе, и это честнее выдуманного времени.
-            "schedule": schedules.get(rep, ''),
+            "schedule": sched if valid_schedule(sched) else '',
             "errors":   msgs,
             "tables":   {},
         }
@@ -528,15 +567,11 @@ def _hook():
 # параметры и вернувшись к умолчаниям из кода (а notify_kafka там 1, то есть стендовый
 # пакет молча поехал бы в ТФС).
 SQL_ALL_ROWS = f"""
-    SELECT
-        extract_name, db_name, replica, schema_name,
-        pk, uk, fields,
-        sql_from, sql_where, sql_join, sql_with, sql_settings,
-        params, description, schedule, is_recent, is_active
+    SELECT {', '.join(COLUMNS)}
     FROM {TABLE} FINAL
     WHERE replica != ''
-    ORDER BY replica, db_name, extract_name
-"""   # порядок только для читаемости логов; ключ таблицы — (db_name, extract_name)
+    ORDER BY replica, extract_name
+"""   # порядок тот же, что у ключа таблицы — (replica, extract_name)
 
 
 def _group_row(hook, replica: str) -> dict:
@@ -544,7 +579,8 @@ def _group_row(hook, replica: str) -> dict:
 
     Ищем по нормализованной реплике: в таблице суффикс группы может быть не проставлен
     ('hrplatform_datalab' и 'hrplatform_datalab__0' — одно и то же), а сравнивать надо
-    так же, как это делает синхронизация.
+    так же, как это делает синхронизация. Поэтому WHERE только по пустому extract_name,
+    а реплика сравнивается в питоне: в SQL пришлось бы повторять правило нормализации.
     """
     want = replica_full(replica)
     rows = get_dict_from_ch(hook, f"""
@@ -626,11 +662,11 @@ def er_setup_dag():
         # последнего синка и могла устареть. FINAL — чтобы не поймать старую версию строки.
         base: dict = {}
         if record != NEW:
-            db_name, extract_name = key_to_where(record)
+            replica, extract_name = key_to_where(record)
             found = get_dict_from_ch(hook, f"""
                 SELECT {', '.join(COLUMNS)}
                 FROM {TABLE} FINAL
-                WHERE db_name = '{_q(db_name)}' AND extract_name = '{_q(extract_name)}'
+                WHERE replica = '{_q(replica)}' AND extract_name = '{_q(extract_name)}'
             """)
             if not found:
                 raise AirflowFailException(
@@ -654,7 +690,7 @@ def er_setup_dag():
                      level='task,dag', context=context, title='⚙️ er_setup')
             logger.info(
                 "Патч пуст — правки не будет. Чтобы править, заполните «Патч», "
-                "например {\"schedule\": \"30 2 * * *\"}"
+                "например {\"params\": \"{\\\"schedule\\\": \\\"30 2 * * *\\\"}\"}"
             )
             return {'mode': 'view', 'record': record, 'merged': shown, 'diff': {}}
 
@@ -667,15 +703,21 @@ def er_setup_dag():
         # берём УЖЕ с наследованием от строки-дефолта группы: schema_name у поставки часто
         # пуст именно потому, что задан на группе, и проверять его в одиночку нельзя.
         errors: list[str] = []
-        if merged['extract_name']:
-            info = wf_entry(merged, _group_row(hook, merged['replica']))
+        if not merged['replica']:
+            errors.append("пустая replica — по ней строится ключ записи и имя пакета")
+        elif merged['extract_name']:
+            grp_row = _group_row(hook, merged['replica'])
+            if not grp_row:
+                # Поставка без группы синхронизацию не пройдёт: расписание и групповые
+                # параметры брать неоткуда. Раньше это выяснялось только на синке, уже
+                # после записи в таблицу.
+                errors.append(
+                    f"группы '{merged['replica']}' ещё нет — заведите сначала строку-дефолт "
+                    '(extract_name пуст) патчем {"replica": "' + merged['replica'] + '", '
+                    '"params": "{\\"schedule\\": \\"30 2 * * *\\"}"}'
+                )
+            info = wf_entry(merged, grp_row)
             check_table(info['row'], record, errors, info['params'])
-        elif merged['db_name'] != merged['replica']:
-            errors.append(
-                f"строка-дефолт группы: db_name должен быть равен replica "
-                f"('{merged['replica']}'), иначе дефолты разных групп схлопнутся "
-                "в одну строку по ключу (db_name, extract_name)"
-            )
         if errors:
             raise AirflowFailException(
                 "Запись не прошла проверку, в таблицу ничего не записано:\n"
@@ -710,18 +752,49 @@ def er_setup_dag():
         if not merged['extract_name']:
             # Строка-дефолт группы: SQL у неё нет физически — проверяем то, что есть.
             result['kind'] = 'группа'
+            bad_json = False
             if merged.get('params'):
                 try:
                     json.loads(merged['params'])
                 except json.JSONDecodeError as err:
                     errors.append(f"params не разбирается как JSON: {err}")
-            if not explicit_schedule(merged):
-                warnings.append("не задан schedule — группа не синхронизируется")
+                    bad_json = True
+
+            # Ошибка, а не предупреждение: группа без cron — это неработающий пакет,
+            # и узнать об этом на записи лучше, чем ночью по неприехавшей поставке.
+            # Отдушина остаётся — галка «Записать несмотря на проверку».
+            sched = explicit_schedule(merged)
+            if bad_json:
+                pass                    # причина уже названа, второй раз про schedule не пишем
+            elif not sched:
+                errors.append(
+                    'не задано расписание — нужен ключ schedule в params: '
+                    '{"params": "{\\"schedule\\": \\"30 2 * * *\\"}"}'
+                )
+            elif not valid_schedule(sched):
+                errors.append(
+                    f"расписание '{sched}' — не cron и не пресет Airflow; такое значение "
+                    "уронило бы разбор файла фабрики вместе со всеми пакетами ЕР"
+                )
             result['group_params'] = merged.get('params')
         else:
             info = wf_entry(merged, _group_row(hook, merged['replica']))
             result['kind'] = 'поставка'
             check_table(info['row'], info['key'], errors, info['params'])
+
+            # Расписание и групповые параметры у поставки игнорируются — предупреждаем
+            # здесь же, чтобы это было видно до записи, а не только в логе синхронизации.
+            own = parse_params(merged.get('params', ''), info['key'])
+            if own.get('schedule'):
+                warnings.append(
+                    f"schedule '{own['schedule']}' в params поставки игнорируется — "
+                    "расписание пакета берётся из строки-дефолта группы"
+                )
+            if stray := sorted(set(own) & set(GROUP_PARAMS) - {'schedule'}):
+                warnings.append(
+                    f"групповые параметры {stray} в params поставки игнорируются — "
+                    "задавайте их в строке-дефолте группы"
+                )
 
             if not errors:
                 q = export_sql(info['entry'], info['params'], info['key'])
@@ -823,7 +896,7 @@ def er_setup_dag():
     def apply(prepared: dict, **context) -> str:
         """✏️ Пишет новую версию строки и перечитывает её из таблицы.
 
-        Правка — это ВСТАВКА: ReplacingMergeTree схлопнет версии по (db_name, extract_name)
+        Правка — это ВСТАВКА: ReplacingMergeTree схлопнет версии по (replica, extract_name)
         при фоновом MERGE, поэтому состояние после читается с FINAL.
         """
         if prepared['mode'] == 'view':
@@ -840,7 +913,7 @@ def er_setup_dag():
         after = get_dict_from_ch(hook, f"""
             SELECT {', '.join(COLUMNS)}, updated_at
             FROM {TABLE} FINAL
-            WHERE db_name = '{_q(merged['db_name'])}'
+            WHERE replica = '{_q(merged['replica'])}'
               AND extract_name = '{_q(merged['extract_name'])}'
         """)
         context['ti'].xcom_push(key='after', value=_dump(after[0] if after else {}))
@@ -893,7 +966,7 @@ def er_setup_dag():
         # (первой из sql_from), а не таблицы с именем выгрузки: имя выгрузки таблице
         # соответствовать не обязано. Один батч-запрос на все записи.
         sources_by_key = {
-            (r["db_name"], r["extract_name"]): sql_sources(
+            raw_key(r): sql_sources(
                 {'from': r.get("sql_from"), 'with': r.get("sql_with"), 'joins': r.get("sql_join")},
                 r["db_name"], r["extract_name"],
             )

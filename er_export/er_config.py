@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-19 14:20 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 11:45 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
 
@@ -37,9 +37,9 @@ from airflow.exceptions import AirflowFailException
 # колбэки должны вести себя одинаково во всех DAG-ах контура. add_note и ensure_pool
 # здесь же реэкспортируются — их импортируют соседние модули этого каталога.
 try:
-    from plugins.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
+    from plugins.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, valid_schedule  # noqa: F401  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
+    from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, valid_schedule  # noqa: F401  # type: ignore
 
 # 🌍 Стенд. Сначала ENV_STAND — именно её читают платформенные операторы
 # (hrp_operators/clickhouse_to_s3.py: os.getenv("ENV_STAND")) и соседний xs_export.
@@ -181,6 +181,11 @@ def obj_save(key: str, data: Any) -> None:
 # extract_name пуст) и относятся к дагу целиком: один тикет, одно уведомление, одно
 # расписание автозапуска. В строках-таблицах игнорируются — у пакета они физически одни.
 GROUP_PARAMS: dict = {
+    # ⏰ Расписание пакета. Живёт в params строки-дефолта группы, а не отдельной колонкой:
+    # колонка позволяла задать его ещё и у поставки, и тогда «какое победит» зависело от
+    # того, у кого поле заполнено. Умолчания у него намеренно нет — пустое значение это
+    # ошибка группы, а не «раз в день»: пакет, поехавший не в своё окно, хуже непоехавшего.
+    'schedule':          '',
     'notify_kafka':      1,            # 1 = отправлять уведомления в Kafka; 0 = пропустить (стенд)
     'auto_confirm':      1,            # 1 = не ждать Kafka-подтверждения от TFS
     'confirm_timeout':   60,           # таймаут ожидания квитанций ТФС, мин (включая ожидание в очереди отправки)
@@ -192,6 +197,11 @@ GROUP_PARAMS: dict = {
 # в строке-таблице.
 TABLE_PARAMS: dict = {
     # ── Дельта ───────────────────────────────────────────────────────────────
+    # 🔀 Режим выгрузки: 0 = дельта (окно из состояния), 1 = recent (скользящее окно).
+    # Здесь, а не колонкой: у колонки UInt8 DEFAULT 0 «не задано» неотличимо от «явно
+    # дельта», поэтому режим не наследовался от группы вовсе. В JSON ключ либо есть,
+    # либо нет — наследование работает так же, как у остальных параметров.
+    'is_recent':         0,
     'full_export':       0,            # 1 = выгружать таблицу целиком: окно дельты не подставляется, состояние не ведётся
     'increment':         60,           # шаг дельты, мин: time_to = time_from + increment (не чаще 1 пакета/час по стандарту ТФС)
     'overlap':           0,            # перекрытие окна дельты назад, сек (для компенсации задержек CDC)
@@ -258,25 +268,28 @@ FORMAT_MAP: dict[str, dict] = {
 def raw_key(row: dict) -> str:
     """🔑 Ключ строки er_wf_meta для Variable и выпадающего списка.
 
-    У поставки — 'db_name.extract_name', как в остальном фреймворке. У строки-дефолта
-    группы extract_name пуст, а db_name равен replica, поэтому ключ превратился бы
-    в 'replica.' — вместо этого помечаем её явно, чтобы в списке было понятно, что это.
+    'replica/extract_name' — ровно ключ сортировки таблицы. У строки-дефолта группы
+    extract_name пуст, поэтому она помечается явно: в списке должно быть видно, что это
+    настройка пакета, а не поставка.
+
+    Разделитель '/' , а не '.': точка занята видом 'db.table', и на ключе с репликой
+    читалась бы неоднозначно — база и реплика в именах различаются не всегда.
     """
     if not row.get('extract_name'):
         return f"{row.get('replica', '')} (дефолты группы)"
-    return f"{row.get('db_name', '')}.{row['extract_name']}"
+    return f"{row.get('replica', '')}/{row['extract_name']}"
 
 
 def key_to_where(key: str) -> tuple[str, str]:
-    """🔎 Ключ из выпадающего списка → (db_name, extract_name) для WHERE.
+    """🔎 Ключ из выпадающего списка → (replica, extract_name) для WHERE.
 
-    Обратная к raw_key: у строки-дефолта extract_name пуст, а db_name равен replica.
+    Обратная к raw_key: у строки-дефолта extract_name пуст.
     """
     marker = ' (дефолты группы)'
     if key.endswith(marker):
         return key[:-len(marker)], ''
-    db, _, name = key.partition('.')
-    return db, name
+    replica, _, name = key.partition('/')
+    return replica, name
 
 
 # Номер группы, который подставляется реплике без суффикса. Пустым он быть не может:
@@ -437,12 +450,14 @@ def get_params(row: dict, group: dict | None = None) -> dict:
 # 🧬 Поля строки-дефолта группы, наследуемые поставками. SQL и ключи (pk, uk, fields,
 # sql_*) сюда намеренно не входят — они всегда описывают конкретную таблицу.
 #
-# is_recent тоже не наследуется, хотя это и не SQL: колонка UInt8 DEFAULT 0, и «не задано»
-# от «явно delta» не отличить. При наследовании через `or` таблица в recent-группе не смогла
-# бы вернуться к дельте — её sql_stmt_export_delta уехал бы под ключом recent.
+# db_name сюда тоже не входит: база источника у поставок пакета бывает разной, а у
+# строки-дефолта её обычно нет вовсе — раньше она была занята под ключ сортировки.
 #
 # description обрабатывается отдельно (см. build_wfs): у него есть третий источник —
 # комментарий таблицы в ClickHouse, и он должен быть приоритетнее группового текста.
+#
+# Остальное наследуется через params (merge_params), включая режим выгрузки is_recent
+# и расписание группы.
 INHERITED = ('schema_name',)
 
 def parse_params(raw: str, where: str) -> dict:
@@ -455,8 +470,15 @@ def parse_params(raw: str, where: str) -> dict:
 
 
 def explicit_schedule(row: dict) -> str:
-    """Расписание строки. Пусто — не задано; умолчания у cron нет, см. er_sync."""
-    return ((row or {}).get('schedule') or '').strip()
+    """Расписание, ЗАДАННОЕ В ЭТОЙ строке: ключ schedule её собственных params.
+
+    Собственных — то есть без наследования: только так синк отличает расписание группы
+    от расписания, по ошибке написанного в поставке (оно игнорируется с предупреждением).
+    Пусто = не задано; умолчания у cron нет, пустое расписание ломает группу целиком.
+    """
+    row = row or {}
+    params = parse_params(row.get('params', ''), f"строка {row.get('replica', '')}")
+    return str(params.get('schedule') or '').strip()
 
 
 def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
@@ -467,6 +489,14 @@ def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
     """
     if not row["sql_from"]:
         errors.append(f"{key}: пустой sql_from")
+        return False
+
+    # Раньше пустой db_name бросался в глаза сам: он входил в ключ записи, и поставка
+    # называлась '.lc_items_opened'. Теперь ключ строится из реплики, и проверка нужна
+    # явная — база источника нужна и для описаний колонок в .meta, и для FROM без
+    # квалификатора.
+    if not row.get("db_name"):
+        errors.append(f"{key}: пустой db_name — не из чего достроить имя таблицы-источника")
         return False
 
     base = replica_base(row["replica"])

@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-28 19:30 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 20:10 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -908,6 +908,15 @@ def _ch_find_receipts(rq_uids: list[str]) -> list[dict]:
     """)
 
 
+# 📋 Колонки очереди, которые несёт КАЖДАЯ её версия строки. Списком, а не россыпью
+# по запросам, потому что цена забытой колонки не «поле пустое в одном месте»:
+# отметка отправки ДОПИСЫВАЕТ версию, а ReplacingMergeTree по ключу rq_uid оставляет
+# последнюю — пропущенное здесь обнуляется у всех уже отправленных файлов. Ровно так
+# терялись dag_id и run_id, пока их не было в _ch_mark_sent.
+CH_SENT_COLS = ('rq_uid', 'file_name', 'replica', 'scenario_id', 'package_ts',
+                'dag_id', 'run_id')
+
+
 def _ch_enqueue(rows: list[dict]) -> None:
     values = ", ".join(
         f"('{_sql_str(r['rq_uid'])}', '{_sql_str(r['file_name'])}', '{_sql_str(r['replica'])}', "
@@ -916,16 +925,16 @@ def _ch_enqueue(rows: list[dict]) -> None:
         for r in rows
     )
     _ch_hook().execute(
-        f"INSERT INTO {SENT_FILES_TABLE} (rq_uid, file_name, replica, scenario_id, "
-        f"package_ts, dag_id, run_id) VALUES {values}"
+        f"INSERT INTO {SENT_FILES_TABLE} ({', '.join(CH_SENT_COLS)}) VALUES {values}"
     )
 
 
 def _ch_pending() -> list[dict]:
     # FINAL обязателен: отправленная строка дописывается второй версией, без схлопывания
     # уже ушедший файл уехал бы повторно.
+    cols = ', '.join(CH_SENT_COLS)
     return get_dict_from_ch(_ch_hook(), f"""
-        SELECT rq_uid, file_name, replica, scenario_id, package_ts, dag_id, run_id, created_at
+        SELECT {cols}, created_at
         FROM {SENT_FILES_TABLE} FINAL
         WHERE notified_at = toDateTime64(0, 3)
         ORDER BY package_ts, created_at
@@ -933,17 +942,13 @@ def _ch_pending() -> list[dict]:
 
 
 def _ch_mark_sent(rq_uid: str) -> None:
-    # dag_id и run_id перечислены наравне с остальным не для красоты: отметка отправки —
-    # это ДОПИСАННАЯ версия строки, а ReplacingMergeTree по ключу rq_uid оставляет
-    # последнюю. Пропусти их здесь — и у каждого отправленного файла оба поля станут
-    # пустыми, хотя при постановке в очередь были записаны (в Postgres-зеркале они
-    # перечислены, в S3 объект переносится целиком, так что расходился только ClickHouse).
+    # Колонки берём списком (CH_SENT_COLS), а не перечисляем заново: отметка отправки —
+    # это ДОПИСАННАЯ версия строки, и всё, что здесь не названо, обнулится у отправленного
+    # файла после схлопывания. Так уже терялись dag_id и run_id.
+    cols = ', '.join(CH_SENT_COLS)
     _ch_hook().execute(f"""
-        INSERT INTO {SENT_FILES_TABLE}
-            (rq_uid, file_name, replica, scenario_id, package_ts, dag_id, run_id,
-             created_at, notified_at)
-        SELECT rq_uid, file_name, replica, scenario_id, package_ts, dag_id, run_id,
-               created_at, now64(3)
+        INSERT INTO {SENT_FILES_TABLE} ({cols}, created_at, notified_at)
+        SELECT {cols}, created_at, now64(3)
         FROM {SENT_FILES_TABLE} FINAL WHERE rq_uid = '{_sql_str(rq_uid)}'
     """)
 
@@ -1291,6 +1296,15 @@ def _s3_queue_state(rq_uids: list[str]) -> list[dict]:
     return out
 
 
+def is_stale(sent_at, now, minutes: int) -> bool:
+    """⏱️ Ждёт ли отправка квитанции дольше `minutes`. Граница ИСКЛЮЧАЮЩАЯ.
+
+    Вынесено отдельной функцией по той же причине, что и window_hits: внутри stale_sent
+    время берётся из now(), и проверить границу детерминированно было бы нельзя.
+    """
+    return (now - sent_at).total_seconds() / 60 > minutes
+
+
 def stale_sent(minutes: int | None = None) -> list[dict]:
     """📭 Отправленные больше `minutes` назад файлы, на которые нет квитанции.
 
@@ -1318,9 +1332,9 @@ def stale_sent(minutes: int | None = None) -> list[dict]:
                 sent_at = datetime.strptime(day + stamp, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             except ValueError:
                 continue
-            waiting = (now - sent_at).total_seconds() / 60
-            if waiting < minutes:
+            if not is_stale(sent_at, now, minutes):
                 continue
+            waiting = (now - sent_at).total_seconds() / 60
 
             _, r_bucket, r_key = _s3_hook_key(f"{s3_base()}/receipts/{uid}.json")
             if hook.check_for_key(key=r_key, bucket_name=r_bucket):

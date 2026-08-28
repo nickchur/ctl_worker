@@ -40,14 +40,20 @@ CREATE TABLE IF NOT EXISTS export.er_sent_files ON CLUSTER datalab
     replica      String                    COMMENT 'Группа поставок (replica целиком, с суффиксом)',
     scenario_id  String                    COMMENT 'Маршрут ТФС — по нему считаются лимиты отправки',
     package_ts   DateTime64(3)             COMMENT 'Метка пакета (logical_date рана); связывает файлы одного тикета',
-    dag_id       String        DEFAULT ''  COMMENT 'DAG, поставивший файл в очередь. ⚠️ Перечислять во ВСЕХ вставках: отметка отправки дописывает версию строки, и пропущенная колонка обнулит поле после схлопывания',
-    run_id       String        DEFAULT ''  COMMENT 'Ран, поставивший файл в очередь. ⚠️ См. dag_id',
+    dag_id       String        DEFAULT ''  COMMENT 'DAG, поставивший файл в очередь',
+    run_id       String        DEFAULT ''  COMMENT 'Ран, поставивший файл в очередь',
     created_at   DateTime64(3) DEFAULT now64(3)        COMMENT 'Когда файл встал в очередь',
     notified_at  DateTime64(3) DEFAULT toDateTime64(0, 3) COMMENT '0 = ещё в очереди; иначе время отправки в Kafka',
     updated_at   DateTime64(3) DEFAULT now64(3)        COMMENT 'Версия строки для ReplacingMergeTree'
 )
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/er_sent_files_{uuid}', '{replica}', updated_at)
 ORDER BY (rq_uid);
+
+-- ⚠️ Обновление строки — это ДОПИСАННАЯ версия: отметка отправки вставляет строку заново
+-- с бо́льшим updated_at, а ReplacingMergeTree по ключу rq_uid оставляет последнюю. Всё,
+-- что во вставке не названо, у отправленного файла обнулится — так уже терялись dag_id
+-- и run_id. Со стороны кода это подпёрто списком CH_SENT_COLS в plugins/tfs_utils.py:
+-- обе вставки собираются из него, а не перечисляют колонки руками.
 
 
 -- ─────────────────────────────────────────────────────────────────────────────

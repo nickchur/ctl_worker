@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-28 13:44 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-28 17:05 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -143,6 +143,16 @@ TFS_QUEUE_ALERT_MIN = 60
 # сделан, но настоятельно рекомендован: забытая пауза копит очередь молча.
 PAUSE_VAR = 'tfs_snd_pause'
 PAUSE_SCOPES = ('packages', 'replicas', 'scenarios')
+
+# ⏰ Первый порог алерта о забытой паузе, часы; дальше удвоение без потолка:
+# 1, 2, 4, 8, 16, 32, 64 … Ряд выбран так, чтобы сигнал не спамил (за неделю — восемь
+# срабатываний) и при этом не растворялся: чем дольше пауза висит, тем громче. Правила
+# со сроком (until) в этот счёт входят, но таск ими не роняют — см. claim_pause_alerts.
+PAUSE_ALERT_FIRST_H = 1
+
+# Поля правила, которые задаёт человек. Остальное (since, alerted_h) служебное: его
+# не сравнивают при повторной постановке и не ждут от того, кто правит Variable руками.
+PAUSE_USER_FIELDS = ('until', 'reason', 'by')
 
 # Сколько минут ждать квитанцию, прежде чем считать отправку неподтверждённой. Нужно
 # потому, что пакет, уехавший при снятой паузе, никто не ждёт: его wait_confirm ушёл
@@ -359,6 +369,10 @@ def pause_rules() -> dict:
                 'reason': str(rule.get('reason') or ''),
                 'until':  str(rule.get('until') or ''),
                 'by':     str(rule.get('by') or ''),
+                # Служебное, для нарастающего алерта: когда паузу поставили и на каком
+                # пороге о ней в последний раз сказали вслух.
+                'since':     str(rule.get('since') or ''),
+                'alerted_h': int(rule.get('alerted_h') or 0),
             }
     return out
 
@@ -416,6 +430,85 @@ def pause_summary(rows: list[dict] | None = None) -> dict:
     return summary
 
 
+def pause_threshold(hours: float) -> int:
+    """⏰ Порог алерта для паузы возрастом `hours`: 1, 2, 4, 8, 16, 32, 64 … часа.
+
+    Наибольшая степень двойки, не превышающая возраст. Потолка нет намеренно: пауза,
+    висящая месяц, должна отзываться реже, чем вчерашняя, но отзываться.
+    Возраст меньше первого порога — 0, то есть «говорить пока не о чем».
+    """
+    if hours < PAUSE_ALERT_FIRST_H:
+        return 0
+    step = PAUSE_ALERT_FIRST_H
+    while step * 2 <= hours:
+        step *= 2
+    return step
+
+
+def claim_pause_alerts(rows: list[dict] | None = None) -> list[dict]:
+    """⏰ Правила, дожившие до НОВОГО порога, и отметка о том, что мы о них сказали.
+
+    Возвращает по записи на правило: `scope`, `key`, `hours` (сколько висит),
+    `threshold` (сработавший порог), `held` (сколько строк очереди придержано этим
+    правилом — если очередь передали), `rule` и `hard` (бессрочное ли).
+
+    ⚠️ Имя с `claim`, потому что функция не только считает, но и **отмечает** порог
+    в переменной. Иначе вызывающий, который на этом падает, падал бы на одном и том же
+    пороге по кругу: таск ретраится, порог всё ещё достигнут, алерт снова и снова.
+
+    Правило без `since` (поставлено до появления этого счётчика) не алертит: ему просто
+    проставляется `since = сейчас`, и отсчёт начинается отсюда — выдумывать за него
+    прошлое неоткуда.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    rules = pause_rules()
+    held_by_key: dict = {}
+    if rows:
+        _, held = split_pending(rows, rules)
+        for row in held:
+            held_by_key[row['pause_reason']] = held_by_key.get(row['pause_reason'], 0) + 1
+
+    data = _pause_raw()
+    out, changed = [], False
+
+    for scope, entries in rules.items():
+        for key, rule in entries.items():
+            raw = data[scope].get(key)
+            raw = raw if isinstance(raw, dict) else {'reason': raw} if isinstance(raw, str) else {}
+
+            since = parse_ts(rule['since']) if rule['since'] else None
+            if since is None:
+                raw['since'] = now.isoformat(timespec='seconds')
+                data[scope][key] = raw
+                changed = True
+                logger.info("⏰ %s/%s: у правила не было since — отсчёт пошёл с этого момента",
+                            scope, key)
+                continue
+
+            hours = (now - since).total_seconds() / 3600
+            threshold = pause_threshold(hours)
+            if threshold <= rule['alerted_h']:
+                continue
+
+            raw['alerted_h'] = threshold
+            data[scope][key] = raw
+            changed = True
+            out.append({
+                'scope': scope, 'key': key, 'rule': rule,
+                'hours': round(hours, 1), 'threshold': threshold,
+                # Бессрочная пауза — та, которую некому снять, кроме человека: только
+                # она заслуживает падения таска. У срочной есть свой конец.
+                'hard': not rule['until'],
+                'held': next((n for r, n in held_by_key.items() if key in r), 0),
+            })
+
+    if changed:
+        _pause_write(data, 'alerts')
+    return out
+
+
 def _pause_write(data: dict, note: str = '') -> None:
     from datetime import datetime, timedelta, timezone
 
@@ -457,8 +550,20 @@ def pause_set(scope: str, key: str, until: str = '', reason: str = '', by: str =
     rule = {k: v for k, v in {'until': until, 'reason': str(reason or '').strip(),
                               'by': str(by or '').strip()}.items() if v}
     data = _pause_raw()
-    if data[scope].get(key) == (rule or {}):
+    prev = data[scope].get(key)
+    prev = prev if isinstance(prev, dict) else ({'reason': prev} if isinstance(prev, str) else None)
+
+    # Сравниваем ТОЛЬКО пользовательские поля: since и alerted_h служебные и всегда
+    # разные, а по ним «уже стоит с теми же параметрами» никогда бы не сработало.
+    if prev is not None and {k: v for k, v in prev.items() if k in PAUSE_USER_FIELDS} == rule:
         return 'skip', f"{scope}/{key}: уже стоит с теми же параметрами"
+
+    # since от существующего правила НЕ обновляем: продлили срок или поправили причину —
+    # пауза та же самая, и счётчик алертов продолжается. Иначе алерты можно было бы
+    # оттягивать бесконечно, переставляя правило.
+    rule['since'] = (prev or {}).get('since') or datetime.now(timezone.utc).isoformat(timespec='seconds')
+    if (prev or {}).get('alerted_h'):
+        rule['alerted_h'] = int(prev['alerted_h'])
 
     data[scope][key] = rule
     _pause_write(data, note)
@@ -1536,6 +1641,7 @@ def get_config() -> dict:
     return {
         'CH_ID':            CH_ID,
         'PAUSE_VAR':        PAUSE_VAR,
+        'PAUSE_ALERT_FIRST_H': PAUSE_ALERT_FIRST_H,
         'PAUSE_SCOPES':     list(PAUSE_SCOPES),
         'TFS_STALE_MIN':    TFS_STALE_MIN,
         'MIRRORS':          mirrors(),   # включённые зеркала; S3 обязателен и в список не входит

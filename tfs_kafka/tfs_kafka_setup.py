@@ -1,5 +1,5 @@
 """⏸️ DAG-пульт паузы отправки в ТФС.
-*2026-08-28 13:27 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-28 17:15 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ставит и снимает паузу отправки, не трогая ни выгрузку, ни постановку в очередь: файлы
 продолжают складываться в очередь по расписанию, а `tfs_kafka_snd` их не берёт. Сняли
@@ -43,8 +43,14 @@
    Пусто — бессрочно; так делать не надо: забытая пауза копит очередь молча.
 4. **Причина** — попадает в правило и в заметки.
 
+⏰ **Бессрочная пауза начнёт напоминать о себе через час** и дальше вдвое реже: 1, 2, 4,
+8, 16, 32, 64 … часа. Напоминание — падение таска `pause_watch` в даге `tfs_kafka_snd`
+(отправка при этом исправна и зелена). Пауза со сроком таск не роняет, только пишет
+заметку: её снимет само время.
+
 Состояние живёт в Variable `tfs_snd_pause`; править её руками можно, но пульт проверяет
-формат ключа и срок, а руки — нет.
+формат ключа и срок, а руки — нет. Служебные поля правила — `since` (когда поставили)
+и `alerted_h` (последний порог, о котором уже сказали).
 """
 from __future__ import annotations
 
@@ -59,12 +65,12 @@ from airflow.utils.trigger_rule import TriggerRule
 try:
     from plugins.tfs_utils import (  # type: ignore
         get_config, add_note, package_key, pause_clean_expired, pause_clear, pause_rules,
-        pause_set, pause_summary, pending,
+        pause_set, pause_summary, parse_ts, pending,
     )
 except ImportError:
     from CI06932748.tools.tfs_utils import (  # type: ignore
         get_config, add_note, package_key, pause_clean_expired, pause_clear, pause_rules,
-        pause_set, pause_summary, pending,
+        pause_set, pause_summary, parse_ts, pending,
     )
 
 _cfg         = get_config()
@@ -130,6 +136,17 @@ NOTE_LIMIT = 15
 )
 def tfs_kafka_setup_dag():
 
+    def _age(rule: dict) -> str:
+        """⏰ «, висит 5.2 ч (алертило на 4 ч)» — сколько правило стоит и когда о нём
+        сказали в последний раз. Пусто, если у правила нет since (поставлено до появления
+        счётчика): выдумывать за него прошлое неоткуда."""
+        since = parse_ts(rule.get('since')) if rule.get('since') else None
+        if since is None:
+            return ''
+        hours = (datetime.now(timezone.utc) - since).total_seconds() / 3600
+        was = rule.get('alerted_h') or 0
+        return f", висит {hours:.1f} ч" + (f" (алертило на {was} ч)" if was else "")
+
     @task(task_id='show')
     def show(**context) -> dict:
         """👁️ Текущие правила паузы и то, что сейчас лежит в очереди.
@@ -158,6 +175,7 @@ def tfs_kafka_setup_dag():
                 note[f"⏸️ {scope}"] = [
                     f"{k} — {v['reason'] or 'без причины'}"
                     + (f", до {v['until']}" if v['until'] else ", бессрочно")
+                    + _age(v)
                     for k, v in rules.items()
                 ]
         if not note:
@@ -223,7 +241,8 @@ def tfs_kafka_setup_dag():
         """
         rules = pause_rules()
         logger.info("⏸️ Правила паузы после правки:\n%s", rules)
-        add_note({"⏸️ Стало": {scope: sorted(items) or '—' for scope, items in rules.items()}},
+        add_note({"⏸️ Стало": {scope: [k + _age(v) for k, v in sorted(items.items())] or '—'
+                               for scope, items in rules.items()}},
                  level='task,dag', context=context, title='⏸️ tfs_kafka_setup')
         return rules
 

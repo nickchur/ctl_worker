@@ -1,5 +1,5 @@
 """🚚 DAG отправки файлов в ТФС с соблюдением темпа маршрута.
-*2026-08-28 13:44 MSK · v2.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-28 17:10 MSK · v2.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Единственное место, откуда файлы ЕР уходят уведомлением в Kafka. Пакетные даги только
 ставят файлы в очередь, а разгребает её этот даг — в темпе, который декларирует ТФС.
@@ -69,6 +69,13 @@ DAG-файла разворачивает `TFS_ROUTES ∪ реестр` в та�
 ронять таск по `TFS_QUEUE_ALERT_MIN`. Сколько придержано и почему — в заметке (один раз
 за окно, пока причина не изменилась) и в `return_value`.
 
+⏰ **Забытая пауза кричит всё громче.** Таск `pause_watch` раз в час смотрит, дожило ли
+правило до нового порога — 1, 2, 4, 8, 16, 32, 64 … часа, — и на каждом пороге пишет
+заметку. **Бессрочная пауза при этом роняет таск**: сигнал уходит штатным каналом падений,
+а сама отправка остаётся зелёной. Пауза со сроком только отмечается в заметке — её снимет
+время. Ряд удваивается, чтобы напоминание не превращалось в шум: за неделю восемь
+срабатываний, и каждое следующее вдвое позже предыдущего.
+
 📭 **Неподтверждённые.** Раз в час `scan_queue` ищет файлы, отправленные больше
 `TFS_STALE_MIN` минут назад и оставшиеся без квитанции, и пишет о них предупреждение.
 Без этого отказ ТФС по пакету, чей `wait_confirm` ушёл в скип из-за паузы, не увидел бы
@@ -80,7 +87,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowFailException
 from airflow.models import Param
 from airflow.sensors.base import PokeReturnValue  # type: ignore
 
@@ -90,7 +97,7 @@ try:
         window_hits, WINDOWS, enqueue_files, order_queue, parse_ts, pending, mark_sent,
         drop_unpooled_scenarios, remember_scenarios, route_topic, scenario_pool,
         sent_counts, task_slug, tfs_route, run_state_get, run_state_set,
-        package_key, split_pending, stale_sent,
+        package_key, split_pending, stale_sent, claim_pause_alerts,
     )
 except ImportError:
     from CI06932748.tools.tfs_utils import (  # type: ignore
@@ -98,7 +105,7 @@ except ImportError:
         window_hits, WINDOWS, enqueue_files, order_queue, parse_ts, pending, mark_sent,
         drop_unpooled_scenarios, remember_scenarios, route_topic, scenario_pool,
         sent_counts, task_slug, tfs_route, run_state_get, run_state_set,
-        package_key, split_pending, stale_sent,
+        package_key, split_pending, stale_sent, claim_pause_alerts,
     )
 
 _cfg             = get_config()
@@ -111,6 +118,7 @@ SEND_SLOTS       = _cfg['TFS_SEND_SLOTS']
 SCENARIOS        = _cfg['SCENARIOS']
 PAUSE_VAR        = _cfg['PAUSE_VAR']
 STALE_MIN        = _cfg['TFS_STALE_MIN']
+ALERT_FIRST_H    = _cfg['PAUSE_ALERT_FIRST_H']
 
 logger = logging.getLogger("airflow.task")
 
@@ -512,6 +520,56 @@ def tfs_kafka_snd_dag():
             return PokeReturnValue(is_done=True, xcom_value=sorted(seen))
 
         return PokeReturnValue(is_done=False)
+
+    @task(task_id='pause_watch', retries=0)
+    def pause_watch(**context) -> list:
+        """⏰ Нарастающий алерт о забытой паузе: 1, 2, 4, 8, 16, 32, 64 … часа.
+
+        Пауза сделана тихой намеренно — придержанное не считается затором, ожидание
+        квитанций уходит в ☮️, красных ранов нет. Ровно поэтому её легко забыть, и нужен
+        сигнал, который со временем становится громче: раз в час даг всё равно
+        просыпается, а какой порог сработал, решает `claim_pause_alerts`.
+
+        **Бессрочная пауза роняет таск** — это и есть алерт по штатному каналу падений,
+        `on_failure_callback` положит заметку. Пауза со сроком только пишет заметку: её
+        снимет само время, и краснеть каждый час из-за «до завтра» незачем — но в заметке
+        она есть, чтобы «до 1 сентября» месячной давности всё-таки попалось на глаза.
+
+        `retries=0` не косметика: порог отмечается в переменной ДО падения, и вторая
+        попытка нашла бы уже пустой список и позеленела — падение потерялось бы.
+        """
+        alerts = claim_pause_alerts(pending())
+        if not alerts:
+            logger.info("⏰ Пауз, доживших до нового порога, нет")
+            return []
+
+        def _line(a: dict) -> str:
+            rule = a['rule']
+            parts = [f"{a['scope']}/{a['key']} — на паузе {a['hours']} ч (порог {a['threshold']} ч)"]
+            if a['held']:
+                parts.append(f"придержано {a['held']} файлов")
+            parts.append(rule['reason'] or 'без причины')
+            parts.append(f"до {rule['until']}" if rule['until'] else 'БЕССРОЧНО')
+            if rule['by']:
+                parts.append(f"поставил {rule['by']}")
+            return ', '.join(parts)
+
+        hard = [a for a in alerts if a['hard']]
+        for a in alerts:
+            logger.warning("⏰ %s", _line(a))
+        add_note({f"⏰ Пауза висит ({len(alerts)})": [_line(a) for a in alerts]},
+                 level='dag', context=context, title='🚚 tfs_kafka_snd')
+
+        if hard:
+            raise AirflowFailException(
+                "Отправка стоит на бессрочной паузе:\n"
+                + "\n".join(f"  • {_line(a)}" for a in hard)
+                + "\nСнять — дагом tfs_kafka_setup (действие «▶️ снять с паузы»). "
+                  "Следующий раз напомню вдвое позже."
+            )
+        return [f"{a['scope']}/{a['key']}" for a in alerts]
+
+    pause_watch()
 
     # timeout заведомо больше окна: сенсор проверяет его ТОЛЬКО после ложного ответа,
     # поэтому зелёный по концу окна успевает сработать первым, а скип по таймауту

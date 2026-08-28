@@ -19,24 +19,21 @@ ClickHouse → S3 (данные → ZIP) → Kafka (XML-уведомление) 
 
 ### 📦 Пакет = группа поставок
 
-**Один DAG — один пакет — одна группа — один внешний тикет.** Группа задаётся значением `replica` целиком: суффикс после `__` отделяет группы одной реплики друг от друга.
+**Один DAG — один пакет — одна группа — один внешний тикет.** Пакет задаётся парой колонок `replica` + `dag_group`, а даг называется `export_er__<replica>__<dag_group>`:
 
 ```
-hrplatform_datalab        — суффикса нет: синхронизация подставит __0
-hrplatform_datalab__0     — то же самое, записанное явно
-hrplatform_datalab__1     — группа 1
-hrplatform_datalab__lm    — суффикс произвольный, не обязательно цифровой
+replica = hrplatform_datalab, dag_group = 1     → export_er__hrplatform_datalab__1
+replica = hrplatform_datalab, dag_group пуста   → синхронизация подставит 0
+dag_group = lm                                  → не обязательно цифра
 ```
 
-**Суффикс есть всегда.** Реплику без него синхронизация приводит к `__0`, потому что имена
-файлов строятся как `{база}__{ts}__{группа}__{table}__{n}_{total}_{rows}.zip`: без суффикса
-разделителей `__` на один меньше, и принимающая сторона разбирает имя иначе. Формат имени
-обязан быть один на все пакеты. В самой `er_wf_meta` строку править не нужно — нормализация
-идёт при синхронизации, а `TFS_MAP` всё равно ищется по базовой реплике, до первого `__`.
+До 28.08.2026 группа была суффиксом внутри `replica` (`hrplatform_datalab__1`) и её приходилось всюду отрезать; теперь это своя колонка.
 
-Маршрут в TFS (`scenario_id` и префикс в S3) ищется по **базовой** реплике — части до первого `__`, поэтому в `TFS_MAP` нужна запись только на базу, а новая группа заводится строкой в ClickHouse без правки кода.
+**Группа есть всегда.** Пустую синхронизация приводит к `0`, потому что имена файлов строятся как `{реплика}__{ts}__{группа}__{table}__{n}_{total}_{rows}.zip`: без группы разделителей `__` на один меньше, и принимающая сторона разбирает имя иначе. Формат имени обязан быть один на все пакеты; в самой `er_wf_meta` строку править не нужно.
 
-В имя архива входит базовая реплика (первой) и суффикс группы (за меткой времени), поэтому архивы разных групп не пересекаются именами. А вот **тикет суффикса не несёт** — его пакеты разводит сама метка времени: её выдаёт таск `make_ts`, сидящий в пуле на одну базовую реплику с единственным слотом, так что группы получают разные секунды (см. «Метка времени пакета»). Внутри одной группы `max_active_runs=1` не даёт двум пакетам родиться одновременно.
+Маршрут в TFS (`scenario_id` и префикс в S3) ищется по **реплике**, поэтому в `TFS_MAP` нужна запись только на неё, а новая группа заводится строкой в ClickHouse без правки кода.
+
+В имя архива входит реплика (первой) и группа (за меткой времени), поэтому архивы разных групп не пересекаются именами. А вот **тикет группы не несёт** — его пакеты разводит сама метка времени: её выдаёт таск `make_ts`, сидящий в пуле на одну реплику с единственным слотом, так что группы получают разные секунды (см. «Метка времени пакета»). Внутри одной группы `max_active_runs=1` не даёт двум пакетам родиться одновременно.
 
 ### 📁 Файлы
 
@@ -185,7 +182,7 @@ ClickHouse (`CH_ID`) и PostgreSQL/Greenplum (`PG_CONN`) подключаютс�
 SELECT s.file_name, s.notified_at, r.status_code, r.rq_tm
 FROM export.er_sent_files AS s FINAL
 LEFT JOIN export.tfs_receipts AS r FINAL USING (rq_uid)
-WHERE s.replica = 'hrplatform_datalab__1'
+WHERE s.replica = 'hrplatform_datalab__1'   -- в очереди лежит имя пакета: реплика + группа
 ORDER BY s.package_ts DESC, s.file_name;
 ```
 
@@ -250,7 +247,7 @@ ORDER BY s.package_ts DESC, s.file_name;
 
 Состав колонок `.meta` считается по `DESCRIBE (<запрос>)` — ровно то, что уедет в заголовок файла данных, с учётом JOIN-ов, алиасов и вычисляемых выражений. А вот **описания** колонок у результата подзапроса взять неоткуда: комментарии есть только у таблиц.
 
-Поэтому источники ищутся в самом запросе — по маске `db.table` в частях `sql_from`, `sql_with`, `sql_join`, **в этом порядке приоритета**. Имя без базы в `sql_from` достраивается `db_name` записи; хвостом к списку добавляется `db_name.extract_name`. У колонки, которая есть в нескольких таблицах, побеждает описание из `sql_from` — из основной таблицы выгрузки.
+Поэтому источники ищутся в самом запросе — по маске `db.table` в частях `sql_from`, `sql_with`, `sql_join`, **в этом порядке приоритета**. У колонки, которая есть в нескольких таблицах, побеждает описание из `sql_from` — из основной таблицы выгрузки. Это единственный источник базы с тех пор, как колонка `db_name` убрана (28.08.2026): если в `sql_from` написано неквалифицированное имя, кандидатов не найдётся и `.meta` соберётся без описаний — с предупреждением в логе, но без ошибки.
 
 Так же берётся и **комментарий самой таблицы**: он идёт в `description` записи при синхронизации и в `.meta`, если у поставки нет своего `description`.
 
@@ -315,15 +312,16 @@ ORDER BY s.package_ts DESC, s.file_name;
 
 ## 🗄️ Управляющая таблица `export.er_wf_meta`
 
-🔑 **Ключ — `(replica, extract_name)`** (с 28.08.2026; до этого был `(db_name, extract_name)`). Таблица под это пересоздана, DDL и порядок переезда — в `er_wf_meta.sql`.
+🔑 **Ключ — `(replica, dag_group, schema_name, extract_name)`** (с 28.08.2026; до этого был `(db_name, extract_name)`). Таблица под это пересоздана, DDL и порядок переезда — в `er_wf_meta.sql`.
 
 Что дал новый ключ:
 
-- **признак строки-дефолта ровно один — пустой `extract_name`.** Раньше дефолт был обязан нести `db_name = replica`, иначе дефолты всех групп схлопывались в одну строку по ключу `('', '')`. Теперь `db_name` у него не нужен вовсе;
-- **одна и та же таблица может входить в разные группы** — например, новая версия пакета живёт рядом со старой. Состояние дельты у них тоже разное: оно ключуется той же парой `(replica, extract_name)`, см. `er_extract_history.sql`;
-- ключ записи в форме `export_er_setup` выглядит так же: `hrplatform_datalab__1/lc_items_opened`.
+- **признак строки-дефолта ровно один — пустой `extract_name`** (у неё пуст и `schema_name`, поэтому дефолт в группе физически один). Раньше дефолт был обязан нести `db_name = replica`, иначе дефолты всех групп схлопывались по ключу `('', '')`;
+- **группа стала отдельной колонкой** `dag_group` вместо суффикса в реплике;
+- **одна и та же таблица может входить в разные группы и приезжать в разные схемы** — например, новая версия пакета живёт рядом со старой. Состояние дельты у них разное: в `export.extract_history` имя выгрузки составное, `<dag_id>.<extract_name>` (см. `er_extract_history.sql`);
+- ключ записи в форме `export_er_setup` выглядит так же: `hrplatform_datalab/1/learning/lc_items_opened`.
 
-Заодно из таблицы убраны колонки `schedule` и `is_recent` — их значения переехали в `params` (см. ниже).
+Заодно колонки `schedule` и `is_recent` переехали в `params`, а `db_name` убран совсем — базу источника фреймворк берёт из `sql_from`.
 
 ### Два типа строк
 
@@ -343,7 +341,7 @@ ORDER BY s.package_ts DESC, s.file_name;
 | `params.schedule` | только из строки-дефолта; в поставке игнорируется с предупреждением |
 | `params.is_recent` | наследуется, как любой ключ `params` |
 | `description` | своё → комментарий таблицы в ClickHouse → групповое |
-| `db_name` | **не наследуется** — база источника у поставок пакета бывает разной |
+| `schema_name` | **не наследуется** — входит в ключ и обязателен у каждой поставки |
 | `pk`, `uk`, `fields`, `sql_from`, `sql_join`, `sql_where`, `sql_with`, `sql_settings` | **не наследуются** — всегда про конкретную таблицу |
 
 **`description`** ставит групповой текст последним намеренно: иначе он затёр бы осмысленные комментарии всех таблиц пакета.
@@ -358,10 +356,10 @@ ORDER BY s.package_ts DESC, s.file_name;
 
 | Колонка | Тип | Умолчание | Описание |
 | :--- | :--- | :--- | :--- |
-| `replica` | String | — | Реплика с суффиксом группы; база до `__` ищется в `TFS_MAP`. Первая часть ключа |
-| `extract_name` | String | — | Имя выгрузки (table name без схемы); **пусто = строка-дефолт группы** |
-| `schema_name` | String | — | Целевая схема в `.meta`; наследуется |
-| `db_name` | String | — | База данных источника; у поставки обязательна, строке-дефолту не нужна |
+| `replica` | String | — | Реплика; ищется в `TFS_MAP`. Первая часть ключа |
+| `dag_group` | String | `''` | Группа поставок = пакет = даг `export_er__<replica>__<dag_group>`; пусто → `0` |
+| `schema_name` | String | `''` | Целевая схема в `.meta`. У поставки обязательна, **у строки-дефолта пуста** |
+| `extract_name` | String | `''` | Имя выгрузки (table name без схемы); **пусто = строка-дефолт группы** |
 | `pk` | Array(String) | `[]` | Первичный ключ |
 | `uk` | Array(String) | `[]` | Уникальный ключ |
 | `fields` | Array(String) | `[]` | SELECT-выражения. **Обязателен и явен**: `*` и `t1.*` запрещены |
@@ -372,7 +370,8 @@ ORDER BY s.package_ts DESC, s.file_name;
 | `sql_settings` | String | `''` | SETTINGS-блок ClickHouse |
 | `params` | String | `'{}'` | JSON с переопределёнными параметрами. Здесь же `schedule` (только у строки-дефолта) и `is_recent` |
 | `description` | String | `''` | Описание; наследуется |
-| `is_active` | UInt8 | `1` | `0` = запись игнорируется |
+| `is_active` | UInt8 | `1` | `0` = записи нет в пакете; на строке-дефолте — нет и самого пакета |
+| `is_paused` | UInt8 | `0` | `1` = мягкое выключение: у группы даг на паузе, у поставки таск скипается |
 | `updated_at` | DateTime64(3) | `now64(3)` | Версия строки для ReplacingMergeTree; читать с `FINAL` |
 
 ### Валидация при синхронизации
@@ -380,13 +379,12 @@ ORDER BY s.package_ts DESC, s.file_name;
 Поставка не проходит валидацию (причина — в заметке таска `sync`, полный список в логе и в XCom `errors`), если:
 
 - пустой `sql_from`;
-- пустой `db_name` — не из чего достроить имя таблицы-источника (раньше это бросалось в глаза само: база входила в ключ записи);
-- пустой `schema_name` (и своего нет, и в строке-дефолте нет) — иначе фабрика падает на разборе файла и уносит с собой **все** пакеты, а не только этот;
+- пустой `schema_name` — он входит в ключ, не наследуется и обязателен у каждой поставки; без него фабрика падает на разборе файла и уносит с собой **все** пакеты, а не только этот;
 - базовая реплика не найдена в `TFS_MAP`;
 - `fields` пуст или содержит `*` / `t1.*`;
 - неизвестный `format` — проверяется по **слитым** параметрам (дефолты + группа + таблица), чтобы опечатка в строке-дефолте не доехала до фабрики.
 
-Группа целиком уходит в ошибку, если у неё **нет строки-дефолта**, либо в её `params` нет `schedule`, либо расписание не разбирается как cron или пресет Airflow. Последнее проверяется тем же `valid_schedule`, что и у tools-чистильщиков: битое значение иначе доехало бы до `DAG(schedule_interval=…)` и уронило разбор файла вместе со **всеми** пакетами ЕР.
+Группа целиком уходит в ошибку, если у неё **нет строки-дефолта**, либо у дефолта заполнен `schema_name` (он должен быть пуст), либо в его `params` нет `schedule`, либо расписание не разбирается как cron или пресет Airflow. Последнее проверяется тем же `valid_schedule`, что и у tools-чистильщиков: битое значение иначе доехало бы до `DAG(schedule_interval=…)` и уронило разбор файла вместе со **всеми** пакетами ЕР.
 
 **Любая такая ошибка ломает весь пакет, а не одну поставку.** Тикет в ЕР один на группу, и уехавший неполный состав — это расхождение данных на стороне КАП. Вместо рабочего DAG появляется заглушка (см. ниже), а годные поставки группы в Variable не переносятся.
 
@@ -401,10 +399,13 @@ ORDER BY s.package_ts DESC, s.file_name;
 
 ### 🚧 DAG-заглушка сломанного пакета
 
-Сломанная группа попадает в Variable без таблиц, но с причинами и расписанием:
+Сломанная группа попадает в Variable без таблиц, но с причинами и расписанием (ключ верхнего уровня — dag_id пакета):
 
 ```json
-"hrplatform_datalab__2": { "schedule": "0 4 * * *", "errors": ["…", "…"], "tables": {} }
+"export_er__hrplatform_datalab__2": {
+    "replica": "hrplatform_datalab", "dag_group": "2",
+    "schedule": "0 4 * * *", "errors": ["…", "…"], "tables": {}
+}
 ```
 
 Фабрика делает по такой записи DAG с тем же `dag_id` — `export_er__<replica>`, так что рабочий пакет **подменяется**, а не двоится:
@@ -562,7 +563,7 @@ ORDER BY s.package_ts DESC, s.file_name;
 сохраняет галка **Записать несмотря на проверку** — ошибки тогда становятся
 предупреждениями, а в заметке остаётся `⚠️ Запись форсирована`.
 
-Структурная проверка (`check_table`: непустые `sql_from` и `db_name`, реплика в `TFS_MAP`,
+Структурная проверка (`check_table`: непустой `sql_from`, реплика в `TFS_MAP`,
 непустой `schema_name`, явный `fields` без звёздочки, известный `format`) идёт раньше,
 в `prepare`, и уже **с наследованием**: пустой `schema_name` у поставки — норма, если он
 задан на группе. Там же проверяется, что группа вообще существует: поставку в реплику без
@@ -637,7 +638,7 @@ ORDER BY s.package_ts DESC, s.file_name;
 занят легаси-модулем старого ER.
 
 Правка существующей записи — это **вставка новой версии**: `ReplacingMergeTree` схлопнет
-её по `(replica, extract_name)` при фоновом MERGE. В заметке к прогону остаётся диф
+её по `(replica, dag_group, schema_name, extract_name)` при фоновом MERGE. В заметке к прогону остаётся диф
 «поле: было → стало».
 
 ---
@@ -647,28 +648,29 @@ ORDER BY s.package_ts DESC, s.file_name;
 ### 1. Строка-дефолт группы
 
 ```sql
-INSERT INTO export.er_wf_meta (replica, extract_name, schema_name, description, params)
+INSERT INTO export.er_wf_meta (replica, dag_group, description, params)
 VALUES (
-    'hrplatform_datalab__1',
-    '',                          -- пусто → строка-дефолт, других признаков у неё нет
-    'target_schema',
+    'hrplatform_datalab',
+    '1',
     'Пакет 1: справочники обучения',
     -- расписание живёт здесь и только здесь
     '{"schedule": "55 0 * * *", "auto_confirm": 0, "max_active_tasks": 2}'
 );
 ```
 
-`db_name` строке-дефолту не нужен: ключ таблицы — `(replica, extract_name)`.
+У строки-дефолта пусты `extract_name` **и** `schema_name` — это её признак и то,
+что делает её единственной в группе.
 
 ### 2. Поставки группы
 
 ```sql
 INSERT INTO export.er_wf_meta
-    (replica, extract_name, db_name, uk, fields, sql_from, sql_where, params)
+    (replica, dag_group, schema_name, extract_name, uk, fields, sql_from, sql_where, params)
 VALUES (
-    'hrplatform_datalab__1',
+    'hrplatform_datalab',
+    '1',
+    'target_schema',
     'my_table',
-    'my_database',
     ['id'],
     ['id', 'name', 'updated_at'],   -- явный список обязателен
     'my_database.my_table',
@@ -683,11 +685,12 @@ VALUES (
 
 ```sql
 INSERT INTO export.er_wf_meta
-    (replica, extract_name, db_name, uk, fields, sql_from, sql_join, sql_where, params)
+    (replica, dag_group, schema_name, extract_name, uk, fields, sql_from, sql_join, sql_where, params)
 VALUES (
-    'hrplatform_datalab__1',
+    'hrplatform_datalab',
+    '1',
+    'target_schema',
     'my_table',
-    'my_database',
     ['id'],
     ['t1.id', 't1.name', 't2.flag'],
     'my_database.my_table t1',
@@ -701,12 +704,13 @@ VALUES (
 
 ```sql
 INSERT INTO export.er_wf_meta
-    (replica, extract_name, db_name, uk, fields,
+    (replica, dag_group, schema_name, extract_name, uk, fields,
      sql_with, sql_from, sql_where, sql_settings, params)
 VALUES (
-    'hrplatform_datalab__1',
+    'hrplatform_datalab',
+    '1',
+    'target_schema',
     'my_heavy_table',
-    'my_database',
     ['id'],
     ['id', 'updated_at'],
     'WITH cte AS (SELECT id, max(updated_at) AS updated_at FROM my_database.my_heavy_table GROUP BY id)',
@@ -723,11 +727,12 @@ VALUES (
 
 ```sql
 INSERT INTO export.er_wf_meta
-    (replica, extract_name, db_name, uk, fields, sql_from, sql_where, params)
+    (replica, dag_group, schema_name, extract_name, uk, fields, sql_from, sql_where, params)
 VALUES (
-    'hrplatform_datalab__1',
+    'hrplatform_datalab',
+    '1',
+    'target_schema',
     'lc_sessions',
-    'my_database',
     ['person_uuid'],
     ['person_uuid',
      'count() AS sessions_cnt',
@@ -771,11 +776,12 @@ sql_where: 'a.mx > 0'
 
 ```sql
 INSERT INTO export.er_wf_meta
-    (replica, extract_name, db_name, uk, fields, sql_from, params)
+    (replica, dag_group, schema_name, extract_name, uk, fields, sql_from, params)
 VALUES (
-    'hrplatform_datalab__2',
+    'hrplatform_datalab',
+    '2',
+    'target_schema',
     'my_table',
-    'my_database',
     ['id'],
     ['id', 'progress'],
     'my_database.my_table',

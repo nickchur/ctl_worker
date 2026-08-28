@@ -1,138 +1,95 @@
 -- Состояние дельты ER-выгрузок: export.extract_history и export.extract_current_vw
--- 2026-08-28 13:05 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
+-- 2026-08-28 19:00 MSK · v2.0 · Чуркин Николай · nschurkin@sber.ru
 --
--- ⚠️ ЭТОТ ФАЙЛ — ПЕРЕХОД, А НЕ ПОЛНАЯ СХЕМА. Боевые объекты созданы давно и их DDL
--- в репозитории никогда не было. Здесь описано ровно то, что от них требует код после
--- перехода на ключ (replica, extract_name), и шаги, которыми это делается. Перед работой
--- снять фактические определения и положить их рядом:
---
---   SHOW CREATE TABLE export.extract_history FORMAT TSVRaw;
---   SHOW CREATE VIEW  export.extract_current_vw FORMAT TSVRaw;
+-- ⚠️ ЭТОТ ФАЙЛ — ПЕРЕХОД, А НЕ СХЕМА. Боевые объекты созданы давно, их DDL в репозитории
+-- никогда не было и **менять его не требуется**. Здесь описано, что ЕР пишет туда после
+-- перехода на ключ (replica, dag_group, schema_name, extract_name) и как переименовать
+-- уже накопленное состояние.
 --
 --
--- 🔑 ЗАЧЕМ
+-- 🔑 СОСТАВНОЕ ИМЯ ВЫГРУЗКИ
 --
--- С ключом er_wf_meta (replica, extract_name) одна и та же таблица может входить в разные
--- группы — например, старая и новая версия пакета живут рядом. Состояние дельты при этом
--- обязано быть РАЗНЫМ: пока оно ключуется одним extract_name, вторая группа читает окно
--- первой (и выгружает пустоту), а её save_status переписывает чужую историю.
+-- Одна и та же таблица может входить в разные группы (например, новая версия пакета
+-- живёт рядом со старой). Состояние дельты у них обязано быть РАЗНЫМ, иначе вторая
+-- группа читает окно первой и выгружает пустоту, а её save_status переписывает чужую
+-- историю.
 --
--- Что требует код (er_export.py):
---   • INSERT в extract_history идёт с колонкой replica первой:
---         INSERT INTO export.extract_history
---             (replica, extract_name, extract_time, extract_count, loaded, sent, confirmed,
---              increment, overlap, recent_interval, time_field, time_from, time_to,
---              exported_files) …
---   • состояние читается так (sql_cur_delta):
---         SELECT * FROM export.extract_current_vw
---         WHERE replica = '<группа>' AND extract_name = '<таблица>'
---     то есть вью обязана отдавать колонку replica и считать «текущее» состояние
---     в разрезе ПАРЫ (replica, extract_name), а не одного имени.
+-- Разводит их имя: с 28.08.2026 ЕР пишет и читает состояние под составным именем
+--
+--     extract_name = '<dag_id>.<extract_name>'
+--     например      'export_er__hrplatform_datalab__1.lc_items_meta'
+--
+-- Именно имя, а не новая колонка: **эту историю мы делим с xStream**
+-- (xs_export/xs_common.py пишет в extract_history три INSERT и читает
+-- extract_current_vw по extract_name). Колонка потребовала бы править и вью, и xStream;
+-- составное имя не трогает ни то, ни другое — короткие имена xStream остаются как были.
+--
+-- Что делает ЕР (er_export.py):
+--   • sql_cur_delta():  SELECT * FROM export.extract_current_vw
+--                       WHERE extract_name = '<dag_id>.<extract_name>'
+--   • _er_save_status(): INSERT … extract_name = '<dag_id>.<extract_name>'
 --
 --
--- 1️⃣ КОЛОНКА В ИСТОРИИ
+-- 1️⃣ ПЕРЕИМЕНОВАНИЕ УЖЕ НАКОПЛЕННОГО СОСТОЯНИЯ
 --
--- Пустая строка по умолчанию, а не NULL: колонки истории String, и весь остальной код
--- рассчитывает на литералы, а не на NULL.
+-- Без него каждая поставка начнёт с bootstrap от lower_bound и перельёт всё заново.
+-- Делать ПОСЛЕ переключения er_wf_meta (там уже есть replica и dag_group) и ДО первого
+-- рана пакетов.
+--
+-- Сначала убедиться, что имена ЕР и xStream не пересекаются:
+--
+--   SELECT h.extract_name, count() AS rows
+--   FROM export.extract_history AS h
+--   WHERE h.extract_name IN (SELECT extract_name FROM export.er_wf_meta FINAL
+--                            WHERE extract_name != '')
+--   GROUP BY h.extract_name ORDER BY 1;
+--
+--   -- те же имена, но принадлежащие xStream, отличить нечем — если такие есть,
+--   -- переименовывать пакетно НЕЛЬЗЯ, разбирать поштучно (по exported_files: у ЕР там
+--   -- список .zip, у xStream пусто)
+--   SELECT extract_name, countIf(notEmpty(exported_files)) AS er_rows,
+--          countIf(empty(exported_files))                  AS other_rows
+--   FROM export.extract_history GROUP BY extract_name HAVING other_rows > 0 AND er_rows > 0;
+--
+-- Само переименование — по одной команде на группу (коррелированных подзапросов
+-- в мутациях ClickHouse нет, IN-подзапрос работает):
 --
 --   ALTER TABLE export.extract_history ON CLUSTER datalab
---       ADD COLUMN IF NOT EXISTS replica String DEFAULT '' FIRST;
---
--- Ключ сортировки расширяется ТОЛЬКО добавлением в хвост (ClickHouse иначе не умеет);
--- если у истории ORDER BY (extract_name, extract_time), то:
---
---   ALTER TABLE export.extract_history ON CLUSTER datalab
---       MODIFY ORDER BY (extract_name, extract_time, replica);
---
--- Если движок истории — ReplacingMergeTree, порядок сортировки И ЕСТЬ ключ схлопывания:
--- без replica в нём две группы с одной таблицей затрут строки друг друга при MERGE.
--- Проверить это по SHOW CREATE прежде, чем считать переход законченным.
---
---
--- 2️⃣ ЗАСЫПКА СТАРЫХ СТРОК
---
--- До перехода каждое имя выгрузки принадлежало ровно одной группе, поэтому реплика
--- восстанавливается однозначно. По запросу на группу (коррелированных подзапросов
--- в мутациях ClickHouse нет, а IN-подзапрос работает):
---
---   ALTER TABLE export.extract_history ON CLUSTER datalab
---   UPDATE replica = 'hrplatform_datalab__1'
---   WHERE replica = ''
---     AND extract_name IN (
---         SELECT extract_name FROM export.er_wf_meta FINAL
---         WHERE replica = 'hrplatform_datalab__1' AND extract_name != ''
---     );
+--   UPDATE extract_name = concat('export_er__hrplatform_datalab__1.', extract_name)
+--   WHERE extract_name IN (
+--       SELECT extract_name FROM export.er_wf_meta FINAL
+--       WHERE replica = 'hrplatform_datalab' AND dag_group = '1' AND extract_name != ''
+--   ) AND position(extract_name, '.') = 0;   -- ← защита от повторного запуска
 --
 -- Список групп для генерации таких команд:
---   SELECT DISTINCT replica FROM export.er_wf_meta FINAL WHERE extract_name != '' ORDER BY 1;
 --
--- Проверка, что не осталось безымянных:
---   SELECT count() FROM export.extract_history WHERE replica = '';
---
---
--- 3️⃣ ВЬЮ ТЕКУЩЕГО СОСТОЯНИЯ
---
--- Тело вью берём из SHOW CREATE и правим механически: везде, где состояние считается
--- «по extract_name», добавляется replica.
---
---   • в PARTITION BY / GROUP BY оконных функций и агрегатов:
---         PARTITION BY extract_name        →  PARTITION BY replica, extract_name
---         GROUP BY extract_name            →  GROUP BY replica, extract_name
---   • в список выбираемых колонок: replica (её читает sql_cur_delta);
---   • в JOIN-ы истории с самой собой, если они там есть, — по обеим колонкам.
---
--- Пересоздание (вью в ClickHouse не ALTER-ится):
---
---   CREATE OR REPLACE VIEW export.extract_current_vw ON CLUSTER datalab AS
---   SELECT
---       replica,                      -- ← добавлено
---       extract_name,
---       …остальные колонки как были: num_state, extract_time, extract_count, loaded, sent,
---        confirmed, increment, overlap, recent_interval, time_field, time_from, time_to,
---        current_time…
---   FROM export.extract_history
---   …тело как было, но в разрезе (replica, extract_name)…;
---
--- Колонки, которые вью обязана отдавать (их читает er_export.sql_cur_delta):
---   replica, extract_name, num_state, extract_time, extract_count, loaded, sent, confirmed,
---   increment, overlap, recent_interval, time_field, time_from, time_to, current_time
+--   SELECT DISTINCT replica, dag_group,
+--          concat('export_er__', replica, '__', dag_group) AS dag_id
+--   FROM export.er_wf_meta FINAL WHERE extract_name != '' ORDER BY 1, 2;
 --
 --
--- 4️⃣ ⚠️ ИСТОРИЮ ДЕЛИТ xStream
+-- 2️⃣ ПРОВЕРКА ПЕРЕХОДА
 --
--- export.extract_history и export.extract_current_vw используются НЕ ТОЛЬКО ЕР:
--- xs_export/xs_common.py пишет туда свои строки (три INSERT) и читает состояние так:
---
---     SELECT … FROM export.extract_current_vw WHERE extract_name = '<таблица>'
---
--- То есть без реплики. Пока имена выгрузок ЕР и xStream не пересекаются, такой запрос
--- вернёт ровно одну строку и после перехода — у строк xStream реплика пустая. Но стоит
--- одному имени завестись в обоих трактах, и xStream получит две строки состояния.
---
--- Поэтому в переходе:
---   • строкам xStream проставляем свою метку реплики, чтобы они были отличимы:
---
---       ALTER TABLE export.extract_history ON CLUSTER datalab
---       UPDATE replica = 'xstream' WHERE replica = '';   -- ПОСЛЕ засыпки строк ЕР (шаг 2)
---
---   • в xs_common.py к чтению состояния дописываем `AND replica = 'xstream'`, а в его
---     INSERT-ы — саму колонку. Это отдельная небольшая правка соседнего фреймворка;
---     без неё переход считается незаконченным, даже если сегодня имена не пересекаются.
---
--- Проверить пересечения прямо сейчас:
---   SELECT extract_name, count(DISTINCT replica) AS r
---   FROM export.extract_history GROUP BY extract_name HAVING r > 1;
---
---
--- 5️⃣ ПРОВЕРКА ПЕРЕХОДА
---
---   -- у каждой пары ровно одна текущая строка
---   SELECT replica, extract_name, count() AS cnt
---   FROM export.extract_current_vw GROUP BY replica, extract_name HAVING cnt > 1;
+--   -- у каждой поставки ровно одна текущая строка, и имя составное
+--   SELECT extract_name, count() AS cnt
+--   FROM export.extract_current_vw
+--   WHERE position(extract_name, 'export_er__') = 1
+--   GROUP BY extract_name HAVING cnt > 1;
 --
 --   -- окно одной поставки читается ровно так, как это делает выгрузка
 --   SELECT * FROM export.extract_current_vw
---   WHERE replica = 'hrplatform_datalab__1' AND extract_name = 'lc_items_meta';
+--   WHERE extract_name = 'export_er__hrplatform_datalab__1.lc_items_meta';
+--
+--   -- строки xStream не задеты: их имена по-прежнему без точки
+--   SELECT count() FROM export.extract_history WHERE position(extract_name, '.') = 0;
 --
 -- И живьём: завести вторую группу с той же таблицей, прогнать оба пакета и убедиться,
 -- что окна у них разные, а extract_history получила две отдельные строки.
+--
+--
+-- 3️⃣ ЕСЛИ ПЕРЕИМЕНОВАНИЕ НЕ ДЕЛАТЬ
+--
+-- Пакеты поедут, но каждая поставка стартует с bootstrap: `lower_bound` (или 1970-01-01)
+-- и полная перезаливка в КАП. Иногда это допустимо — тогда переименование можно
+-- пропустить осознанно, а старые строки останутся в истории под короткими именами
+-- и никем читаться не будут.

@@ -1,5 +1,5 @@
 -- DDL для export.er_wf_meta
--- 2026-08-28 12:50 MSK · v2.0 · Чуркин Николай · nschurkin@sber.ru
+-- 2026-08-28 18:40 MSK · v3.0 · Чуркин Николай · nschurkin@sber.ru
 -- Управляющая таблица ER-выгрузок. Синхронизируется в Airflow Variable "datalab_er_wfs"
 -- DAG-ом export_er_setup, который раскладывает записи по группам поставок.
 --
@@ -20,62 +20,84 @@
 --   SELECT * FROM export.er_wf_meta FINAL WHERE is_active = 1
 --
 --
--- 🔑 КЛЮЧ — (replica, extract_name)
+-- 🔑 КЛЮЧ — (replica, dag_group, schema_name, extract_name)
 --
--- До 2026-08-28 ключом было (db_name, extract_name), и из этого росли два неудобства:
+-- До 28.08.2026 ключом было (db_name, extract_name), а группа кодировалась суффиксом
+-- в самой реплике ('hrplatform_datalab__1'). Из этого росли три неудобства:
 --   • строка-дефолт группы была обязана нести db_name = replica — иначе дефолты ВСЕХ
 --     групп получали один ключ ('', '') и схлопывались в одну строку;
 --   • одну и ту же таблицу нельзя было включить в две группы, то есть нельзя было
---     завести новую версию пакета, не убив старую.
--- С ключом (replica, extract_name) признак строки-дефолта ровно один — пустой
--- extract_name, а db_name стал обычной колонкой. Ключ записи в форме export_er_setup
--- выглядит так же: 'hrplatform_datalab__1/lc_items_opened'.
+--     завести новую версию пакета, не убив старую;
+--   • группу приходилось всюду отрезать от реплики.
 --
--- ⚠️ Состояние дельты ключуется той же парой (см. er_extract_history.sql): две группы
--- с одинаковой таблицей ведут РАЗНЫЕ окна и разную историю.
+-- Теперь группа — отдельная колонка dag_group, а признак строки-дефолта ровно один:
+-- пустой extract_name (у неё пуст и schema_name, поэтому дефолт в группе физически один).
+-- Ключ записи в форме export_er_setup выглядит так же:
+-- 'hrplatform_datalab/1/learning/lc_items_opened'.
+--
+-- Колонки db_name больше нет: база источника берётся из sql_from, где имя и так пишут
+-- квалифицированным ('evolution.lc_items_meta'). Если базы там нет вовсе, описания
+-- колонок в .meta просто не найдутся — с предупреждением, но без ошибки.
+--
+-- ⚠️ Состояние дельты ключуется составным ИМЕНЕМ ВЫГРУЗКИ: в export.extract_history ЕР
+-- пишет '<dag_id>.<extract_name>' (см. er_extract_history.sql). Так две группы с одной
+-- таблицей ведут разные окна, а структуру истории — общую с xStream — трогать не пришлось.
 --
 --
 -- 📦 ГРУППЫ ПОСТАВОК
 --
 -- Один пакет = одна группа = один DAG = один внешний тикет на все поставки группы.
--- Группа кодируется суффиксом после '__' в поле replica:
---     hrplatform_datalab       — суффикса нет: синхронизация подставит __0
---     hrplatform_datalab__1    — группа 1 той же реплики
---     hrplatform_datalab__lm   — суффикс произвольный, не обязательно цифровой
+-- Пакет задаётся парой (replica, dag_group), даг называется
+-- 'export_er__<replica>__<dag_group>':
+--     replica = 'hrplatform_datalab', dag_group = '1'  → export_er__hrplatform_datalab__1
+--     dag_group пуста                                  → синхронизация подставит '0'
+--     dag_group произвольна, не обязательно цифра      → 'lm' тоже годится
 --
--- Суффикс есть ВСЕГДА: имя архива строится как '{база}__{ts}__{группа}__{table}__...', и без
--- суффикса разделителей '__' на один меньше, чем у остальных пакетов. Строку в таблице
--- под это править не нужно — реплика нормализуется при синхронизации.
+-- Группа есть ВСЕГДА: имя архива строится как '{реплика}__{ts}__{группа}__{table}__…',
+-- и без неё разделителей '__' на один меньше, чем у остальных пакетов. Строку в таблице
+-- под это править не нужно — пустая группа нормализуется при синхронизации.
 --
--- Маршрут в TFS (scenario_id и префикс в S3) ищется по БАЗОВОЙ реплике — части до первого
--- '__', то есть в TFS_MAP (er_config.py) нужна запись только на базу. В имя архива уходят
--- обе части: база первой, суффикс группы за меткой времени, — поэтому архивы разных групп
--- не пересекаются именами. Тикет пакета суффикса не несёт, его разводит сама метка времени
--- (таск make_ts, пул на базовую реплику с одним слотом).
+-- Маршрут в TFS (scenario_id и префикс в S3) ищется по РЕПЛИКЕ, то есть в TFS_MAP
+-- (er_config.py) нужна запись только на неё; новая группа заводится строкой в таблице,
+-- без правки кода. В имя архива уходят обе части: реплика первой, группа за меткой
+-- времени, — поэтому архивы разных групп не пересекаются именами. Тикет пакета группы
+-- не несёт, его разводит сама метка времени (таск make_ts, пул на реплику с одним слотом).
 --
 --
 -- 🧩 ДВА ТИПА СТРОК
 --
---   replica заполнена, extract_name ПУСТ  → строка-дефолт группы (ОБЯЗАТЕЛЬНА)
---   replica и extract_name заполнены      → поставка (одна таблица)
+--   extract_name и schema_name ПУСТЫ  → строка-дефолт группы (ОБЯЗАТЕЛЬНА)
+--   extract_name и schema_name заданы → поставка (одна таблица)
 --
 -- Строка-дефолт задаёт значения для всей группы и обязана существовать: без неё группа
--- целиком уходит в ошибку и вместо пакета создаётся даг-заглушка. Каждое поле разрешается
--- по своему правилу:
+-- целиком уходит в ошибку и вместо пакета создаётся даг-заглушка. schema_name у неё
+-- обязан быть пуст — он входит в ключ, и с ним в группе появился бы второй «дефолт»
+-- с другой схемой.
 --
---   schema_name — наследуется напрямую: своё непустое перебивает групповое;
+-- Что откуда берётся:
+--
 --   params      — merge по ключам: умолчания er_config.py → группа → таблица;
 --   description — своё, иначе комментарий таблицы в CH, иначе групповое (групповой текст
 --                 последний, иначе он затрёт осмысленные комментарии всех таблиц пакета);
---   db_name     — НЕ наследуется: база источника у поставок пакета бывает разной,
---                 а строке-дефолту она не нужна вовсе;
+--   schema_name — НЕ наследуется: входит в ключ и обязателен у каждой поставки;
 --   pk, uk, fields, sql_from, sql_join, sql_where, sql_with, sql_settings — НЕ наследуются,
 --                 они всегда про конкретную таблицу.
 --
--- is_active = 0 на строке-дефолте выключает группу целиком.
 --
--- Обязательные поля поставки: replica, extract_name, db_name, sql_from, fields
--- (пустые → запись пропускается при синхронизации и ломает свою группу).
+-- ⏹️ is_active И ⏸️ is_paused
+--
+--   is_active = 0 у строки-дефолта  → пакета нет вовсе (DAG не создаётся)
+--   is_active = 0 у поставки        → её нет в пакете (таск не создаётся)
+--   is_paused = 1 у строки-дефолта  → DAG создаётся, но ставится на паузу. Синк дожимает
+--                                     паузу и на уже созданном даге; обратно НЕ снимает —
+--                                     паузу, поставленную руками в UI, настройка возвращать
+--                                     не должна
+--   is_paused = 1 у поставки        → таск создаётся, но штатно скипается: флаг в форме
+--                                     запуска снят по умолчанию, и его можно включить
+--                                     галкой на один ран
+--
+-- Обязательные поля поставки: replica, schema_name, extract_name, sql_from, fields
+-- (пустые → запись ломает свою группу при синхронизации).
 --
 --
 -- ⚙️ ЧТО ПЕРЕЕХАЛО В params
@@ -97,45 +119,54 @@
 
 CREATE TABLE IF NOT EXISTS export.er_wf_meta ON CLUSTER datalab
 (
-    replica       String                    COMMENT 'Реплика с суффиксом группы: база до "__" ищется в TFS_MAP (er_config.py); обязательное, первая часть ключа',
-    extract_name  String                    COMMENT 'Имя выгрузки (table name без схемы); ПУСТО = строка-дефолт группы',
-    schema_name   String                    COMMENT 'Целевая схема в .meta-файле для TFS; наследуется от строки-дефолта группы',
-    db_name       String                    COMMENT 'База данных источника в ClickHouse (левая часть "db.table"); у поставки обязательна, у строки-дефолта не нужна',
+    replica       String                    COMMENT 'Реплика: ищется в TFS_MAP (er_config.py). Обязательна, первая часть ключа',
+    dag_group     String        DEFAULT ''  COMMENT 'Группа поставок = один пакет = один даг export_er__<replica>__<dag_group>; пусто → 0',
+    schema_name   String        DEFAULT ''  COMMENT 'Целевая схема в .meta-файле для TFS. У поставки обязательна, у строки-дефолта ПУСТА',
+    extract_name  String        DEFAULT ''  COMMENT 'Имя выгрузки (table name без схемы); ПУСТО = строка-дефолт группы',
+    description   String        DEFAULT ''  COMMENT 'Описание (отображается в Airflow UI); наследуется от строки-дефолта группы',
+    is_active     UInt8         DEFAULT 1   COMMENT '0 = записи нет в пакете; на строке-дефолте — нет и самого пакета',
+    is_paused     UInt8         DEFAULT 0   COMMENT '1 = мягкое выключение: у группы даг на паузе, у поставки таск скипается',
     pk            Array(String) DEFAULT []             COMMENT 'Список колонок первичного ключа; не наследуется',
     uk            Array(String) DEFAULT []             COMMENT 'Список колонок уникального ключа; не наследуется',
     fields        Array(String) DEFAULT []             COMMENT 'SELECT-выражения таблицы-источника; ОБЯЗАТЕЛЬНО и явно — "*" и "t1.*" запрещены, чтобы новая колонка источника не уезжала в выгрузку сама',
-    sql_from      String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос; у поставки обязательное',
+    sql_from      String        DEFAULT ''             COMMENT 'FROM-часть запроса: "db.table" или подзапрос; у поставки обязательное. Отсюда же берётся база источника для описаний колонок',
     sql_where     String        DEFAULT ''             COMMENT 'WHERE-условие: только бизнес-фильтр, окно дельты дописывается само',
     sql_join      String        DEFAULT ''             COMMENT 'JOIN-clause (полное выражение: JOIN t ON ...); вставляется между FROM и WHERE',
     sql_with      String        DEFAULT ''             COMMENT 'WITH-блок (CTE); вставляется перед SELECT',
     sql_settings  String        DEFAULT ''             COMMENT 'SETTINGS-блок ClickHouse; вставляется в конец запроса',
     params        String        DEFAULT '{}'           COMMENT 'JSON с параметрами (GROUP_PARAMS/TABLE_PARAMS в er_config.py). Здесь же schedule (только у строки-дефолта) и is_recent',
-    description   String        DEFAULT ''             COMMENT 'Описание (отображается в Airflow UI); наследуется от строки-дефолта группы',
-    is_active     UInt8         DEFAULT 1              COMMENT '0 = запись игнорируется при синхронизации; на строке-дефолте выключает всю группу',
-    updated_at    DateTime64(3) DEFAULT now64(3)        COMMENT 'Версия строки для ReplacingMergeTree (мс-точность исключает коллизии при быстрых обновлениях)'
+    updated_at    DateTime64(3) DEFAULT now64(3)       COMMENT 'Версия строки для ReplacingMergeTree (мс-точность исключает коллизии при быстрых обновлениях)'
 )
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/er_wf_meta_{uuid}', '{replica}', updated_at)
-ORDER BY (replica, extract_name);
+ORDER BY (replica, dag_group, schema_name, extract_name);
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 🔄 ПЕРЕЕЗД СО СТАРОЙ СТРУКТУРЫ (ключ (db_name, extract_name), колонки schedule/is_recent)
+-- 🔄 ПЕРЕЕЗД СО СТАРОЙ СТРУКТУРЫ
+--    (ключ (db_name, extract_name), группа суффиксом в replica, колонки schedule/is_recent)
 --
 -- Порядок: новая таблица → переливка → сверка → пауза export_er_setup и пакетов ЕР →
--- RENAME → выкладка кода → синк с галкой «Синхронизировать принудительно».
+-- RENAME → переименование состояния дельты (er_extract_history.sql) → выкладка кода →
+-- синк с галкой «Синхронизировать принудительно».
 -- Старую таблицу не удалять, пока новая не отработала: откат — обратный RENAME.
 --
 --   CREATE TABLE export.er_wf_meta_v2 ON CLUSTER datalab (…как выше…)
 --       ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/er_wf_meta_v2_{uuid}', '{replica}', updated_at)
---       ORDER BY (replica, extract_name);
+--       ORDER BY (replica, dag_group, schema_name, extract_name);
 --
 --   INSERT INTO export.er_wf_meta_v2
---       (replica, extract_name, schema_name, db_name, pk, uk, fields,
---        sql_from, sql_where, sql_join, sql_with, sql_settings,
---        params, description, is_active, updated_at)
+--       (replica, dag_group, schema_name, extract_name, description, is_active, is_paused,
+--        pk, uk, fields, sql_from, sql_where, sql_join, sql_with, sql_settings,
+--        params, updated_at)
 --   SELECT
---       replica, extract_name, schema_name, db_name, pk, uk, fields,
---       sql_from, sql_where, sql_join, sql_with, sql_settings,
+--       -- реплика без суффикса, суффикс → в свою колонку ('' → '0')
+--       splitByString('__', replica)[1]                                    AS replica,
+--       if(position(replica, '__') = 0, '0',
+--          substring(replica, position(replica, '__') + 2))                AS dag_group,
+--       -- у строки-дефолта схема обязана быть пустой, у поставки — как была
+--       if(extract_name = '', '', schema_name)                             AS schema_name,
+--       extract_name, description, is_active, 0 AS is_paused,
+--       pk, uk, fields, sql_from, sql_where, sql_join, sql_with, sql_settings,
 --       -- schedule и is_recent вливаются в params; пустые значения не добавляем
 --       jsonMergePatch(
 --           if(params = '', '{}', params),
@@ -143,22 +174,28 @@ ORDER BY (replica, extract_name);
 --               if(schedule != '', concat('"schedule":"', schedule, '"'), ''),
 --               if(is_recent != 0, '"is_recent":1', '')
 --           ]), ','), '}')
---       ) AS params,
---       description, is_active, updated_at
+--       )                                                                  AS params,
+--       updated_at
 --   FROM export.er_wf_meta FINAL;
 --
 -- ⚠️ jsonMergePatch есть не на всех сборках ClickHouse — сначала проверить
 --    (SELECT jsonMergePatch('{}','{}')). Нет функции — перелить одноразовым скриптом
 --    на питоне: собрать params в json.dumps и вставить готовые значения.
+-- ⚠️ Схему старых дефолтов переливка обнуляет намеренно: раньше она у них была и
+--    наследовалась, теперь входит в ключ. Если у какой-то группы поставки жили БЕЗ своей
+--    схемы, её надо проставить им руками — иначе синк отвергнет их как «пустой schema_name».
 --
---   -- сверка перед переключением: строк столько же, у каждой группы есть дефолт с cron
+--   -- сверка перед переключением
 --   SELECT count() FROM export.er_wf_meta FINAL;
 --   SELECT count() FROM export.er_wf_meta_v2 FINAL;
---   SELECT replica,
+--   SELECT replica, dag_group,
 --          countIf(extract_name = '')                                  AS defaults,
 --          countIf(extract_name = '' AND JSONHas(params, 'schedule'))  AS with_cron,
+--          countIf(extract_name = '' AND schema_name != '')            AS bad_defaults,
+--          countIf(extract_name != '' AND schema_name = '')            AS no_schema,
 --          countIf(extract_name != '')                                 AS tables
---   FROM export.er_wf_meta_v2 FINAL GROUP BY replica ORDER BY replica;
+--   FROM export.er_wf_meta_v2 FINAL GROUP BY replica, dag_group ORDER BY 1, 2;
+--   -- defaults = 1, with_cron = 1, bad_defaults = 0, no_schema = 0 у каждой группы
 --
 --   RENAME TABLE export.er_wf_meta    TO export.er_wf_meta_old,
 --                export.er_wf_meta_v2 TO export.er_wf_meta
@@ -169,65 +206,69 @@ ORDER BY (replica, extract_name);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Пример: группа из двух поставок.
--- Первая строка — дефолты группы (расписание, схема, групповые параметры),
+-- Первая строка — дефолты группы (расписание и групповые параметры в params),
 -- остальные — поставки, у которых своё только SQL, ключи и состав полей.
 --
 -- В params указываются только отличия от DEFAULT_PARAMS (er_config.py).
--- Повторный INSERT той же (replica, extract_name) не заменяет строку мгновенно —
--- дедупликация происходит при фоновом MERGE; для немедленного чтения использовать FINAL.
+-- Повторный INSERT того же ключа не заменяет строку мгновенно — дедупликация происходит
+-- при фоновом MERGE; для немедленного чтения использовать FINAL.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-INSERT INTO export.er_wf_meta (replica, extract_name, schema_name, description, params)
+INSERT INTO export.er_wf_meta (replica, dag_group, description, params)
 VALUES (
-    'hrplatform_datalab__1',
-    '',                                     -- пусто → это строка-дефолт группы
-    'learning',
+    'hrplatform_datalab',
+    '1',
     'Пакет 1: справочники обучения',
-    -- schedule обязателен и живёт только здесь
+    -- schedule обязателен и живёт только здесь; schema_name и extract_name пусты
     '{"schedule": "30 2 * * *", "auto_confirm": 0, "confirm_timeout": 90, "max_active_tasks": 2}'
 );
 
 -- Поставка с JOIN. При непустом sql_join поле fields задаёт состав явно, иначе колонки
 -- обеих таблиц уехали бы в CSV и в .meta: дубли справа ClickHouse назовёт 't2.col'.
 INSERT INTO export.er_wf_meta
-    (replica, extract_name, db_name, uk, fields, sql_from, sql_join, sql_where, params)
+    (replica, dag_group, schema_name, extract_name, uk, fields, sql_from, sql_join, params)
 VALUES (
-    'hrplatform_datalab__1',
+    'hrplatform_datalab',
+    '1',
+    'learning',
     'lc_items_opened',
-    'evolution',
     ['person_uuid', 'item_id'],
-    ['t1.person_uuid', 't1.item_id', 't1.opened_at', 't1.status'],
+    ['t1.person_uuid AS person_uuid', 't1.item_id AS item_id', 't1.opened_at AS opened_at'],
     'evolution.lc_items_opened t1',
     'LEFT JOIN evolution_export.lc_items_opened_exp t2 ON t1.person_uuid = t2.person_uuid AND t1.item_id = t2.item_id',
-    '',
     '{"selfrun_timeout": 10}'
 );
 
 -- Вторая поставка того же пакета, выгрузка построчным JSON (файлы .json).
 INSERT INTO export.er_wf_meta
-    (replica, extract_name, db_name, uk, fields, sql_from, sql_where, params)
+    (replica, dag_group, schema_name, extract_name, uk, fields, sql_from, params)
 VALUES (
-    'hrplatform_datalab__1',
+    'hrplatform_datalab',
+    '1',
+    'learning',
     'lc_items_meta',
-    'evolution',
     ['item_id'],
     ['item_id', 'title', 'tags'],
     'evolution.lc_items_meta',
-    '',
     '{"format": "JSONEachRow"}'
 );
 
 -- Та же таблица во ВТОРОЙ группе — так заводится новая версия пакета рядом со старой.
 -- Раньше это было невозможно: ключ (db_name, extract_name) схлопнул бы обе строки в одну.
--- Состояние дельты у групп разное — оно ключуется парой (replica, extract_name).
+-- Состояние дельты у групп разное: в extract_history имя выгрузки составное,
+-- '<dag_id>.<extract_name>', а dag_id у них разные.
+INSERT INTO export.er_wf_meta (replica, dag_group, params)
+VALUES ('hrplatform_datalab', '2', '{"schedule": "0 5 * * *"}');
+
 INSERT INTO export.er_wf_meta
-    (replica, extract_name, db_name, uk, fields, sql_from, params)
+    (replica, dag_group, schema_name, extract_name, uk, fields, sql_from, is_paused)
 VALUES (
-    'hrplatform_datalab__2',
+    'hrplatform_datalab',
+    '2',
+    'learning',
     'lc_items_meta',
-    'evolution',
     ['item_id'],
     ['item_id', 'title', 'tags', 'updated_at'],
     'evolution.lc_items_meta',
-    '{}'
+    1                                       -- пока на паузе: таск создастся, но скипнется
 );

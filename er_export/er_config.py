@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-28 13:40 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 17:20 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
 Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
@@ -41,9 +41,9 @@ from airflow.exceptions import AirflowFailException
 # колбэки должны вести себя одинаково во всех DAG-ах контура. add_note и ensure_pool
 # здесь же реэкспортируются — их импортируют соседние модули этого каталога.
 try:
-    from plugins.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, valid_schedule  # noqa: F401  # type: ignore
+    from plugins.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, update_dag_pause, valid_schedule  # noqa: F401  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, valid_schedule  # noqa: F401  # type: ignore
+    from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, update_dag_pause, valid_schedule  # noqa: F401  # type: ignore
 
 # 🌍 Стенд. Сначала ENV_STAND — именно её читают платформенные операторы
 # (hrp_operators/clickhouse_to_s3.py: os.getenv("ENV_STAND")) и соседний xs_export.
@@ -365,28 +365,31 @@ FORMAT_MAP: dict[str, dict] = {
 def raw_key(row: dict) -> str:
     """🔑 Ключ строки er_wf_meta для Variable и выпадающего списка.
 
-    'replica/extract_name' — ровно ключ сортировки таблицы. У строки-дефолта группы
-    extract_name пуст, поэтому она помечается явно: в списке должно быть видно, что это
-    настройка пакета, а не поставка.
+    'replica/dag_group/schema_name/extract_name' — ровно ключ сортировки таблицы.
+    У строки-дефолта группы пусты и extract_name, и schema_name, поэтому она помечается
+    явно: в списке должно быть видно, что это настройка пакета, а не поставка.
 
-    Разделитель '/' , а не '.': точка занята видом 'db.table', и на ключе с репликой
-    читалась бы неоднозначно — база и реплика в именах различаются не всегда.
+    Разделитель '/', а не '.': точка занята видом 'db.table' и 'schema.table' и на
+    составном ключе читалась бы неоднозначно.
     """
+    rep, grp = row.get('replica', ''), norm_group(row.get('dag_group'))
     if not row.get('extract_name'):
-        return f"{row.get('replica', '')} (дефолты группы)"
-    return f"{row.get('replica', '')}/{row['extract_name']}"
+        return f"{rep}/{grp} (дефолты группы)"
+    return f"{rep}/{grp}/{row.get('schema_name', '')}/{row['extract_name']}"
 
 
-def key_to_where(key: str) -> tuple[str, str]:
-    """🔎 Ключ из выпадающего списка → (replica, extract_name) для WHERE.
+def key_to_where(key: str) -> tuple[str, str, str, str]:
+    """🔎 Ключ из выпадающего списка → (replica, dag_group, schema_name, extract_name).
 
-    Обратная к raw_key: у строки-дефолта extract_name пуст.
+    Обратная к raw_key: у строки-дефолта пусты и schema_name, и extract_name.
     """
     marker = ' (дефолты группы)'
     if key.endswith(marker):
-        return key[:-len(marker)], ''
-    replica, _, name = key.partition('/')
-    return replica, name
+        rep, _, grp = key[:-len(marker)].partition('/')
+        return rep, norm_group(grp), '', ''
+    parts = key.split('/')
+    parts += [''] * (4 - len(parts))
+    return parts[0], norm_group(parts[1]), parts[2], parts[3]
 
 
 # Номер группы, который подставляется реплике без суффикса. Пустым он быть не может:
@@ -471,47 +474,35 @@ def parse_s3_target(path: str, conn_id: str, bucket: str, prefix: str) -> dict:
     return _target(head, new_bucket, new_prefix.strip('/'))
 
 
-def replica_full(replica: str) -> str:
-    """🔢 Реплика с обязательным суффиксом группы: без него подставляется DEFAULT_GROUP.
+def norm_group(dag_group) -> str:
+    """🔢 Группа пакета: пустая нормализуется к DEFAULT_GROUP.
 
-    Нужна, чтобы у всех пакетов был один формат имени файла с одинаковым числом '__'.
-    'hrplatform_datalab' → 'hrplatform_datalab__0', 'hrplatform_datalab__1' — как есть.
+    Пустой она быть не может: имя архива строится как '{реплика}__{ts}__{группа}__{table}…',
+    и без группы разделителей '__' стало бы на один меньше, чем у остальных пакетов, —
+    принимающая сторона разбирает имя по ним.
     """
-    rep = (replica or '').strip()
-    return rep if not rep or '__' in rep else f"{rep}__{DEFAULT_GROUP}"
+    return str(dag_group or '').strip() or DEFAULT_GROUP
 
 
-def replica_base(replica: str) -> str:
-    """🔀 Базовая реплика — часть до первого '__'; остальное считается номером группы.
+def dag_id_for(replica: str, dag_group) -> str:
+    """🏷️ Имя DAG-а пакета: 'export_er__<реплика>__<группа>'.
 
-    Группа поставок кодируется суффиксом в replica ('hrplatform_datalab__1'). В имена
-    файлов базовая реплика идёт первой, суффикс группы — за меткой времени и только
-    в имени архива; тикет пакета обходится без него вовсе. Маршрут в TFS (scenario_id +
-    префикс в S3) один на всю реплику, поэтому TFS_MAP ищется по базе — новая группа
-    заводится строкой в er_wf_meta, без правки кода.
+    Собирается в одном месте, потому что служит тремя вещами сразу: именем дага, ключом
+    группы в Variable и первой частью имени выгрузки в export.extract_history
+    ('<dag_id>.<extract_name>' — так состояние дельты разных групп не смешивается).
     """
-    return replica.split('__', 1)[0]
-
-
-def replica_group(replica: str) -> str:
-    """🔢 Суффикс группы — часть после первого '__'; без него подставляется DEFAULT_GROUP.
-
-    В имени архива стоит сразу за меткой времени и разводит по именам архивы разных групп
-    одной реплики. Пустым не бывает: replica_full() дописывает суффикс ещё при синхронизации,
-    и число разделителей '__' в имени обязано быть одним на все пакеты.
-    """
-    return replica.split('__', 1)[1] if '__' in replica else DEFAULT_GROUP
+    return f"export_er__{replica}__{norm_group(dag_group)}"
 
 
 def ts_pool(replica: str) -> str:
-    """🏊 Имя пула метки времени — одно на БАЗОВУЮ реплику, на все её группы сразу.
+    """🏊 Имя пула метки времени — одно на РЕПЛИКУ, на все её группы сразу.
 
-    Именно на базовую: сталкиваются именами тикеты РАЗНЫХ ГРУПП одной реплики (суффикс
-    из имени тикета убран, а logical_date у групп на одном cron совпадает до секунды),
+    Именно на реплику: сталкиваются именами тикеты РАЗНЫХ ГРУПП одной реплики (группа
+    в имя тикета не входит, а logical_date у групп на одном cron совпадает до секунды),
     и развести их может только общий на эти группы пул с единственным слотом.
     Пул на группу был бы бесполезен — каждая заняла бы свой слот и стартовали бы разом.
     """
-    return f"{POOL_NAME}_ts__{replica_base(replica)}"
+    return f"{POOL_NAME}_ts__{replica}"
 
 
 # Параметры-словари, которые сливаются ПО КЛЮЧАМ, а не заменяются целиком.
@@ -544,18 +535,15 @@ def get_params(row: dict, group: dict | None = None) -> dict:
     return merge_params(DEFAULT_PARAMS, group or {}, overrides)
 
 
-# 🧬 Поля строки-дефолта группы, наследуемые поставками. SQL и ключи (pk, uk, fields,
-# sql_*) сюда намеренно не входят — они всегда описывают конкретную таблицу.
+# 🧬 Прямого наследования полей больше нет, и списка INHERITED — тоже.
 #
-# db_name сюда тоже не входит: база источника у поставок пакета бывает разной, а у
-# строки-дефолта её обычно нет вовсе — раньше она была занята под ключ сортировки.
+# Единственным наследуемым полем был schema_name, но с 2026-08-28 он входит в ключ
+# таблицы (replica, dag_group, schema_name, extract_name) и у строки-дефолта пуст:
+# наследовать нечего, у каждой поставки схема своя и обязательна.
 #
-# description обрабатывается отдельно (см. build_wfs): у него есть третий источник —
-# комментарий таблицы в ClickHouse, и он должен быть приоритетнее группового текста.
-#
-# Остальное наследуется через params (merge_params), включая режим выгрузки is_recent
-# и расписание группы.
-INHERITED = ('schema_name',)
+# Наследуется теперь только params (merge_params: умолчания → группа → таблица), включая
+# расписание группы и режим выгрузки is_recent, и отдельно description — у него есть
+# третий источник, комментарий таблицы в ClickHouse, и он приоритетнее группового текста.
 
 def parse_params(raw: str, where: str) -> dict:
     """Разбирает JSON-поле params; при битом JSON возвращает {} и пишет предупреждение."""
@@ -588,23 +576,16 @@ def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
         errors.append(f"{key}: пустой sql_from")
         return False
 
-    # Раньше пустой db_name бросался в глаза сам: он входил в ключ записи, и поставка
-    # называлась '.lc_items_opened'. Теперь ключ строится из реплики, и проверка нужна
-    # явная — база источника нужна и для описаний колонок в .meta, и для FROM без
-    # квалификатора.
-    if not row.get("db_name"):
-        errors.append(f"{key}: пустой db_name — не из чего достроить имя таблицы-источника")
+    replica = row.get("replica", "")
+    if replica not in TFS_MAP:
+        errors.append(f"{key}: реплика '{replica}' не найдена в TFS_MAP")
         return False
 
-    base = replica_base(row["replica"])
-    if base not in TFS_MAP:
-        errors.append(f"{key}: базовая реплика '{base}' не найдена в TFS_MAP")
-        return False
-
-    # Без схемы фабрика падает на schema_name.replace(), а падение при разборе файла
+    # Схема входит в ключ таблицы и не наследуется — у каждой поставки она своя.
+    # Без неё фабрика падает на schema_name.replace(), а падение при разборе файла
     # уносит с собой ВСЕ пакеты, а не только этот.
     if not row.get("schema_name"):
-        errors.append(f"{key}: пустой schema_name — задайте его в строке-дефолте группы или в поставке")
+        errors.append(f"{key}: пустой schema_name — целевая схема .meta задаётся у каждой поставки")
         return False
 
     # Состав полей задаётся только настройкой: иначе новая колонка источника уехала бы
@@ -872,8 +853,6 @@ def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool, int | None, i
 # Маска квалифицированного имени: db.table. Ловит и алиасы колонок (t1.person_uuid) —
 # отсеются проверкой в ClickHouse, зато не нужен разбор SQL.
 _QUALIFIED = re.compile(r'\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b')
-# Первое слово FROM-части: имя без базы достраивается db_name записи.
-_FIRST_WORD = re.compile(r'^\s*([A-Za-z_]\w*)')
 
 
 def _quote(value) -> str:
@@ -881,16 +860,17 @@ def _quote(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def sql_sources(parts: dict, db_name: str = '', extract_name: str = '') -> list[tuple[str, str]]:
+def sql_sources(parts: dict) -> list[tuple[str, str]]:
     """🔎 Таблицы, к которым обращается запрос, в порядке приоритета: from → with → joins.
 
     Приоритет решает, чьё описание достанется колонке, встречающейся в нескольких
     таблицах: побеждает основная, из FROM.
 
-    Имена ищутся маской `db.table`; в FROM имя без базы достраивается db_name записи —
-    там первое слово это гарантированно таблица, а в JOIN-ах и CTE так гадать нельзя.
-    Хвостом идёт (db_name, extract_name): у выгрузки, названной по своей таблице, это
-    та же таблица, а у прочих пара просто не найдётся.
+    Имена ищутся маской `db.table` — и это единственный источник базы с тех пор, как
+    колонка db_name убрана (28.08.2026). Раньше неквалифицированное первое слово FROM
+    достраивалось ею; теперь такой FROM просто не даёт кандидата, и .meta соберётся
+    без описаний колонок — с предупреждением, но без ошибки. Пишите в sql_from 'db.table',
+    это и так норма.
 
     Мусорные пары (алиасы вида t1.person_uuid) не отсеиваем: разбирать SQL ради этого
     дороже, чем проверить кандидатов одним запросом в system.columns.
@@ -907,13 +887,9 @@ def sql_sources(parts: dict, db_name: str = '', extract_name: str = '') -> list[
         text = str(parts.get(key) or '').strip()
         if not text:
             continue
-        if key == 'from' and '.' not in text.split()[0]:
-            if first := _FIRST_WORD.match(text):
-                _add(db_name, first.group(1))
         for db, table in _QUALIFIED.findall(text):
             _add(db, table)
 
-    _add(db_name, extract_name)
     return out
 
 

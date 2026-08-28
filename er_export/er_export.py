@@ -1,19 +1,25 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-28 12:35 MSK · v3.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 18:10 MSK · v3.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Один DAG — один пакет — одна группа поставок — один внешний тикет. Группа задаётся
-значением `replica` целиком (суффикс после '__'), внутри DAG-а по TaskGroup на таблицу:
+Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
+`replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
+`export_er__<replica>__<dag_group>`; внутри — по TaskGroup на таблицу:
 
-  make_ts → <db>__<tbl>: init → [build_meta, export_to_s3] → pack_zip
-                                                                ↓
+  make_ts → <схема>__<таблица>: init → [build_meta, export_to_s3] → pack_zip
+                                                                      ↓
   make_summary → wait_confirm → save_status → schedule_next
 
-Имена файлов пакета: `[базовая реплика]__[ts]__[группа]__[таблица]__[часть]_[всего]_[строк].zip`
-и `[базовая реплика]__[ts].tkt` — суффикс группы стоит за меткой времени, а в тикете его нет
-вовсе. Метку выдаёт make_ts, по одному таску за раз на базовую реплику (пул на один слот).
+Имена файлов пакета: `[реплика]__[ts]__[группа]__[таблица]__[часть]_[всего]_[строк].zip`
+и `[реплика]__[ts].tkt` — группа стоит за меткой времени, а в тикете её нет вовсе.
+Метку выдаёт make_ts, по одному таску за раз на реплику (пул на один слот).
 
-Метаданные выгрузок хранятся в Airflow Variable `datalab_er_wfs` (JSON-словарь),
-который синхронизируется DAG-ом export_er_setup из таблицы export.er_wf_meta.
+Состояние дельты живёт в `export.extract_history` под составным именем
+`<dag_id>.<extract_name>`: одна и та же таблица может входить в разные группы, и по
+короткому имени они делили бы одно окно.
+
+Метаданные выгрузок хранятся в Airflow Variable `datalab_er_wfs` (JSON-словарь, ключ —
+dag_id пакета), который синхронизируется DAG-ом export_er_setup из таблицы
+export.er_wf_meta.
 
 Поддерживаемые режимы выгрузки:
   📈 delta  — инкрементальный, окно [time_from, time_to] из export.extract_current_vw
@@ -38,7 +44,7 @@ from airflow.utils.task_group import TaskGroup
 try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params,
-        replica_base, replica_group, ts_pool,
+        norm_group, ts_pool,
         build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
         cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,
         unnamed_fields,
@@ -46,7 +52,7 @@ try:
 except ImportError:
     from er_export.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params,
-        replica_base, replica_group, ts_pool,
+        norm_group, ts_pool,
         build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
         cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,
         unnamed_fields,
@@ -84,14 +90,22 @@ VAR_NAME        = _cfg['VAR_NAME']
 FORMAT_MAP      = _cfg['FORMAT_MAP']
 
 
-def sql_cur_delta(replica: str, tbl: str) -> str:
-    """SQL для получения текущего состояния дельты из export.extract_current_vw.
+def state_name(dag_id: str, tbl: str) -> str:
+    """🔑 Имя выгрузки в export.extract_history: '<dag_id>.<extract_name>'.
 
-    Ключ состояния — ПАРА (replica, extract_name), а не одно имя выгрузки: с ключом
-    er_wf_meta (replica, extract_name) одна и та же таблица может входить в разные группы
-    (например, старая и новая версия пакета), и по одному имени они делили бы одно окно
-    дельты — вторая группа выгружала бы пустоту, а её save_status переписывал бы чужую
-    историю.
+    Составное, потому что одна и та же таблица может входить в разные группы (например,
+    старая и новая версия пакета): по короткому имени они делили бы одно окно дельты —
+    вторая группа выгружала бы пустоту, а её save_status переписывал бы чужую историю.
+
+    Именно составное имя, а не отдельная колонка: extract_history и extract_current_vw
+    мы делим с xStream (xs_export/xs_common.py пишет туда же и читает по extract_name),
+    и менять общую структуру ради ЕР значило бы чинить заодно и его.
+    """
+    return f"{dag_id}.{tbl}"
+
+
+def sql_cur_delta(dag_id: str, tbl: str) -> str:
+    """SQL для получения текущего состояния дельты из export.extract_current_vw.
 
     Все значения возвращаются как строки-SQL-литералы ('2024-01-01' или null),
     чтобы их можно было подставлять напрямую в шаблонные SQL-запросы через str.format().
@@ -114,7 +128,7 @@ def sql_cur_delta(replica: str, tbl: str) -> str:
             "toString(0) as recent_interval",
         ],
         "from": ("(SELECT * FROM export.extract_current_vw "
-                 f"WHERE replica = '{replica}' AND extract_name = '{tbl}') as a"),
+                 f"WHERE extract_name = '{state_name(dag_id, tbl)}') as a"),
     })
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -174,7 +188,10 @@ def _enqueue_files(gcfg: dict, files: list[str], context) -> list[dict]:
     rows = [{
         'rq_uid':      uuid.uuid4().hex,
         'file_name':   f,
-        'replica':     gcfg['replica'],
+        # В очередь идёт ИМЯ ПАКЕТА (реплика + группа): тракт ТФС и пауза отправки видят
+        # пакет именно так, и это ровно та строка, что стояла здесь до выноса группы
+        # в свою колонку.
+        'replica':     gcfg['pkg_name'],
         'scenario_id': gcfg['scenario'],
         'package_ts':  package_ts,
         'dag_id':      gcfg['dag_id'],
@@ -283,17 +300,20 @@ def _er_init(cfg, **context):
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
     # 🚦 Флаги таблиц. Все снятые — это не «пропустить всё», а ошибка запуска: пустой
-    # пакет означал бы тикет без единого файла, чего ТФС от нас не ждёт.
+    # пакет означал бы тикет без единого файла, чего ТФС от нас не ждёт. Исключение —
+    # пакет, у которого ВСЕ поставки приостановлены настройкой (is_paused): там снятые
+    # флаги не ошибка человека, а само это состояние.
     flags = {k: v for k, v in context['params'].items() if k.startswith('tbl_')}
-    if flags and not any(flags.values()):
+    if flags and not any(flags.values()) and not cfg.get('all_paused'):
         raise AirflowFailException(
             "Сняты флаги всех таблиц пакета — грузить нечего. "
             "Отметьте хотя бы одну таблицу либо не запускайте пакет"
         )
     if not context['params'].get(f"tbl_{cfg['tg']}", True):
-        add_note({f"⏭️ {cfg['db']}.{cfg['tbl']}": "флаг таблицы снят — поставка пропущена"},
-                 level='task', context=context)
-        raise AirflowSkipException(f"{cfg['db']}.{cfg['tbl']}: флаг таблицы снят в параметрах запуска")
+        why = ("поставка приостановлена настройкой (is_paused=1)" if cfg.get('paused')
+               else "флаг таблицы снят — поставка пропущена")
+        add_note({f"⏭️ {cfg['schema_name']}.{cfg['tbl']}": why}, level='task', context=context)
+        raise AirflowSkipException(f"{cfg['schema_name']}.{cfg['tbl']}: {why}")
 
     # 🔌 Коннекты проверяем САМИ, до первого обращения. Провайдер amazon на отсутствующий
     # conn_id не падает: пишет «Unable to find AWS Connection ID …, switching to empty»
@@ -371,7 +391,7 @@ def _er_init(cfg, **context):
             'num_state':       '0',
         })
         result = reg
-        logger.info("📚 %s.%s: полная выгрузка, окно дельты не применяется", cfg['db'], cfg['tbl'])
+        logger.info("📚 %s.%s: полная выгрузка, окно дельты не применяется", cfg['schema_name'], cfg['tbl'])
     elif cfg['sql_get_current']:
         cur_res = get_dict_from_ch(hook, cfg['sql_get_current'])
         if not cur_res:
@@ -457,7 +477,7 @@ def _er_init(cfg, **context):
     shown = list(key_map) + ['is_current', 'extract_time', 'condition', 'increment',
                              'time_from', 'time_to', 'ad_hoc']
     add_note({k: result.get(k) for k in shown},
-             level='task', context=context, title=f"⚙️ Delta State · {cfg['db']}.{cfg['tbl']}")
+             level='task', context=context, title=f"⚙️ Delta State · {cfg['schema_name']}.{cfg['tbl']}")
     return result
 
 
@@ -486,7 +506,7 @@ def _er_build_meta(cfg, **context):
     # 💬 Описания колонок берём у таблиц, к которым обращается САМ ЗАПРОС: from → with →
     # joins. Имя выгрузки для этого не годится — из одной таблицы делают несколько выгрузок
     # с разными джойнами, и таблицы с именем выгрузки может не быть вовсе.
-    sources        = sql_sources(cfg.get('sql_parts') or {}, cfg['db'], cfg['tbl'])
+    sources        = sql_sources(cfg.get('sql_parts') or {})
     ch_cols, found = ch_source_columns(hook, sources)
     if found:
         logger.info("💬 Описания колонок из %s (описано %d из %d)",
@@ -516,7 +536,7 @@ def _er_build_meta(cfg, **context):
         """
         if not found:
             raise AirflowFailException(
-                f"{cfg['db']}.{cfg['tbl']}: состав колонок .meta взять неоткуда — "
+                f"{cfg['schema_name']}.{cfg['tbl']}: состав колонок .meta взять неоткуда — "
                 f"DESCRIBE по запросу не удался, а таблиц-источников не нашлось "
                 f"(кандидаты: {', '.join(f'{db}.{t}' for db, t in sources) or 'нет'}). "
                 f"Проверьте запрос дагом export_er_setup"
@@ -534,7 +554,7 @@ def _er_build_meta(cfg, **context):
         except Exception as err:
             # Схема из DESCRIBE TABLE лучше, чем упавший DAG, но она может разойтись с CSV
             logger.warning("DESCRIBE по запросу не удался, откат на DESCRIBE TABLE: %s", err)
-            add_note(f"DESCRIBE по запросу не удался, схема взята по DESCRIBE TABLE {cfg['db']}.{cfg['tbl']}\n\n{err}",
+            add_note(f"DESCRIBE по запросу не удался, схема взята по DESCRIBE TABLE {cfg['schema_name']}.{cfg['tbl']}\n\n{err}",
                      level='task', context=context, title='⚠️ build_meta fallback')
             data_cols = _cols_from_table()
     else:
@@ -543,7 +563,7 @@ def _er_build_meta(cfg, **context):
     # 🔍 Состав колонок обязан совпадать с настройкой: новая колонка в источнике не должна
     # доезжать до КАП сама, только через правку fields. Выгрузке нужен красный таск —
     # ретраить тут нечего, от повтора настройка не изменится.
-    key = f"{cfg['db']}.{cfg['tbl']}"
+    key = f"{cfg['schema_name']}.{cfg['tbl']}"
     names = [c['column_name'] for c in data_cols]
     # Обе сверки — про одно: настройка разошлась с тем, что уедет. Ретраить нечего,
     # поэтому ошибки собираются вместе и падают одним внятным сообщением.
@@ -656,8 +676,8 @@ def _er_pack_zip(cfg, **context):
                    if FORMAT_MAP[cfg['format']]['header'] else b""
         data_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__0_1_0.{ext}".lower()
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__0_1_0.meta".lower()
-        tkt_n  = f"{cfg['replica_base']}__{ts}.tkt".lower()
-        zip_n  = (f"{cfg['replica_base']}__{ts}__{cfg['replica_group']}__"
+        tkt_n  = f"{cfg['replica']}__{ts}.tkt".lower()
+        zip_n  = (f"{cfg['replica']}__{ts}__{cfg['dag_group']}__"
                   f"{cfg['tbl']}__0_1_0.zip").lower()
         members = [
             (tkt_n,  mtime, S_IFREG | 0o600, ZIP_32, [f"{data_n};0".encode()]),
@@ -679,8 +699,8 @@ def _er_pack_zip(cfg, **context):
     for i, (key, rows) in enumerate(zip(s3_keys, counts)):
         data_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.{ext}".lower()
         meta_n = f"{cfg['schema_name']}__{cfg['tbl']}__{ts}__{i+1}_{total}_{rows}.meta".lower()
-        tkt_n  = f"{cfg['replica_base']}__{ts}.tkt".lower()
-        zip_n  = (f"{cfg['replica_base']}__{ts}__{cfg['replica_group']}__"
+        tkt_n  = f"{cfg['replica']}__{ts}.tkt".lower()
+        zip_n  = (f"{cfg['replica']}__{ts}__{cfg['dag_group']}__"
                   f"{cfg['tbl']}__{i+1}_{total}_{rows}.zip").lower()
 
         s3_body = hook.get_key(key=key, bucket_name=dst['bucket']).get()["Body"]
@@ -729,7 +749,7 @@ def _er_make_summary(gcfg, **context):
         return
 
     ts          = _pkg_ts(context).strftime("%Y%m%d%H%M%S")
-    summary_tkt = f"{gcfg['replica_base']}__{ts}.tkt".lower()
+    summary_tkt = f"{gcfg['replica']}__{ts}.tkt".lower()
     dst = parse_s3_target(context['params'].get('export_path'), S3_CONN, BUCKET, gcfg['s3_prefix'])
     S3Hook(aws_conn_id=dst['conn_id']).load_bytes(
         "\n".join(zips).encode(), key=f"{dst['key_prefix']}{summary_tkt}",
@@ -830,9 +850,10 @@ def _er_wait_confirm(gcfg, **context):
 def _er_save_status(gcfg, **context):
     """💾 Записывает результат по каждой таблице пакета в export.extract_history.
 
-    Одна вставка на весь пакет: строк столько, сколько таблиц отработало. Реплика пишется
-    в каждую строку — состояние дельты ключуется парой (replica, extract_name), иначе две
-    группы с одной и той же таблицей переписывали бы историю друг другу.
+    Одна вставка на весь пакет: строк столько, сколько таблиц отработало. Имя выгрузки
+    составное — '<dag_id>.<extract_name>' (state_name): иначе две группы с одной и той же
+    таблицей переписывали бы историю друг другу. Структуру таблицы это не трогает — её
+    мы делим с xStream.
     trigger_rule=none_failed: запускается при успехе или при skipped-тасках
     (wait_confirm пропускается при auto_confirm=True или отсутствии данных).
     confirmed — время квитанции ТФС из wait_confirm; null, если ждать не стали
@@ -871,8 +892,8 @@ def _er_save_status(gcfg, **context):
         # оттого и не всплывало.
         selects.append(f"""
             SELECT
-                '{_sql_str(gcfg['replica'])}' AS replica,
-                '{tbl}' AS extract_name, {dp['extract_time']} AS extract_time,
+                '{_sql_str(state_name(gcfg['dag_id'], tbl))}' AS extract_name,
+                {dp['extract_time']} AS extract_time,
                 {rows} AS extract_count, now() AS loaded, now() AS sent, {confirmed} AS confirmed,
                 {dp['increment']} AS increment, {dp['overlap']} AS overlap,
                 {dp['recent_interval']} AS recent_interval,
@@ -884,7 +905,7 @@ def _er_save_status(gcfg, **context):
     if selects:
         ClickHouseHook(clickhouse_conn_id=CH_ID).execute(f"""
             INSERT INTO export.extract_history (
-                replica, extract_name, extract_time, extract_count, loaded, sent, confirmed,
+                extract_name, extract_time, extract_count, loaded, sent, confirmed,
                 increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
             ) {' UNION ALL '.join(selects)}
         """)
@@ -926,22 +947,21 @@ def _er_schedule_next(gcfg, **context):
 
 # ── DAG Factory ───────────────────────────────────────────────────────────────
 
-def _table_cfg(extract_name: str, entry: dict, replica: str, prefix: str) -> dict:
+def _table_cfg(table_key: str, entry: dict, gcfg: dict) -> dict:
     """🗂️ Конфиг одной поставки внутри пакета.
 
-    extract_name — ключ поставки внутри группы; в пакете он уникален по построению
-                   (ключ er_wf_meta — пара (replica, extract_name))
-    entry        — запись из Variable: schema, db, PK, UK, fields, params (уже разрешённые
-                   наследованием от строки-дефолта группы) и ровно один из
-                   sql_stmt_export_delta / sql_stmt_export_recent.
+    table_key — ключ поставки внутри группы, 'схема.имя_выгрузки': по ключу er_wf_meta
+                (replica, dag_group, schema_name, extract_name) эта пара уникальна в пакете
+    entry     — запись из Variable: schema, PK, UK, fields, params (уже разрешённые
+                наследованием от строки-дефолта группы), необязательный is_paused и ровно
+                один из sql_stmt_export_delta / sql_stmt_export_recent
+    gcfg      — конфиг пакета: dag_id, replica, dag_group, s3_prefix
 
-    База источника берётся из самой записи ('db'), а не из ключа: ключом до 2026-08-28
-    была строка 'db.table', и её резали пополам. Реплика в ключ не входит — она одна
-    на весь пакет и повторять её в каждой поставке незачем.
+    Базы источника в конфиге нет с 28.08.2026: колонка db_name убрана, и таблицы-источники
+    находятся по квалифицированным именам в самом запросе (sql_sources).
     """
     p = get_params(entry)
-    db, tbl   = entry.get('db', ''), extract_name
-    table_key = f"{replica}/{extract_name}"
+    schema, tbl = entry['schema'], table_key.split('.', 1)[-1]
 
     if p['format'] not in FORMAT_MAP:
         raise AirflowFailException(
@@ -962,23 +982,24 @@ def _table_cfg(extract_name: str, entry: dict, replica: str, prefix: str) -> dic
 
     return {
         # ── Идентификация ────────────────────────────────────────────────────
-        # id TaskGroup, он же префикс XCom и хвост имени параметра формы 'tbl_<tg>'.
-        # Собирается из базы и имени выгрузки, а не из ключа записи: имена тасков должны
-        # пережить смену ключа, иначе история ранов и снятые флаги таблиц потерялись бы.
-        'tg':              f"{db}__{tbl}",
-        'db':              db,
+        # id TaskGroup, он же префикс XCom и хвост имени параметра формы 'tbl_<tg>'
+        'tg':              f"{schema}__{tbl}",
         'tbl':             tbl,
-        'schema_name':     entry['schema'],
-        'replica':         replica,
-        # Части replica считаем здесь, а не в тасках: правило имени файла (база первой,
-        # суффикс группы — за меткой времени) должно жить в одном месте.
-        'replica_base':    replica_base(replica),
-        'replica_group':   replica_group(replica),
-        's3_prefix':       prefix,
+        'schema_name':     schema,
+        'replica':         gcfg['replica'],
+        'dag_group':       gcfg['dag_group'],
+        's3_prefix':       gcfg['s3_prefix'],
+        # ⏸️ Приостановленная поставка: флаг в форме запуска снят по умолчанию, поэтому
+        # таск создаётся и штатно скипается — но его можно включить галкой на один ран.
+        'paused':          bool(entry.get('is_paused')),
+        # Проставляется после сборки всех поставок (см. create_export_dag): init по нему
+        # отличает «настройка приостановила весь пакет» от «человек снял все флаги».
+        'all_paused':      False,
         # ── SQL ──────────────────────────────────────────────────────────────
         'sql_export':      q['sql_export'],
         # None → состояние дельты не читается: так работают recent и full_export
-        'sql_get_current': sql_cur_delta(replica, tbl) if (is_delta and not p['full_export']) else None,
+        'sql_get_current': (sql_cur_delta(gcfg['dag_id'], tbl)
+                            if (is_delta and not p['full_export']) else None),
         'sql_meta':        q['sql_meta'],
         # Части запроса как есть — из них build_meta достаёт таблицы-источники, чтобы
         # взять описания колонок. Имя выгрузки для этого не годится: таблицы с таким
@@ -1013,7 +1034,7 @@ def _table_cfg(extract_name: str, entry: dict, replica: str, prefix: str) -> dic
 
 
 def _dag_params(gp: dict, tables: dict) -> dict:
-    """🎛️ DAG Params пакета.
+    """🎛️ DAG Params пакета. tables — {tg: (имя выгрузки, приостановлена ли)}.
 
     Состав намеренно скупой. Табличные настройки (формат, санитизация, стратегия слияния,
     признак recent) живут в er_wf_meta и правятся дагом export_er_setup — как параметр
@@ -1111,62 +1132,77 @@ def _dag_params(gp: dict, tables: dict) -> dict:
         # ── Что грузим: по флагу на таблицу ──────────────────────────────────
         # Снятый флаг скипает TaskGroup таблицы целиком, состояние её дельты не двигается.
         # Нужно, чтобы перелить одну сломавшуюся поставку, не гоняя весь пакет.
+        # ⏸️ У приостановленной поставки (is_paused в настройке) флаг снят по умолчанию:
+        # таск создаётся и штатно скипается, но его можно включить на один ран галкой.
         **{
             f'tbl_{tg}': Param(
-                True, type='boolean', title=f'Грузить {tbl}',
-                description='Снять — эта таблица в текущем ране пропускается: '
-                            'в ZIP и тикет не попадёт, её дельта останется на месте.',
+                not paused, type='boolean',
+                title=f"Грузить {tbl}" + (' ⏸️' if paused else ''),
+                description=('Поставка приостановлена настройкой (is_paused=1). '
+                             if paused else '')
+                            + 'Снять — эта таблица в текущем ране пропускается: '
+                              'в ZIP и тикет не попадёт, её дельта останется на месте.',
             )
-            for tg, tbl in tables.items()
+            for tg, (tbl, paused) in tables.items()
         },
     }
 
 
-def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
+def create_export_dag(dag_id: str, group: dict) -> tuple[str, DAG]:
     """🏭 Создаёт Airflow DAG на одну группу поставок — то есть на один пакет ЕР.
 
-    replica — ключ группы из Variable, он же имя в архивах и тикете
-              ('hrplatform_datalab__1'); маршрут в TFS ищется по части до первого '__'
-    group   — {schedule, description, params (групповые), tables: {extract_name: entry}}
+    dag_id — ключ группы из Variable, он же имя дага ('export_er__<реплика>__<группа>')
+             и первая часть имени выгрузки в export.extract_history
+    group  — {replica, dag_group, schedule, is_paused, description, params (групповые),
+              tables: {'схема.имя_выгрузки': entry}}
 
     Возвращает (dag_id, dag) для регистрации в globals().
     """
     from hrp_operators.clickhouse_to_s3 import HrpClickNativeToS3ListOperator # type: ignore
 
-    base = replica_base(replica)
-    if base not in TFS_MAP:
-        raise AirflowFailException(f"{replica}: базовая реплика '{base}' не найдена в TFS_MAP")
-    scen, prefix = TFS_MAP[base]
+    replica   = group['replica']
+    dag_group = norm_group(group.get('dag_group'))
+    if replica not in TFS_MAP:
+        raise AirflowFailException(f"{dag_id}: реплика '{replica}' не найдена в TFS_MAP")
+    scen, prefix = TFS_MAP[replica]
 
     gp     = get_params(group)
     tables = group.get('tables') or {}
     if not tables:
-        raise AirflowFailException(f"{replica}: в группе нет ни одной поставки")
-
-    cfgs   = {tk: _table_cfg(tk, entry, replica, prefix) for tk, entry in tables.items()}
-    dag_id = f"export_er__{replica}"
+        raise AirflowFailException(f"{dag_id}: в группе нет ни одной поставки")
 
     gcfg = {
         'dag_id':          dag_id,
         'replica':         replica,
-        'replica_base':    base,
-        'replica_group':   replica_group(replica),
+        'dag_group':       dag_group,
+        # Имя пакета в очереди отправки: тракт ТФС и пауза видят пакет именно так,
+        # и это ровно та строка, что стояла в replica до выноса группы в свою колонку.
+        'pkg_name':        f"{replica}__{dag_group}",
         'scenario':        scen,
         's3_prefix':       prefix,
         'confirm_timeout': gp['confirm_timeout'],
         'selfrun_timeout': gp['selfrun_timeout'],
-        # Соответствие «TaskGroup → имя выгрузки»: по нему групповые таски собирают XCom
-        'groups':          [c['tg'] for c in cfgs.values()],
-        'tables':          {c['tg']: c['tbl'] for c in cfgs.values()},
     }
+
+    cfgs = {tk: _table_cfg(tk, entry, gcfg) for tk, entry in tables.items()}
+    # Соответствие «TaskGroup → имя выгрузки»: по нему групповые таски собирают XCom
+    gcfg['groups'] = [c['tg'] for c in cfgs.values()]
+    gcfg['tables'] = {c['tg']: c['tbl'] for c in cfgs.values()}
+    # Все поставки на паузе — это не «человек снял все флаги», а настройка: init такой
+    # пакет не роняет, он просто весь скипается.
+    gcfg['all_paused'] = all(c['paused'] for c in cfgs.values())
+    for cfg in cfgs.values():
+        cfg['all_paused'] = gcfg['all_paused']
 
     schemas = sorted({c['schema_name'].replace(' ', '_').lower() for c in cfgs.values()})
 
     dag = DAG(
         dag_id=dag_id,
-        description=group.get('description') or f"ER: пакет {replica} ({len(cfgs)} табл.)",
+        description=(group.get('description')
+                     or f"ER: пакет {replica}/{dag_group} ({len(cfgs)} табл.)"),
         doc_md=(
-            f"### Пакет ЕР `{replica}` — {len(cfgs)} поставок, один тикет\n\n"
+            f"### Пакет ЕР `{replica}`, группа `{dag_group}` — "
+            f"{len(cfgs)} поставок, один тикет\n\n"
             f"Групповые параметры:\n```json\n{json.dumps(gp, indent=2, default=str)}\n```\n\n"
             + "\n".join(
                 f"**{tk}** — формат `{c['format']}`, стратегия `{c['strategy']}`, "
@@ -1180,8 +1216,11 @@ def create_export_dag(replica: str, group: dict) -> tuple[str, DAG]:
         schedule_interval=group['schedule'],
         max_active_tasks=int(gp['max_active_tasks']), max_active_runs=1, catchup=False,
         tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, *schemas],
-        render_template_as_native_obj=True, is_paused_upon_creation=True,
-        params=_dag_params(gp, {c['tg']: tk for tk, c in cfgs.items()}),
+        render_template_as_native_obj=True,
+        # На паузе создаётся любой новый пакет, а при is_paused в настройке паузу ещё
+        # и дожимает синк — на уже созданный даг этот флаг сам по себе не действует.
+        is_paused_upon_creation=True,
+        params=_dag_params(gp, {c['tg']: (c['tbl'], c['paused']) for c in cfgs.values()}),
         # Путь выгрузки задаётся параметром запуска, а поля оператора выставляются при
         # РАЗБОРЕ файла — подменить их можно только шаблоном. Отсюда макрос: он зовёт тот же
         # parse_s3_target, что и питоновские таски, поэтому цель у оператора, упаковки
@@ -1294,14 +1333,14 @@ def _er_config_error(replica: str, errors: list, **context):
     )
 
 
-def create_broken_dag(replica: str, errors: list, schedule=None) -> tuple[str, DAG]:
+def create_broken_dag(dag_id: str, errors: list, schedule=None) -> tuple[str, DAG]:
     """🚧 DAG-заглушка вместо пакета, который не удалось собрать.
 
     dag_id тот же, что у рабочего пакета: DAG не двоится, а подменяется — в списке сразу
     видно, что выгрузки нет. Расписание группы сохраняется, поэтому поломка продолжает
     сигналить красным раном в том же ритме, в каком должен был ходить пакет.
     """
-    dag_id = f"export_er__{replica}"
+    replica = dag_id.removeprefix('export_er__')
     dag = DAG(
         dag_id=dag_id,
         description=f"❌ Пакет сломан: {len(errors)} ошибок в настройке er_wf_meta",
@@ -1337,17 +1376,17 @@ except Exception as e:
     logger.error("Failed to load workflows: %s", e)
     workflows = {}
 
-for _replica, _group in workflows.items():
+for _dag_id, _group in workflows.items():
     # Сломанную группу подменяем заглушкой, а не роняем разбор файла: раньше одна битая
     # запись уносила ВСЕ ER-пакеты. Причины видны в описании DAG, в логе и в заметках,
     # а таск заглушки падает — молча пропущенной выгрузки не остаётся.
     try:
         if _group.get('errors'):
-            dag_id, dag_obj = create_broken_dag(_replica, _group['errors'], _group.get('schedule'))
+            dag_id, dag_obj = create_broken_dag(_dag_id, _group['errors'], _group.get('schedule'))
         else:
-            dag_id, dag_obj = create_export_dag(_replica, _group)
+            dag_id, dag_obj = create_export_dag(_dag_id, _group)
     except Exception as e:
-        logger.error("DAG generation failed for %s: %s", _replica, e)
-        dag_id, dag_obj = create_broken_dag(_replica, [f"Ошибка сборки DAG: {e}"],
+        logger.error("DAG generation failed for %s: %s", _dag_id, e)
+        dag_id, dag_obj = create_broken_dag(_dag_id, [f"Ошибка сборки DAG: {e}"],
                                             _group.get('schedule'))
     globals()[dag_id] = dag_obj

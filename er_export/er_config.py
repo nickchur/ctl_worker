@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-28 14:06 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 14:06 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
 Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров

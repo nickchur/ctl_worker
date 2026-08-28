@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-28 13:44 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 13:44 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`

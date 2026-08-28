@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-21 12:41 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 12:41 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:

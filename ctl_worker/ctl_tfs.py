@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-08-21 13:11 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-21 13:11 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 

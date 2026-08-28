@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-17 15:20 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 15:10 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -105,8 +105,17 @@ TFS_LIMITS_DEFAULT = {'sec': 10, 'min': 200, 'hour': 500, 'day': 2000}
 # 🗺️ Справочник маршрутов: всё про сценарий в одном месте — топик отправки и лимиты.
 # Топик здесь, а не у отправителя, потому что решение «в какой топик» принимается
 # по файлу в очереди, а у файла из всех признаков маршрута есть только scenario_id.
+#
+# conn/bucket/prefix — где лежат файлы маршрута. Нужны ручной досылке: она проверяет,
+# что объект ещё в бакете, и только тогда заводит новый RqUID. Забранный ТФС файл
+# переотправить нельзя — его там уже нет, и повтор вернулся бы квитанцией с ошибкой.
+# У ЕР те же значения продублированы в er_config.py (S3_CONN/BUCKET/TFS_MAP): фабрика
+# намеренно не импортирует этот модуль на уровне файла, чтобы неполная выкладка тракта
+# не роняла все пакеты разом.
 TFS_ROUTES: dict[str, dict] = {
-    'HRPLATFORM-4000': {'topic': 'TFS.HRPLT.IN', 'limits': TFS_LIMITS_DEFAULT},
+    'HRPLATFORM-4000': {'topic': 'TFS.HRPLT.IN', 'limits': TFS_LIMITS_DEFAULT,
+                        'conn': 's3-tfs-hrplt', 'bucket': 'tfshrplt',
+                        'prefix': 'from/KAP802/hrpl_lm_er'},
     'HRPLATFORM-2100': {'topic': 'TFS.HRPLT.IN',
                         'limits': {'sec': 1, 'min': 15, 'hour': 100, 'day': 500}},
     # ПКАП (альфа, TFS.PKAPHR.IN): ScenarioId ещё не выдан. Пока строки нет, его файлы
@@ -114,8 +123,31 @@ TFS_ROUTES: dict[str, dict] = {
 }
 
 # Очередь старше этого возраста (мин) роняет даг-отправитель: затор должен быть виден
-# в мониторинге, а не только в логе.
+# в мониторинге, а не только в логе. Придержанные паузой строки в этот счёт НЕ идут —
+# осознанная пауза не авария.
 TFS_QUEUE_ALERT_MIN = 60
+
+# ⏸️ Пауза отправки. Файлы продолжают вставать в очередь по расписанию, но отправитель
+# их не берёт — очередь копится, а после снятия паузы уезжает сама. Нужна на технические
+# работы, выкладку доработок и сбои на стороне ТФС: выгрузка данных длинная и дорогая,
+# останавливать её ради паузы в отправке незачем.
+#
+# Правится дагом-пультом tfs_kafka_setup; формат — три раздела, в каждом {ключ: правило}:
+#
+#   {"scenarios": {"HRPLATFORM-4000": {"until": "2026-09-01T22:00:00+03:00",
+#                                      "reason": "техработы ТФС"}},
+#    "replicas":  {"hrplatform_datalab__1": "внедрение доработок"},
+#    "packages":  {"hrplatform_datalab__1__20260828120000": "разбираемся с отказом"}}
+#
+# Правило — либо строка-причина, либо объект с until/reason/by. until обязательным не
+# сделан, но настоятельно рекомендован: забытая пауза копит очередь молча.
+PAUSE_VAR = 'tfs_snd_pause'
+PAUSE_SCOPES = ('packages', 'replicas', 'scenarios')
+
+# Сколько минут ждать квитанцию, прежде чем считать отправку неподтверждённой. Нужно
+# потому, что пакет, уехавший при снятой паузе, никто не ждёт: его wait_confirm ушёл
+# в скип (см. er_export._pre_await), и без этой сверки отказ ТФС остался бы незамеченным.
+TFS_STALE_MIN = 180
 
 # 🔒 Пул на 1 слот НА СЦЕНАРИЙ: файлы одного маршрута отправляет кто-то один. Пул своего
 # сценария берёт таск tfs_kafka_snd и обязан брать любой даг, который шлёт в ТФС МИМО
@@ -259,6 +291,223 @@ def drop_unpooled_scenarios() -> list[str]:
         known.pop(s, None)
     Variable.set(SCENARIOS_VAR, known, serialize_json=True)
     return gone
+
+
+# ── ⏸️ Пауза отправки ─────────────────────────────────────────────────────────
+
+def package_key(row: dict) -> str:
+    """🔑 Имя пакета: replica + метка пакета — 'hrplatform_datalab__1__20260828120000'.
+
+    Тем же ключом сенсор отправителя раскладывает XCom, и это не совпадение: имя пакета
+    должно быть одно на весь тракт, иначе поставленную на паузу строку пришлось бы искать
+    глазами по другому написанию того же самого.
+    """
+    digits = ''.join(c for c in str(row.get('package_ts') or '') if c.isdigit())
+    return f"{row.get('replica', '')}__{digits[:14]}"
+
+
+def _pause_raw() -> dict:
+    """Переменная паузы как есть, с гарантированными разделами. Ничего не бросает."""
+    from airflow.models import Variable
+
+    try:
+        raw = Variable.get(PAUSE_VAR, default_var={}, deserialize_json=True) or {}
+    except Exception as exc:
+        logger.warning("⚠️ %s не прочитана (%s) — считаем, что паузы нет", PAUSE_VAR, exc)
+        raw = {}
+    if not isinstance(raw, dict):
+        logger.warning("⚠️ %s содержит %s, а нужен объект — считаем, что паузы нет",
+                       PAUSE_VAR, type(raw).__name__)
+        raw = {}
+    return {scope: dict(raw.get(scope) or {}) for scope in PAUSE_SCOPES}
+
+
+def pause_rules() -> dict:
+    """⏸️ Действующие правила паузы: {'packages'|'replicas'|'scenarios': {ключ: правило}}.
+
+    Нормализует строку-причину к объекту и выбрасывает истёкшие по until. **Не бросает
+    ничего**: битая переменная означает «паузы нет», а не остановку тракта — эту функцию
+    зовёт каждый опрос отправителя.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    out: dict = {scope: {} for scope in PAUSE_SCOPES}
+
+    for scope, entries in _pause_raw().items():
+        for key, rule in entries.items():
+            if isinstance(rule, str):
+                rule = {'reason': rule}
+            if not isinstance(rule, dict):
+                logger.warning("⚠️ %s/%s/%s: правило должно быть строкой или объектом — пропущено",
+                               PAUSE_VAR, scope, key)
+                continue
+
+            until = None
+            if rule.get('until'):
+                until = parse_ts(rule['until'])
+                if until is None:
+                    logger.warning("⚠️ %s/%s/%s: until '%s' не разобран — правило пропущено",
+                                   PAUSE_VAR, scope, key, rule['until'])
+                    continue
+                if until <= now:
+                    logger.info("⌛ %s/%s/%s: пауза истекла %s — не действует",
+                                PAUSE_VAR, scope, key, rule['until'])
+                    continue
+
+            out[scope][str(key)] = {
+                'reason': str(rule.get('reason') or ''),
+                'until':  str(rule.get('until') or ''),
+                'by':     str(rule.get('by') or ''),
+            }
+    return out
+
+
+def pause_reason(row: dict, rules: dict | None = None) -> str:
+    """⏸️ Почему строка очереди стоит; пусто — ехать можно.
+
+    Порядок от частного к общему (пакет → реплика → маршрут): в сообщении должно стоять
+    самое конкретное правило, иначе «маршрут на паузе» будет написано и там, где на самом
+    деле придержан один пакет.
+    """
+    rules = pause_rules() if rules is None else rules
+    titles = {'packages': 'пакет', 'replicas': 'реплика', 'scenarios': 'маршрут'}
+
+    for scope, key in (('packages', package_key(row)),
+                       ('replicas', str(row.get('replica') or '')),
+                       ('scenarios', str(row.get('scenario_id') or ''))):
+        rule = rules.get(scope, {}).get(key) if key else None
+        if not rule:
+            continue
+        text = f"{titles[scope]} {key} на паузе"
+        if rule['until']:
+            text += f" до {rule['until']}"
+        if rule['reason']:
+            text += f" — {rule['reason']}"
+        return text
+    return ''
+
+
+def split_pending(rows: list[dict], rules: dict | None = None) -> tuple[list, list]:
+    """⏸️ Очередь надвое: (свободные, придержанные). У придержанных добавлен pause_reason.
+
+    Делить обязаны все одинаково: отправитель по этому же делению решает, что везти,
+    а проверка затора — что НЕ считать простоем.
+    """
+    rules = pause_rules() if rules is None else rules
+    free, held = [], []
+    for row in rows:
+        reason = pause_reason(row, rules)
+        (held if reason else free).append({**row, 'pause_reason': reason} if reason else row)
+    return free, held
+
+
+def pause_summary(rows: list[dict] | None = None) -> dict:
+    """📊 Что сейчас на паузе и сколько строк очереди этим придержано."""
+    rules = pause_rules()
+    summary: dict = {'rules': rules, 'held': 0, 'by_reason': {}}
+    if rows is None:
+        return summary
+
+    _, held = split_pending(rows, rules)
+    summary['held'] = len(held)
+    for row in held:
+        summary['by_reason'][row['pause_reason']] = summary['by_reason'].get(row['pause_reason'], 0) + 1
+    return summary
+
+
+def _pause_write(data: dict, note: str = '') -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from airflow.models import Variable
+
+    stamp = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')
+    Variable.set(PAUSE_VAR, {scope: data.get(scope) or {} for scope in PAUSE_SCOPES},
+                 serialize_json=True, description=f"{stamp} MSK · {note}".strip(' ·'))
+
+
+def pause_set(scope: str, key: str, until: str = '', reason: str = '', by: str = '',
+              note: str = '') -> tuple[str, str]:
+    """⏸️ Ставит правило паузы. Возвращает (status, message): 'ok' | 'skip' | 'fail'.
+
+    Статусом, а не исключением: решение «скип или падение» принимает таск пульта — там же,
+    где стоят trigger_rule и текст, который увидит человек (так же устроен store_params
+    в plugins/utils.py).
+    """
+    from datetime import datetime, timezone
+
+    if scope not in PAUSE_SCOPES:
+        return 'fail', f"область '{scope}' неизвестна, можно: {', '.join(PAUSE_SCOPES)}"
+
+    key = str(key or '').strip()
+    if not key:
+        return 'fail', 'не задан ключ — что именно ставим на паузу'
+    if scope == 'packages' and not re.fullmatch(r'.+__\d{14}', key):
+        return 'fail', (f"ключ пакета '{key}' не того вида: нужен "
+                        "'<реплика>__<14 цифр метки>', например hrplatform_datalab__1__20260828120000")
+
+    until = str(until or '').strip()
+    if until:
+        parsed = parse_ts(until)
+        if parsed is None:
+            return 'fail', f"until '{until}' не разобран; нужен ISO, например 2026-09-01T22:00:00+03:00"
+        if parsed <= datetime.now(timezone.utc):
+            return 'fail', f"until '{until}' уже прошёл — такая пауза не подействует ни секунды"
+
+    rule = {k: v for k, v in {'until': until, 'reason': str(reason or '').strip(),
+                              'by': str(by or '').strip()}.items() if v}
+    data = _pause_raw()
+    if data[scope].get(key) == (rule or {}):
+        return 'skip', f"{scope}/{key}: уже стоит с теми же параметрами"
+
+    data[scope][key] = rule
+    _pause_write(data, note)
+    if not until:
+        logger.warning("⚠️ %s/%s поставлен на паузу БЕЗ срока — очередь будет копиться, "
+                       "пока паузу не снимут руками", scope, key)
+    return 'ok', f"{scope}/{key} на паузе" + (f" до {until}" if until else " бессрочно")
+
+
+def pause_clear(scope: str, key: str, note: str = '') -> tuple[str, str]:
+    """▶️ Снимает правило паузы. (status, message), см. pause_set."""
+    if scope not in PAUSE_SCOPES:
+        return 'fail', f"область '{scope}' неизвестна, можно: {', '.join(PAUSE_SCOPES)}"
+
+    key = str(key or '').strip()
+    if not key:
+        return 'fail', 'не задан ключ — что именно снимаем с паузы'
+
+    data = _pause_raw()
+    if key not in data[scope]:
+        return 'skip', f"{scope}/{key}: такого правила нет — снимать нечего"
+
+    data[scope].pop(key)
+    _pause_write(data, note)
+    return 'ok', f"{scope}/{key} снят с паузы"
+
+
+def pause_clean_expired(note: str = '') -> tuple[str, str]:
+    """🧹 Убирает из переменной правила с прошедшим until.
+
+    Действовать они перестают и сами (pause_rules их отбрасывает), но в переменной
+    копятся и мешают читать, что на паузе прямо сейчас.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    data, gone = _pause_raw(), []
+    for scope, entries in data.items():
+        for key, rule in list(entries.items()):
+            until = rule.get('until') if isinstance(rule, dict) else None
+            parsed = parse_ts(until) if until else None
+            if parsed is not None and parsed <= now:
+                entries.pop(key)
+                gone.append(f"{scope}/{key}")
+
+    if not gone:
+        return 'skip', 'истёкших правил нет'
+    _pause_write(data, note)
+    return 'ok', 'убраны истёкшие: ' + ', '.join(gone)
 
 
 def send_budget(counts: dict[str, int], limits: dict[str, int]) -> tuple[int, str]:
@@ -1035,6 +1284,53 @@ def _s3_queue_state(rq_uids: list[str]) -> list[dict]:
     return out
 
 
+def stale_sent(minutes: int | None = None) -> list[dict]:
+    """📭 Отправленные больше `minutes` назад файлы, на которые нет квитанции.
+
+    Нужна из-за паузы: пакет, чей wait_confirm ушёл в скип, никто не ждёт, и отказ ТФС
+    по его файлам иначе остался бы незамеченным. Читает только папки сегодня/вчера —
+    те же две, что и счётчики лимитов, — поэтому объём ограничен суточной отправкой,
+    а не всем архивом, который никто не чистит.
+
+    Только S3: это источник истины тракта, зеркала могут отставать.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    minutes = TFS_STALE_MIN if minutes is None else int(minutes)
+    now = datetime.now(timezone.utc)
+    out: list[dict] = []
+
+    hook, bucket, _ = _s3_hook_key(f"{s3_base()}/queue/")
+    for day in _s3_days(now):
+        _, _, prefix = _s3_hook_key(f"{s3_base()}/queue/sent/{day}/")
+        for key in hook.list_keys(bucket_name=bucket, prefix=prefix) or []:
+            name = key.split('/')[-1].removesuffix('.json')
+            uid, _, stamp = name.partition('__')
+            try:
+                sent_at = datetime.strptime(day + stamp, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            waiting = (now - sent_at).total_seconds() / 60
+            if waiting < minutes:
+                continue
+
+            _, r_bucket, r_key = _s3_hook_key(f"{s3_base()}/receipts/{uid}.json")
+            if hook.check_for_key(key=r_key, bucket_name=r_bucket):
+                continue
+
+            row = _json.loads(hook.read_key(key=key, bucket_name=bucket))
+            out.append({
+                'rq_uid':      uid,
+                'file_name':   row.get('file_name', ''),
+                'scenario_id': row.get('scenario_id', ''),
+                'replica':     row.get('replica', ''),
+                'sent_at':     sent_at.strftime('%Y-%m-%d %H:%M:%S'),
+                'waiting_min': int(waiting),
+            })
+    return sorted(out, key=lambda r: r['sent_at'])
+
+
 # ── Выбор бэкенда ─────────────────────────────────────────────────────────────
 
 _BACKENDS = {
@@ -1089,12 +1385,45 @@ def enqueue(rows: list[dict]) -> None:
     return _write(2, rows)
 
 
+def route_s3(scenario_id: str) -> dict:
+    """🪣 Где лежат файлы маршрута: {'conn', 'bucket', 'prefix'}; пусто — не описано."""
+    route = tfs_route(scenario_id)
+    if not (route.get('conn') and route.get('bucket')):
+        return {}
+    return {'conn': route['conn'], 'bucket': route['bucket'],
+            'prefix': str(route.get('prefix') or '').strip('/')}
+
+
+def missing_in_bucket(names: list[str], scenario_id: str) -> list[str]:
+    """🔍 Имена, которых НЕТ в бакете маршрута. Маршрут без бакета — проверки нет.
+
+    Это и есть различитель «можно retry или нельзя»: файл, который ТФС уже забрал,
+    из бакета исчез, и повторная отправка вернулась бы квитанцией с ошибкой вместо
+    внятного отказа на нашей стороне. Заодно ловится опечатка в имени.
+    """
+    dst = route_s3(scenario_id)
+    if not dst:
+        logger.warning("⚠️ У маршрута %s не описан бакет — наличие файлов не проверяем", scenario_id)
+        return []
+
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+    hook = S3Hook(aws_conn_id=dst['conn'])
+    pref = f"{dst['prefix']}/" if dst['prefix'] else ''
+    return [n for n in names if not hook.check_for_key(key=f"{pref}{n}", bucket_name=dst['bucket'])]
+
+
 def enqueue_files(files: list[str], scenario_id: str, replica: str = '',
-                  dag_id: str = '', run_id: str = '') -> list[dict]:
+                  dag_id: str = '', run_id: str = '',
+                  check_exists: bool = True) -> tuple[list[dict], list[str]]:
     """📮 Ставит в очередь готовые имена файлов из S3 — ручная досылка.
 
-    RqUID генерируется здесь: по нему потом ищется обратная квитанция. Возвращает
-    поставленные строки, чтобы вызывающий мог их показать в логе и заметке.
+    Возвращает (поставленные строки, пропущенные имена). Пропускаются те, которых нет
+    в бакете маршрута: либо ТФС уже забрал файл — и тогда переотправка невозможна
+    в принципе, — либо в имени опечатка. Без этой проверки и то, и другое уезжало
+    в ТФС и возвращалось квитанцией с кодом 101/108, где причина не видна.
+
+    RqUID генерируется здесь: по нему потом ищется обратная квитанция.
 
     Досылка идёт через очередь, а не мимо неё: только так файл попадает в учёт
     лимитов маршрута и потом находится по RqUID вместе с остальными.
@@ -1107,11 +1436,16 @@ def enqueue_files(files: list[str], scenario_id: str, replica: str = '',
 
     names = [str(f).strip() for f in (files or []) if str(f).strip()]
     if not names:
-        return []
+        return [], []
 
     scenario_id = (scenario_id or '').strip()
     if not scenario_id:
         raise ValueError("Переданы файлы, но не задан scenario_id — маршрут ТФС неизвестен")
+
+    missing = missing_in_bucket(names, scenario_id) if check_exists else []
+    names = [n for n in names if n not in missing]
+    if not names:
+        return [], missing
 
     now = datetime.now(timezone.utc)
     rows = [{
@@ -1125,7 +1459,7 @@ def enqueue_files(files: list[str], scenario_id: str, replica: str = '',
     } for name in names]
 
     enqueue(rows)
-    return rows
+    return rows, missing
 
 
 def order_queue(rows: list[dict]) -> list[dict]:
@@ -1180,6 +1514,9 @@ def get_config() -> dict:
     """📦 Снимок констант модуля для передачи в DAG-файлы."""
     return {
         'CH_ID':            CH_ID,
+        'PAUSE_VAR':        PAUSE_VAR,
+        'PAUSE_SCOPES':     list(PAUSE_SCOPES),
+        'TFS_STALE_MIN':    TFS_STALE_MIN,
         'MIRRORS':          mirrors(),   # включённые зеркала; S3 обязателен и в список не входит
         'DEF_ARGS':         DEF_ARGS,
         'ENV_SPACE':        ENV_SPACE,

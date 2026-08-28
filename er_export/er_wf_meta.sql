@@ -1,5 +1,5 @@
 -- DDL для export.er_wf_meta
--- 2026-08-28 21:50 MSK · v3.1 · Чуркин Николай · nschurkin@sber.ru
+-- 2026-08-28 22:30 MSK · v3.2 · Чуркин Николай · nschurkin@sber.ru
 -- Управляющая таблица ER-выгрузок. Синхронизируется в Airflow Variable "datalab_er_wfs"
 -- DAG-ом export_er_setup, который раскладывает записи по группам поставок.
 --
@@ -178,30 +178,36 @@ ORDER BY (replica, dag_group, schema_name, extract_name);
 --        params, updated_at)
 --   SELECT
 --       -- реплика без суффикса, суффикс → в свою колонку ('' → '0')
---       splitByString('__', replica)[1]                                    AS replica,
---       if(position(replica, '__') = 0, '0',
---          substring(replica, position(replica, '__') + 2))                AS dag_group,
---       -- у строки-дефолта схема обязана быть пустой, у поставки — как была
---       if(extract_name = '', '', schema_name)                             AS schema_name,
---       extract_name, description, is_active, 0 AS is_paused,
---       pk, uk, fields, sql_from, sql_where, sql_join, sql_with, sql_settings,
+--       splitByString('__', t.replica)[1]                                  AS replica,
+--       if(position(t.replica, '__') = 0, '0',
+--          substring(t.replica, position(t.replica, '__') + 2))            AS dag_group,
+--       -- у строки-дефолта схема обнуляется, поставке — своя, иначе ГРУППОВАЯ:
+--       -- раньше schema_name наследовался, и у большинства поставок он пуст
+--       if(t.extract_name = '', '',
+--          if(t.schema_name != '', t.schema_name, g.schema_name))          AS schema_name,
+--       t.extract_name, t.description, t.is_active, 0 AS is_paused,
+--       t.pk, t.uk, t.fields, t.sql_from, t.sql_where, t.sql_join, t.sql_with, t.sql_settings,
 --       -- schedule и is_recent вливаются в params; пустые значения не добавляем
 --       jsonMergePatch(
---           if(params = '', '{}', params),
+--           if(t.params = '', '{}', t.params),
 --           concat('{', arrayStringConcat(arrayFilter(x -> x != '', [
---               if(schedule != '', concat('"schedule":"', schedule, '"'), ''),
---               if(is_recent != 0, '"is_recent":1', '')
+--               if(t.schedule != '', concat('"schedule":"', t.schedule, '"'), ''),
+--               if(t.is_recent != 0, '"is_recent":1', '')
 --           ]), ','), '}')
 --       )                                                                  AS params,
---       updated_at
---   FROM export.er_wf_meta FINAL;
+--       t.updated_at
+--   FROM export.er_wf_meta AS t FINAL
+--   LEFT JOIN (
+--       SELECT replica, schema_name FROM export.er_wf_meta FINAL WHERE extract_name = ''
+--   ) AS g ON g.replica = t.replica;
 --
 -- ⚠️ jsonMergePatch есть не на всех сборках ClickHouse — сначала проверить
 --    (SELECT jsonMergePatch('{}','{}')). Нет функции — перелить одноразовым скриптом
 --    на питоне: собрать params в json.dumps и вставить готовые значения.
--- ⚠️ Схему старых дефолтов переливка обнуляет намеренно: раньше она у них была и
---    наследовалась, теперь входит в ключ. Если у какой-то группы поставки жили БЕЗ своей
---    схемы, её надо проставить им руками — иначе синк отвергнет их как «пустой schema_name».
+-- ⚠️ JOIN на строку-дефолт — не украшение. schema_name раньше НАСЛЕДОВАЛСЯ, поэтому
+--    у большинства поставок он пуст, а теперь входит в ключ и обязателен: без раздачи
+--    групповой схемы вниз синк отвергнет их все как «пустой schema_name». Проверено
+--    на тестовом стенде 28.08.2026 — там пустой была схема у 8 поставок из 8.
 --
 --   -- сверка перед переключением
 --   SELECT count() FROM export.er_wf_meta FINAL;

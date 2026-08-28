@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-28 13:27 MSK · v3.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 21:00 MSK · v3.19 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
 `replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
@@ -128,14 +128,19 @@ def sql_cur_delta(dag_id: str, tbl: str) -> str:
             "toString(0) as recent_interval",
         ],
         "from": ("(SELECT * FROM export.extract_current_vw "
-                 f"WHERE extract_name = '{state_name(dag_id, tbl)}') as a"),
+                 f"WHERE extract_name = '{_sql_str(state_name(dag_id, tbl))}') as a"),
     })
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _fmt_val(v: Any) -> str:
-    """None → 'null', иначе → SQL-строковый литерал в одинарных кавычках."""
-    return 'null' if v is None else f"'{v}'"
+    """None → 'null', иначе → SQL-строковый литерал в одинарных кавычках.
+
+    Кавычки внутри значения удваиваются: сюда попадают поля состояния дельты, и хотя
+    сейчас это даты и числа, литерал есть литерал — одиночная кавычка ломала бы запрос
+    в месте, где причину пришлось бы искать по трассировке ClickHouse.
+    """
+    return 'null' if v is None else f"'{_sql_str(v)}'"
 
 
 def _ch_ts(dt: datetime) -> str:
@@ -293,7 +298,14 @@ def _pre_await(gcfg, context):
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
 class _ZipReader:
-    """Адаптер stream_zip (генератор байт) → file-like object для S3 multipart upload."""
+    """Адаптер stream_zip (генератор байт) → file-like object для S3 multipart upload.
+
+    ⚠️ Ветка read(-1) собирает весь поток в память — это единственное место, где стриминг
+    перестал бы быть стримингом. В нашем пути она не вызывается: load_file_obj отдаёт
+    объект в upload_fileobj, а тот читает кусками фиксированного размера. Ветка оставлена
+    ради полноты файлового интерфейса — уберёшь её, и адаптер перестанет быть file-like
+    для любого другого потребителя.
+    """
     def __init__(self, g): self._g, self._b = g, bytearray()
     def read(self, n=-1):
         if n < 0:

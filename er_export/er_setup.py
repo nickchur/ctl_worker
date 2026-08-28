@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-28 12:10 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 14:05 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -8,9 +8,14 @@
 
 ## Как пользоваться
 
-1. **Поток** — что смотрим или правим: `— только синхронизация —`, `➕ новая запись`
+Форма из двух групп: **⚙️ Общие настройки фреймворка** и **📋 Запись export.er_wf_meta**.
+Группы независимы — в одном ране можно тронуть и то, и другое, а можно ничего:
+
+1. **Патч общих настроек** — JSON с ключами из `OVERRIDABLE` (`er_config.py`);
+   пусто — только показать текущие. См. раздел «⚙️ Общие настройки» ниже.
+2. **Поток** — что смотрим или правим: `— только синхронизация —`, `➕ новая запись`
    либо ключ существующей записи из списка.
-2. **Патч** — JSON **только с теми полями, которые меняем**. Для новой записи — вся
+3. **Патч** — JSON **только с теми полями, которые меняем**. Для новой записи — вся
    запись целиком.
 
 Что из этого получится:
@@ -53,6 +58,25 @@
 **Удаление** отдельной кнопкой не сделано и не нужно: `{"is_active": 0}` выключает
 запись, а у строки-дефолта группы — весь пакет.
 
+## ⚙️ Общие настройки
+
+Константы фреймворка (`CH_ID`, `S3_CONN`, `BUCKET`, `TFS_MAP`, `LIMITS`, умолчания
+`DEFAULT_PARAMS`) читаются из Variable `datalab_er_config`, а код остаётся запасным
+вариантом. Патч меняет только перечисленные в нём ключи, `null` возвращает значение
+из кода:
+
+    {"LIMITS": {"DEV": 1000}, "DEFAULT_PARAMS": {"confirm_timeout": 90}}
+
+Таск `config` проверяет патч строго: неизвестный ключ, чужой тип, `TFS_MAP` не парой
+`["ScenarioId", "префикс"]`, нецелой `LIMITS` — ран красный, переменная не тронута.
+На разборе файла те же ошибки только предупреждают: ронять все пакеты ЕР из-за настройки
+нельзя, а здесь за экраном человек.
+
+⏳ **Применяется со следующего разбора файла** (~30 секунд): константы читаются на
+парсинге. Синк в этом же ране работает ещё со старым снимком и, скорее всего, уйдёт
+в скип по контрольной сумме — а когда снимок обновится, сумма разойдётся сама и
+следующий синк пересоберёт пакеты. Форсировать ничего не нужно.
+
 ## Что делает проверка
 
 Собирает запрос **тем же кодом, что и выгрузка** (`er_config.export_sql`), подставляет
@@ -83,8 +107,9 @@
 
 ## Где смотреть результаты
 
-Полностью — в логе и в XCom: `before` (состояние до), `check` (запрос, колонки, `.meta`,
-ошибки), `after` (состояние после), у синхронизации — `errors`, `warnings`, `summary`.
+Полностью — в логе и в XCom: `config_before` / `config_after` (общие настройки),
+`before` (состояние записи до), `check` (запрос, колонки, `.meta`, ошибки), `after`
+(состояние после), у синхронизации — `errors`, `warnings`, `summary`.
 В заметках только короткие итоги: `add_note` режет их до 1000 символов.
 
 Правка существующей записи — это **вставка новой версии**: `ReplacingMergeTree` схлопнет
@@ -110,7 +135,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
@@ -145,6 +170,9 @@ POOL_NAME      = _cfg['POOL_NAME']
 POOL_SLOTS     = _cfg['POOL_SLOTS']
 TS_POOL_SLOTS  = _cfg['TS_POOL_SLOTS']
 TFS_MAP        = _cfg['TFS_MAP']
+CFG_VAR_NAME   = _cfg['CFG_VAR_NAME']
+OVERRIDABLE    = _cfg['OVERRIDABLE']
+OVERRIDES      = _cfg['OVERRIDES']
 DEFAULT_PARAMS = _cfg['DEFAULT_PARAMS']
 GROUP_PARAMS   = _cfg['GROUP_PARAMS']
 FORMAT_MAP     = _cfg['FORMAT_MAP']
@@ -156,6 +184,10 @@ TABLE = 'export.er_wf_meta'
 # Пункты выпадающего списка, которые не являются ключами записей.
 NONE = '— только синхронизация —'
 NEW  = '➕ новая запись'
+
+# Группы полей формы запуска (Param(section=…)).
+SEC_CONFIG = '⚙️ Общие настройки фреймворка'
+SEC_RECORD = '📋 Запись export.er_wf_meta'
 
 # Пул намеренно не POOL_NAME: настройка не должна занимать слоты выгрузок.
 SETUP_POOL = 'default_pool'
@@ -282,6 +314,51 @@ def merge_patch(base: dict, patch: dict) -> dict:
             f"Допустимы: {sorted(COLUMNS)}"
         )
     return {**COLUMNS, **base, **patch}
+
+
+def _check_config_patch(patch: dict) -> list[str]:
+    """🔍 Проверяет патч общих настроек. Возвращает список причин отказа.
+
+    Тип сверяется с ИТОГОВЫМ значением (снимок конфига), а не с кодом: снимок уже
+    содержит переопределения, и типы у них те же — иначе значение не применилось бы.
+    Составные ключи проверяем поэлементно: TFS_MAP и LIMITS уезжают в фабрику, где
+    их битое содержимое роняет разбор файла у всех пакетов сразу.
+    """
+    errors: list[str] = []
+    for key, val in patch.items():
+        if key not in OVERRIDABLE:
+            errors.append(f"'{key}' не переопределяется. Можно: {', '.join(OVERRIDABLE)}")
+            continue
+        if val is None:                        # null = вернуть значение из кода
+            continue
+
+        current = _cfg.get(key)
+        if isinstance(current, bool) or not isinstance(val, type(current)):
+            errors.append(f"{key}: ожидался {type(current).__name__}, пришёл {type(val).__name__}")
+            continue
+
+        if key == 'TFS_MAP':
+            bad = [k for k, v in val.items()
+                   if not isinstance(v, (list, tuple)) or len(v) != 2
+                   or not all(isinstance(x, str) for x in v)]
+            if bad:
+                errors.append(f"TFS_MAP: у реплик {bad} значение должно быть парой "
+                              '["ScenarioId", "префикс в S3"]')
+        elif key == 'LIMITS':
+            bad = [k for k, v in val.items() if not isinstance(v, int) or isinstance(v, bool)]
+            if bad:
+                errors.append(f"LIMITS: у стендов {bad} лимит должен быть целым числом")
+        elif key == 'DEFAULT_PARAMS':
+            for name, value in val.items():
+                if name not in DEFAULT_PARAMS:
+                    errors.append(f"DEFAULT_PARAMS: параметра '{name}' нет; "
+                                  f"допустимы {sorted(DEFAULT_PARAMS)}")
+                elif isinstance(DEFAULT_PARAMS[name], bool) or not isinstance(
+                        value, type(DEFAULT_PARAMS[name])):
+                    errors.append(f"DEFAULT_PARAMS.{name}: ожидался "
+                                  f"{type(DEFAULT_PARAMS[name]).__name__}, "
+                                  f"пришёл {type(value).__name__}")
+    return errors
 
 
 def row_diff(base: dict, merged: dict) -> dict:
@@ -606,9 +683,22 @@ def _group_row(hook, replica: str) -> dict:
     is_paused_upon_creation=False,
     doc_md=__doc__ + "\n\n### ⚙️ Конфигурация\n\n```\n"
            + json.dumps(_doc_cfg, indent=4, default=str) + "\n```",
+    # Поля формы разложены по двум группам (Param(section=…)): сначала общие настройки
+    # фреймворка, затем правка записей er_wf_meta. Поля без секции Airflow рисует выше
+    # секционированных, поэтому секция есть у всех — иначе порядок разъедется.
     params={
+        'config_patch': Param(
+            {}, type='object', title='Патч общих настроек',
+            section=SEC_CONFIG,
+            description=(
+                'JSON только с изменяемыми ключами; null возвращает значение из кода. '
+                f'Можно менять: {", ".join(OVERRIDABLE)}. Пусто — только показать текущие. '
+                'Применяется со СЛЕДУЮЩЕГО разбора файла: константы читаются на парсинге.'
+            ),
+        ),
         'record': Param(
             NONE, type='string', title='Поток',
+            section=SEC_RECORD,
             description='Что смотрим или правим. Список берётся из Variable '
                         'datalab_er_wf_meta и обновляется после каждой синхронизации.',
             # Именно enum, а не examples: examples на строковом параметре Airflow рендерит
@@ -618,25 +708,89 @@ def _group_row(hook, replica: str) -> dict:
         ),
         'patch': Param(
             {}, type='object', title='Патч',
+            section=SEC_RECORD,
             description='JSON только с изменяемыми полями. Для новой записи — вся запись. '
                         'Выключить запись: {"is_active": 0}. Оставить пустым — просмотр: '
                         'запись показывается и проверяется, но не меняется. '
-                        'У строки-дефолта группы (extract_name пуст) db_name обязан быть '
-                        'равен replica — иначе дефолты всех групп схлопнутся в одну строку.',
+                        'Расписание группы живёт в params строки-дефолта: '
+                        '{"params": "{\\"schedule\\": \\"30 2 * * *\\"}"}.',
         ),
         'force_write': Param(
             False, type='boolean', title='Записать несмотря на проверку',
+            section=SEC_RECORD,
             description='Сохранить правку, даже если проверка SQL не прошла. Для случаев, '
                         'когда виновата не запись: источник недоступен, таблица ещё не создана.',
         ),
         'force_sync': Param(
             False, type='boolean', title='Синхронизировать принудительно',
+            section=SEC_RECORD,
             description='Не смотреть на контрольную сумму. Нужно, если Variable правили '
                         'руками.',
         ),
     },
 )
 def er_setup_dag():
+
+    @task(task_id="config", pool=SETUP_POOL)
+    def config(**context) -> dict:
+        """⚙️ Показывает общие настройки фреймворка и правит их в Variable.
+
+        Пустой патч — просмотр: по каждому переопределяемому ключу видно итоговое значение
+        и то, что задано в переменной. Непустой — проверка и запись.
+
+        Проверяем строго, в отличие от чтения на разборе файла: там неизвестный ключ только
+        предупреждает (ронять все пакеты ЕР из-за настройки нельзя), а здесь за экраном
+        человек, и молча проглоченная опечатка означала бы «поправил и не применилось».
+
+        ⚠️ Правка применяется со СЛЕДУЮЩЕГО разбора файла: константы читаются на парсинге.
+        Синк в этом же ране работает ещё со старым снимком конфига и, скорее всего, уйдёт
+        в скип по контрольной сумме — а через полминуты снимок изменится, сумма разойдётся,
+        и следующий синк соберёт пакеты уже по новым настройкам.
+        """
+        from airflow.models import Variable
+
+        patch = context['params'].get('config_patch') or {}
+        if isinstance(patch, str):
+            patch = json.loads(patch)
+
+        shown = {key: {'итог': _cfg.get(key), 'в переменной': OVERRIDES.get(key, '—')}
+                 for key in OVERRIDABLE}
+        context['ti'].xcom_push(key='config_before', value=_dump(shown))
+        logger.info("⚙️ Общие настройки (%s):\n%s", CFG_VAR_NAME, _dump(shown))
+
+        if not patch:
+            add_note({f"⚙️ Общие настройки · {CFG_VAR_NAME}":
+                      {k: repr(v['итог']) for k, v in shown.items()}},
+                     level='task,dag', context=context, title='⚙️ er_setup')
+            raise AirflowSkipException(
+                "Патч общих настроек пуст — только показ. Чтобы править, заполните "
+                'поле «Патч общих настроек», например {"LIMITS": {"DEV": 1000}}'
+            )
+
+        errors = _check_config_patch(patch)
+        if errors:
+            raise AirflowFailException(
+                f"Патч общих настроек не принят, {CFG_VAR_NAME} не тронута:\n"
+                + "\n".join(f"  • {e}" for e in errors)
+            )
+
+        # null удаляет переопределение — значение возвращается к тому, что в коде
+        new = {k: v for k, v in {**OVERRIDES, **patch}.items() if v is not None}
+        if new == OVERRIDES:
+            raise AirflowSkipException("Патч ничего не меняет — в переменной уже это")
+
+        stamp = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')
+        Variable.set(CFG_VAR_NAME, new, serialize_json=True,
+                     description=f"{stamp} MSK · {context['dag_run'].run_id}")
+
+        diff = {k: f"{OVERRIDES.get(k, '∅')!r} → {v!r}" for k, v in patch.items()}
+        context['ti'].xcom_push(key='config_after', value=_dump(new))
+        logger.info("✅ %s обновлена:\n%s", CFG_VAR_NAME, _dump(diff))
+        add_note({f"⚙️ Общие настройки изменены · {CFG_VAR_NAME}": diff},
+                 level='task,dag', context=context, title='⚙️ er_setup')
+        logger.warning("⏳ Новые значения применятся со следующего разбора файла (~30 сек), "
+                       "тогда же разойдётся контрольная сумма и синк пересоберёт пакеты")
+        return diff
 
     @task(task_id="prepare", pool=SETUP_POOL)
     def prepare(**context) -> dict:
@@ -1042,7 +1196,11 @@ def er_setup_dag():
                 "Полный список — в логе и в XCom 'errors'"
             )
 
-    apply(check(prepare())) >> sync()
+    # Ветка настроек идёт ПАРАЛЛЕЛЬНО разбору записи, а не перед ним: таск config штатно
+    # скипает себя (показ без правки), и стоя он выше по цепочке утянул бы в скип всё
+    # остальное. Синк с trigger_rule='none_failed' переживает скип обеих веток — ран
+    # «только синхронизация» выглядит именно так.
+    [config(), apply(check(prepare()))] >> sync()
 
 
 er_setup_dag()  # вызов регистрирует DAG в globals() через декоратор @dag

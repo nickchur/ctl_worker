@@ -1,7 +1,11 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-28 11:45 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 13:40 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
+CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
+Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
+(список OVERRIDABLE). Правятся они формой `export_er_setup`, первой группой полей;
+код при этом остаётся запасным вариантом, а null в переменной возвращает значение из него.
+Применяется правка со следующего разбора файла.
 
 Поведение на стенде управляется ENV_STAND, при её отсутствии — ENVIRONMENT
 (PROM / UAT / QA / IFT / DEV).
@@ -61,14 +65,84 @@ RAW_VAR_NAME = "datalab_er_wf_meta"
 # подробности в er_setup.py, функция wf_checksum. Удалить переменную = пересчитать всё.
 CKSUM_VAR_NAME = "datalab_er_wf_hash"
 
-CH_ID   = 'dlab-click'
-S3_CONN = 's3-tfs-hrplt'
+logger = logging.getLogger("airflow.task")
 
-BUCKET = 'tfshrplt'
+# ── ⚙️ Общие настройки фреймворка ────────────────────────────────────────────
+#
+# Код задаёт запасной вариант, переменная — рабочий: та же механика, что у
+# tools-чистильщиков. Правится из формы export_er_setup (первая группа полей), значение
+# null возвращает значение из кода.
+#
+# Переопределяются ТОЛЬКО ключи из OVERRIDABLE. Остальное живёт в коде осознанно:
+# DEF_ARGS содержит функции; FORMAT_MAP, TYPE_MAP, EXTRA_PRE/SUF и HIVE_RESERVED — это
+# контракт обмена с КАП, а не настройка стенда; TS_POOL_SLOTS обязан быть 1 по устройству
+# пула меток времени; POOL_SLOTS не берём, потому что ensure_pool существующий пул
+# не трогает — правка выглядела бы применённой, не будучи ею.
+CFG_VAR_NAME = "datalab_er_config"
 
-# 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
+OVERRIDABLE = ('CH_ID', 'S3_CONN', 'BUCKET', 'TFS_MAP', 'LIMITS', 'DEFAULT_PARAMS')
+
+
+def cfg_overrides() -> dict:
+    """📥 Переопределения общих настроек из Variable; при любой беде — пустой словарь.
+
+    Читается НА РАЗБОРЕ ФАЙЛА, поэтому не бросает вообще ничего: недоступная метабаза
+    или битый JSON должны означать «работаем по коду», а не Broken DAG у всех пакетов ЕР.
+    Неизвестные ключи только предупреждают — в форме er_setup тот же случай ошибка,
+    там за экраном человек.
+    """
+    from airflow.models import Variable
+
+    try:
+        raw = Variable.get(CFG_VAR_NAME, default_var={}, deserialize_json=True) or {}
+    except Exception as exc:
+        logger.warning("⚠️ %s не прочитана (%s) — общие настройки берём из кода", CFG_VAR_NAME, exc)
+        return {}
+
+    if not isinstance(raw, dict):
+        logger.warning("⚠️ %s содержит %s, а нужен объект {ключ: значение} — берём код",
+                       CFG_VAR_NAME, type(raw).__name__)
+        return {}
+
+    if unknown := [k for k in raw if k not in OVERRIDABLE]:
+        logger.warning("⚠️ %s: ключи %s не переопределяются, пропущены. Можно: %s",
+                       CFG_VAR_NAME, unknown, list(OVERRIDABLE))
+    return raw
+
+
+_OVR = cfg_overrides()
+
+
+def _ovr(key: str, default):
+    """Значение настройки: из переменной, если оно там есть и того же типа, иначе из кода.
+
+    Тип сверяется с тем, что написано в коде: строка вместо словаря в TFS_MAP уронила бы
+    разбор файла у всех пакетов сразу, а такой ценой настройка из UI не стоит ничего.
+    """
+    if key not in _OVR or _OVR[key] is None:      # null = вернуть значение из кода
+        return default
+    value = _OVR[key]
+    if isinstance(default, bool) or not isinstance(value, type(default)):
+        logger.warning("⚠️ %s.%s: ожидался %s, пришёл %s — беру значение из кода",
+                       CFG_VAR_NAME, key, type(default).__name__, type(value).__name__)
+        return default
+    return value
+
+
+CH_ID   = _ovr('CH_ID',   'dlab-click')
+S3_CONN = _ovr('S3_CONN', 's3-tfs-hrplt')
+
+BUCKET = _ovr('BUCKET', 'tfshrplt')
+
+# 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS.
+# Из переменной пара приезжает списком (в JSON кортежей нет) — приводим к кортежу, чтобы
+# распаковка `scen, prefix = TFS_MAP[base]` работала одинаково с обоими источниками.
 TFS_MAP = {
-    "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
+    key: tuple(val)
+    for key, val in _ovr('TFS_MAP', {
+        "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
+    }).items()
+    if isinstance(val, (list, tuple)) and len(val) == 2
 }
 
 POOL_NAME   = 'datalab_export_er'
@@ -79,8 +153,6 @@ POOL_SLOTS  = 20
 # групп совпали бы именем (суффикс группы в имя тикета не входит). Имя пула собирает
 # ts_pool(), слот ровно один — увеличение слотов ломает саму цель пула.
 TS_POOL_SLOTS = 1
-
-logger = logging.getLogger("airflow.task")
 
 
 DEF_ARGS = {
@@ -96,11 +168,15 @@ DEF_ARGS = {
 
 # 🔢 Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
 LIMITS = {
-    "PROM": 0,
-    "UAT":  100,
-    "QA":   100,
-    "IFT":  100,
-    "DEV":  100,
+    key: int(val)
+    for key, val in _ovr('LIMITS', {
+        "PROM": 0,
+        "UAT":  100,
+        "QA":   100,
+        "IFT":  100,
+        "DEV":  100,
+    }).items()
+    if isinstance(val, int) and not isinstance(val, bool)
 }
 
 TYPE_MAP: dict[str, str] = {
@@ -241,7 +317,28 @@ TABLE_PARAMS: dict = {
     'descriptions':      {},
 }
 
-DEFAULT_PARAMS: dict = {**GROUP_PARAMS, **TABLE_PARAMS}
+def _param_overrides() -> dict:
+    """Умолчания параметров из переменной: только известные ключи и только те же типы.
+
+    По ключам, а не целиком: переопределяют обычно одно-два значения, и полный словарь
+    в переменной означал бы, что каждый новый параметр в коде надо не забыть дописать
+    и туда — то есть однажды не дописать.
+    """
+    known = {**GROUP_PARAMS, **TABLE_PARAMS}
+    over  = _ovr('DEFAULT_PARAMS', {})
+    out   = {}
+    for key, val in over.items():
+        if key not in known:
+            logger.warning("⚠️ %s.DEFAULT_PARAMS: ключ '%s' неизвестен, пропущен", CFG_VAR_NAME, key)
+        elif isinstance(val, bool) or not isinstance(val, type(known[key])):
+            logger.warning("⚠️ %s.DEFAULT_PARAMS.%s: ожидался %s, пришёл %s — беру код",
+                           CFG_VAR_NAME, key, type(known[key]).__name__, type(val).__name__)
+        else:
+            out[key] = val
+    return out
+
+
+DEFAULT_PARAMS: dict = {**GROUP_PARAMS, **TABLE_PARAMS, **_param_overrides()}
 
 # 🔤 Поддерживаемые форматы выгрузки. Ключ — имя формата ClickHouse (как его пишут в params),
 # значение — как этот формат прокинуть в оператор и как назвать файл.
@@ -1118,8 +1215,16 @@ def probe_sql(sql: str) -> str:
 
 
 def get_config() -> dict:
-    """📦 Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта."""
+    """📦 Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта.
+
+    Снимок берётся УЖЕ с переопределениями из Variable — на нём же считается контрольная
+    сумма синхронизации (er_setup.wf_checksum), поэтому правка общих настроек сама
+    вызывает пересборку пакетов, без отдельного форс-синка.
+    """
     return {
+        'CFG_VAR_NAME':    CFG_VAR_NAME,
+        'OVERRIDABLE':     list(OVERRIDABLE),
+        'OVERRIDES':       _OVR,
         'CH_ID':           CH_ID,
         'TYPE_MAP':        TYPE_MAP,
         'DEF_ARGS':        DEF_ARGS,

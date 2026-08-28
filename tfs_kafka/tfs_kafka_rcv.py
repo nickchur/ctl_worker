@@ -1,5 +1,5 @@
 """📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
-*2026-08-28 21:00 MSK · v2.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 14:02 MSK · v2.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
 и сопоставляется с отправкой по `RqUID`. Результат передачи — в `File/Status/StatusCode`,

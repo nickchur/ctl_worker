@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-28 18:10 MSK · v3.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 13:27 MSK · v3.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
 `replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
@@ -247,11 +247,35 @@ def _format_cur_state(cur: dict) -> dict:
     }
 
 
-def _pre_await(context):
-    """Пропускает ожидание подтверждения: auto_confirm=True, notify_kafka=False или пакет пуст.
+def _pause_reason(gcfg: dict, context) -> str:
+    """⏸️ Причина, по которой файлы этого пакета сейчас придержаны в очереди; пусто — едут.
+
+    Строка собирается той же формы, что лежит в очереди отправки, — тогда правило паузы
+    ищется общим кодом тракта (tfs_utils.pause_reason), и «пакет на паузе» здесь и у
+    отправителя означает ровно одно и то же.
+    """
+    return _tfs().pause_reason({
+        'scenario_id': gcfg['scenario'],
+        # Именно pkg_name (реплика + группа), а НЕ голая реплика: ровно эта строка лежит
+        # в очереди отправки, и по ней же считается ключ пакета. Возьми мы здесь replica —
+        # правило паузы, поставленное на пакетный даг, отправитель бы видел, а ожидание
+        # квитанций нет, и пакет досидел бы до таймаута.
+        'replica':     gcfg['pkg_name'],
+        'package_ts':  _pkg_ts(context).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+    })
+
+
+def _pre_await(gcfg, context):
+    """Пропускает ожидание подтверждения: auto_confirm, notify_kafka=0, пустой пакет или пауза.
 
     Вызывается первым делом в wait_confirm — так один таск заменяет
     EmptyOperator/ожидание switch.
+
+    ⏸️ Пауза отправки: ждать квитанцию по файлу, который никуда не поедет, бессмысленно —
+    час занятого слота в пуле выгрузок и красный ран в конце. Уходим в скип, а
+    save_status при этом отработает с confirmed = null: дельта двигается, следующий цикл
+    взводится, пакет уедет, когда паузу снимут. Цена — квитанции по нему никто не ждёт;
+    ловит их сверка неподтверждённых в tfs_kafka_snd (stale_sent).
     """
     p = context['params']
     if p.get('auto_confirm', False):
@@ -261,6 +285,11 @@ def _pre_await(context):
     summary_tkt = context['ti'].xcom_pull(task_ids="make_summary", key='summary_tkt_name')
     if not summary_tkt:
         raise AirflowSkipException("No data exported, skipping wait")
+
+    if reason := _pause_reason(gcfg, context):
+        add_note({"⏸️ Отправка на паузе": reason}, level='task,dag', context=context,
+                 title='📨 TFS confirm')
+        raise AirflowSkipException(f"Отправка на паузе, квитанций не ждём: {reason}")
 # ── Tasks ───────────────────────────────────────────────────────────────────
 
 class _ZipReader:
@@ -788,10 +817,16 @@ def _er_wait_confirm(gcfg, **context):
 
     Любой status_code != 0 роняет таск сразу, не дожидаясь остальных файлов: пакет уже
     не доедет целиком, ждать бессмысленно.
+
+    ⏸️ Паузу отправки смотрим ДВАЖДЫ и оба раза вне цикла: на входе (ждать нечего, файлы
+    никуда не поедут) и по истечении таймаута (тогда это скип, а не падение). Внутри цикла
+    не смотрим намеренно: пауза, поставленная и снятая за то же окно, пакета не касается —
+    файлы уедут, квитанции придут, — а проверка в цикле погасила бы такой пакет на ровном
+    месте. Заодно это два чтения Variable на таск вместо сотен.
     """
     import time
 
-    _pre_await(context)  # auto_confirm / notify_kafka / нет данных → skip
+    _pre_await(gcfg, context)  # auto_confirm / notify_kafka / нет данных / пауза → skip
 
     rq_uids = context['ti'].xcom_pull(task_ids="make_summary", key='rq_uids') or []
     if not rq_uids:
@@ -832,7 +867,17 @@ def _er_wait_confirm(gcfg, **context):
             break
         time.sleep(10)
 
-    # Таймаут. Различаем два диагноза: очередь стоит или ТФС молчит — лечатся они разно.
+    # Таймаут. Сначала пауза: если её поставили, пока мы ждали, это не авария, а решение
+    # человека — уходим в скип, как если бы она стояла на входе.
+    if reason := _pause_reason(gcfg, context):
+        add_note({"⏸️ Отправка на паузе": f"{reason}; квитанций нет, ждать перестали"},
+                 level='task,dag', context=context, title='📨 TFS confirm')
+        raise AirflowSkipException(
+            f"Квитанций нет за {timeout} мин, но отправка на паузе: {reason}"
+        )
+
+    # Дальше — настоящий таймаут. Различаем два диагноза: очередь стоит или ТФС молчит,
+    # лечатся они по-разному.
     missing = list(set(rq_uids) - {r['rq_uid'] for r in got})
     queued  = _tfs().queue_state(missing)
     not_sent  = [r['file_name'] for r in queued if r['pending']]

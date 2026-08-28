@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-28 17:20 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 21:40 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
 Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
@@ -566,6 +566,60 @@ def explicit_schedule(row: dict) -> str:
     return str(params.get('schedule') or '').strip()
 
 
+# 🔤 Маска имени, из которого строятся файлы, ключи и SQL-литералы: буквы, цифры,
+# одиночное подчёркивание и дефис. Проверяются replica, dag_group, schema_name
+# и extract_name — все четыре части ключа таблицы.
+_SAFE_NAME = re.compile(r'[A-Za-z0-9_-]+')
+
+
+def check_name(value, field: str, key: str, errors: list[str]) -> bool:
+    """🔤 Проверяет часть имени пакета/поставки. Возвращает False и пишет причину в errors.
+
+    Запрещено ровно две вещи, и обе — не вкусовщина:
+
+    * **двойное подчёркивание** — это РАЗДЕЛИТЕЛЬ в именах файлов ЕР:
+      `{replica}__{ts}__{dag_group}__{table}__{часть}_{всего}_{строк}.zip`
+      и `{schema}__{table}__{ts}__…` для данных и `.meta`. Лишнее `__` внутри любой
+      части сдвигает разбор у принимающей стороны — она режет имя по этому же
+      разделителю, и файл уедет «не тем», молча;
+    * **всё, кроме букв, цифр, `_` и `-`** — точка разделяет части в ключе выгрузки
+      внутри пакета (`схема.имя`) и в имени состояния дельты (`<dag_id>.<extract_name>`),
+      слэш разделяет части ключа записи (`replica/dag_group/schema/extract`), кавычка
+      ломает SQL-литерал, пробел — ключ объекта в S3.
+
+    Одиночное подчёркивание разрешено: в хвосте имени файла (`_{всего}_{строк}`)
+    разделитель как раз одинарный, и внутри имени он неоднозначности не создаёт.
+    """
+    value = str(value or '')
+    if not value:
+        errors.append(f"{key}: пустой {field}")
+        return False
+    if not _SAFE_NAME.fullmatch(value):
+        bad = sorted({c for c in value if not _SAFE_NAME.fullmatch(c)})
+        errors.append(
+            f"{key}: {field} = '{value}' содержит {bad} — допустимы только буквы, цифры, "
+            "'_' и '-'. Точка, слэш, пробел и кавычка разъезжаются с ключами записи, "
+            "именем состояния дельты и ключом объекта в S3"
+        )
+        return False
+    if '__' in value:
+        errors.append(
+            f"{key}: {field} = '{value}' содержит '__' — это разделитель в именах файлов ЕР "
+            "({реплика}__{ts}__{группа}__{таблица}__{часть}_{всего}_{строк}.zip), и лишний "
+            "он сдвинет разбор имени на принимающей стороне"
+        )
+        return False
+    return True
+
+
+def check_group_names(replica: str, dag_group, errors: list[str]) -> bool:
+    """🔤 Проверяет имена частей ПАКЕТА — их достаточно проверить раз на группу."""
+    name = f"группа {replica}/{norm_group(dag_group)}"
+    ok_rep = check_name(replica, 'replica', name, errors)
+    ok_grp = check_name(norm_group(dag_group), 'dag_group', name, errors)
+    return ok_rep and ok_grp
+
+
 def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
     """Проверяет строку-поставку. Непрошедшая запись ломает всю группу, причина — в errors.
 
@@ -576,16 +630,16 @@ def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
         errors.append(f"{key}: пустой sql_from")
         return False
 
+    # Схема и имя выгрузки уезжают в имена файлов данных и .meta и в ключи записи —
+    # проверяем их той же маской, что и части пакета.
+    if not check_name(row.get("schema_name"), 'schema_name', key, errors):
+        return False
+    if not check_name(row.get("extract_name"), 'extract_name', key, errors):
+        return False
+
     replica = row.get("replica", "")
     if replica not in TFS_MAP:
         errors.append(f"{key}: реплика '{replica}' не найдена в TFS_MAP")
-        return False
-
-    # Схема входит в ключ таблицы и не наследуется — у каждой поставки она своя.
-    # Без неё фабрика падает на schema_name.replace(), а падение при разборе файла
-    # уносит с собой ВСЕ пакеты, а не только этот.
-    if not row.get("schema_name"):
-        errors.append(f"{key}: пустой schema_name — целевая схема .meta задаётся у каждой поставки")
         return False
 
     # Состав полей задаётся только настройкой: иначе новая колонка источника уехала бы

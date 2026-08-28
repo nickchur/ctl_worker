@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-08-28 17:40 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 21:40 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -152,7 +152,7 @@ try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         dag_id_for, norm_group, ts_pool, update_dag_pause,
-        ch_error, clean_row, parse_params, explicit_schedule, check_table,
+        ch_error, clean_row, parse_params, explicit_schedule, check_table, check_group_names,
         raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
         check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
         merge_params, probe_sql, query_columns, sql_sources, unnamed_fields, valid_schedule,
@@ -161,7 +161,7 @@ except ImportError:
     from er_export.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         dag_id_for, norm_group, ts_pool, update_dag_pause,
-        ch_error, clean_row, parse_params, explicit_schedule, check_table,
+        ch_error, clean_row, parse_params, explicit_schedule, check_table, check_group_names,
         raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
         check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
         merge_params, probe_sql, query_columns, sql_sources, unnamed_fields, valid_schedule,
@@ -512,6 +512,11 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
     schedules, fallbacks = {}, {}
     for gkey in {(r["replica"], r["dag_group"]) for r in tables}:
         grp_row = defaults.get(gkey)
+
+        # Имена частей пакета проверяем ЗДЕСЬ, а не в check_table: они одни на группу,
+        # и проверка внутри цикла по поставкам написала бы одну и ту же причину столько
+        # раз, сколько в пакете таблиц.
+        check_group_names(gkey[0], gkey[1], errors.setdefault(gkey, []))
         fallbacks[gkey] = next(
             (s for s in (explicit_schedule(r) for r in tables
                          if (r["replica"], r["dag_group"]) == gkey) if s), ''
@@ -898,6 +903,8 @@ def er_setup_dag():
         group_name = f"{merged['replica']}/{norm_group(merged.get('dag_group'))}"
         if not merged['replica']:
             errors.append("пустая replica — по ней строится ключ записи и имя пакета")
+        elif not check_group_names(merged['replica'], merged.get('dag_group'), errors):
+            pass                       # причина уже в errors, дальше проверять нечего
         elif merged['extract_name']:
             grp_row = _group_row(hook, merged['replica'], merged.get('dag_group'))
             if not grp_row:
@@ -952,6 +959,7 @@ def er_setup_dag():
         if not merged['extract_name']:
             # Строка-дефолт группы: SQL у неё нет физически — проверяем то, что есть.
             result['kind'] = 'группа'
+            check_group_names(merged['replica'], merged.get('dag_group'), errors)
             bad_json = False
             if merged.get('params'):
                 try:
@@ -980,6 +988,7 @@ def er_setup_dag():
         else:
             info = wf_entry(merged, _group_row(hook, merged['replica'], merged.get('dag_group')))
             result['kind'] = 'поставка'
+            check_group_names(merged['replica'], merged.get('dag_group'), errors)
             check_table(info['row'], info['key'], errors, info['params'])
 
             # Расписание и групповые параметры у поставки игнорируются — предупреждаем

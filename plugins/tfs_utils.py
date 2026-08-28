@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-28 15:10 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 19:30 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -925,7 +925,7 @@ def _ch_pending() -> list[dict]:
     # FINAL обязателен: отправленная строка дописывается второй версией, без схлопывания
     # уже ушедший файл уехал бы повторно.
     return get_dict_from_ch(_ch_hook(), f"""
-        SELECT rq_uid, file_name, replica, scenario_id, package_ts, created_at
+        SELECT rq_uid, file_name, replica, scenario_id, package_ts, dag_id, run_id, created_at
         FROM {SENT_FILES_TABLE} FINAL
         WHERE notified_at = toDateTime64(0, 3)
         ORDER BY package_ts, created_at
@@ -933,10 +933,17 @@ def _ch_pending() -> list[dict]:
 
 
 def _ch_mark_sent(rq_uid: str) -> None:
+    # dag_id и run_id перечислены наравне с остальным не для красоты: отметка отправки —
+    # это ДОПИСАННАЯ версия строки, а ReplacingMergeTree по ключу rq_uid оставляет
+    # последнюю. Пропусти их здесь — и у каждого отправленного файла оба поля станут
+    # пустыми, хотя при постановке в очередь были записаны (в Postgres-зеркале они
+    # перечислены, в S3 объект переносится целиком, так что расходился только ClickHouse).
     _ch_hook().execute(f"""
         INSERT INTO {SENT_FILES_TABLE}
-            (rq_uid, file_name, replica, scenario_id, package_ts, created_at, notified_at)
-        SELECT rq_uid, file_name, replica, scenario_id, package_ts, created_at, now64(3)
+            (rq_uid, file_name, replica, scenario_id, package_ts, dag_id, run_id,
+             created_at, notified_at)
+        SELECT rq_uid, file_name, replica, scenario_id, package_ts, dag_id, run_id,
+               created_at, now64(3)
         FROM {SENT_FILES_TABLE} FINAL WHERE rq_uid = '{_sql_str(rq_uid)}'
     """)
 

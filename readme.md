@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-08-31 15:39 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-31 18:22 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -134,10 +134,10 @@ CTL.<profile>.sensor
 | `er_export/` | `openspec/specs/er-export/spec.md` | полная |
 | `tfs_kafka/` | `openspec/specs/tfs-kafka/spec.md` | полная |
 | `xs_export/` | `openspec/specs/xs-export/spec.md` | заготовка |
-| `tools/` | `openspec/specs/tools/spec.md` | заготовка |
-| `check/` | `openspec/specs/check/spec.md` | заготовка |
+| `tools/` | `openspec/specs/tools/spec.md` | полная |
+| `check/` | `openspec/specs/check/spec.md` | полная |
 
-Заготовку дописывает тот, кто первым правит соответствующий каталог: спека на код, который
+Заготовку `xs-export` дописывает тот, кто первым правит этот каталог: спека на код, который
 никто не меняет, устаревает молча.
 
 ```bash

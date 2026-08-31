@@ -1,17 +1,36 @@
+"""🏭 Фабрика DAG-ов выгрузок xStream: метаданные из JSON → DAG на поставку.
+*2026-08-31 20:58 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+
+Читает export_xs_optimized.json и на каждую запись собирает DAG, вся начинка которого —
+группа задач из xs_common. Сборщику передаётся name_file целиком: по нему он выбирает
+маршрут ТФС (сценарий, префикс, пул) и строит имя объекта в S3.
+
+Запись, из которой DAG собрать нельзя (не собирается load_delta или export_delta),
+пропускается с предупреждением: все поставки живут в одном файле, и одна негодная не
+должна уносить остальные. Сейчас из 191 записи собирается 186.
+"""
 import json
 import os
+import sys
 from datetime import datetime, timezone
 import logging
 import re
 from airflow import DAG
 
-# Импортируем стандартные компоненты из xStream common
+# Импортируем стандартные компоненты из xStream common. Три пути — три раскладки:
+# каталог рядом с dags_folder, боевой пакет export.export_xs и, наконец, сосед по каталогу.
+# Последний вариант требует, чтобы в sys.path лежала папка самого файла, а её туда не
+# кладёт никто: Airflow добавляет dags_folder, но не подкаталоги, и разбор падал с
+# 'No module named xs_common' ещё до первого DAG-а. Кладём сами — один раз, без дублей.
+_HERE = os.path.dirname(os.path.abspath(__file__))
 try:
     from xs_export.xs_common import make_xs_export_task_group, DEFAULT_ARGS
 except ImportError:
     try:
         from export.export_xs.xs_common import make_xs_export_task_group, DEFAULT_ARGS
     except ImportError:
+        if _HERE not in sys.path:
+            sys.path.insert(0, _HERE)
         from xs_common import make_xs_export_task_group, DEFAULT_ARGS
 
 logger = logging.getLogger("airflow.task")
@@ -123,6 +142,21 @@ def create_dynamic_dags():
     common_tags = ["DataLab", "CI02420667", "ClickHouse", "xStream"]
 
     for dag_id, config in dag_configs.items():
+        # Запись, из которой SQL не собирается, дальше упрётся в RuntimeError сборщика —
+        # но уже посреди сборки, уронив разбор файла вместе со всеми остальными DAG-ами.
+        # Проверяем ровно то, на чём он падает: непустые load_delta и export_delta.
+        # Пустой список columns при этом нормален — колонки бывают целиком в extra_columns.
+        base_cols = config.get("columns") or []
+        queries = {
+            key: build_dynamic_select(base_cols, config.get(key))
+            for key in ("update_exp", "load_delta", "export_delta")
+        }
+        missing = [f for f in ("full_table_name", "name_file") if not config.get(f)]
+        missing += [key for key in ("load_delta", "export_delta") if not queries[key]]
+        if missing:
+            logger.warning("Пропускаю %s: нет %s", dag_id, ", ".join(missing))
+            continue
+
         schedule = config.get("schedule_interval", "@daily")
         desc = config.get("description", "")
 
@@ -141,13 +175,16 @@ def create_dynamic_dags():
         with dag:
             full_name = config["full_table_name"]
             db_name, table_name = full_name.split(".")
-            base_cols = config["columns"]
 
             params = {
-                "replica": config["name_file"].split("__")[2],
-                "sql_stmt_update_exp": build_dynamic_select(base_cols, config.get("update_exp")),
-                "sql_stmt_load_delta": build_dynamic_select(base_cols, config.get("load_delta")),
-                "sql_stmt_export_delta": build_dynamic_select(base_cols, config.get("export_delta")),
+                # Имя файла целиком, а не третий его сегмент: сборщик берёт из него и поток
+                # данных для маршрута ТФС (xs_common: params['name_file'].split('__')[2]),
+                # и имя объекта в S3. С прежним ключом 'replica' сборка падала на первой же
+                # поставке — KeyError, и ни одного DAG-а выгрузок не появлялось.
+                "name_file": config["name_file"],
+                "sql_stmt_update_exp": queries["update_exp"],
+                "sql_stmt_load_delta": queries["load_delta"],
+                "sql_stmt_export_delta": queries["export_delta"],
             }
 
             make_xs_export_task_group(

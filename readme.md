@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-31 20:40 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -121,4 +121,37 @@ CTL.<profile>.sensor
 
 ---
 
-**Автор:** EDP.ETL | **Версия:** 1.1 | **Год:** 2026
+## Спецификации
+
+Каждый каталог репозитория — отдельный проект со своей спецификацией в `openspec/specs/`:
+что система обязана делать, требованиями и сценариями. Общий контекст (стек, контуры,
+соглашения) — в `openspec/project.md`.
+
+| Каталог | Спецификация | Состояние |
+|---|---|---|
+| `ctl_worker/` | `openspec/specs/ctl-worker/spec.md` | полная |
+| `plugins/` | `openspec/specs/plugins/spec.md` | полная |
+| `er_export/` | `openspec/specs/er-export/spec.md` | полная |
+| `tfs_kafka/` | `openspec/specs/tfs-kafka/spec.md` | полная |
+| `xs_export/` | `openspec/specs/xs-export/spec.md` | полная |
+| `tools/` | `openspec/specs/tools/spec.md` | полная |
+| `check/` | `openspec/specs/check/spec.md` | полная |
+
+Спека описывает требуемое поведение, а не текущее состояние кода: расхождение между ними —
+это дефект, который видно сравнением, а не повод переписать спеку.
+
+```bash
+npm i -g --prefix ~/.local @fission-ai/openspec   # CLI (в /usr прав нет)
+openspec list --specs                             # что описано
+openspec show er-export                           # прочитать спеку
+openspec validate --all --strict                  # проверить формат
+```
+
+Правка поведения начинается с предложения — `/opsx:propose "что меняем"`, — которое кладёт
+в `openspec/changes/` дельту (`ADDED` / `MODIFIED` / `REMOVED`), задачи и обоснование.
+После реализации `/opsx:archive` вливает дельту в основную спецификацию. Readme отвечает на
+«как устроено», спека — на «что обязано работать»; дублировать одно в другом не нужно.
+
+---
+
+**Автор:** EDP.ETL | **Версия:** 1.2 | **Год:** 2026

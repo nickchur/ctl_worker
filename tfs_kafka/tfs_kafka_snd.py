@@ -1,5 +1,5 @@
 """🚚 DAG отправки файлов в ТФС с соблюдением темпа маршрута.
-*2026-08-17 15:20 MSK · v2.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 17:10 MSK · v2.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Единственное место, откуда файлы ЕР уходят уведомлением в Kafka. Пакетные даги только
 ставят файлы в очередь, а разгребает её этот даг — в темпе, который декларирует ТФС.
@@ -62,6 +62,24 @@ DAG-файла разворачивает `TFS_ROUTES ∪ реестр` в та�
 ⏳ **Бюджет кончился** — файлы остаются в очереди и уедут, когда окно откроется. Если
 в конце окна самая старая строка ждёт дольше `TFS_QUEUE_ALERT_MIN`, таск падает: затор
 должен быть виден в мониторинге. Всё, что влезло в бюджет, к этому моменту уже отправлено.
+
+⏸️ **Пауза** (`Variable tfs_snd_pause`, пульт — даг `tfs_kafka_setup`) держит файлы
+маршрута, реплики или одного пакета в очереди: постановка идёт своим чередом, отправка —
+нет. Придержанные строки **не считаются затором**: осознанная пауза не должна каждый час
+ронять таск по `TFS_QUEUE_ALERT_MIN`. Сколько придержано и почему — в заметке (один раз
+за окно, пока причина не изменилась) и в `return_value`.
+
+⏰ **Забытая пауза кричит всё громче.** Таск `pause_watch` раз в час смотрит, дожило ли
+правило до нового порога — 1, 2, 4, 8, 16, 32, 64 … часа, — и на каждом пороге пишет
+заметку. **Бессрочная пауза при этом роняет таск**: сигнал уходит штатным каналом падений,
+а сама отправка остаётся зелёной. Пауза со сроком только отмечается в заметке — её снимет
+время. Ряд удваивается, чтобы напоминание не превращалось в шум: за неделю восемь
+срабатываний, и каждое следующее вдвое позже предыдущего.
+
+📭 **Неподтверждённые.** Раз в час `scan_queue` ищет файлы, отправленные больше
+`TFS_STALE_MIN` минут назад и оставшиеся без квитанции, и пишет о них предупреждение.
+Без этого отказ ТФС по пакету, чей `wait_confirm` ушёл в скип из-за паузы, не увидел бы
+никто.
 """
 from __future__ import annotations
 
@@ -69,7 +87,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowFailException
 from airflow.models import Param
 from airflow.sensors.base import PokeReturnValue  # type: ignore
 
@@ -79,6 +97,7 @@ try:
         window_hits, WINDOWS, enqueue_files, order_queue, parse_ts, pending, mark_sent,
         drop_unpooled_scenarios, remember_scenarios, route_topic, scenario_pool,
         sent_counts, task_slug, tfs_route, run_state_get, run_state_set,
+        package_key, split_pending, stale_sent, claim_pause_alerts,
     )
 except ImportError:
     from CI06932748.tools.tfs_utils import (  # type: ignore
@@ -86,6 +105,7 @@ except ImportError:
         window_hits, WINDOWS, enqueue_files, order_queue, parse_ts, pending, mark_sent,
         drop_unpooled_scenarios, remember_scenarios, route_topic, scenario_pool,
         sent_counts, task_slug, tfs_route, run_state_get, run_state_set,
+        package_key, split_pending, stale_sent, claim_pause_alerts,
     )
 
 _cfg             = get_config()
@@ -96,6 +116,9 @@ SEND_SLOTS       = _cfg['TFS_SEND_SLOTS']
 # Сценарии читаются НА ПАРСИНГЕ: из TFS_ROUTES и реестра-Variable, который наполняет
 # таск scan_queue по очереди отправки. Список задаёт состав тасков дага.
 SCENARIOS        = _cfg['SCENARIOS']
+PAUSE_VAR        = _cfg['PAUSE_VAR']
+STALE_MIN        = _cfg['TFS_STALE_MIN']
+ALERT_FIRST_H    = _cfg['PAUSE_ALERT_FIRST_H']
 
 logger = logging.getLogger("airflow.task")
 
@@ -112,6 +135,9 @@ POKE_BUDGET_SEC = 10
 SENT_KEY   = 'sent'
 SEEN_KEY   = 'new_scenarios'
 PARAMS_KEY = 'params_done'
+# Причины паузы, о которых уже написали в заметку: пишем один раз на причину за окно,
+# а не каждые 15 секунд.
+PAUSE_KEY  = 'pause_noted'
 
 
 @dag(
@@ -165,7 +191,7 @@ def tfs_kafka_snd_dag():
 
         dag_run = context.get('dag_run')
         try:
-            rows = enqueue_files(
+            rows, missing = enqueue_files(
                 files,
                 scenario_id=p.get('scenario') or '',
                 replica=p.get('replica') or '',
@@ -180,14 +206,13 @@ def tfs_kafka_snd_dag():
 
         logger.info("📮 Из параметров запуска в очередь добавлено файлов: %d", len(rows))
 
-    def _package_key(row: dict) -> str:
-        """Имя пакета: replica + метка пакета — то же, из чего строится имя тикета.
-
-        Ключ XCom — пакет, а не файл: в один ран сценария их уезжает несколько, и по такому
-        ключу видно, что именно доехало целиком, а что застряло наполовину.
-        """
-        digits = ''.join(c for c in str(row.get('package_ts') or '') if c.isdigit())
-        return f"{row.get('replica', '')}__{digits[:14]}"
+        # Не нашлись в бакете маршрута: либо ТФС уже забрал файл — и тогда переотправить
+        # его нельзя в принципе, — либо в имени опечатка. Молча пропустить нельзя: человек
+        # запускал досылку и должен увидеть, что уехало не всё.
+        if missing:
+            logger.error("❌ Нет в бакете маршрута, в очередь не поставлены: %s", missing)
+            add_note({"❌ Нет в бакете (ТФС забрал файл или опечатка)": missing},
+                     level='dag', context=context, title='🚚 tfs_kafka_snd')
 
     def _push_xcom(context, items: list) -> None:
         """📤 Отправленное — записью на ПАКЕТ, внутри {метка отправки: файл}.
@@ -205,6 +230,31 @@ def tfs_kafka_snd_dag():
 
         for package, files in by_package.items():
             context['ti'].xcom_push(key=package, value=files)
+
+    def _note_pause(context, scenario: str, held: list) -> None:
+        """⏸️ Пишет в заметку, что и почему придержано, — по разу на причину за окно.
+
+        Опрос идёт каждые 15 секунд, а add_note склеивает записи и режет всё вместе
+        по MAX_NOTE_LEN: писать на каждом опросе значит вытеснить из заметки всё остальное.
+
+        Признак «об этой причине уже писали» живёт в S3-объекте рана (run_state_*, не XCom —
+        тот в reschedule стирается перед каждым опросом), то есть ровно столько, сколько
+        сам ран: после clear заметки напишутся заново — но и старые чистятся вместе с раном.
+        """
+        by_reason: dict = {}
+        for row in held:
+            by_reason[row['pause_reason']] = by_reason.get(row['pause_reason'], 0) + 1
+
+        noted = set(run_state_get(context, PAUSE_KEY) or [])
+        fresh = sorted(set(by_reason) - noted)
+        logger.info("⏸️ %s: придержано %d файлов — %s", scenario, len(held),
+                    "; ".join(f"{r} ({n})" for r, n in by_reason.items()))
+        if not fresh:
+            return
+
+        run_state_set(context, PAUSE_KEY, sorted(noted | set(by_reason)))
+        add_note({f"⏸️ {scenario}": [f"{r} — придержано {by_reason[r]}" for r in fresh]},
+                 level='dag', context=context, title='🚚 tfs_kafka_snd')
 
     def poke_queue(scenario: str, **context) -> PokeReturnValue:
         """🚚 Отправляет файлы своего сценария в темпе, который декларирует ТФС.
@@ -235,7 +285,18 @@ def tfs_kafka_snd_dag():
             logger.info("📭 %s: очередь пуста", scenario)
             return _finish(context, scenario, sent_state, left=[], blocked='', last_poke=last_poke)
 
-        queue = order_queue(queued)
+        # ⏸️ Придержанные паузой уходят из работы ЦЕЛИКОМ: их не везём и в затор не считаем.
+        # Иначе осознанная пауза каждый час роняла бы таск по TFS_QUEUE_ALERT_MIN, то есть
+        # выглядела бы как авария.
+        free, held = split_pending(queued)
+        if held:
+            _note_pause(context, scenario, held)
+        if not free:
+            logger.info("⏸️ %s: вся очередь придержана паузой (%d файлов)", scenario, len(held))
+            return _finish(context, scenario, sent_state, left=[], blocked='',
+                           last_poke=last_poke, held=held)
+
+        queue = order_queue(free)
         topic = route_topic(scenario)
         limits = tfs_limits(scenario)
         logger.info("📦 %s → %s: в очереди %d файлов, пакетов: %d, лимиты %s",
@@ -302,7 +363,7 @@ def tfs_kafka_snd_dag():
         if sent:
             now_ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             fresh = [
-                {'package': _package_key(r),
+                {'package': package_key(r),
                  'key': f"{now_ts}_{len(sent_state) + n:03d}",
                  'row': {'rq_uid': r['rq_uid'], 'file_name': r['file_name'],
                          'scenario_id': scenario, 'topic': topic,
@@ -325,12 +386,16 @@ def tfs_kafka_snd_dag():
         return _finish(context, scenario, sent_state, left, blocked, last_poke)
 
     def _finish(context, scenario: str, sent_state: list, left: list, blocked: str,
-                last_poke: bool) -> PokeReturnValue:
+                last_poke: bool, held: list | None = None) -> PokeReturnValue:
         """Итог опроса: ждать дальше, зеленеть или заявить о заторе.
 
         Затор проверяем ТОЛЬКО на последнем опросе окна: сработай он в середине —
         оборвал бы отправку тех файлов, которые ещё успели бы уехать в этом же окне.
+
+        held сюда приходит уже отфильтрованным из left: придержанное паузой — не простой,
+        а решение человека, и заявлять о нём как о заторе нельзя.
         """
+        held = held or []
         if not last_poke:
             return PokeReturnValue(is_done=False)
 
@@ -345,6 +410,7 @@ def tfs_kafka_snd_dag():
                     f"🚦 Очередь маршрута {scenario} стоит {waiting:.0f} мин при пороге "
                     f"{QUEUE_ALERT_MIN}. Ждут {len(left)} файлов, упёршийся лимит: "
                     f"{blocked or 'нет'}. Самый старый файл в очереди с {oldest:%Y-%m-%d %H:%M:%S} UTC"
+                    + (f". Ещё {len(held)} придержано паузой (в этот счёт не входят)" if held else "")
                 )
 
         if sent_state:
@@ -358,10 +424,37 @@ def tfs_kafka_snd_dag():
                 'scenario': scenario,
                 'count':    len(sent_state),
                 'packages': packages,
+                'held':     len(held),
             })
 
         # Ничего не ушло за весь час — сенсор упрётся в timeout и пометит таск скипнутым.
+        # Придержанное паузой попадает сюда же: отправлять было нечего, и это не ошибка.
+        if held:
+            logger.info("⏸️ %s: за окно не ушло ничего, придержано паузой: %d", scenario, len(held))
         return PokeReturnValue(is_done=False)
+
+    def _check_stale(context) -> None:
+        """📭 Отправленные без квитанции — раз за окно, в конце.
+
+        Пакет, чей wait_confirm ушёл в скип (пауза или auto_confirm), квитанции не ждёт,
+        и отказ ТФС по его файлам иначе не увидел бы никто. Предупреждение, а не падение:
+        причина может быть и на стороне ТФС, ронять этим отправку незачем.
+        """
+        try:
+            stale = stale_sent(STALE_MIN)
+        except Exception as exc:      # noqa: BLE001 — сверка не должна ронять отправку
+            logger.warning("⚠️ Сверка неподтверждённых не удалась: %s", exc)
+            return
+
+        if not stale:
+            logger.info("📨 Неподтверждённых отправок старше %d мин нет", STALE_MIN)
+            return
+
+        logger.warning("📭 Без квитанции старше %d мин: %d файлов", STALE_MIN, len(stale))
+        add_note({f"📭 Нет квитанции старше {STALE_MIN} мин ({len(stale)})":
+                  [f"{r['file_name']} · {r['scenario_id']} · ждём {r['waiting_min']} мин"
+                   for r in stale[:10]]},
+                 level='dag', context=context, title='🚚 tfs_kafka_snd')
 
     def poke_scan(**context) -> PokeReturnValue:
         """🔎 Ищет в очереди сценарии, у которых ещё нет своего таска, и заводит их.
@@ -423,9 +516,60 @@ def tfs_kafka_snd_dag():
 
         elapsed = (datetime.now(timezone.utc) - context['dag_run'].start_date).total_seconds()
         if elapsed >= WINDOW:
+            _check_stale(context)
             return PokeReturnValue(is_done=True, xcom_value=sorted(seen))
 
         return PokeReturnValue(is_done=False)
+
+    @task(task_id='pause_watch', retries=0)
+    def pause_watch(**context) -> list:
+        """⏰ Нарастающий алерт о забытой паузе: 1, 2, 4, 8, 16, 32, 64 … часа.
+
+        Пауза сделана тихой намеренно — придержанное не считается затором, ожидание
+        квитанций уходит в ☮️, красных ранов нет. Ровно поэтому её легко забыть, и нужен
+        сигнал, который со временем становится громче: раз в час даг всё равно
+        просыпается, а какой порог сработал, решает `claim_pause_alerts`.
+
+        **Бессрочная пауза роняет таск** — это и есть алерт по штатному каналу падений,
+        `on_failure_callback` положит заметку. Пауза со сроком только пишет заметку: её
+        снимет само время, и краснеть каждый час из-за «до завтра» незачем — но в заметке
+        она есть, чтобы «до 1 сентября» месячной давности всё-таки попалось на глаза.
+
+        `retries=0` не косметика: порог отмечается в переменной ДО падения, и вторая
+        попытка нашла бы уже пустой список и позеленела — падение потерялось бы.
+        """
+        alerts = claim_pause_alerts(pending())
+        if not alerts:
+            logger.info("⏰ Пауз, доживших до нового порога, нет")
+            return []
+
+        def _line(a: dict) -> str:
+            rule = a['rule']
+            parts = [f"{a['scope']}/{a['key']} — на паузе {a['hours']} ч (порог {a['threshold']} ч)"]
+            if a['held']:
+                parts.append(f"придержано {a['held']} файлов")
+            parts.append(rule['reason'] or 'без причины')
+            parts.append(f"до {rule['until']}" if rule['until'] else 'БЕССРОЧНО')
+            if rule['by']:
+                parts.append(f"поставил {rule['by']}")
+            return ', '.join(parts)
+
+        hard = [a for a in alerts if a['hard']]
+        for a in alerts:
+            logger.warning("⏰ %s", _line(a))
+        add_note({f"⏰ Пауза висит ({len(alerts)})": [_line(a) for a in alerts]},
+                 level='dag', context=context, title='🚚 tfs_kafka_snd')
+
+        if hard:
+            raise AirflowFailException(
+                "Отправка стоит на бессрочной паузе:\n"
+                + "\n".join(f"  • {_line(a)}" for a in hard)
+                + "\nСнять — дагом tfs_kafka_setup (действие «▶️ снять с паузы»). "
+                  "Следующий раз напомню вдвое позже."
+            )
+        return [f"{a['scope']}/{a['key']}" for a in alerts]
+
+    pause_watch()
 
     # timeout заведомо больше окна: сенсор проверяет его ТОЛЬКО после ложного ответа,
     # поэтому зелёный по концу окна успевает сработать первым, а скип по таймауту

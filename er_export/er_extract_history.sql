@@ -1,0 +1,95 @@
+-- Состояние дельты ER-выгрузок: export.extract_history и export.extract_current_vw
+-- 2026-08-28 13:18 MSK · v2.0 · Nick Churkin · NSChurkin@sber.ru
+--
+-- ⚠️ ЭТОТ ФАЙЛ — ПЕРЕХОД, А НЕ СХЕМА. Боевые объекты созданы давно, их DDL в репозитории
+-- никогда не было и **менять его не требуется**. Здесь описано, что ЕР пишет туда после
+-- перехода на ключ (replica, dag_group, schema_name, extract_name) и как переименовать
+-- уже накопленное состояние.
+--
+--
+-- 🔑 СОСТАВНОЕ ИМЯ ВЫГРУЗКИ
+--
+-- Одна и та же таблица может входить в разные группы (например, новая версия пакета
+-- живёт рядом со старой). Состояние дельты у них обязано быть РАЗНЫМ, иначе вторая
+-- группа читает окно первой и выгружает пустоту, а её save_status переписывает чужую
+-- историю.
+--
+-- Разводит их имя: с 28.08.2026 ЕР пишет и читает состояние под составным именем
+--
+--     extract_name = '<dag_id>.<extract_name>'
+--     например      'export_er__hrplatform_datalab__1.lc_items_meta'
+--
+-- Именно имя, а не новая колонка: **эту историю мы делим с xStream**
+-- (xs_export/xs_common.py пишет в extract_history три INSERT и читает
+-- extract_current_vw по extract_name). Колонка потребовала бы править и вью, и xStream;
+-- составное имя не трогает ни то, ни другое — короткие имена xStream остаются как были.
+--
+-- Что делает ЕР (er_export.py):
+--   • sql_cur_delta():  SELECT * FROM export.extract_current_vw
+--                       WHERE extract_name = '<dag_id>.<extract_name>'
+--   • _er_save_status(): INSERT … extract_name = '<dag_id>.<extract_name>'
+--
+--
+-- 1️⃣ ПЕРЕИМЕНОВАНИЕ УЖЕ НАКОПЛЕННОГО СОСТОЯНИЯ
+--
+-- Без него каждая поставка начнёт с bootstrap от lower_bound и перельёт всё заново.
+-- Делать ПОСЛЕ переключения er_wf_meta (там уже есть replica и dag_group) и ДО первого
+-- рана пакетов.
+--
+-- Сначала убедиться, что имена ЕР и xStream не пересекаются:
+--
+--   SELECT h.extract_name, count() AS rows
+--   FROM export.extract_history AS h
+--   WHERE h.extract_name IN (SELECT extract_name FROM export.er_wf_meta FINAL
+--                            WHERE extract_name != '')
+--   GROUP BY h.extract_name ORDER BY 1;
+--
+--   -- те же имена, но принадлежащие xStream, отличить нечем — если такие есть,
+--   -- переименовывать пакетно НЕЛЬЗЯ, разбирать поштучно (по exported_files: у ЕР там
+--   -- список .zip, у xStream пусто)
+--   SELECT extract_name, countIf(notEmpty(exported_files)) AS er_rows,
+--          countIf(empty(exported_files))                  AS other_rows
+--   FROM export.extract_history GROUP BY extract_name HAVING other_rows > 0 AND er_rows > 0;
+--
+-- Само переименование — по одной команде на группу (коррелированных подзапросов
+-- в мутациях ClickHouse нет, IN-подзапрос работает):
+--
+--   ALTER TABLE export.extract_history ON CLUSTER datalab
+--   UPDATE extract_name = concat('export_er__hrplatform_datalab__1.', extract_name)
+--   WHERE extract_name IN (
+--       SELECT extract_name FROM export.er_wf_meta FINAL
+--       WHERE replica = 'hrplatform_datalab' AND dag_group = '1' AND extract_name != ''
+--   ) AND position(extract_name, '.') = 0;   -- ← защита от повторного запуска
+--
+-- Список групп для генерации таких команд:
+--
+--   SELECT DISTINCT replica, dag_group,
+--          concat('export_er__', replica, '__', dag_group) AS dag_id
+--   FROM export.er_wf_meta FINAL WHERE extract_name != '' ORDER BY 1, 2;
+--
+--
+-- 2️⃣ ПРОВЕРКА ПЕРЕХОДА
+--
+--   -- у каждой поставки ровно одна текущая строка, и имя составное
+--   SELECT extract_name, count() AS cnt
+--   FROM export.extract_current_vw
+--   WHERE position(extract_name, 'export_er__') = 1
+--   GROUP BY extract_name HAVING cnt > 1;
+--
+--   -- окно одной поставки читается ровно так, как это делает выгрузка
+--   SELECT * FROM export.extract_current_vw
+--   WHERE extract_name = 'export_er__hrplatform_datalab__1.lc_items_meta';
+--
+--   -- строки xStream не задеты: их имена по-прежнему без точки
+--   SELECT count() FROM export.extract_history WHERE position(extract_name, '.') = 0;
+--
+-- И живьём: завести вторую группу с той же таблицей, прогнать оба пакета и убедиться,
+-- что окна у них разные, а extract_history получила две отдельные строки.
+--
+--
+-- 3️⃣ ЕСЛИ ПЕРЕИМЕНОВАНИЕ НЕ ДЕЛАТЬ
+--
+-- Пакеты поедут, но каждая поставка стартует с bootstrap: `lower_bound` (или 1970-01-01)
+-- и полная перезаливка в КАП. Иногда это допустимо — тогда переименование можно
+-- пропустить осознанно, а старые строки останутся в истории под короткими именами
+-- и никем читаться не будут.

@@ -1,5 +1,5 @@
 -- DDL для export.er_sent_files
--- 2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · nschurkin@sber.ru
+-- 2026-08-12 19:16 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru
 -- Вариант ClickHouse (STORAGE = 'ch' в plugins/tfs_utils.py).
 -- Для PostgreSQL/Greenplum — er_sent_files_pg.sql; при STORAGE = 's3' таблица не нужна.
 -- Очередь отправки и реестр отправленных файлов ER.
@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS export.er_sent_files ON CLUSTER datalab
 )
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/er_sent_files_{uuid}', '{replica}', updated_at)
 ORDER BY (rq_uid);
+
+-- ⚠️ Обновление строки — это ДОПИСАННАЯ версия: отметка отправки вставляет строку заново
+-- с бо́льшим updated_at, а ReplacingMergeTree по ключу rq_uid оставляет последнюю. Всё,
+-- что во вставке не названо, у отправленного файла обнулится — так уже терялись dag_id
+-- и run_id. Со стороны кода это подпёрто списком CH_SENT_COLS в plugins/tfs_utils.py:
+-- обе вставки собираются из него, а не перечисляют колонки руками.
 
 
 -- ─────────────────────────────────────────────────────────────────────────────

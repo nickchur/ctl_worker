@@ -1,7 +1,11 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-19 14:20 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-28 14:06 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) фиксированы.
+CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
+Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
+(список OVERRIDABLE). Правятся они формой `export_er_setup`, первой группой полей;
+код при этом остаётся запасным вариантом, а null в переменной возвращает значение из него.
+Применяется правка со следующего разбора файла.
 
 Поведение на стенде управляется ENV_STAND, при её отсутствии — ENVIRONMENT
 (PROM / UAT / QA / IFT / DEV).
@@ -37,9 +41,9 @@ from airflow.exceptions import AirflowFailException
 # колбэки должны вести себя одинаково во всех DAG-ах контура. add_note и ensure_pool
 # здесь же реэкспортируются — их импортируют соседние модули этого каталога.
 try:
-    from plugins.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
+    from plugins.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, update_dag_pause, valid_schedule  # noqa: F401  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback  # noqa: F401  # type: ignore
+    from CI06932748.tools.utils import add_note, ensure_pool, get_dict_from_ch, on_callback, update_dag_pause, valid_schedule  # noqa: F401  # type: ignore
 
 # 🌍 Стенд. Сначала ENV_STAND — именно её читают платформенные операторы
 # (hrp_operators/clickhouse_to_s3.py: os.getenv("ENV_STAND")) и соседний xs_export.
@@ -61,14 +65,84 @@ RAW_VAR_NAME = "datalab_er_wf_meta"
 # подробности в er_setup.py, функция wf_checksum. Удалить переменную = пересчитать всё.
 CKSUM_VAR_NAME = "datalab_er_wf_hash"
 
-CH_ID   = 'dlab-click'
-S3_CONN = 's3-tfs-hrplt'
+logger = logging.getLogger("airflow.task")
 
-BUCKET = 'tfshrplt'
+# ── ⚙️ Общие настройки фреймворка ────────────────────────────────────────────
+#
+# Код задаёт запасной вариант, переменная — рабочий: та же механика, что у
+# tools-чистильщиков. Правится из формы export_er_setup (первая группа полей), значение
+# null возвращает значение из кода.
+#
+# Переопределяются ТОЛЬКО ключи из OVERRIDABLE. Остальное живёт в коде осознанно:
+# DEF_ARGS содержит функции; FORMAT_MAP, TYPE_MAP, EXTRA_PRE/SUF и HIVE_RESERVED — это
+# контракт обмена с КАП, а не настройка стенда; TS_POOL_SLOTS обязан быть 1 по устройству
+# пула меток времени; POOL_SLOTS не берём, потому что ensure_pool существующий пул
+# не трогает — правка выглядела бы применённой, не будучи ею.
+CFG_VAR_NAME = "datalab_er_config"
 
-# 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS
+OVERRIDABLE = ('CH_ID', 'S3_CONN', 'BUCKET', 'TFS_MAP', 'LIMITS', 'DEFAULT_PARAMS')
+
+
+def cfg_overrides() -> dict:
+    """📥 Переопределения общих настроек из Variable; при любой беде — пустой словарь.
+
+    Читается НА РАЗБОРЕ ФАЙЛА, поэтому не бросает вообще ничего: недоступная метабаза
+    или битый JSON должны означать «работаем по коду», а не Broken DAG у всех пакетов ЕР.
+    Неизвестные ключи только предупреждают — в форме er_setup тот же случай ошибка,
+    там за экраном человек.
+    """
+    from airflow.models import Variable
+
+    try:
+        raw = Variable.get(CFG_VAR_NAME, default_var={}, deserialize_json=True) or {}
+    except Exception as exc:
+        logger.warning("⚠️ %s не прочитана (%s) — общие настройки берём из кода", CFG_VAR_NAME, exc)
+        return {}
+
+    if not isinstance(raw, dict):
+        logger.warning("⚠️ %s содержит %s, а нужен объект {ключ: значение} — берём код",
+                       CFG_VAR_NAME, type(raw).__name__)
+        return {}
+
+    if unknown := [k for k in raw if k not in OVERRIDABLE]:
+        logger.warning("⚠️ %s: ключи %s не переопределяются, пропущены. Можно: %s",
+                       CFG_VAR_NAME, unknown, list(OVERRIDABLE))
+    return raw
+
+
+_OVR = cfg_overrides()
+
+
+def _ovr(key: str, default):
+    """Значение настройки: из переменной, если оно там есть и того же типа, иначе из кода.
+
+    Тип сверяется с тем, что написано в коде: строка вместо словаря в TFS_MAP уронила бы
+    разбор файла у всех пакетов сразу, а такой ценой настройка из UI не стоит ничего.
+    """
+    if key not in _OVR or _OVR[key] is None:      # null = вернуть значение из кода
+        return default
+    value = _OVR[key]
+    if isinstance(default, bool) or not isinstance(value, type(default)):
+        logger.warning("⚠️ %s.%s: ожидался %s, пришёл %s — беру значение из кода",
+                       CFG_VAR_NAME, key, type(default).__name__, type(value).__name__)
+        return default
+    return value
+
+
+CH_ID   = _ovr('CH_ID',   'dlab-click')
+S3_CONN = _ovr('S3_CONN', 's3-tfs-hrplt')
+
+BUCKET = _ovr('BUCKET', 'tfshrplt')
+
+# 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS.
+# Из переменной пара приезжает списком (в JSON кортежей нет) — приводим к кортежу, чтобы
+# распаковка `scen, prefix = TFS_MAP[base]` работала одинаково с обоими источниками.
 TFS_MAP = {
-    "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
+    key: tuple(val)
+    for key, val in _ovr('TFS_MAP', {
+        "hrplatform_datalab": ("HRPLATFORM-4000", "from/KAP802/hrpl_lm_er"),
+    }).items()
+    if isinstance(val, (list, tuple)) and len(val) == 2
 }
 
 POOL_NAME   = 'datalab_export_er'
@@ -79,8 +153,6 @@ POOL_SLOTS  = 20
 # групп совпали бы именем (суффикс группы в имя тикета не входит). Имя пула собирает
 # ts_pool(), слот ровно один — увеличение слотов ломает саму цель пула.
 TS_POOL_SLOTS = 1
-
-logger = logging.getLogger("airflow.task")
 
 
 DEF_ARGS = {
@@ -96,11 +168,15 @@ DEF_ARGS = {
 
 # 🔢 Лимит строк при выгрузке на стенде; 0 = без ограничений (прод)
 LIMITS = {
-    "PROM": 0,
-    "UAT":  100,
-    "QA":   100,
-    "IFT":  100,
-    "DEV":  100,
+    key: int(val)
+    for key, val in _ovr('LIMITS', {
+        "PROM": 0,
+        "UAT":  100,
+        "QA":   100,
+        "IFT":  100,
+        "DEV":  100,
+    }).items()
+    if isinstance(val, int) and not isinstance(val, bool)
 }
 
 TYPE_MAP: dict[str, str] = {
@@ -181,6 +257,11 @@ def obj_save(key: str, data: Any) -> None:
 # extract_name пуст) и относятся к дагу целиком: один тикет, одно уведомление, одно
 # расписание автозапуска. В строках-таблицах игнорируются — у пакета они физически одни.
 GROUP_PARAMS: dict = {
+    # ⏰ Расписание пакета. Живёт в params строки-дефолта группы, а не отдельной колонкой:
+    # колонка позволяла задать его ещё и у поставки, и тогда «какое победит» зависело от
+    # того, у кого поле заполнено. Умолчания у него намеренно нет — пустое значение это
+    # ошибка группы, а не «раз в день»: пакет, поехавший не в своё окно, хуже непоехавшего.
+    'schedule':          '',
     'notify_kafka':      1,            # 1 = отправлять уведомления в Kafka; 0 = пропустить (стенд)
     'auto_confirm':      1,            # 1 = не ждать Kafka-подтверждения от TFS
     'confirm_timeout':   60,           # таймаут ожидания квитанций ТФС, мин (включая ожидание в очереди отправки)
@@ -192,6 +273,11 @@ GROUP_PARAMS: dict = {
 # в строке-таблице.
 TABLE_PARAMS: dict = {
     # ── Дельта ───────────────────────────────────────────────────────────────
+    # 🔀 Режим выгрузки: 0 = дельта (окно из состояния), 1 = recent (скользящее окно).
+    # Здесь, а не колонкой: у колонки UInt8 DEFAULT 0 «не задано» неотличимо от «явно
+    # дельта», поэтому режим не наследовался от группы вовсе. В JSON ключ либо есть,
+    # либо нет — наследование работает так же, как у остальных параметров.
+    'is_recent':         0,
     'full_export':       0,            # 1 = выгружать таблицу целиком: окно дельты не подставляется, состояние не ведётся
     'increment':         60,           # шаг дельты, мин: time_to = time_from + increment (не чаще 1 пакета/час по стандарту ТФС)
     'overlap':           0,            # перекрытие окна дельты назад, сек (для компенсации задержек CDC)
@@ -231,7 +317,28 @@ TABLE_PARAMS: dict = {
     'descriptions':      {},
 }
 
-DEFAULT_PARAMS: dict = {**GROUP_PARAMS, **TABLE_PARAMS}
+def _param_overrides() -> dict:
+    """Умолчания параметров из переменной: только известные ключи и только те же типы.
+
+    По ключам, а не целиком: переопределяют обычно одно-два значения, и полный словарь
+    в переменной означал бы, что каждый новый параметр в коде надо не забыть дописать
+    и туда — то есть однажды не дописать.
+    """
+    known = {**GROUP_PARAMS, **TABLE_PARAMS}
+    over  = _ovr('DEFAULT_PARAMS', {})
+    out   = {}
+    for key, val in over.items():
+        if key not in known:
+            logger.warning("⚠️ %s.DEFAULT_PARAMS: ключ '%s' неизвестен, пропущен", CFG_VAR_NAME, key)
+        elif isinstance(val, bool) or not isinstance(val, type(known[key])):
+            logger.warning("⚠️ %s.DEFAULT_PARAMS.%s: ожидался %s, пришёл %s — беру код",
+                           CFG_VAR_NAME, key, type(known[key]).__name__, type(val).__name__)
+        else:
+            out[key] = val
+    return out
+
+
+DEFAULT_PARAMS: dict = {**GROUP_PARAMS, **TABLE_PARAMS, **_param_overrides()}
 
 # 🔤 Поддерживаемые форматы выгрузки. Ключ — имя формата ClickHouse (как его пишут в params),
 # значение — как этот формат прокинуть в оператор и как назвать файл.
@@ -258,25 +365,31 @@ FORMAT_MAP: dict[str, dict] = {
 def raw_key(row: dict) -> str:
     """🔑 Ключ строки er_wf_meta для Variable и выпадающего списка.
 
-    У поставки — 'db_name.extract_name', как в остальном фреймворке. У строки-дефолта
-    группы extract_name пуст, а db_name равен replica, поэтому ключ превратился бы
-    в 'replica.' — вместо этого помечаем её явно, чтобы в списке было понятно, что это.
+    'replica/dag_group/schema_name/extract_name' — ровно ключ сортировки таблицы.
+    У строки-дефолта группы пусты и extract_name, и schema_name, поэтому она помечается
+    явно: в списке должно быть видно, что это настройка пакета, а не поставка.
+
+    Разделитель '/', а не '.': точка занята видом 'db.table' и 'schema.table' и на
+    составном ключе читалась бы неоднозначно.
     """
+    rep, grp = row.get('replica', ''), norm_group(row.get('dag_group'))
     if not row.get('extract_name'):
-        return f"{row.get('replica', '')} (дефолты группы)"
-    return f"{row.get('db_name', '')}.{row['extract_name']}"
+        return f"{rep}/{grp} (дефолты группы)"
+    return f"{rep}/{grp}/{row.get('schema_name', '')}/{row['extract_name']}"
 
 
-def key_to_where(key: str) -> tuple[str, str]:
-    """🔎 Ключ из выпадающего списка → (db_name, extract_name) для WHERE.
+def key_to_where(key: str) -> tuple[str, str, str, str]:
+    """🔎 Ключ из выпадающего списка → (replica, dag_group, schema_name, extract_name).
 
-    Обратная к raw_key: у строки-дефолта extract_name пуст, а db_name равен replica.
+    Обратная к raw_key: у строки-дефолта пусты и schema_name, и extract_name.
     """
     marker = ' (дефолты группы)'
     if key.endswith(marker):
-        return key[:-len(marker)], ''
-    db, _, name = key.partition('.')
-    return db, name
+        rep, _, grp = key[:-len(marker)].partition('/')
+        return rep, norm_group(grp), '', ''
+    parts = key.split('/')
+    parts += [''] * (4 - len(parts))
+    return parts[0], norm_group(parts[1]), parts[2], parts[3]
 
 
 # Номер группы, который подставляется реплике без суффикса. Пустым он быть не может:
@@ -361,47 +474,35 @@ def parse_s3_target(path: str, conn_id: str, bucket: str, prefix: str) -> dict:
     return _target(head, new_bucket, new_prefix.strip('/'))
 
 
-def replica_full(replica: str) -> str:
-    """🔢 Реплика с обязательным суффиксом группы: без него подставляется DEFAULT_GROUP.
+def norm_group(dag_group) -> str:
+    """🔢 Группа пакета: пустая нормализуется к DEFAULT_GROUP.
 
-    Нужна, чтобы у всех пакетов был один формат имени файла с одинаковым числом '__'.
-    'hrplatform_datalab' → 'hrplatform_datalab__0', 'hrplatform_datalab__1' — как есть.
+    Пустой она быть не может: имя архива строится как '{реплика}__{ts}__{группа}__{table}…',
+    и без группы разделителей '__' стало бы на один меньше, чем у остальных пакетов, —
+    принимающая сторона разбирает имя по ним.
     """
-    rep = (replica or '').strip()
-    return rep if not rep or '__' in rep else f"{rep}__{DEFAULT_GROUP}"
+    return str(dag_group or '').strip() or DEFAULT_GROUP
 
 
-def replica_base(replica: str) -> str:
-    """🔀 Базовая реплика — часть до первого '__'; остальное считается номером группы.
+def dag_id_for(replica: str, dag_group) -> str:
+    """🏷️ Имя DAG-а пакета: 'export_er__<реплика>__<группа>'.
 
-    Группа поставок кодируется суффиксом в replica ('hrplatform_datalab__1'). В имена
-    файлов базовая реплика идёт первой, суффикс группы — за меткой времени и только
-    в имени архива; тикет пакета обходится без него вовсе. Маршрут в TFS (scenario_id +
-    префикс в S3) один на всю реплику, поэтому TFS_MAP ищется по базе — новая группа
-    заводится строкой в er_wf_meta, без правки кода.
+    Собирается в одном месте, потому что служит тремя вещами сразу: именем дага, ключом
+    группы в Variable и первой частью имени выгрузки в export.extract_history
+    ('<dag_id>.<extract_name>' — так состояние дельты разных групп не смешивается).
     """
-    return replica.split('__', 1)[0]
-
-
-def replica_group(replica: str) -> str:
-    """🔢 Суффикс группы — часть после первого '__'; без него подставляется DEFAULT_GROUP.
-
-    В имени архива стоит сразу за меткой времени и разводит по именам архивы разных групп
-    одной реплики. Пустым не бывает: replica_full() дописывает суффикс ещё при синхронизации,
-    и число разделителей '__' в имени обязано быть одним на все пакеты.
-    """
-    return replica.split('__', 1)[1] if '__' in replica else DEFAULT_GROUP
+    return f"export_er__{replica}__{norm_group(dag_group)}"
 
 
 def ts_pool(replica: str) -> str:
-    """🏊 Имя пула метки времени — одно на БАЗОВУЮ реплику, на все её группы сразу.
+    """🏊 Имя пула метки времени — одно на РЕПЛИКУ, на все её группы сразу.
 
-    Именно на базовую: сталкиваются именами тикеты РАЗНЫХ ГРУПП одной реплики (суффикс
-    из имени тикета убран, а logical_date у групп на одном cron совпадает до секунды),
+    Именно на реплику: сталкиваются именами тикеты РАЗНЫХ ГРУПП одной реплики (группа
+    в имя тикета не входит, а logical_date у групп на одном cron совпадает до секунды),
     и развести их может только общий на эти группы пул с единственным слотом.
     Пул на группу был бы бесполезен — каждая заняла бы свой слот и стартовали бы разом.
     """
-    return f"{POOL_NAME}_ts__{replica_base(replica)}"
+    return f"{POOL_NAME}_ts__{replica}"
 
 
 # Параметры-словари, которые сливаются ПО КЛЮЧАМ, а не заменяются целиком.
@@ -434,16 +535,15 @@ def get_params(row: dict, group: dict | None = None) -> dict:
     return merge_params(DEFAULT_PARAMS, group or {}, overrides)
 
 
-# 🧬 Поля строки-дефолта группы, наследуемые поставками. SQL и ключи (pk, uk, fields,
-# sql_*) сюда намеренно не входят — они всегда описывают конкретную таблицу.
+# 🧬 Прямого наследования полей больше нет, и списка INHERITED — тоже.
 #
-# is_recent тоже не наследуется, хотя это и не SQL: колонка UInt8 DEFAULT 0, и «не задано»
-# от «явно delta» не отличить. При наследовании через `or` таблица в recent-группе не смогла
-# бы вернуться к дельте — её sql_stmt_export_delta уехал бы под ключом recent.
+# Единственным наследуемым полем был schema_name, но с 2026-08-28 он входит в ключ
+# таблицы (replica, dag_group, schema_name, extract_name) и у строки-дефолта пуст:
+# наследовать нечего, у каждой поставки схема своя и обязательна.
 #
-# description обрабатывается отдельно (см. build_wfs): у него есть третий источник —
-# комментарий таблицы в ClickHouse, и он должен быть приоритетнее группового текста.
-INHERITED = ('schema_name',)
+# Наследуется теперь только params (merge_params: умолчания → группа → таблица), включая
+# расписание группы и режим выгрузки is_recent, и отдельно description — у него есть
+# третий источник, комментарий таблицы в ClickHouse, и он приоритетнее группового текста.
 
 def parse_params(raw: str, where: str) -> dict:
     """Разбирает JSON-поле params; при битом JSON возвращает {} и пишет предупреждение."""
@@ -455,8 +555,69 @@ def parse_params(raw: str, where: str) -> dict:
 
 
 def explicit_schedule(row: dict) -> str:
-    """Расписание строки. Пусто — не задано; умолчания у cron нет, см. er_sync."""
-    return ((row or {}).get('schedule') or '').strip()
+    """Расписание, ЗАДАННОЕ В ЭТОЙ строке: ключ schedule её собственных params.
+
+    Собственных — то есть без наследования: только так синк отличает расписание группы
+    от расписания, по ошибке написанного в поставке (оно игнорируется с предупреждением).
+    Пусто = не задано; умолчания у cron нет, пустое расписание ломает группу целиком.
+    """
+    row = row or {}
+    params = parse_params(row.get('params', ''), f"строка {row.get('replica', '')}")
+    return str(params.get('schedule') or '').strip()
+
+
+# 🔤 Маска имени, из которого строятся файлы, ключи и SQL-литералы: буквы, цифры,
+# одиночное подчёркивание и дефис. Проверяются replica, dag_group, schema_name
+# и extract_name — все четыре части ключа таблицы.
+_SAFE_NAME = re.compile(r'[A-Za-z0-9_-]+')
+
+
+def check_name(value, field: str, key: str, errors: list[str]) -> bool:
+    """🔤 Проверяет часть имени пакета/поставки. Возвращает False и пишет причину в errors.
+
+    Запрещено ровно две вещи, и обе — не вкусовщина:
+
+    * **двойное подчёркивание** — это РАЗДЕЛИТЕЛЬ в именах файлов ЕР:
+      `{replica}__{ts}__{dag_group}__{table}__{часть}_{всего}_{строк}.zip`
+      и `{schema}__{table}__{ts}__…` для данных и `.meta`. Лишнее `__` внутри любой
+      части сдвигает разбор у принимающей стороны — она режет имя по этому же
+      разделителю, и файл уедет «не тем», молча;
+    * **всё, кроме букв, цифр, `_` и `-`** — точка разделяет части в ключе выгрузки
+      внутри пакета (`схема.имя`) и в имени состояния дельты (`<dag_id>.<extract_name>`),
+      слэш разделяет части ключа записи (`replica/dag_group/schema/extract`), кавычка
+      ломает SQL-литерал, пробел — ключ объекта в S3.
+
+    Одиночное подчёркивание разрешено: в хвосте имени файла (`_{всего}_{строк}`)
+    разделитель как раз одинарный, и внутри имени он неоднозначности не создаёт.
+    """
+    value = str(value or '')
+    if not value:
+        errors.append(f"{key}: пустой {field}")
+        return False
+    if not _SAFE_NAME.fullmatch(value):
+        bad = sorted({c for c in value if not _SAFE_NAME.fullmatch(c)})
+        errors.append(
+            f"{key}: {field} = '{value}' содержит {bad} — допустимы только буквы, цифры, "
+            "'_' и '-'. Точка, слэш, пробел и кавычка разъезжаются с ключами записи, "
+            "именем состояния дельты и ключом объекта в S3"
+        )
+        return False
+    if '__' in value:
+        errors.append(
+            f"{key}: {field} = '{value}' содержит '__' — это разделитель в именах файлов ЕР "
+            "({реплика}__{ts}__{группа}__{таблица}__{часть}_{всего}_{строк}.zip), и лишний "
+            "он сдвинет разбор имени на принимающей стороне"
+        )
+        return False
+    return True
+
+
+def check_group_names(replica: str, dag_group, errors: list[str]) -> bool:
+    """🔤 Проверяет имена частей ПАКЕТА — их достаточно проверить раз на группу."""
+    name = f"группа {replica}/{norm_group(dag_group)}"
+    ok_rep = check_name(replica, 'replica', name, errors)
+    ok_grp = check_name(norm_group(dag_group), 'dag_group', name, errors)
+    return ok_rep and ok_grp
 
 
 def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
@@ -469,15 +630,16 @@ def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
         errors.append(f"{key}: пустой sql_from")
         return False
 
-    base = replica_base(row["replica"])
-    if base not in TFS_MAP:
-        errors.append(f"{key}: базовая реплика '{base}' не найдена в TFS_MAP")
+    # Схема и имя выгрузки уезжают в имена файлов данных и .meta и в ключи записи —
+    # проверяем их той же маской, что и части пакета.
+    if not check_name(row.get("schema_name"), 'schema_name', key, errors):
+        return False
+    if not check_name(row.get("extract_name"), 'extract_name', key, errors):
         return False
 
-    # Без схемы фабрика падает на schema_name.replace(), а падение при разборе файла
-    # уносит с собой ВСЕ пакеты, а не только этот.
-    if not row.get("schema_name"):
-        errors.append(f"{key}: пустой schema_name — задайте его в строке-дефолте группы или в поставке")
+    replica = row.get("replica", "")
+    if replica not in TFS_MAP:
+        errors.append(f"{key}: реплика '{replica}' не найдена в TFS_MAP")
         return False
 
     # Состав полей задаётся только настройкой: иначе новая колонка источника уехала бы
@@ -745,8 +907,6 @@ def parse_ch_type(ch_type: str, mapping: dict) -> tuple[str, bool, int | None, i
 # Маска квалифицированного имени: db.table. Ловит и алиасы колонок (t1.person_uuid) —
 # отсеются проверкой в ClickHouse, зато не нужен разбор SQL.
 _QUALIFIED = re.compile(r'\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b')
-# Первое слово FROM-части: имя без базы достраивается db_name записи.
-_FIRST_WORD = re.compile(r'^\s*([A-Za-z_]\w*)')
 
 
 def _quote(value) -> str:
@@ -754,16 +914,17 @@ def _quote(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def sql_sources(parts: dict, db_name: str = '', extract_name: str = '') -> list[tuple[str, str]]:
+def sql_sources(parts: dict) -> list[tuple[str, str]]:
     """🔎 Таблицы, к которым обращается запрос, в порядке приоритета: from → with → joins.
 
     Приоритет решает, чьё описание достанется колонке, встречающейся в нескольких
     таблицах: побеждает основная, из FROM.
 
-    Имена ищутся маской `db.table`; в FROM имя без базы достраивается db_name записи —
-    там первое слово это гарантированно таблица, а в JOIN-ах и CTE так гадать нельзя.
-    Хвостом идёт (db_name, extract_name): у выгрузки, названной по своей таблице, это
-    та же таблица, а у прочих пара просто не найдётся.
+    Имена ищутся маской `db.table` — и это единственный источник базы с тех пор, как
+    колонка db_name убрана (28.08.2026). Раньше неквалифицированное первое слово FROM
+    достраивалось ею; теперь такой FROM просто не даёт кандидата, и .meta соберётся
+    без описаний колонок — с предупреждением, но без ошибки. Пишите в sql_from 'db.table',
+    это и так норма.
 
     Мусорные пары (алиасы вида t1.person_uuid) не отсеиваем: разбирать SQL ради этого
     дороже, чем проверить кандидатов одним запросом в system.columns.
@@ -780,13 +941,9 @@ def sql_sources(parts: dict, db_name: str = '', extract_name: str = '') -> list[
         text = str(parts.get(key) or '').strip()
         if not text:
             continue
-        if key == 'from' and '.' not in text.split()[0]:
-            if first := _FIRST_WORD.match(text):
-                _add(db_name, first.group(1))
         for db, table in _QUALIFIED.findall(text):
             _add(db, table)
 
-    _add(db_name, extract_name)
     return out
 
 
@@ -1088,8 +1245,16 @@ def probe_sql(sql: str) -> str:
 
 
 def get_config() -> dict:
-    """📦 Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта."""
+    """📦 Возвращает снимок всех констант модуля для передачи в DAG-файлы без прямого импорта.
+
+    Снимок берётся УЖЕ с переопределениями из Variable — на нём же считается контрольная
+    сумма синхронизации (er_setup.wf_checksum), поэтому правка общих настроек сама
+    вызывает пересборку пакетов, без отдельного форс-синка.
+    """
     return {
+        'CFG_VAR_NAME':    CFG_VAR_NAME,
+        'OVERRIDABLE':     list(OVERRIDABLE),
+        'OVERRIDES':       _OVR,
         'CH_ID':           CH_ID,
         'TYPE_MAP':        TYPE_MAP,
         'DEF_ARGS':        DEF_ARGS,

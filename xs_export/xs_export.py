@@ -1,5 +1,5 @@
 """🏭 Фабрика DAG-ов выгрузок xStream: метаданные из JSON → DAG на поставку.
-*2026-08-31 20:44 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-31 20:58 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Читает export_xs_optimized.json и на каждую запись собирает DAG, вся начинка которого —
 группа задач из xs_common. Сборщику передаётся name_file целиком: по нему он выбирает
@@ -11,18 +11,26 @@
 """
 import json
 import os
+import sys
 from datetime import datetime, timezone
 import logging
 import re
 from airflow import DAG
 
-# Импортируем стандартные компоненты из xStream common
+# Импортируем стандартные компоненты из xStream common. Три пути — три раскладки:
+# каталог рядом с dags_folder, боевой пакет export.export_xs и, наконец, сосед по каталогу.
+# Последний вариант требует, чтобы в sys.path лежала папка самого файла, а её туда не
+# кладёт никто: Airflow добавляет dags_folder, но не подкаталоги, и разбор падал с
+# 'No module named xs_common' ещё до первого DAG-а. Кладём сами — один раз, без дублей.
+_HERE = os.path.dirname(os.path.abspath(__file__))
 try:
     from xs_export.xs_common import make_xs_export_task_group, DEFAULT_ARGS
 except ImportError:
     try:
         from export.export_xs.xs_common import make_xs_export_task_group, DEFAULT_ARGS
     except ImportError:
+        if _HERE not in sys.path:
+            sys.path.insert(0, _HERE)
         from xs_common import make_xs_export_task_group, DEFAULT_ARGS
 
 logger = logging.getLogger("airflow.task")

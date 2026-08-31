@@ -96,6 +96,44 @@ def json_fields(rows: list, on_bad: str = 'raise') -> tuple:
     return ''.join(parts), skipped
 
 
+def sql_fields(wf_name: str) -> str:
+    """Запрос, определяющий поля потока и их типы по самим данным.
+
+    Тип берётся из JSONType по первым строкам. Одно поле в разных строках может
+    приехать разным типом — целое в одной, дробное в другой, — и прежний
+    group_concat склеивал их в 'Double,Int64'. Такого типа не существует:
+    JSONExtract с ним падает, а на разведке нового потока падала вся задача.
+    Разошлись типы — берём String: он вмещает любое значение, а точный тип всё
+    равно задаётся вручную при создании целевой таблицы.
+
+    Object и Array тоже уходят в String — это было и раньше.
+    """
+    return f"""
+                with srs as (
+                    select JSONExtractString(a._gp_data) _gp_data, _gp_id
+                    from {CH_BD}.gp_ue_exchange a where _gp_name = '{escape_str(wf_name)}' order by _gp_id
+                ), fld as (
+                    select fld, max(i) ind
+                    from (select distinct JSONExtractKeys(_gp_data) arr from srs limit 10)
+                    array join arr as fld, arrayEnumerate(arr) as i
+                    group by 1 order by 2
+                ), typed as (
+                    select fld.ind as ind, fld.fld as fld, srs._gp_id as _gp_id
+                        , multiIf(JSONType(srs._gp_data, fld.fld) in ('Object', 'Array'), 'String',
+                                  JSONType(srs._gp_data, fld.fld)) as tp
+                    from fld, srs
+                    where JSONType(srs._gp_data, fld.fld) != 'Null'
+                )
+                select ind, fld
+                    , if(uniqExact(tp) > 1, 'String', any(tp)) as type
+                    , max(_gp_id) as id
+                from typed
+                group by 1, 2
+                order by 1, 2
+                limit 1000
+    """
+
+
 def escape_str(value: str) -> str:
     return value.replace("'", "''")
 
@@ -169,11 +207,16 @@ def process_any(fields, tbl_bd='', table='', ins_str='', engine='', drop_src=Fal
         if exists:
             sql=f"""
             select 
-                CASE type
-                when 'DateTime' then printf($$, parseDateTimeBestEffort(JSONExtract(a._gp_data, '%s', 'String')) as %s$$, a.name, a.name)
-                when 'Nullable(DateTime)' then printf($$, parseDateTimeBestEffortOrNull(JSONExtract(a._gp_data, '%s', 'Nullable(String)')) as %s$$, a.name, a.name)
-                else printf($$, JSONExtract(a._gp_data, '%s', '%s') as %s$$, a.name, a.type, a.name)
-                END as fld
+                -- multiIf, а не CASE: CASE в ClickHouse — это transform, а он требует
+                -- константных веток, тогда как здесь в каждой ветке printf по колонкам
+                -- system.columns. С CASE запрос падает с 'Argument at index 2 for
+                -- function transform must be constant', то есть поток с fields='*'
+                -- не грузился вовсе, когда целевая таблица уже создана.
+                multiIf(
+                    type = 'DateTime', printf($$, parseDateTimeBestEffort(JSONExtract(a._gp_data, '%s', 'String')) as %s$$, a.name, a.name),
+                    type = 'Nullable(DateTime)', printf($$, parseDateTimeBestEffortOrNull(JSONExtract(a._gp_data, '%s', 'Nullable(String)')) as %s$$, a.name, a.name),
+                    printf($$, JSONExtract(a._gp_data, '%s', '%s') as %s$$, a.name, a.type, a.name)
+                ) as fld
             from system.columns a
             where a.database = '{tbl_bd}' and a.table = '{table}'
                 and a.name not in ('_gp_ts', '_gp_key', '_gp_id', '_gp_hash')
@@ -187,28 +230,7 @@ def process_any(fields, tbl_bd='', table='', ins_str='', engine='', drop_src=Fal
             fields_str = ''.join(fields_list)
         else:
             sql=f"""
-                with srs as (
-                    select JSONExtractString(a._gp_data) _gp_data, _gp_id 
-                    from {CH_BD}.gp_ue_exchange a where _gp_name = '{wf_name}' order by _gp_id 
-                ), fld as (
-                    select fld , max(i) ind
-                    from (select distinct JSONExtractKeys(_gp_data) arr from srs limit 10)
-                    array join arr as fld, arrayEnumerate(arr) as i
-                    group by 1 order by 2
-                )
-                select ind, fld
-                    , group_concat(',')(distinct
-                        case JSONType(srs._gp_data, fld) 
-                        when 'Object' then 'String'
-                        when 'Array'  then 'String'
-                        else JSONType(srs._gp_data, fld) end
-                    ) as type
-                    , max(_gp_id) as id
-                from fld, srs
-                where JSONType(srs._gp_data, fld) != 'Null'
-                group by 1,2 
-                order by 1,2
-                limit 1000
+                {sql_fields(wf_name)}
             """
             res = select_dic(ch_hook, sql)
             # ti.xcom_push(key=f'{wf_name}_fields', value=json_out(res)[:500])
@@ -747,28 +769,7 @@ def do_process_other(**context):
         validate_identifier(table)
         logging.info(f"Find new table: {table}")
         sql = f"""
-            with srs as (
-                select JSONExtractString(a._gp_data) _gp_data, _gp_id 
-                from {CH_BD}.gp_ue_exchange a where _gp_name = '{table}' order by _gp_id 
-            ), fld as (
-                select fld , max(i) ind
-                from (select distinct JSONExtractKeys(_gp_data) arr from srs limit 10)
-                array join arr as fld, arrayEnumerate(arr) as i
-                group by 1 order by 2
-            )
-            select ind, fld
-                , group_concat(',')(distinct
-                    case JSONType(srs._gp_data, fld) 
-                    when 'Object' then 'String'
-                    when 'Array'  then 'String'
-                    else JSONType(srs._gp_data, fld) end
-                ) as type
-                , max(_gp_id) as id
-            from fld, srs
-            where JSONType(srs._gp_data, fld) != 'Null'
-            group by 1,2 
-            order by 1,2
-            limit 1000
+            {sql_fields(table)}
         """
         res = select_dic(ch_hook, sql)
         jsn = json_out(res)

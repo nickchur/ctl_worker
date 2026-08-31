@@ -50,6 +50,52 @@ def validate_identifier(name: str) -> str:
     return name
 
 
+_TYPE_RE = re.compile(r'^[A-Za-z0-9_]+(\([A-Za-z0-9_, ]*\))?$')
+
+
+def validate_type(name: str) -> str:
+    """Тип ClickHouse для JSONExtract: имя, необязательно со скобками.
+
+    Пропускает 'String', 'Int64', 'Nullable(DateTime)' и режет всё остальное.
+    Тип приезжает из JSONType над присланными данными, то есть управляется чужой
+    стороной, и подставляется в запрос текстом.
+    """
+    if not _TYPE_RE.match(name):
+        raise ValueError(f"Invalid ClickHouse type: {name!r}")
+    return name
+
+
+def json_fields(rows: list, on_bad: str = 'raise') -> tuple:
+    """Собирает список выражений JSONExtract по описанию полей из данных.
+
+    Имя поля и его тип приходят из самого сообщения (JSONExtractKeys / JSONType),
+    то есть их задаёт присылающая сторона, а подставляются они в запрос текстом —
+    без проверки ключ вида "x') as y, (select …" встраивается в SQL. Проверяем оба.
+
+    Args:
+        rows: строки с ключами 'fld' и 'type'.
+        on_bad: 'raise' — падать на негодном поле (загрузка в целевую таблицу),
+            'skip' — пропустить его, вернув вторым элементом список пропущенных
+            (разведка неизвестного потока: один странный ключ не должен её отменять).
+
+    Returns:
+        Кортеж (строка с выражениями, список пропущенных полей).
+    """
+    parts, skipped = [], []
+    for row in rows:
+        try:
+            fld = validate_identifier(row['fld'])
+            typ = validate_type(row['type'])
+        except ValueError as e:
+            if on_bad == 'raise':
+                raise AirflowFailException(f"Bad field in incoming data: {e}") from e
+            logging.warning("Пропускаю поле: %s", e)
+            skipped.append(f"{row['fld']}: {row['type']}")
+            continue
+        parts.append(f"\n, JSONExtract(a._gp_data, '{fld}', '{typ}') as {fld}")
+    return ''.join(parts), skipped
+
+
 def escape_str(value: str) -> str:
     return value.replace("'", "''")
 
@@ -167,8 +213,7 @@ def process_any(fields, tbl_bd='', table='', ins_str='', engine='', drop_src=Fal
             res = select_dic(ch_hook, sql)
             # ti.xcom_push(key=f'{wf_name}_fields', value=json_out(res)[:500])
 
-            fields_list = [f"\n, JSONExtract(a._gp_data, '{k['fld']}', '{k['type']}') as {k['fld']}"for k in res]
-            fields_str = ''.join(fields_list)
+            fields_str, _ = json_fields(res)
     else:
         fields_str = fields
 
@@ -222,8 +267,12 @@ def process_any(fields, tbl_bd='', table='', ins_str='', engine='', drop_src=Fal
     engine = engine or ''
     final = ' FINAL' if engine and any(t in engine for t in final_types) else ''
 
+    # Ниже везде _gp_name = wf_name, а не table: в gp_ue_exchange лежит имя потока
+    # ('_exchange_log'), тогда как table — имя целевой таблицы ('gp__exchange_log').
+    # С именем таблицы выборка ключей пуста, а DROP PARTITION молча не находит партицию:
+    # очистка и удаление источника не делали ничего и не жаловались.
     if clear_trg == 'drop':
-        res = ch_hook.execute(f""" select distinct {_gp_key} from {CH_BD}.gp_ue_exchange where _gp_name = '{table}' """)
+        res = ch_hook.execute(f""" select distinct {_gp_key} from {CH_BD}.gp_ue_exchange where _gp_name = '{wf_name}' """)
         for key in res:
             logging.info(f"clear_trg: drop partition {key[0]}")
             ch_hook.execute(f""" ALTER TABLE {tbl_bd}.{table} {ON_CLUSTER} DROP PARTITION '{key[0]}' """)
@@ -233,7 +282,7 @@ def process_any(fields, tbl_bd='', table='', ins_str='', engine='', drop_src=Fal
         ch_hook.execute(f"""TRUNCATE TABLE {tbl_bd}.{table} {ON_CLUSTER}""")
 
     elif clear_trg == 'delete':
-        res = ch_hook.execute(f"""select distinct {_gp_key} from {CH_BD}.gp_ue_exchange where _gp_name = '{table}' """)
+        res = ch_hook.execute(f"""select distinct {_gp_key} from {CH_BD}.gp_ue_exchange where _gp_name = '{wf_name}' """)
         for key in res:
             where = f"WHERE {_gp_key} = cast('{key[0]}', toTypeName({_gp_key}))"
             logging.info(f"clear_trg: delete {where}")
@@ -321,7 +370,7 @@ def process_any(fields, tbl_bd='', table='', ins_str='', engine='', drop_src=Fal
     ret = select_dic(ch_hook, sql)
     jsn = json_out(ret)
 
-    if drop_src: ch_hook.execute(f""" ALTER TABLE {CH_BD}.gp_ue_exchange {ON_CLUSTER} DROP PARTITION '{table}' """)
+    if drop_src: ch_hook.execute(f""" ALTER TABLE {CH_BD}.gp_ue_exchange {ON_CLUSTER} DROP PARTITION '{wf_name}' """)
     ti.xcom_push(key=f'stat', value=jsn[:500])
 
     if chk_uniq:
@@ -727,8 +776,9 @@ def do_process_other(**context):
         logging.info(f"Table {table}: {jsn}")
         ti.xcom_push(key=f'{table}', value=jsn[:500])
 
-        fields_list = [f", JSONExtract(a._gp_data, '{k['fld']}', '{k['type']}') as {k['fld']}\n"for k in res]
-        fields_str = ''.join(fields_list)
+        fields_str, skipped = json_fields(res, on_bad='skip')
+        if skipped:
+            ti.xcom_push(key=f'{table}_skipped', value=skipped[:50])
         # ti.xcom_push(key=f'{table}_fields', value=fields_list[:500])
 
         sql = f"""
@@ -887,7 +937,9 @@ with DAG(
                 'chk_src': 'ue_exchange_load',
                 'chk_trg': 'ue_exchange_load',
                 'chk_type': 'full',
-                'params': ['raise', 'not_empty', 'only_err']
+                # именно chk_prm: 'params' — зарезервированное имя контекста Airflow,
+                # список уезжал в **context, а проверка молча шла с набором по умолчанию
+                'chk_prm': ['raise', 'not_empty', 'only_err'],
             }
         )
 
@@ -913,7 +965,7 @@ with DAG(
                 'chk_src': '_exchange_log',
                 'chk_trg': 'ue_exchange',
                 'chk_type': 'right',
-                'params': ['only_err', 'raise', 'not_empty', 'now'],
+                'chk_prm': ['only_err', 'raise', 'not_empty', 'now'],
             }
         )
 

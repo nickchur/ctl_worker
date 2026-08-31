@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-08-31 18:22 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-31 20:40 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -133,12 +133,12 @@ CTL.<profile>.sensor
 | `plugins/` | `openspec/specs/plugins/spec.md` | полная |
 | `er_export/` | `openspec/specs/er-export/spec.md` | полная |
 | `tfs_kafka/` | `openspec/specs/tfs-kafka/spec.md` | полная |
-| `xs_export/` | `openspec/specs/xs-export/spec.md` | заготовка |
+| `xs_export/` | `openspec/specs/xs-export/spec.md` | полная |
 | `tools/` | `openspec/specs/tools/spec.md` | полная |
 | `check/` | `openspec/specs/check/spec.md` | полная |
 
-Заготовку `xs-export` дописывает тот, кто первым правит этот каталог: спека на код, который
-никто не меняет, устаревает молча.
+Спека описывает требуемое поведение, а не текущее состояние кода: расхождение между ними —
+это дефект, который видно сравнением, а не повод переписать спеку.
 
 ```bash
 npm i -g --prefix ~/.local @fission-ai/openspec   # CLI (в /usr прав нет)

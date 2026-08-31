@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# История переписана (rebase, amend) — даты коммитов поехали, свежесть пересчитать.
+exec "$(git rev-parse --show-toplevel)/.githooks/_sync" "после rebase"

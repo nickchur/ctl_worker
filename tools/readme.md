@@ -1,5 +1,5 @@
 # 🛠️ Tools — Служебные DAG'и
-*2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-31 23:20 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Инструменты для администрирования и отладки. Все DAG'и запускаются вручную (`schedule=None`).
 
@@ -17,6 +17,7 @@
 | `s3_from_content.py` | `tools_s3_from_content` | Загружает текстовый контент в S3 из параметров запуска |
 | `s3_to_s3.py` | `tools_s3_to_s3` | Копирует один объект между S3-бакетами с опциональным сжатием |
 | `s3_to_s3_test.py` | `tools_s3_to_s3_test` | Находит файлы по маске и копирует/перемещает их S3→S3 |
+| `test_package.py` | `tools_test_package` | Собирает тестовый ZIP-пакет формата ЕР/ТФС (данные, `.meta`, `.tkt`) и кладёт в S3; на PROM не регистрируется |
 | `dummy.py` | `dummy_dag` | Шаблон DAG для проверки отображения Markdown в Airflow UI |
 
 > `db_cleanup.py`, `show_connections.py` и `maintenance.py` (теперь `log_cleanup.py`)

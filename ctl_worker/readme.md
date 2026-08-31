@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-31 23:20 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -214,6 +214,21 @@ XCom из `ctl_monitor`: `{lid: {wid, wfn, sts, act, sch, ...}}` — перед�
 - `priority_weight=999` — запускается раньше остальных задач в пуле.
 
 ---
+
+## 🤝 Контракт решателей
+
+Проверки состояния загрузки (`ctl_chk_status`, `ctl_chk_new`, `ctl_chk_wait`,
+`ctl_chk_expire`) таск не останавливают: они возвращают пару `(status, payload)` со
+статусом `ok` / `skip` / `fail`, а решение принимает сам таск через `raise_status`.
+
+```python
+st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
+raise_status(st, ld_sts)
+```
+
+`skip` даёт штатный пропуск, поэтому у следующего таска в цепочке нужен
+`trigger_rule=NONE_FAILED`. Требования к поведению DAG'ов каталога —
+в [`openspec/specs/ctl-worker/spec.md`](../openspec/specs/ctl-worker/spec.md).
 
 ## ⚙️ Интеграция с Airflow
 

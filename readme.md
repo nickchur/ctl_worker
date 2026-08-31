@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-08-31 22:50 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-31 23:20 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -123,6 +123,22 @@ CTL.<profile>.sensor
 - pendulum
 - PyYAML
 - hrp_operators (KerberosHttpHook)
+
+---
+
+## Контекст для работы
+
+| Файл | О чём |
+|---|---|
+| [CLAUDE.md](CLAUDE.md) | правила работы в репозитории: язык, метки версий, контракты, порядок правки поведения |
+| [CONTEXT.md](CONTEXT.md) | карта артефактов и их свежесть — собирается автоматически |
+
+После `pull`, `merge` и `checkout` git-хуки сами раскладывают навыки и команды агента,
+пересобирают карту и показывают документы, отставшие от кода. Включаются один раз на клон:
+
+```bash
+bash .githooks/install.sh
+```
 
 ---
 

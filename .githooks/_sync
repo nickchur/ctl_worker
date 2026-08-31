@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Общее тело хуков: синхронизация контекста с коротким отчётом.
+#
+# Тихо и быстро: печатаем только то, что требует внимания. Ошибка синхронизации
+# не должна мешать работе с git, поэтому код возврата всегда 0.
+set -u
+ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT="$ROOT/.claude/scripts/sync_context.py"
+[ -f "$SCRIPT" ] || exit 0
+
+OUT=$(python3 "$SCRIPT" --quiet 2>&1)
+STATUS=$?
+
+if [ $STATUS -ne 0 ]; then
+    echo "context: синхронизация $1 не удалась — $(echo "$OUT" | tail -1)"
+    exit 0
+fi
+
+if echo "$OUT" | grep -q '⚠️'; then
+    echo "── контекст $1 ──"
+    echo "$OUT"
+    echo "── подробности: python3 .claude/scripts/check_context.py ──"
+else
+    echo "context: документы в порядке ($1)"
+fi
+exit 0

@@ -1,5 +1,5 @@
 # 🛠️ CTL Plugins для Apache Airflow
-*2026-08-12 19:16 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-08-31 23:20 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Этот модуль содержит набор плагинов для интеграции Apache Airflow с системой CTL (Control Layer) и управления ETL-процессами.
 
@@ -49,6 +49,21 @@ plugins/
 - `tenacity` для автоматических повторов
 - `log_retry_attempt` для логирования попыток
 
+### tfs_utils.py — Тракт ТФС
+
+Единственный источник настроек обмена с ТФС: им пользуются и отправитель (`tfs_kafka/`),
+и выгрузки (`er_export/`), поэтому модуль живёт здесь, а не рядом с одним из них. Копий
+быть не должно — разъехавшийся путь к квитанции подвешивает пакет до таймаута, и причина
+не видна ниоткуда.
+
+- **Маршруты и лимиты**: `TFS_ROUTES`, скользящие ограничения темпа (10/сек, 200/мин,
+  500/час, 2000/сутки), выбор топика по сценарию
+- **Очередь отправки**: `enqueue_files`, `pending`, `mark_sent`, `missing_in_bucket`
+- **Пауза**: `pause_rules`, `pause_reason`, `split_pending`, `pause_set` / `pause_clear`,
+  нарастающий алерт `claim_pause_alerts` (1, 2, 4, 8 … часа)
+- **Квитанции**: `parse_receipt` — по строке на каждый файл квитанции, ключ
+  `(rq_uid, file_name)`; `stale_sent` — сверка неподтверждённых
+
 ### s3_utils.py — Расширенные утилиты S3
 
 Содержит расширенные функции для работы с S3:
@@ -62,6 +77,21 @@ plugins/
 - **`s3_from_zip`** — Потоковая распаковка ZIP в S3 без сохранения на диск
 - **`s3_IterStream`** — Обёртка итератора байтов в file-like объект (защита от OOM: лимит 512 МБ)
 
+### Контракт решателей
+
+Функции, решающие судьбу таска (`ctl_chk_status`, `ctl_chk_new`, `ctl_chk_wait`,
+`ctl_chk_expire`, `pause_set`, `store_params`), возвращают пару `(status, payload)`,
+где статус — `ok` / `skip` / `fail`. Решение принимает сам таск:
+
+```python
+st, ld_sts = ctl_chk_status(lid, wf['name'], step='RUN')
+raise_status(st, ld_sts)      # skip → AirflowSkipException, fail → AirflowFailException
+```
+
+`skip` — это штатный пропуск, поэтому у следующего таска в цепочке нужен
+`trigger_rule=NONE_FAILED`, иначе пропуск утянет всю цепочку. На исключениях остаются
+только транспортные функции: HTTP, SQL, S3.
+
 ### utils.py — Общие утилиты
 
 Общие функции для работы с Airflow:
@@ -73,6 +103,11 @@ plugins/
 - **`readable_size`** — Конвертация размера файлов в читаемый формат (KB, MB, GB...)
 - **`s3_*`** — Утилиты для работы с S3 (TTL, размер бакета, список объектов)
 - **`str2timedelta`** — Парсинг timedelta из строки
+- **`saved_params` / `store_params`** — Значения по умолчанию из Variable и сохранение
+  параметров запуска как новых умолчаний (включая `schedule`); возвращает `(status, message)`
+- **`update_dag_pause`** — Переключение паузы DAG-а из кода
+- **`valid_schedule`** — Проверка cron-строки до записи: битое расписание уронило бы
+  разбор файла и убрало из UI саму форму, через которую его чинят
 
 ## 📊 Логирование и статусы
 

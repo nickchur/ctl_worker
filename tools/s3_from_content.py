@@ -1,5 +1,4 @@
 """### 🛠️ Загрузка контента в S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает текстовый контент в S3 из параметров запуска DAG.
 
@@ -35,7 +34,7 @@ from airflow.configuration import get_custom_secret_backend
 
 import os
 import base64
-from datetime import datetime, timedelta, timezone
+import pendulum
 
 from logging import getLogger
 logger = getLogger("airflow.task")
@@ -68,9 +67,9 @@ s3_conns=get_conns_by_type(conn_type='aws')
     default_args = {
         'owner': 'DataLab (CI02420667)',
         'retries': 2,
-        'retry_delay': timedelta(seconds=30),
+        'retry_delay': pendulum.duration(seconds=30),
     },
-    start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
+    start_date=pendulum.datetime(2025, 8, 7, tz=pendulum.UTC),
     tags=['DataLab', 'tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,
@@ -101,7 +100,7 @@ def tools_s3_from_content():
     @task
     def s3_from_content(**context):
         from airflow.models import Connection
-        from airflow.exceptions import AirflowNotFoundException, AirflowSkipException
+        from airflow.exceptions import AirflowNotFoundException, AirflowSkipException, AirflowFailException
 
         params = context['params']
         s3_conn_id = params['s3_conn_id']
@@ -131,12 +130,55 @@ def tools_s3_from_content():
         if not hook.check_for_bucket(bucket_name):
             raise AirflowSkipException(f"Бакет '{bucket_name}' не существует или недоступен для '{s3_conn_id}'")
 
+        # Шлюз TFS отдаёт XAmzContentSHA256Mismatch и при UNSIGNED-PAYLOAD (дефолт botocore),
+        # и при настоящем SHA256 — т.е. это, похоже, мусорный catch-all шлюза, а не реальная
+        # сверка хэша. payload_signing_enabled=True оставляем как наиболее «правильный» режим
+        # (кладёт настоящий SHA256 тела); реальную причину выясняем по логу ответа ниже.
+        from botocore.config import Config
+        from botocore.exceptions import ClientError
+        import botocore.handlers
+
+        # Мержим с конфигом из коннекта, чтобы не потерять его настройки
+        # (verify/region/CA — иначе ловим SSL CERTIFICATE_VERIFY_FAILED).
+        base_cfg = hook.config or Config()
+        client = hook.get_session().client(
+            's3',
+            endpoint_url=hook.conn_config.endpoint_url,
+            region_name=hook.region_name,
+            verify=hook.verify,
+            config=base_cfg.merge(Config(signature_version='s3v4', s3={'payload_signing_enabled': True})),
+        )
+
+        # Снимаем Expect: 100-continue — проксированные не-AWS S3 (haproxy) часто
+        # обрабатывают его некорректно, что выглядит как ошибка загрузки.
+        client.meta.events.unregister('before-call.s3', botocore.handlers.add_expect_header)
+
+        def _put(key: str, body: bytes):
+            if not replace and hook.check_for_key(key, bucket_name):
+                raise AirflowFailException(f"Ключ s3://{bucket_name}/{key} уже существует (replace=False)")
+            try:
+                client.put_object(Bucket=bucket_name, Key=key, Body=body)
+            except ClientError as e:
+                # botocore сворачивает ответ шлюза в ': Unknown' — логируем полный ответ,
+                # чтобы увидеть реальный код/сообщение/заголовки шлюза.
+                logger.error("PutObject отклонён шлюзом для %s: %s", key, e.response)
+                raise
+
         content = '\n'.join(content)
         content = content.replace('{{empty}}', '')
-        try:
-            content = base64.b64decode(content).decode('utf-8')
-        except Exception:
-            pass
+
+        # content может быть обычным текстом или base64. Декодируем строго:
+        # validate=True не игнорирует символы вне алфавита, а round-trip
+        # гарантирует, что вход действительно был корректным base64
+        # (иначе обычный CSV случайно «декодировался» бы в мусор).
+        stripped = content.strip()
+        if stripped:
+            try:
+                decoded = base64.b64decode(stripped, validate=True)
+                if base64.b64encode(decoded) == stripped.encode('ascii'):
+                    content = decoded.decode('utf-8')
+            except (ValueError, UnicodeDecodeError):
+                pass
 
         import io, gzip, zipfile
 
@@ -146,8 +188,7 @@ def tools_s3_from_content():
             buf = io.BytesIO()
             with gzip.GzipFile(fileobj=buf, mode='wb') as f:
                 f.write(raw)
-            buf.seek(0)
-            hook.load_file_obj(file_obj=buf, bucket_name=bucket_name, key=s3_key, replace=replace)
+            _put(s3_key, buf.getvalue())
 
         elif compress == 'zip':
             zip_marker = '.zip/'
@@ -167,18 +208,17 @@ def tools_s3_from_content():
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr(internal_name, raw)
-            buf.seek(0)
-            hook.load_file_obj(file_obj=buf, bucket_name=bucket_name, key=zip_s3_key, replace=replace)
+            _put(zip_s3_key, buf.getvalue())
             s3_key = f"{zip_s3_key} (internal: {internal_name})"
 
         else:
-            hook.load_bytes(raw, bucket_name=bucket_name, key=s3_key, replace=replace)
+            _put(s3_key, raw)
 
         logger.info(f"Successfully uploaded to s3://{bucket_name}/{s3_key}")
 
         if done_file:
             done_key = zip_s3_key + '.done' if compress == 'zip' else s3_key + '.done'
-            hook.load_bytes(b'', bucket_name=bucket_name, key=done_key, replace=replace)
+            _put(done_key, b'')
             logger.info(f"Created done file s3://{bucket_name}/{done_key}")
 
     s3_from_content()

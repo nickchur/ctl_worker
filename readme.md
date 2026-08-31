@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-08-31 20:40 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-31 21:36 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -39,6 +39,11 @@ check/                   # DAG'и проверки и обслуживания �
 ├── test_kafka.py        # 📨 Проверка Kafka: продюсер и консьюмер тестовых сообщений
 ├── db_cleanup.py        # 🧹 Очистка метадаты Airflow старше N дней
 └── log_cleanup.py       # 🪣 Обслуживание бакета логов задач: удаление старых объектов
+
+gp_exchange/                 # Приём универсального обмена из ПКАП: S3 → ClickHouse
+├── tfs_exchange_sensor.py   # 📡 S3KeySensor на ue_exchange_*.csv, публикует Dataset
+├── tfs_exchange_import.py   # 📥 Загрузка CSV в gp_ue_exchange, ветвление по _gp_name, разбор JSON в целевые таблицы
+└── tfs_exchange_common.py   # ⚙️ Конфигурация тракта ТФС (сценарий, бакет, топик) и сообщение TransferFileCephRq
 
 plugins/             # Переиспользуемые модули (импортируются DAG'ами)
 ├── ctl_core.py      # 🧠 Ядро: retry, события (AND/OR), TIME-WAIT, нормализация данных
@@ -136,6 +141,7 @@ CTL.<profile>.sensor
 | `xs_export/` | `openspec/specs/xs-export/spec.md` | полная |
 | `tools/` | `openspec/specs/tools/spec.md` | полная |
 | `check/` | `openspec/specs/check/spec.md` | полная |
+| `gp_exchange/` | — | нет, каталог перенесён из отдельного репозитория |
 
 Спека описывает требуемое поведение, а не текущее состояние кода: расхождение между ними —
 это дефект, который видно сравнением, а не повод переписать спеку.

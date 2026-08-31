@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-08-31 22:32 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-08-31 22:50 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -144,9 +144,9 @@ CTL.<profile>.sensor
 | `gp_exchange/` | `openspec/specs/gp-exchange/spec.md` | полная |
 
 Спека описывает требуемое поведение, а не текущее состояние кода: расхождение между ними —
-это дефект, который видно сравнением, а не повод переписать спеку. Два таких расхождения
-сейчас живут в `gp-exchange` — первая загрузка потока и публикация события на пустом
-ветвлении, — оба найдены прогоном на стенде (`gp_exchange/testbed/`).
+это дефект, который видно сравнением, а не повод переписать спеку. Так были найдены и
+закрыты два расхождения в `gp-exchange` — первая загрузка потока и публикация события на
+пустом ветвлении; оба проверены прогоном на стенде (`gp_exchange/testbed/`).
 
 ```bash
 npm i -g --prefix ~/.local @fission-ai/openspec   # CLI (в /usr прав нет)

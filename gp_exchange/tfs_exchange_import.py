@@ -709,7 +709,11 @@ def do_branch(**context):
                 , min(_gp_id) min_id, max(_gp_id) max_id, count(distinct _gp_id) cnt_id
                 , min(_gp_key) min_key, max(_gp_key) max_key, count(distinct _gp_key) cnt_key
             from {CH_BD}.gp_ue_exchange a final
-            join (
+            -- left join, а не join: поток, по которому в журнале ещё нет ни одной
+            -- записи IN_log, inner join отсекал, а запись появляется только после его
+            -- обработки — первый пакет нового потока не грузился никогда, пока журнал
+            -- не засеют вручную. Отсутствующий максимум даёт 0, и проходит любой _gp_id.
+            left join (
                 select b.wf_name wf, max(toInt64OrZero(JSONExtractString(b._gp_data, 'wf_key'))) as max
                 from {CH_BD}.gp__exchange_log b
                 join (
@@ -721,7 +725,7 @@ def do_branch(**context):
                 where b.wf_type = 'IN_log'
                 group by 1
             ) b on a._gp_name = b.wf 
-            where a._gp_id > b.max
+            where a._gp_id > coalesce(b.max, 0)
             group by 1
         ) a
         order by _gp_name asc
@@ -743,9 +747,16 @@ def do_branch(**context):
     if other:
         logging.warning(f"Other tables found: {other}")
         ti.xcom_push(key='other', value=other[:500])
-        branches.append('process__other')
-    # return branches if branches else 'process__empty'
-    return branches
+        # с префиксом группы: задача называется 'process.process__other', и без него
+        # BranchPythonOperator не нашёл бы её среди downstream — падал бы первый же
+        # пакет с незнакомым потоком, то есть ровно тот случай, ради которого разведка
+        # и заведена
+        branches.append('process.process__other')
+
+    # Пустой список означал бы skip у всех process_* и, по цепочке, у end_task с его
+    # one_success: Dataset не публикуется, зависимые DAG-и молча не запускаются, а сам
+    # прогон при этом зелёный. Пустая ветка доводит DAG до конца честно.
+    return branches or ['process.process__empty']
 
 def do_end_task(**context):
     if context['ti'].xcom_pull(key='chk', task_ids='chk') == 'Ok':
@@ -1023,6 +1034,10 @@ with DAG(
             python_callable=do_process_other,
             task_id="process__other",
         )
+
+        # Ветка на случай, когда обрабатывать нечего: без неё ветвление возвращает
+        # пустой список, и end_task не выполняется вовсе (см. do_branch).
+        process__empty = EmptyOperator(task_id="process__empty")
 
         tasks = {
             "vw_exchange_log": {

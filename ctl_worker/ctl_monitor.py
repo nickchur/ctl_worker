@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-01 19:13 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -21,7 +21,7 @@ from airflow.sensors.base import PokeReturnValue # type: ignore
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
 from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
-from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status  # type: ignore
+from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_wait_until  # type: ignore
 
 import ast
 import sys
@@ -216,17 +216,37 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                             action = 'Skipped'
 
                     elif sts == 'TIME-WAIT' and not running:
-                        if log.startswith('Start scheduled on '):
-                            # time = datetime.strptime(log[19:], "%Y-%m-%d %H:%M:%S")
-                            time = pendulum.parse(log[19:], tz=get_config()['tz'])
+                        # Время старта достаём общим разбором: наш словарь, старый текст
+                        # CTL 'Start scheduled on …' либо расписание воркфлоу. Раньше здесь
+                        # понимался ТОЛЬКО текст CTL, а всё остальное считалось мусором и
+                        # уходило в Aborted — то есть повтор, поставленный нами же, монитор
+                        # отменял. CTL этот текст больше не пишет, так что ветка else стала
+                        # основной.
+                        # Сначала только лог: наш словарь либо старый текст CTL.
+                        wait_to = ctl_wait_until(log)
 
-                            if time + timedelta(minutes=15) <= now:
-                                add_note(log, context, level='Task', title=f'reStarted {lid}')
-                                action = 'reStarted'
-                            else:
-                                action = 'Skipped'
+                        if not wait_to:
+                            # Лог молчит — смотрим условие запуска. Оно приходит ТОЛЬКО
+                            # в полной загрузке (в списке /loading/extended его нет),
+                            # поэтому дотягиваем её здесь, а не для каждой ожидающей.
+                            #
+                            # Спрашивать условие ДО расписания обязательно: при заданном
+                            # startCondition CTL игнорирует wf_time_sched, и посчитанное
+                            # по нему время было бы неправдой.
+                            cond = (ctl_api(f'/v4/api/loading/{lid}') or {}).get('startCondition')
+                            wait_to = ctl_wait_until(log, wf=wf, sdt=sdt, cond=cond)
+
+                        if not wait_to:
+                            # Время неизвестно НАМ, но известно CTL: он и разбудит загрузку.
+                            # Пропускаем, а залипшую поймает проверка SLA ниже и покажет
+                            # человеку — это лучше, чем отменить молча.
+                            action = 'Skipped'
+                        elif pendulum.parse(wait_to, tz=get_config()['tz']) + timedelta(minutes=15) <= now:
+                            add_note({'log': log, 'старт был назначен на': wait_to},
+                                     context, level='Task', title=f'reStarted {lid}')
+                            action = 'reStarted'
                         else:
-                            action = 'Aborted'
+                            action = 'Skipped'
 
                     elif sts == 'EVENT-WAIT' and not running:
                         chk = ctl_events_mon(sdt, wf, now)

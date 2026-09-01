@@ -1,6 +1,6 @@
 # 🚀 Быстрый старт: заводим выгрузку в ЕР
 
-*2026-09-01 00:08 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-01 08:48 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Пошагово, с готовыми текстами для копирования. Подробности — в [README.md](README.md);
 сюда вынесено то, что нужно, чтобы довести первую выгрузку до зелёного рана.
@@ -108,7 +108,7 @@ DAG `export_er__hrplatform_datalab__7` создаётся **на паузе** �
 | `<таблица>.pack_zip` | пакует в ZIP формата ЕР | заметка с именами архивов |
 | `make_summary` | общий тикет пакета, постановка файлов в очередь отправки | заметка `🧾` |
 | `wait_confirm` | ждёт квитанции ТФС (☮️ при `auto_confirm=1`) | заметка `📨 TFS confirm` |
-| `save_status` | пишет результат в `export.extract_history` | заметка `💾` |
+| `save_status` | пишет результат в `export.er_extract_history` | заметка `💾` |
 | `schedule_next` | взводит следующий цикл, если дельта отстала | заметка `⏭️` |
 
 Файлы лежат в `s3://tfshrplt/from/KAP802/hrpl_lm_er/`, очередь отправки и квитанции —

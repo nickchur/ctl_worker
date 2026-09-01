@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-08-28 14:02 MSK · v3.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-01 08:48 MSK · v3.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
 `replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
@@ -13,16 +13,17 @@
 и `[реплика]__[ts].tkt` — группа стоит за меткой времени, а в тикете её нет вовсе.
 Метку выдаёт make_ts, по одному таску за раз на реплику (пул на один слот).
 
-Состояние дельты живёт в `export.extract_history` под составным именем
-`<dag_id>.<extract_name>`: одна и та же таблица может входить в разные группы, и по
-короткому имени они делили бы одно окно.
+Состояние дельты живёт в своей таблице `export.er_extract_history`: выгрузка опознаётся
+тройкой (replica, schema_name, extract_name), окно следующей выгрузки считает next_window
+здесь же, в коде. До 01.09.2026 состояние лежало в общей с xStream `export.extract_history`
+под составным именем `<dag_id>.<extract_name>`, а окно считала чужая вью.
 
 Метаданные выгрузок хранятся в Airflow Variable `datalab_er_wfs` (JSON-словарь, ключ —
 dag_id пакета), который синхронизируется DAG-ом export_er_setup из таблицы
 export.er_wf_meta.
 
 Поддерживаемые режимы выгрузки:
-  📈 delta  — инкрементальный, окно [time_from, time_to] из export.extract_current_vw
+  📈 delta  — инкрементальный, окно [time_from, time_to] от достигнутого состояния
   🔄 recent — скользящее окно [now() - recent_interval, now()], без сохранения состояния
   📅 период — ручной запуск с date_from/date_to; состояние дельты при этом не двигается
 """
@@ -45,7 +46,7 @@ try:
     from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params,
         norm_group, ts_pool,
-        build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
+        build_meta, ch_source_columns, check_descriptions, check_fields,
         cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,
         unnamed_fields,
     )
@@ -53,7 +54,7 @@ except ImportError:
     from er_export.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params,
         norm_group, ts_pool,
-        build_sql, build_meta, ch_source_columns, check_descriptions, check_fields,
+        build_meta, ch_source_columns, check_descriptions, check_fields,
         cols_from_fields, export_sql, parse_s3_target, query_columns, sql_sources,
         unnamed_fields,
     )
@@ -88,48 +89,74 @@ TFS_MAP         = _cfg['TFS_MAP']
 S3_CONN         = _cfg['S3_CONN']
 VAR_NAME        = _cfg['VAR_NAME']
 FORMAT_MAP      = _cfg['FORMAT_MAP']
+HIST_TABLE      = _cfg['HIST_TABLE']
+HIST_CURRENT_VW = _cfg['HIST_CURRENT_VW']
+CH_HIST_COLS    = tuple(_cfg['CH_HIST_COLS'])
 
 
-def state_name(dag_id: str, tbl: str) -> str:
-    """🔑 Имя выгрузки в export.extract_history: '<dag_id>.<extract_name>'.
+def sql_cur_state(replica: str, schema: str, tbl: str) -> str:
+    """SQL: последнее состояние поставки из export.er_extract_current_vw.
 
-    Составное, потому что одна и та же таблица может входить в разные группы (например,
-    старая и новая версия пакета): по короткому имени они делили бы одно окно дельты —
-    вторая группа выгружала бы пустоту, а её save_status переписывал бы чужую историю.
+    Возвращает СЫРЫЕ значения, а не готовые SQL-литералы: окно следующей выгрузки
+    считает next_window здесь же, в коде. Раньше его считала вью export.extract_current_vw
+    (чужая, общая с xStream), и арифметику окна нельзя было ни увидеть в репозитории,
+    ни поправить иначе как ALTER-ом на боевом кластере.
 
-    Именно составное имя, а не отдельная колонка: extract_history и extract_current_vw
-    мы делим с xStream (xs_export/xs_common.py пишет туда же и читает по extract_name),
-    и менять общую структуру ради ЕР значило бы чинить заодно и его.
+    Ключ — тройка (replica, schema_name, extract_name); группы в нём нет, поэтому одна
+    таблица в двух группах запрещена настройкой (er_config.state_conflicts).
     """
-    return f"{dag_id}.{tbl}"
+    return (f"SELECT * FROM {HIST_CURRENT_VW} "
+            f"WHERE replica = '{_sql_str(replica)}' "
+            f"AND schema_name = '{_sql_str(schema)}' "
+            f"AND extract_name = '{_sql_str(tbl)}'")
 
 
-def sql_cur_delta(dag_id: str, tbl: str) -> str:
-    """SQL для получения текущего состояния дельты из export.extract_current_vw.
+def _parse_ts(value) -> datetime:
+    """Момент времени из настройки или из ClickHouse → наивный datetime в UTC.
 
-    Все значения возвращаются как строки-SQL-литералы ('2024-01-01' или null),
-    чтобы их можно было подставлять напрямую в шаблонные SQL-запросы через str.format().
+    lower_bound в er_wf_meta пишут и датой ('2026-01-01'), и датой со временем, и через
+    'T' — принимаем всё три вида: значение это человеческое, а падать разбором файла
+    из-за пропущенных часов не за что.
     """
-    return build_sql({
-        "fields": [
-            "toString(a.num_state) as num_state",
-            "concat('\\'', toString(a.extract_time), '\\'') as extract_time",
-            "ifNull(toString(a.extract_count), 'null') as extract_count",
-            "if(a.extract_count is null, 'null', concat('\\'', toString(a.loaded), '\\'')) as loaded",
-            "if(a.extract_count is null, 'null', concat('\\'', toString(a.sent), '\\'')) as sent",
-            "if(a.extract_count is null, 'null', concat('\\'', toString(a.confirmed), '\\'')) as confirmed",
-            "toString(a.increment) as increment",
-            "toString(a.overlap) as overlap",
-            "concat('\\'', a.time_field, '\\'') as time_field",
-            "concat('\\'', toString(a.time_from), '\\'') as time_from",
-            "concat('\\'', toString(a.time_to), '\\'') as time_to",
-            "concat('\\'', toString(a.time_from), '\\' < ', a.time_field, ' and ', a.time_field, ' <= \\'', toString(a.time_to), '\\'') as condition",
-            "if(a.current_time = a.extract_time, 'True', 'False') as is_current",
-            "toString(0) as recent_interval",
-        ],
-        "from": ("(SELECT * FROM export.extract_current_vw "
-                 f"WHERE extract_name = '{_sql_str(state_name(dag_id, tbl))}') as a"),
-    })
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+    s = str(value).strip().replace('T', ' ')
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    raise AirflowFailException(
+        f"Не разобрал момент времени '{value}'. Форматы: 'ГГГГ-ММ-ДД' или 'ГГГГ-ММ-ДД ЧЧ:ММ:СС'"
+    )
+
+
+def next_window(reached: datetime, increment: int, overlap: int,
+                now: datetime | None = None) -> tuple[datetime, datetime, bool]:
+    """🪟 Окно следующей выгрузки: (time_from, time_to, догнали ли текущее время).
+
+    Повторяет арифметику прежней вью export.extract_current_vw один в один:
+
+        time_from  = reached - overlap        (СЕКУНДЫ, нахлёст назад под задержки CDC)
+        time_to    = min(reached + increment, now)   (increment — МИНУТЫ)
+        is_current = reached + increment >= now
+
+    Единицы разные и такими остаются: ровно так они заданы в er_wf_meta и в форме
+    запуска, и ровно так их считала вью (toIntervalSecond / toIntervalMinute).
+
+    increment и overlap берутся из НАСТРОЙКИ, а не из строки состояния. Прежде их брала
+    вью из истории, и правка шага в er_wf_meta ни на что не влияла, пока не пройдёт
+    полный цикл, — а у поставок, заведённых bootstrap-ом, там и вовсе лежало значение
+    в других единицах (минуты, умноженные на 60).
+
+    Время наивное, в UTC: ровно в таком виде его хранит ClickHouse и печатает _ch_ts.
+    """
+    now = (now or datetime.now(timezone.utc)).replace(tzinfo=None)
+    if reached.tzinfo is not None:
+        reached = reached.astimezone(timezone.utc).replace(tzinfo=None)
+    edge = reached + timedelta(minutes=int(increment))
+    return reached - timedelta(seconds=int(overlap)), min(edge, now), edge >= now
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -149,11 +176,17 @@ def _ch_ts(dt: datetime) -> str:
     Намеренно не isoformat(): у tz-aware времени он даёт '2026-08-12T12:47:47+00:00',
     а смещение ClickHouse не разбирает вовсе — такую строку он отказывается и сравнивать
     с DateTime64 (TYPE_MISMATCH при построении WHERE), и вставлять в колонку этого типа
-    (CANNOT_PARSE_TEXT в extract_history). Разделитель 'T' сам по себе допустим, ломает
+    (CANNOT_PARSE_TEXT в er_extract_history). Разделитель 'T' сам по себе допустим, ломает
     именно хвост со смещением, но пробел заодно совпадает с тем, что отдаёт toString()
     в состоянии дельты: export_time не должен выглядеть по-разному в зависимости от
     режима выгрузки, принимающая сторона парсит его одним форматом.
+
+    Наивное время считаем UTC, а не локальным: ровно таким его отдаёт ClickHouse
+    (состояние дельты), а astimezone на наивном значении подставил бы зону сервера —
+    в бою это МСК, то есть окно уехало бы на три часа, причём молча.
     """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
 
@@ -226,29 +259,40 @@ def _xcom(context, tg: str, task_id: str, key: str = 'return_value', required: b
     return val
 
 
-def _format_cur_state(cur: dict) -> dict:
-    """Преобразует сырую строку extract_current_vw в словарь SQL-литералов.
+def _state_to_params(cur: dict, cfg: dict) -> dict:
+    """Строка состояния из вью + настройка → словарь SQL-литералов для шаблонов.
 
-    Нужно при bootstrap (первый запуск) или когда вью вернула сырые Python-значения
-    вместо уже отформатированных строк (например, None вместо 'null').
+    Окно считается здесь (next_window), а не читается готовым: вью отдаёт только
+    достигнутое состояние (reached = верхняя граница прошлого окна). Шаг и нахлёст
+    берутся из НАСТРОЙКИ поставки, а не из истории — правка increment в er_wf_meta
+    должна применяться со следующего же рана.
+
+    extract_time = reached: это «версия» состояния и ключ строки истории; новая верхняя
+    граница уезжает в time_to. Так было и в общей таблице — ключ там (extract_name,
+    extract_time), и по нему же argMax находит последнюю строку.
     """
-    tf = str(cur['time_field']).strip("'")
-    ec = cur['extract_count']
+    tf   = str(cur.get('time_field') or cfg.get('time_field') or '').strip("'")
+    inc  = int(cfg.get('increment', 60) or 60)
+    ovl  = int(cfg.get('overlap', 0) or 0)
+    ec   = cur['extract_count']
+    reached = cur['reached']
+    time_from, time_to, is_current = next_window(reached, inc, ovl)
     return {
-        'num_state':       str(cur['num_state']),
-        'extract_time':    _fmt_val(cur['extract_time']),
+        'num_state':       str(cur.get('num_state', 0)),
+        'extract_time':    f"'{_ch_ts(reached)}'",
         'extract_count':   'null' if ec is None else str(ec),
-        'loaded':          _fmt_val(cur['loaded']) if ec is not None else 'null',
-        'sent':            _fmt_val(cur['sent']) if ec is not None else 'null',
-        'confirmed':       _fmt_val(cur['confirmed']) if ec is not None else 'null',
-        'increment':       str(cur['increment']),
-        'overlap':         str(cur['overlap']),
+        'loaded':          _fmt_val(cur.get('loaded')) if ec is not None else 'null',
+        'sent':            _fmt_val(cur.get('sent')) if ec is not None else 'null',
+        'confirmed':       _fmt_val(cur.get('confirmed')) if ec is not None else 'null',
+        'increment':       str(inc),
+        'overlap':         str(ovl),
         'time_field':      f"'{tf}'",
-        'time_from':       _fmt_val(cur['time_from']),
-        'time_to':         _fmt_val(cur['time_to']),
-        'condition':       f"{_fmt_val(cur['time_from'])} < {tf} and {tf} <= {_fmt_val(cur['time_to'])}",
-        'is_current':      'True' if cur.get('current_time') == cur.get('extract_time') else 'False',
-        'recent_interval': str(cur.get('recent_interval', 0)),
+        'time_from':       f"'{_ch_ts(time_from)}'",
+        'time_to':         f"'{_ch_ts(time_to)}'",
+        'condition':       f"'{_ch_ts(time_from)}' < {tf} and {tf} <= '{_ch_ts(time_to)}'",
+        'is_current':      'True' if is_current else 'False',
+        'recent_interval': '0',
+        'mode':            "'delta'",
     }
 
 
@@ -390,7 +434,7 @@ def _er_init(cfg, **context):
     # `or ''`, а не значение по умолчанию у get: пустая строка приезжает в cfg как None.
     # DAG собран с render_template_as_native_obj=True, а Jinja в native-режиме отдаёт None
     # для шаблона без единого узла — то есть ровно для ''. Без этого time_field таблицы
-    # с full_export уходил в extract_history строкой 'None'. Пустым он бывает только там:
+    # с full_export уходил в историю строкой 'None'. Пустым он бывает только там:
     # у дельты его отсутствие не пропускает check_table.
     tf  = cfg.get('time_field') or ''
     lb  = cfg.get('lower_bound') or '1970-01-01 00:00:00'
@@ -430,25 +474,26 @@ def _er_init(cfg, **context):
             'is_current':      'True',
             'recent_interval': '0',
             'num_state':       '0',
+            'mode':            "'full'",
         })
         result = reg
         logger.info("📚 %s.%s: полная выгрузка, окно дельты не применяется", cfg['schema_name'], cfg['tbl'])
     elif cfg['sql_get_current']:
         cur_res = get_dict_from_ch(hook, cfg['sql_get_current'])
         if not cur_res:
+            # 🌱 Первый запуск: достигнутым состоянием считаем lower_bound, дальше окно
+            # считается общей формулой. Первое окно поэтому не пустое, как было раньше:
+            # прежний bootstrap записывал time_from = time_to = lower_bound, то есть
+            # первый ран новой поставки уходил впустую, только чтобы завести строку.
             logger.warning("First execution for %s. Bootstrapping from lower_bound=%s.", cfg['tbl'], lb)
             state = {
-                'num_state': 0, 'extract_time': lb, 'extract_count': None,
-                'loaded': None, 'sent': None, 'confirmed': None,
-                'increment': int(cfg.get('increment', 60)) * 60,
-                'overlap': int(cfg.get('overlap', 0)),
+                'num_state': 0, 'reached': _parse_ts(lb),
+                'extract_count': None, 'loaded': None, 'sent': None, 'confirmed': None,
                 'time_field': tf,
-                'time_from': lb, 'time_to': lb, 'current_time': lb,
             }
-            result = {**reg, **_format_cur_state(state)}
+            result = {**reg, **_state_to_params(state, cfg)}
         else:
-            cur = cur_res[0]
-            result = {**reg, **(cur if 'condition' in cur else _format_cur_state(cur))}
+            result = {**reg, **_state_to_params(cur_res[0], cfg)}
     else:
         ri  = int(cfg.get('recent_interval', 60))
         now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -466,6 +511,7 @@ def _er_init(cfg, **context):
             'is_current':      'True',
             'recent_interval': str(ri),
             'num_state':       '0',
+            'mode':            "'recent'",
         })
         result = reg
 
@@ -505,11 +551,12 @@ def _er_init(cfg, **context):
             'time_from':    f"'{date_from}'",
             'time_to':      f"'{date_to}'",
             'condition':    f"'{date_from}' < {tf} and {tf} <= '{date_to}'",
-            # Состояние дельты не двигаем: save_status пропустит запись в extract_history,
+            # Состояние дельты не двигаем: save_status пропустит запись в историю,
             # а is_current=True не даст schedule_next запустить следующий цикл. Иначе разовая
             # доливка за прошлый месяц отбросила бы регулярный поток назад.
             'is_current':   'True',
             'ad_hoc':       'True',
+            'mode':         "'ad_hoc'",
         })
         logger.info("📅 Разовая выгрузка за период %s .. %s, состояние дельты не сохраняется", date_from, date_to)
 
@@ -517,8 +564,21 @@ def _er_init(cfg, **context):
     # (у каждой таблицы своё состояние), но в заметке нужны — смотрят именно на них.
     shown = list(key_map) + ['is_current', 'extract_time', 'condition', 'increment',
                              'time_from', 'time_to', 'ad_hoc']
-    add_note({k: result.get(k) for k in shown},
-             level='task', context=context, title=f"⚙️ Delta State · {cfg['schema_name']}.{cfg['tbl']}")
+    note = {k: result.get(k) for k in shown}
+
+    # 🐢 Сколько ранов осталось до текущего времени. Окно двигается на increment минут за
+    # ран (schedule_next взводит следующий сам), поэтому отставание в неделю — это сотни
+    # циклов. Человеку это надо видеть сразу: лечится либо разовой выгрузкой за период,
+    # либо временно увеличенным increment, но никак не ожиданием.
+    if str(result.get('is_current')).lower() != 'true':
+        behind = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - _parse_ts(str(result['time_to']).strip("'")))
+        note['отставание'] = f"{behind.days} дн {behind.seconds // 3600} ч"
+        note['циклов до текущего времени'] = (
+            int(behind.total_seconds() // 60 // max(int(result['increment']), 1)) + 1)
+
+    add_note(note, level='task', context=context,
+             title=f"⚙️ Delta State · {cfg['schema_name']}.{cfg['tbl']}")
     return result
 
 
@@ -905,18 +965,24 @@ def _er_wait_confirm(gcfg, **context):
 
 @task(task_id='save_status', trigger_rule='none_failed')
 def _er_save_status(gcfg, **context):
-    """💾 Записывает результат по каждой таблице пакета в export.extract_history.
+    """💾 Записывает результат по каждой таблице пакета в export.er_extract_history.
 
-    Одна вставка на весь пакет: строк столько, сколько таблиц отработало. Имя выгрузки
-    составное — '<dag_id>.<extract_name>' (state_name): иначе две группы с одной и той же
-    таблицей переписывали бы историю друг другу. Структуру таблицы это не трогает — её
-    мы делим с xStream.
+    Одна вставка на весь пакет: строк столько, сколько таблиц отработало. Выгрузка
+    опознаётся тройкой (replica, schema_name, extract_name) — своими колонками, а не
+    составным именем внутри одного поля, как это было в общей с xStream таблице
+    export.extract_history (до 01.09.2026).
+
+    Колонки перечисляет CH_HIST_COLS, а не этот код: строка состояния ДОПИСЫВАЕТСЯ при
+    смене статуса (ReplacingMergeTree по ключу окна), и колонка, забытая во второй
+    вставке, обнулилась бы — так уже терялись dag_id и run_id в er_sent_files.
+
     trigger_rule=none_failed: запускается при успехе или при skipped-тасках
     (wait_confirm пропускается при auto_confirm=True или отсутствии данных).
     confirmed — время квитанции ТФС из wait_confirm; null, если ждать не стали
-    (auto_confirm=1) или пакет был пуст. Раньше сюда всегда писался null: подтверждение
-    было неотличимо от его отсутствия.
-    extract_time берётся из XCom init как SQL-литерал (уже в кавычках).
+    (auto_confirm=1) или пакет был пуст.
+    extract_time берётся из XCom init как SQL-литерал (уже в кавычках) и означает
+    ДОСТИГНУТОЕ до этого рана состояние; новая верхняя граница уезжает в time_to —
+    из неё следующий ран и посчитает своё окно.
 
     Разовая выгрузка за период (ad_hoc) состояние не двигает — иначе следующая штатная
     дельта оттолкнулась бы от вручную заданных границ.
@@ -926,6 +992,8 @@ def _er_save_status(gcfg, **context):
     # wait_confirm вернул время получения квитанций; при skip (auto_confirm=1) — None
     confirmed_at = context['ti'].xcom_pull(task_ids='wait_confirm')
     confirmed = f"toDateTime64('{confirmed_at[:23].replace('T', ' ')}', 3)" if confirmed_at else 'null'
+    pkg_ts    = _pkg_ts(context).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    run_id    = _sql_str(str(context.get('run_id') or context['ti'].run_id))
 
     selects, noted, skipped = [], {}, []
     for tg, tbl in gcfg['tables'].items():
@@ -938,7 +1006,38 @@ def _er_save_status(gcfg, **context):
 
         rows = _xcom(context, tg, 'pack_zip', key='total_row_count', required=False) or 0
         zips = _xcom(context, tg, 'pack_zip', key='zip_name_list',   required=False) or []
-        zip_arr = "[" + ", ".join(f"'{z}'" for z in zips) + "]"
+        zip_arr = "[" + ", ".join(f"'{_sql_str(z)}'" for z in zips) + "]"
+
+        # id таск-группы собран как '<schema>__<table>', а двойное подчёркивание внутри
+        # частей ключа запрещено проверкой имён (check_name) — поэтому первое же '__'
+        # делит его однозначно.
+        schema = tg.partition('__')[0]
+
+        # Значения по колонкам, а не позиционным списком: порядок задаёт CH_HIST_COLS,
+        # и разъехаться им негде.
+        vals = {
+            'replica':         f"'{_sql_str(gcfg['replica'])}'",
+            'schema_name':     f"'{_sql_str(schema)}'",
+            'extract_name':    f"'{_sql_str(tbl)}'",
+            'extract_time':    dp['extract_time'],
+            'dag_group':       f"'{_sql_str(gcfg['dag_group'])}'",
+            'extract_count':   str(rows),
+            'loaded':          'now64(3)',
+            'sent':            'now64(3)',
+            'confirmed':       confirmed,
+            'increment':       dp['increment'],
+            'overlap':         dp['overlap'],
+            'recent_interval': dp['recent_interval'],
+            'time_field':      dp['time_field'],
+            'time_from':       dp['time_from'],
+            'time_to':         dp['time_to'],
+            'exported_files':  zip_arr,
+            'mode':            dp.get('mode', "'delta'"),
+            'dag_id':          f"'{_sql_str(gcfg['dag_id'])}'",
+            'run_id':          f"'{run_id}'",
+            'package_ts':      f"toDateTime64('{pkg_ts}', 3)",
+            'updated_at':      'now64(3)',
+        }
 
         # Алиас у КАЖДОЙ колонки обязателен, хотя INSERT и подставляет их по позиции.
         # Неименованную константу ClickHouse называет текстом выражения, поэтому у таблицы
@@ -947,25 +1046,14 @@ def _er_save_status(gcfg, **context):
         # по именам, и пакет из двух и более поставок падал с AMBIGUOUS_COLUMN_NAME
         # («Block structure mismatch»). На пакете из одной таблицы UNION ALL не возникает —
         # оттого и не всплывало.
-        selects.append(f"""
-            SELECT
-                '{_sql_str(state_name(gcfg['dag_id'], tbl))}' AS extract_name,
-                {dp['extract_time']} AS extract_time,
-                {rows} AS extract_count, now() AS loaded, now() AS sent, {confirmed} AS confirmed,
-                {dp['increment']} AS increment, {dp['overlap']} AS overlap,
-                {dp['recent_interval']} AS recent_interval,
-                {dp['time_field']} AS time_field, {dp['time_from']} AS time_from,
-                {dp['time_to']} AS time_to, {zip_arr} AS exported_files
-        """)
+        selects.append("SELECT " + ", ".join(f"{vals[c]} AS {c}" for c in CH_HIST_COLS))
         noted[tbl] = {"time_from": dp['time_from'], "time_to": dp['time_to'], "rows": rows, "zips": zips}
 
     if selects:
-        ClickHouseHook(clickhouse_conn_id=CH_ID).execute(f"""
-            INSERT INTO export.extract_history (
-                extract_name, extract_time, extract_count, loaded, sent, confirmed,
-                increment, overlap, recent_interval, time_field, time_from, time_to, exported_files
-            ) {' UNION ALL '.join(selects)}
-        """)
+        ClickHouseHook(clickhouse_conn_id=CH_ID).execute(
+            f"INSERT INTO {HIST_TABLE} ({', '.join(CH_HIST_COLS)}) "
+            + ' UNION ALL '.join(selects)
+        )
 
     if skipped:
         add_note(f"📅 разовая выгрузка за период — состояние не сохранено: {', '.join(skipped)}",
@@ -1055,7 +1143,7 @@ def _table_cfg(table_key: str, entry: dict, gcfg: dict) -> dict:
         # ── SQL ──────────────────────────────────────────────────────────────
         'sql_export':      q['sql_export'],
         # None → состояние дельты не читается: так работают recent и full_export
-        'sql_get_current': (sql_cur_delta(gcfg['dag_id'], tbl)
+        'sql_get_current': (sql_cur_state(gcfg['replica'], schema, tbl)
                             if (is_delta and not p['full_export']) else None),
         'sql_meta':        q['sql_meta'],
         # Части запроса как есть — из них build_meta достаёт таблицы-источники, чтобы
@@ -1098,7 +1186,7 @@ def _dag_params(gp: dict, tables: dict) -> dict:
     ПАКЕТА они применяли бы одно значение ко ВСЕМ таблицам сразу, то есть чинили одну
     поставку и молча ломали остальные. Рычаги правки состояния дельты (extract_time,
     condition, increment) убраны по той же причине, усиленной тем, что состояние у каждой
-    таблицы своё и сохраняется в extract_history.
+    таблицы своё и сохраняется в er_extract_history.
 
     Все умолчания подобраны так, чтобы автозапуск (`schedule_next` → trigger_dag(conf={}))
     отрабатывал обычный цикл дельты без единого заполненного поля.
@@ -1208,8 +1296,8 @@ def _dag_params(gp: dict, tables: dict) -> dict:
 def create_export_dag(dag_id: str, group: dict) -> tuple[str, DAG]:
     """🏭 Создаёт Airflow DAG на одну группу поставок — то есть на один пакет ЕР.
 
-    dag_id — ключ группы из Variable, он же имя дага ('export_er__<реплика>__<группа>')
-             и первая часть имени выгрузки в export.extract_history
+    dag_id — ключ группы из Variable, он же имя дага ('export_er__<реплика>__<группа>');
+             в историю он пишется отдельной колонкой, ключом состояния не является
     group  — {replica, dag_group, schedule, is_paused, description, params (групповые),
               tables: {'схема.имя_выгрузки': entry}}
 

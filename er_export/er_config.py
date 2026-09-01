@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-08-28 14:06 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-01 09:14 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
 Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
@@ -80,7 +80,8 @@ logger = logging.getLogger("airflow.task")
 # не трогает — правка выглядела бы применённой, не будучи ею.
 CFG_VAR_NAME = "datalab_er_config"
 
-OVERRIDABLE = ('CH_ID', 'S3_CONN', 'BUCKET', 'TFS_MAP', 'LIMITS', 'DEFAULT_PARAMS')
+OVERRIDABLE = ('CH_ID', 'S3_CONN', 'BUCKET', 'TFS_MAP', 'LIMITS', 'DEFAULT_PARAMS',
+               'HIST_TABLE', 'HIST_CURRENT_VW')
 
 
 def cfg_overrides() -> dict:
@@ -133,6 +134,24 @@ CH_ID   = _ovr('CH_ID',   'dlab-click')
 S3_CONN = _ovr('S3_CONN', 's3-tfs-hrplt')
 
 BUCKET = _ovr('BUCKET', 'tfshrplt')
+
+# 📜 Своя история выгрузок ЕР (DDL и перенос состояния — er_extract_history.sql).
+# До 01.09.2026 состояние лежало в общей с xStream export.extract_history под составным
+# именем '<dag_id>.<extract_name>': идентификация выгрузки была спрятана внутрь строки,
+# и ни отобрать по реплике, ни соединить с er_wf_meta было нечем. Теперь она разложена
+# по колонкам, а окно дельты считает код (er_export.next_window), а не чужая вью.
+HIST_TABLE      = _ovr('HIST_TABLE',      'export.er_extract_history')
+HIST_CURRENT_VW = _ovr('HIST_CURRENT_VW', 'export.er_extract_current_vw')
+
+# Колонки вставки в историю — списком, а не перечислением внутри SQL: строка состояния
+# ДОПИСЫВАЕТСЯ (ReplacingMergeTree по ключу окна), и колонка, забытая во второй вставке,
+# обнулилась бы. Тот же приём и по той же причине, что CH_SENT_COLS в plugins/tfs_utils.py.
+CH_HIST_COLS = (
+    'replica', 'schema_name', 'extract_name', 'extract_time', 'dag_group',
+    'extract_count', 'loaded', 'sent', 'confirmed',
+    'increment', 'overlap', 'recent_interval', 'time_field', 'time_from', 'time_to',
+    'exported_files', 'mode', 'dag_id', 'run_id', 'package_ts', 'updated_at',
+)
 
 # 🗺️ replica → (scenario_id, s3_prefix): используется в create_export_dag для маршрутизации в TFS.
 # Из переменной пара приезжает списком (в JSON кортежей нет) — приводим к кортежу, чтобы
@@ -618,6 +637,53 @@ def check_group_names(replica: str, dag_group, errors: list[str]) -> bool:
     ok_rep = check_name(replica, 'replica', name, errors)
     ok_grp = check_name(norm_group(dag_group), 'dag_group', name, errors)
     return ok_rep and ok_grp
+
+
+def state_conflicts(rows: list[dict], paused_groups=()) -> dict[tuple, dict[str, str]]:
+    """🔑 Тройки (replica, schema_name, extract_name), встречающиеся В НЕСКОЛЬКИХ группах.
+
+    Ключ состояния дельты — эта самая тройка (er_extract_history, ORDER BY), группа в него
+    не входит. Значит, две РАБОТАЮЩИЕ поставки с одной тройкой ведут одну серию состояний:
+    вторая прочитает окно первой и выгрузит пустоту, а её save_status перепишет чужое
+    состояние. Раньше это разводилось составным именем '<dag_id>.<tbl>', теперь разводить
+    нечем.
+
+    Но запрещать любое совпадение нельзя: так поставку не перенести из группы в группу.
+    Поэтому здесь считается не наличие строки, а её РАБОЧЕЕ состояние:
+
+      • is_paused у поставки или у её группы — не выгружает, состояние не двигает,
+        поэтому такая пара считается переносом; проверяется здесь;
+      • is_active = 0 у поставки ИЛИ у строки-дефолта её группы — до этой функции
+        вообще не доходит: и то, и другое отсеивает split_rows (выключенная группа
+        уносит с собой все свои поставки).
+
+    Отсюда разница в громкости, и она намеренная. Выключенную группу возвращают в строй
+    правкой is_active и новым синком — он же снова прогонит эту проверку и, если тройка
+    к тому времени активна в другой группе, откажет. А вот паузу поставки снимают галкой
+    в форме запуска, мимо всякой синхронизации, — поэтому про пару с паузой вызывающий
+    предупреждает, а про выключенную молчит.
+
+    Значит, перенос делается так: старую строку ставим на паузу или гасим, новую заводим
+    в другой группе.
+
+    Возвращает {(replica, schema_name, extract_name): {группа: 'активна' | 'на паузе'}} —
+    только тройки больше чем в одной группе. Что с этим делать, решает вызывающий: две
+    активные — ошибка настройки, активная рядом с приостановленными — перенос, и о нём
+    достаточно предупредить.
+    """
+    paused = set(paused_groups)
+    seen: dict[tuple, dict[str, str]] = {}
+    for row in rows:
+        if not row.get("extract_name"):          # строка-дефолт группы состояния не ведёт
+            continue
+        if not row.get("is_active", 1):          # выключенная не выгружает вовсе
+            continue
+        group = norm_group(row.get("dag_group"))
+        key   = (row.get("replica", ""), row.get("schema_name", ""), row["extract_name"])
+        state = 'на паузе' if (row.get("is_paused")
+                               or (row.get("replica", ""), group) in paused) else 'активна'
+        seen.setdefault(key, {})[group] = state
+    return {k: g for k, g in seen.items() if len(g) > 1}
 
 
 def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
@@ -1265,6 +1331,9 @@ def get_config() -> dict:
         'BUCKET':          BUCKET,
         'TFS_MAP':         TFS_MAP,
         'S3_CONN':         S3_CONN,
+        'HIST_TABLE':      HIST_TABLE,
+        'HIST_CURRENT_VW': HIST_CURRENT_VW,
+        'CH_HIST_COLS':    list(CH_HIST_COLS),
         'VAR_NAME':        VAR_NAME,
         'RAW_VAR_NAME':    RAW_VAR_NAME,
         'CKSUM_VAR_NAME':  CKSUM_VAR_NAME,

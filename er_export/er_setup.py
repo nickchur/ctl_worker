@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-09-01 00:08 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-01 09:14 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -55,9 +55,13 @@
 🔑 Ключ таблицы — `(replica, dag_group, schema_name, extract_name)`, и ключ записи в форме
 выглядит так же: `hrplatform_datalab/1/learning/lc_items_opened`. Отсюда следствия:
 группа стала отдельной колонкой (раньше это был суффикс `__1` в реплике), `db_name` убран
-совсем — базу источника фреймворк берёт из `sql_from`, — а одна и та же таблица может
-входить в РАЗНЫЕ группы и даже приезжать в разные схемы. Состояние дельты у них тоже
-разное: в `export.extract_history` имя выгрузки составное, `<dag_id>.<extract_name>`.
+совсем — базу источника фреймворк берёт из `sql_from`.
+
+⚠️ Одна и та же поставка **не может быть активной в двух группах** одной реплики: ключ
+состояния дельты — тройка `(replica, schema_name, extract_name)` без группы
+(`er_extract_history.sql`), и группы переписывали бы окно друг другу. Синхронизация такую
+пару отвергает. Перенос между группами при этом возможен: старую строку выключаем
+(`is_active`) или ставим на паузу (`is_paused`), новую заводим — состояние переезжает само.
 
 ⏹️ `is_active = 0` у строки-дефолта гасит весь пакет, у поставки — убирает её из пакета.
 ⏸️ `is_paused = 1` мягче: у группы даг создаётся, но ставится на паузу, у поставки таск
@@ -154,7 +158,7 @@ try:
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         dag_id_for, norm_group, ts_pool, update_dag_pause,
         ch_error, clean_row, parse_params, explicit_schedule, check_table, check_group_names,
-        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
+        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments, state_conflicts,
         check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
         merge_params, probe_sql, query_columns, sql_sources, unnamed_fields, valid_schedule,
     )
@@ -163,7 +167,7 @@ except ImportError:
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         dag_id_for, norm_group, ts_pool, update_dag_pause,
         ch_error, clean_row, parse_params, explicit_schedule, check_table, check_group_names,
-        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments,
+        raw_key, key_to_where, build_meta, ch_source_columns, ch_table_comments, state_conflicts,
         check_descriptions, check_fields, cols_from_fields, export_sql, fit_descriptions,
         merge_params, probe_sql, query_columns, sql_sources, unnamed_fields, valid_schedule,
     )
@@ -503,7 +507,7 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
     ch_comments — {ключ записи (raw_key): комментарий таблицы-источника}
 
     Возвращает (структура для Variable, ошибки, предупреждения). Ключ верхнего уровня —
-    dag_id пакета: он же имя дага и первая часть имени выгрузки в extract_history.
+    dag_id пакета: он же имя дага; в историю выгрузок он попадает отдельной колонкой.
 
     Ошибки — это исключённые записи; они ломают группу целиком и делают таск синка красным.
     Предупреждения ничего не исключают (расписание в поставке, групповой ключ не там)
@@ -567,6 +571,34 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
                 "Airflow; такое значение уронило бы разбор файла и вместе с ним все пакеты ЕР"
             )
             schedules[gkey] = ''
+
+    # 🔑 Ключ состояния дельты — тройка (replica, schema_name, extract_name), группы
+    # в нём нет (см. er_extract_history.sql). Две РАБОТАЮЩИЕ поставки с одной тройкой
+    # вели бы одну серию состояний на двоих: вторая читала бы окно первой и выгружала
+    # пустоту. Ошибка — обеим активным группам: какая из записей лишняя, знает человек.
+    #
+    # Приостановленная поставка (или поставка приостановленной группы) состояние не
+    # двигает, поэтому пара «активная + на паузе» — это перенос из группы в группу, и он
+    # разрешён. Молча его всё же не пропускаем: паузу снимают галкой в форме запуска на
+    # один ран, и тогда писать состояние начнут обе.
+    paused_groups = {gkey for gkey, r in defaults.items() if r.get("is_paused")}
+    for (rep, sch, ext), groups in state_conflicts(tables, paused_groups).items():
+        active = sorted(g for g, state in groups.items() if state == 'активна')
+        where  = ', '.join(f"{g} ({state})" for g, state in sorted(groups.items()))
+        if len(active) > 1:
+            for grp in active:
+                errors.setdefault((rep, grp), []).append(
+                    f"{rep}/{grp}: поставка {sch}.{ext} активна сразу в группах {', '.join(active)}. "
+                    f"Состояние дельты у них общее (ключ — replica/schema_name/extract_name), "
+                    f"и группы переписывали бы окно друг другу. Оставьте активной одну, "
+                    f"остальные поставьте на паузу (is_paused) или выключите (is_active)"
+                )
+        else:
+            warnings.append(
+                f"{rep}: поставка {sch}.{ext} заведена в группах {where}. Состояние дельты "
+                f"у них общее, работает только активная — снятие паузы со второй разведёт "
+                f"окна по разным группам и собьёт обе"
+            )
 
     for row in tables:
         gkey    = (row["replica"], row["dag_group"])

@@ -1,5 +1,5 @@
 -- DDL для export.er_wf_meta
--- 2026-08-28 14:48 MSK · v3.2 · Nick Churkin · NSChurkin@sber.ru
+-- 2026-09-01 09:14 MSK · v3.4 · Nick Churkin · NSChurkin@sber.ru
 -- Управляющая таблица ER-выгрузок. Синхронизируется в Airflow Variable "datalab_er_wfs"
 -- DAG-ом export_er_setup, который раскладывает записи по группам поставок.
 --
@@ -39,8 +39,9 @@
 -- квалифицированным ('evolution.lc_items_meta'). Если базы там нет вовсе, описания
 -- колонок в .meta просто не найдутся — с предупреждением, но без ошибки.
 --
--- ⚠️ Состояние дельты ключуется составным ИМЕНЕМ ВЫГРУЗКИ: в export.extract_history ЕР
--- пишет '<dag_id>.<extract_name>' (см. er_extract_history.sql). Так две группы с одной
+-- ⚠️ Состояние дельты ключуется тройкой (replica, schema_name, extract_name) в своей
+-- таблице export.er_extract_history (см. er_extract_history.sql). Группы в ключе нет,
+-- поэтому одну поставку НЕЛЬЗЯ заводить в двух группах одной реплики. Раньше две группы с одной
 -- таблицей ведут разные окна, а структуру истории — общую с xStream — трогать не пришлось.
 --
 --
@@ -164,7 +165,7 @@ ORDER BY (replica, dag_group, schema_name, extract_name);
 --    (ключ (db_name, extract_name), группа суффиксом в replica, колонки schedule/is_recent)
 --
 -- Порядок: новая таблица → переливка → сверка → пауза export_er_setup и пакетов ЕР →
--- RENAME → переименование состояния дельты (er_extract_history.sql) → выкладка кода →
+-- RENAME → перенос состояния дельты (er_extract_history.sql) → выкладка кода →
 -- синк с галкой «Синхронизировать принудительно».
 -- Старую таблицу не удалять, пока новая не отработала: откат — обратный RENAME.
 --
@@ -277,22 +278,26 @@ VALUES (
     '{"format": "JSONEachRow"}'
 );
 
--- Та же таблица во ВТОРОЙ группе — так заводится новая версия пакета рядом со старой.
--- Раньше это было невозможно: ключ (db_name, extract_name) схлопнул бы обе строки в одну.
--- Состояние дельты у групп разное: в extract_history имя выгрузки составное,
--- '<dag_id>.<extract_name>', а dag_id у них разные.
-INSERT INTO export.er_wf_meta (replica, dag_group, params)
-VALUES ('hrplatform_datalab', '2', '{"schedule": "0 5 * * *"}');
-
-INSERT INTO export.er_wf_meta
-    (replica, dag_group, schema_name, extract_name, uk, fields, sql_from, is_paused)
-VALUES (
-    'hrplatform_datalab',
-    '2',
-    'learning',
-    'lc_items_meta',
-    ['item_id'],
-    ['item_id', 'title', 'tags', 'updated_at'],
-    'evolution.lc_items_meta',
-    1                                       -- пока на паузе: таск создастся, но скипнется
-);
+-- 🔀 ПЕРЕНОС ПОСТАВКИ ИЗ ГРУППЫ В ГРУППУ
+--
+-- Ключ состояния дельты — (replica, schema_name, extract_name), группы в нём нет
+-- (er_extract_history.sql). Поэтому АКТИВНОЙ одна и та же поставка может быть только
+-- в одной группе: иначе обе вели бы одну серию состояний, вторая читала бы окно первой
+-- и выгружала пустоту. Синхронизация такую пару отвергает и называет обе группы.
+--
+-- Перенос от этого не страдает — состояние переезжает само, ключ-то один. Порядок:
+-- сначала гасим старую строку, потом заводим новую.
+--
+--   ALTER TABLE export.er_wf_meta UPDATE is_active = 0
+--   WHERE replica = 'hrplatform_datalab' AND dag_group = '1'
+--         AND schema_name = 'learning' AND extract_name = 'lc_items_meta';
+--   -- либо мягче, с возможностью вернуть: is_paused = 1
+--
+--   INSERT INTO export.er_wf_meta
+--       (replica, dag_group, schema_name, extract_name, uk, fields, sql_from)
+--   VALUES ('hrplatform_datalab', '2', 'learning', 'lc_items_meta', ['item_id'],
+--           ['item_id', 'title', 'tags'], 'evolution.lc_items_meta');
+--
+-- Пока старая строка на паузе, синк о паре предупреждает: снятая галкой пауза вернёт
+-- второго писателя состояния. Две версии пакета, работающие ОДНОВРЕМЕННО, разводятся
+-- схемой (schema_name), именем выгрузки или репликой — но не группой.

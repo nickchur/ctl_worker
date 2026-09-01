@@ -1,0 +1,24 @@
+# Эмулятор CTL API для тестового стенда → /etc/systemd/system/ctl-mock.service
+# 2026-09-01 13:20 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru
+#
+#   systemctl daemon-reload && systemctl enable --now ctl-mock
+#   journalctl -u ctl-mock -f
+#
+# Слушает только 127.0.0.1: наружу эмулятор не нужен, а перепутать его с настоящим CTL
+# из соседнего окружения — можно.
+
+[Unit]
+Description=CTL API mock (тестовый стенд Airflow)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/aftest/ctl-mock
+EnvironmentFile=/opt/aftest/ctl-mock/ctl-mock.env
+ExecStart=/opt/aftest/venv/bin/python -m uvicorn ctl_mock:app --host 127.0.0.1 --port 9080 --log-level info
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

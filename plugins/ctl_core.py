@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-08-27 13:48 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-01 19:13 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -288,6 +288,134 @@ def ctl_chk_wait(wf, params, context):
     return 'skip', ret
 
 
+def _ctl_ts(value):
+    """Отметка времени CTL → 'ГГГГ-ММ-ДД ЧЧ:ММ:СС'. Не разобралась — None.
+
+    CTL присылает их в двух видах: '2026-09-01T13:40:06.940' и короткий '2026-08-12T05:00'.
+    """
+    if not value:
+        return None
+    s = str(value).strip().replace('T', ' ')
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(s[:26], fmt).strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            continue
+    logger.warning("Не разобрали отметку времени CTL: %r", value)
+    return None
+
+
+def _cron_next(expr, sdt):
+    """Ближайшее срабатывание cron после sdt; не вышло — None."""
+    if not (expr and sdt):
+        return None
+    try:
+        from croniter import croniter          # ленивый импорт: нужен только здесь
+        base = datetime.strptime(str(sdt)[:19], '%Y-%m-%d %H:%M:%S')
+        return croniter(str(expr).strip(), base).get_next(datetime).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception as err:
+        logger.warning("Не посчитали время по cron %r от %s: %s", expr, sdt, err)
+        return None
+
+
+def ctl_cond_ready(cond, sdt=None):
+    """⏱️ Когда выполнилось (или выполнится) условие запуска startCondition.
+
+    Возвращает 'ГГГГ-ММ-ДД ЧЧ:ММ:СС' либо None, если сказать нечего.
+
+    Предикаты условий (`expectedValue`, `relevance`, `trackedMetrics`) мы НЕ вычисляем:
+    CTL присылает у каждого узла готовое состояние — `state.satisfied` и
+    `state.satisfiedDttm`. Дублировать его логику значит однажды с ней разойтись.
+
+    Дерево:
+      • `and` — готово, когда готовы все; момент готовности самый ПОЗДНИЙ из них;
+      • `or`  — готово, когда готов хотя бы один; момент самый РАННИЙ из готовых;
+      • лист  — `state.satisfied` и `state.satisfiedDttm`.
+
+    Неготовый лист `cronExpression` — единственный, про который можно сказать больше:
+    у него есть `expr`, и следующее срабатывание считается от `sdt` (момента статуса).
+
+    Просроченное окно (`state.validTillEpoch` в прошлом) считается НЕготовым: CTL такую
+    загрузку сам уже не поднимет, и решать её судьбу должен человек по SLA, а не перезапуск.
+    """
+    if not isinstance(cond, dict):
+        return None
+
+    kind = cond.get('$type')
+
+    if kind in ('and', 'or'):
+        times = [ctl_cond_ready(c, sdt) for c in cond.get('inner') or []]
+        if kind == 'and':
+            return max(times) if times and all(times) else None
+        ready = [t for t in times if t]
+        return min(ready) if ready else None
+
+    state = cond.get('state') or {}
+
+    if state.get('satisfied'):
+        till = state.get('validTillEpoch')
+        if till:
+            # Эпоха приходит и в секундах, и в миллисекундах — различаем по величине.
+            till = float(till)
+            till_dt = datetime.fromtimestamp(till / 1000 if till > 1e11 else till)
+            if till_dt < datetime.now():
+                logger.info("Условие %s выполнено, но окно закрылось %s", kind, till_dt)
+                return None
+        return _ctl_ts(state.get('satisfiedDttm'))
+
+    if kind == 'cronExpression':
+        return _cron_next(cond.get('expr'), sdt)
+
+    return None
+
+
+def ctl_wait_until(log, wf=None, sdt=None, cond=None):
+    """⏳ Когда загрузка в TIME-WAIT должна стартовать: 'ГГГГ-ММ-ДД ЧЧ:ММ:СС' или None.
+
+    Четыре источника, в порядке убывания надёжности:
+
+    1. **наш лог** — `str({'time': …})`: так пишут ctl_chk_wait и повторы воркера. Если
+       загрузку усыпил наш же воркер, его время и есть ответ на «когда просыпаться»;
+    2. **startCondition загрузки** — условие запуска CTL с уже вычисленным состоянием
+       (`ctl_cond_ready`). Приходит ТОЛЬКО в полной загрузке `/v4/api/loading/{lid}`,
+       в списке `/loading/extended` его нет;
+    3. **лог CTL** `'Start scheduled on ГГГГ-ММ-ДД ЧЧ:ММ:СС'` — форма, которую CTL писал
+       раньше; в накопленных записях она ещё встречается, новые приходят без неё;
+    4. **расписание воркфлоу** `wf_time_sched.sched` — ближайшее срабатывание после `sdt`.
+       Только когда `startCondition` НЕ задан: при заданном условии CTL игнорирует и
+       `wf_time_sched`, и `wf_event_sched`, и считать по ним значит считать не то.
+
+    Ни один не сработал — None. Это НЕ повод считать загрузку мусорной: время может быть
+    неизвестно нам, но известно CTL, и загрузка спокойно ждёт своего часа.
+    """
+    log = (log or '').strip()
+
+    # 1. Наш формат: словарь с ключом time.
+    if log.startswith('{'):
+        try:
+            value = (ast.literal_eval(log) or {}).get('time')
+            if value:
+                return str(value)[:19]
+        except Exception as err:
+            logger.debug("TIME-WAIT: лог похож на словарь, но не разобрался: %s", err)
+
+    # 2. Условие запуска CTL.
+    if cond:
+        ready = ctl_cond_ready(cond, sdt)
+        if ready:
+            return ready
+
+    # 3. Старая форма CTL.
+    if log.startswith('Start scheduled on '):
+        return log[len('Start scheduled on '):].strip()[:19]
+
+    # 4. Расписание воркфлоу — только если условия нет вовсе.
+    if not cond:
+        return _cron_next(((wf or {}).get('wf_time_sched') or {}).get('sched'), sdt)
+
+    return None
+
+
 def ctl_chk_new(lid, wf_name, status, log, context):
     """Проверяет, можно ли запустить задачу (новая или TIME-WAIT истек).
 
@@ -303,13 +431,19 @@ def ctl_chk_new(lid, wf_name, status, log, context):
     # wf_name = wf['name']
 
     if status == 'TIME-WAIT':
+        # Лог TIME-WAIT бывает не только нашим словарём: CTL пишет туда свой текст, а
+        # иногда не пишет ничего. Время достаём общим разбором, повторы — только из
+        # словаря: у чужого лога их и не бывает.
         try:
-            r = ast.literal_eval(log)
+            r = ast.literal_eval(log) if (log or '').strip().startswith('{') else {}
         except Exception as err:
-            logging(f"Ошибка при парсинге TIME-WAIT: {err}", action='error', obj=lid)
-            return 'fail', f"Ошибка при парсинге TIME-WAIT: {err}"
-        
-        sdt = r['time']
+            logger.warning("TIME-WAIT %s: лог не разобрался как словарь: %s", lid, err)
+            r = {}
+
+        sdt = ctl_wait_until(log)
+        if not sdt:
+            logging(f"Не определили время старта TIME-WAIT: {log!r}", action='error', obj=lid)
+            return 'fail', f"Не определили время старта TIME-WAIT: {log!r}"
         if sdt <= now:
             retry = r.get('retry', {})
             if retry:

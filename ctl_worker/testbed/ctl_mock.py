@@ -1,5 +1,5 @@
 """🎭 Эмулятор CTL API для тестового стенда.
-*2026-09-01 13:10 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-01 19:13 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Отвечает так, как отвечает CTL нашим дагам: справочники — из фикстур (снимок боевого
 бакета `edpetl-ctl`, развёрнутый `fixtures_from_cache.py`), состояние загрузок — в
@@ -41,6 +41,7 @@ from starlette.routing import Route
 DSN = os.getenv('CTL_MOCK_DSN', 'postgresql://airflow:airflow@127.0.0.1:5432/gp_test')
 FIXTURES = Path(os.getenv('CTL_MOCK_FIXTURES', Path(__file__).with_name('fixtures')))
 PROFILE = os.getenv('CTL_MOCK_PROFILE', 'HR_Data')
+MOCK_TZ = os.getenv('CTL_MOCK_TZ', 'Europe/Moscow')   # в этой зоне CTL отдаёт все отметки
 ROOT_ENTITY = int(os.getenv('CTL_MOCK_ROOT_ENTITY', '941010000'))
 
 TS = '%Y-%m-%d %H:%M:%S.%f'
@@ -90,6 +91,12 @@ def db():
     conn = POOL.getconn()
     try:
         conn.autocommit = True
+        with conn.cursor() as cur:
+            # Время у CTL — московское: в таком виде приходят и effective_from, и
+            # satisfiedDttm, и его же ждёт наш код (ctl_config.tz). Без этой строки
+            # стенд писал бы UTC, все отметки оказывались бы на три часа «старше»,
+            # и пороги монитора (15 минут, 6 часов, SLA) проверялись бы неправдой.
+            cur.execute("SET TIME ZONE %s", (MOCK_TZ,))
         yield conn
     finally:
         POOL.putconn(conn)
@@ -196,6 +203,22 @@ def loading_obj(lid: int) -> dict | None:
     if 'workflow' not in ld:
         ld['workflow'] = wf_obj(row['wf_id'])
     return ld
+
+
+# Поля, которые CTL отдаёт в СПИСКЕ загрузок. Полный объект (startCondition,
+# retriesLeft, awaitedEvents, workflow, locksSet и прочее) приходит только из
+# /v4/api/loading/{lid} — проверено по снимку бакета: в записях ctl_prf_events этих
+# ключей нет вовсе. Эмулятор обязан врать так же, иначе код, который дотягивает
+# условие запуска отдельным запросом, на стенде никогда не сработает.
+EXTENDED_FIELDS = (
+    'id', 'wf_id', 'profile', 'alive', 'auto', 'status', 'status_log',
+    'start_dttm', 'end_dttm', 'params', 'stats', 'loading_status', 'uuid',
+)
+
+
+def loading_brief(ld: dict) -> dict:
+    """Загрузка в том виде, в каком её отдаёт /loading/extended."""
+    return {k: v for k, v in ld.items() if k in EXTENDED_FIELDS}
 
 
 def set_status(lid: int, status: str, log: str = '') -> dict:
@@ -432,7 +455,7 @@ async def loading_extended(request: Request):
                 continue
         if engines and (ld.get('workflow') or {}).get('engine') not in engines:
             continue
-        out.append(ld)
+        out.append(loading_brief(ld))
         if len(out) >= limit:
             break
     return JSONResponse(out)

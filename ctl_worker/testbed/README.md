@@ -1,6 +1,6 @@
 # 🎭 Эмулятор CTL API для тестового стенда
 
-*2026-09-01 13:55 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-01 19:13 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `ctl_worker/` — единственный каталог репозитория, который до сих пор проверялся только
 выкладкой на alpha: все его даги ходят в CTL API, а он живёт на контуре и закрыт Kerberos.
@@ -79,6 +79,26 @@ curl -s http://127.0.0.1:9080/v5/api/info
 | Variable `ctl_config` | копия `ctl_config.json` с этими conn_id, `test_mode: "event"` и бакетами `edpetl-ctl` / `edpetl-files` |
 | Пулы | `ctl_pool`, `gp_pool` — без них таски висят в очереди |
 | Бакеты MinIO | `edpetl-ctl`, `edpetl-files` |
+
+## Две вещи, в которых эмулятор намеренно повторяет CTL
+
+**Список и полная загрузка отдают РАЗНОЕ.** `GET /v4/api/loading/{lid}` возвращает полный
+объект (`startCondition`, `retriesLeft`, `awaitedEvents`, `workflow`, `locksSet`), а список
+`/v5/api/loading/extended` — только ядро (`id`, `wf_id`, `profile`, `alive`, `auto`,
+`status`, `status_log`, `start_dttm`, `end_dttm`, `params`, `stats`, `loading_status`,
+`uuid`). Проверено по снимку бакета: у записей `ctl_prf_events` остальных ключей нет вовсе.
+Эмулятор режет список так же (`EXTENDED_FIELDS` в `ctl_mock.py`) — иначе код, который
+дотягивает условие запуска отдельным запросом, на стенде никогда бы не сработал.
+
+**Время — московское.** Соединения эмулятора выставляют `SET TIME ZONE Europe/Moscow`:
+в этой зоне CTL отдаёт `effective_from`, `satisfiedDttm` и прочие отметки, и её же ждёт
+наш код (`ctl_config.tz`). Без этого стенд писал бы UTC, всё выглядело бы на три часа
+старше, и пороги монитора (15 минут, 6 часов, SLA) проверялись бы неправдой — на этом
+уже один прогон дал ложный `reStarted`.
+
+⚠️ Фильтр `category_ids` эмулятор не применяет: монитор обходит категории и на каждой
+видит один и тот же набор загрузок. На решения это не влияет, но запросов в журнале
+получается в разы больше, чем было бы на контуре.
 
 ## Контракт загрузки, который легко пропустить
 

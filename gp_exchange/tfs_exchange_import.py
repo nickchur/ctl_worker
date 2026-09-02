@@ -26,19 +26,35 @@ from airflow.utils.task_group import TaskGroup
 # from airflow.utils.dates import days_ago
 # from random import randint
 
-# from tfs_exchange_common import (
-from CI06932748.analytics.datalab.gp_exchange.tfs_exchange_common import (
-    ON_CLUSTER,
-    REPLICATED,
-    TFS_IN_DATASET,
-    TFS_IN_CONN_ID,
-    TFS_IN_BUCKET,
-    TFS_IN_PREFIX,
-    default_args,
-    CH_BD,
-    CH_ID,
-    GP_EXCHANGE
-)
+# Двойной импорт, как во всём репозитории: на контуре общий модуль приезжает боевым
+# пакетом, на стенде и в свежем клоне — соседним файлом каталога. Жёсткий импорт держался
+# на заглушке CI06932748 в PYTHONPATH стенда; без неё файл не разбирался вовсе.
+try:
+    from CI06932748.analytics.datalab.gp_exchange.tfs_exchange_common import ( # type: ignore
+        ON_CLUSTER,
+        REPLICATED,
+        TFS_IN_DATASET,
+        TFS_IN_CONN_ID,
+        TFS_IN_BUCKET,
+        TFS_IN_PREFIX,
+        default_args,
+        CH_BD,
+        CH_ID,
+        GP_EXCHANGE
+    )
+except ImportError:
+    from gp_exchange.tfs_exchange_common import ( # type: ignore
+        ON_CLUSTER,
+        REPLICATED,
+        TFS_IN_DATASET,
+        TFS_IN_CONN_ID,
+        TFS_IN_BUCKET,
+        TFS_IN_PREFIX,
+        default_args,
+        CH_BD,
+        CH_ID,
+        GP_EXCHANGE
+    )
 
 
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')

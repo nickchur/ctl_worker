@@ -993,8 +993,10 @@ def tools_test_dags():
         # # DAGs в статистике планировщика считает построенные, а не записанные.
         # Такой DAG остаётся в таблице dag (виден в UI), но trigger_dag по нему падает
         # с DagNotFound: он берёт DAG именно из serialized_dag.
-        gap_rows, gap_ids = [], []
+        gap_rows, gap_ids, gap_state, gap_no_row, gap_fresh = [], [], [], [], "—"
         try:
+            from sqlalchemy import func  # noqa: PLC0415
+
             from airflow.models.serialized_dag import SerializedDagModel  # noqa: PLC0415
             from airflow.utils.session import create_session  # noqa: PLC0415
 
@@ -1022,6 +1024,23 @@ def tools_test_dags():
                                  "tail": tail,
                                  "ids": sorted(dag_ids[i] for i in gone)[:200]})
             gap_rows.sort(key=lambda r: -r["missing"])
+
+            # Состояние пропавших в таблице dag. Разбор их построил, значит строки dag у
+            # них обновились вместе со всеми: свежий last_parsed_time = писатель их
+            # пропустил, отставший = строку убрал deactivate_stale_dags как устаревшую
+            # (dag_processing/manager.py), а inactive — что этот уже сработал.
+            from airflow.models import DagModel  # noqa: PLC0415
+
+            with create_session() as session:
+                probe = session.query(
+                    DagModel.dag_id, DagModel.is_active, DagModel.last_parsed_time,
+                ).filter(DagModel.dag_id.in_(gap_ids)).all()
+                fresh = session.query(func.max(DagModel.last_parsed_time)).filter(
+                    DagModel.fileloc == gap_rows[0]["file"]).scalar() if gap_rows else None
+            gap_state = [{"dag_id": r.dag_id, "active": r.is_active,
+                          "parsed": str(r.last_parsed_time)[:19]} for r in probe]
+            gap_no_row = sorted(set(gap_ids) - {r.dag_id for r in probe})
+            gap_fresh = str(fresh)[:19]
         except Exception as e:                       # сверка не должна ронять таск
             logger.warning("Сверка с serialized_dag не вышла: %s: %s", type(e).__name__, e)
 
@@ -1062,13 +1081,23 @@ def tools_test_dags():
                 gap_block += ("\n\nПропавшие занимают хвост файла — запись оборвалась на "
                               "полпути. Смотреть в сторону `dag_file_processor_timeout` и "
                               "времени разбора файла, а не отдельных DAG'ов.")
+            if gap_state or gap_no_row:
+                gap_block += (f"\n\n**Они же в таблице `dag`** (файл разобран {gap_fresh}):\n\n"
+                              "| DAG | is_active | last_parsed_time |\n|---|---|---|\n"
+                              + "\n".join(f"| `{s['dag_id']}` | {s['active']} | {s['parsed']} |"
+                                          for s in gap_state))
+                if gap_no_row:
+                    gap_block += ("\n\nБез строки в `dag` вовсе: "
+                                  + ", ".join(f"`{d}`" for d in gap_no_row))
 
         add_xcom("parse_time", {"stats": {"files": len(rows), "mean": round(mean, 2),
                                           "sigma": round(sigma, 2),
                                           "threshold": round(threshold, 2)},
                                 "outliers": outliers,
                                 "serialized_gap": {"files": gap_rows,
-                                                   "examples": gap_ids}}, context)
+                                                   "examples": gap_ids,
+                                                   "dag_rows": gap_state,
+                                                   "no_dag_row": gap_no_row}}, context)
         add_note(f"{head}\n\n{stats_block}\n\n{table}{gap_block}", context, level="task",
                  title=f"🕐 {elapsed:.1f} sec parse_time: {len(rows)} файлов")
         logger.info("🕐 разобрано %d файлов за %.1fс, среднее %.2fс, σ %.2fс, порог %.2fс, "

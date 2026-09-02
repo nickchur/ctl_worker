@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-02 20:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут выгружает данные из CTL и сохраняет в S3 + Airflow Variables.
 
@@ -202,8 +202,40 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         md5  = md5_hash(data)
         wfs = {j['wf']['id']: ctl_wf_norm(j['wf'], j.get('connectedEntities', [])) for j in data}
 
+        # Усохший список не сохраняем. Фабрика строит даги из этой же Variable, а Airflow
+        # считает даг пропавшим, если разбор файла его не вернул, и удаляет строку из
+        # serialized_dag (deactivate_stale_dags). То есть короткий ответ CTL молча убил бы
+        # часть дагов; лучше упасть и оставить прежние данные в силе.
+        pct = int(get_config().get('wf_shrink_pct', 10))
+        was = ctl_obj_load('ctl_workflows') or {}
+        if not wfs:
+            msg = '❌ CTL вернул пустой список workflow — ctl_workflows не трогаем'
+            add_note(msg, context, level='DAG,Task')
+            raise Exception(msg)
+        if was and len(wfs) < len(was) * (100 - pct) / 100:
+            msg = (f'❌ Список workflow усох: было {len(was)}, пришло {len(wfs)} '
+                   f'(порог {pct}%) — ctl_workflows не перезаписываем')
+            add_note(msg, context, level='DAG,Task')
+            raise Exception(msg)
+
+        # Счётчик пишем ДО сохранения: load_obj_save при неизменившихся данных бросает
+        # AirflowSkipException, и всё, что стоит после него, не выполнится никогда.
+        # Счётчик для фабрики: она читает его отдельной Variable и сверяет с тем, что
+        # прочитала сама. Если ctl_workflows подменился копией из S3, расхождение видно
+        prf = get_config()['profile']
+        eligible = sum(1 for w in wfs.values()
+                       if w.get('profile') == prf and not w.get('deleted', False))
+        ctl_obj_save('ctl_workflows_stat', {
+            'count': len(wfs),
+            'eligible': eligible,
+            'profile': prf,
+            'md5': md5,
+            'saved': str(pendulum.now(get_config()['tz']))[:19],
+        }, var=True)
+
         # Сохраняем в S3
         load_obj_save('ctl_workflows', wfs, var=True, skip=True)
+
 
 
     @task(pool='ctl_pool')

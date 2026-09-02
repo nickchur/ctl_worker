@@ -1,5 +1,5 @@
 """### 📡 DAG: Сенсор CTL
-*2026-08-27 13:48 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-02 20:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
 
@@ -14,8 +14,11 @@ from airflow import DAG, Dataset
 from airflow.datasets import DatasetAlias
 from airflow.decorators import task, task_group
 from airflow.api.common.trigger_dag import trigger_dag           
-from airflow.exceptions import DagRunAlreadyExists
+from airflow.exceptions import DagRunAlreadyExists, DagNotFound
 from airflow.exceptions import AirflowSkipException, AirflowFailException
+from airflow.models import DagModel
+from airflow.models.serialized_dag import SerializedDagModel
+from airflow.utils.session import create_session
 
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load  # type: ignore
@@ -33,6 +36,38 @@ logger = getLogger("airflow.task")
 
 MAX_WFS = 50
 MAX_XCOM = 500
+
+
+def dag_gone_reason(dag_id: str, wf: dict | None) -> str:
+    """Почему дага нет: те же условия, по которым его строит фабрика, плюс метабаза.
+
+    `trigger_dag` берёт даг из `serialized_dag`, а UI показывает его по строке в `dag`.
+    Отсюда «даг виден, но missing from DagBag»: строка в `dag` осталась, сериализованной
+    нет. Разбираем оба слоя, чтобы в заметке была причина, а не DagNotFound.
+    """
+    bits = []
+    if not wf:
+        bits.append('воркфлоу нет в ctl_workflows — фабрика его не строит')
+    else:
+        if wf.get('deleted'):
+            bits.append('воркфлоу помечен deleted')
+        if wf.get('profile') != profile:
+            bits.append(f"профиль воркфлоу {wf.get('profile')}, а у нас {profile}")
+    try:
+        with create_session() as session:
+            dm = session.query(DagModel.is_active, DagModel.last_parsed_time).filter(
+                DagModel.dag_id == dag_id).first()
+            sd = session.query(SerializedDagModel.dag_id).filter(
+                SerializedDagModel.dag_id == dag_id).first()
+        if dm is None:
+            bits.append('в таблице dag записи нет')
+        else:
+            bits.append(f"в dag есть (is_active={dm.is_active}, "
+                        f"разобран {str(dm.last_parsed_time)[:19]})")
+        bits.append('сериализован' if sd else 'в serialized_dag НЕТ — запускать нечего')
+    except Exception as e:                       # диагност не должен ронять таск
+        bits.append(f'метабазу опросить не вышло: {type(e).__name__}: {e}')
+    return '; '.join(bits)
 
 wfs_dict = ctl_obj_load('ctl_workflows')
 
@@ -303,8 +338,12 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         wid = params['wf_id']
         run_type = params.get('wfp_run_type','UNKNOWN')
         
-        wf = wfs_dict[wid]
-        wf_name = wf['name']
+        wf = wfs_dict.get(wid) or wfs_dict.get(str(wid))
+        wf_name = (wf or {}).get('name') or jsn.get('workflow', {}).get('name') or jsn.get('wf_name')
+        if not wf:
+            msg = (f"⏭️ Загрузка {lid} ({wf_name}): {dag_gone_reason(f'CTL.{wf_name}', None)}")
+            add_note(msg, context, level='Task,DAG', title='⏭️ НЕТ ДАГА')
+            raise AirflowSkipException(msg)
         
         af_sdt = pendulum.instance(ti.start_date).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
         params['af_sdt'] = af_sdt
@@ -347,6 +386,16 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
             new_dag = dict(dag_id=f'CTL.{wf_name}', run_id=run_id, conf=params, )
             try:
                 trigger_dag(**new_dag)
+            except DagNotFound as e:
+                # Дага нет в serialized_dag — запускать нечего. Загрузку в CTL не трогаем:
+                # вернётся даг (следующая сборка фабрики) — поедет и она
+                reason = dag_gone_reason(new_dag['dag_id'], wf)
+                msg = f"⏭️ Загрузка {lid} ({wf_name}): {reason}"
+                logger.error(msg, exc_info=True)
+                ti.xcom_push(key='result', value={'action': '⏭️ no dag', 'id': lid,
+                                                  'name': wf_name, 'msg': reason})
+                add_note(msg, context, level='Task,DAG', title='⏭️ НЕТ ДАГА')
+                raise AirflowSkipException(msg) from e
             except errors.UniqueViolation as e:
                 ret = {
                     "action": "❌ already",

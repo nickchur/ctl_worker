@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-08-27 13:48 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-02 20:10 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -860,11 +860,45 @@ def build_worker_dag(w):
     return dag
 
 
-for w in ctl_obj_load('ctl_workflows').values():
-    if w.get('profile') != profile:
-        continue
-    if w.get('deleted', False):
-        continue
+def _wf_eligible(wfs: dict) -> list:
+    """Воркфлоу, из которых вообще строятся даги: наш профиль и не удалённые."""
+    return [w for w in wfs.values()
+            if w.get('profile') == profile and not w.get('deleted', False)]
+
+
+def _wf_check_shrink(eligible: list) -> None:
+    """Не давать «успешному» разбору с усохшим списком уничтожить уже собранные даги.
+
+    Airflow считает даг пропавшим, если очередной разбор файла его не вернул, и через
+    stale_dag_threshold удаляет строку из serialized_dag (dag_processing/manager.py,
+    deactivate_stale_dags). То есть короткий список воркфлоу молча убивает даги, а
+    ошибка импорта — нет: при ней уже сериализованные даги остаются на месте.
+
+    Откуда берётся короткий список: ctl_obj_load при пустой Variable подставляет копию
+    из S3, а она может быть старее. Ожидаемое число пишет ctl_loader в ctl_workflows_stat.
+    """
+    pct = int(get_config().get('wf_shrink_pct', 10))
+    if not eligible:
+        raise RuntimeError(
+            'ctl_workflows пуст или не содержит ни одного воркфлоу профиля '
+            f'{profile}: даги не строим, чтобы не потерять уже собранные. '
+            'Проверьте Variable ctl_workflows и прогон ctl_loader'
+        )
+    stat = ctl_obj_load('ctl_workflows_stat') or {}
+    expected = int(stat.get('eligible') or 0)
+    if expected and len(eligible) < expected * (100 - pct) / 100:
+        raise RuntimeError(
+            f'ctl_workflows усох: ожидали около {expected} воркфлоу профиля {profile}, '
+            f'а прочитали {len(eligible)} (порог {pct}%). Даги не строим — иначе Airflow '
+            'вычистит недостающие из serialized_dag. Прогоните ctl_loader; если воркфлоу '
+            'и правда удалили массово, обновите ctl_workflows_stat'
+        )
+
+
+_eligible = _wf_eligible(ctl_obj_load('ctl_workflows'))
+_wf_check_shrink(_eligible)
+
+for w in _eligible:
     try:
         dag = build_worker_dag(w)
         globals()[dag.dag_id] = dag

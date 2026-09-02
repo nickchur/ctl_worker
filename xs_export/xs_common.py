@@ -28,7 +28,13 @@ TFS_OUT_BUCKET = 'tfshrplt'
 TFS_OUT_TOPIC = 'TFS.HRPLT.IN'
 # TFS_OUT_SCENARIO = 'HRPLATFORM-2100'
 # TFS_OUT_PREFIX = 'from/DFDC/hrplt_to_kap802'
-TFS_KAFKA_CALLBACK = 'CI06932748.analytics.datalab.export_xs.xs_common.tfs_message_delivery_callback'
+# ⚠️ Путь к колбэку собирается из __name__, а не пишется строкой. ProduceToTopicOperator
+# принимает delivery_callback ТОЛЬКО строкой и делает import_string ещё в конструкторе,
+# а этот модуль импортируется по-разному: на контуре как
+# CI06932748.analytics.datalab.export_xs.xs_common, на стенде — как xs_export.xs_common
+# либо просто xs_common (фабрика кладёт свой каталог в sys.path). Прибитый путь
+# резолвился только на контуре, то есть проверить отправку в ТФС на стенде было нельзя.
+TFS_KAFKA_CALLBACK = f"{__name__}.tfs_message_delivery_callback"
 
 # определяем стенд
 ENV_STAND = os.getenv("ENV_STAND", "").strip().lower()

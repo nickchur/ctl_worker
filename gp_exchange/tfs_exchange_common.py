@@ -14,7 +14,14 @@ TFS_IN_CONN_ID = 's3-tfs-hrplt' ###
 TFS_IN_BUCKET = 'tfshrplt' ###
 TFS_IN_TOPIC = 'TFS.DSSIGMA.IN'
 TFS_IN_PREFIX = 'to/CAPUE/pkap1080_to_hrplt/pc1080.' ###
-TFS_KAFKA_CALLBACK = 'CI06932748.analytics.datalab.export_tfs.tfs_common.tfs_message_delivery_callback'
+# ⚠️ Путь собирается из __name__: ProduceToTopicOperator принимает delivery_callback
+# только строкой и делает import_string. Прежнее значение указывало на ЧУЖОЙ модуль —
+# export_tfs.tfs_common, — хотя колбэк лежит здесь же, ниже, а сам файл приезжает как
+# CI06932748.analytics.datalab.gp_exchange.tfs_exchange_common на контуре (см. импорты
+# в tfs_exchange_import.py и tfs_exchange_sensor.py) и как gp_exchange.tfs_exchange_common
+# на стенде. __name__ даёт верное имя в обоих случаях.
+# Продюсера в gp_exchange пока нет — константа готова к тому, что он появится.
+TFS_KAFKA_CALLBACK = f"{__name__}.tfs_message_delivery_callback"
 
 ON_CLUSTER = 'ON CLUSTER datalab'
 CH_BD = 'support'

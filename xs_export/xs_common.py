@@ -16,7 +16,24 @@ from airflow.utils.task_group import TaskGroup
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseOperator
 from airflow_clickhouse_plugin.operators.clickhouse_dbapi import ClickHouseBranchSQLOperator
 
-from CI06932748.analytics.datalab.default_default_args import DEFAULT_DEFAULT_ARGS  # type: ignore
+# Общие default_args приезжают из платформенного пакета — в нашем репозитории такого
+# модуля нет и быть не должно. Импорт был жёстким, поэтому вне контура файл не
+# разбирался вовсе: фабрику xStream нельзя было ни импортировать, ни проверить.
+# Запасные значения повторяют боевые по смыслу, а всё, что задаёт сам xStream,
+# перебивает их ниже в DEFAULT_ARGS.
+try:
+    from CI06932748.analytics.datalab.default_default_args import DEFAULT_DEFAULT_ARGS  # type: ignore
+except ImportError:
+    from datetime import timedelta
+
+    DEFAULT_DEFAULT_ARGS = {
+        "owner": "DataLab (CI02420667)",
+        "retries": 2,
+        "retry_delay": timedelta(minutes=5),
+        "depends_on_past": False,
+        "email_on_failure": False,
+        "email_on_retry": False,
+    }
 from hrp_operators.clickhouse_to_s3 import HrpClickNativeToS3Operator, HrpClickNativeToS3ListOperator
 
 logger = logging.getLogger(__name__)

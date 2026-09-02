@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-08-21 13:11 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-02 08:30 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -162,6 +162,19 @@ def _on_delivery_tfs(err, msg) -> None:
     if err:
         raise AirflowFailException(f"Kafka delivery failed: {err}")
     logger.info("Receipt delivered to %s [%s]", msg.topic(), msg.partition())
+
+
+# ⚠️ ProduceToTopicOperator принимает delivery_callback ТОЛЬКО строкой-путём: и в 1.12
+# (контур), и в 1.15 (стенд) конструктор делает import_string(delivery_callback).
+# Переданная функция роняет РАЗБОР ФАЙЛА — 'function' object has no attribute 'rsplit',
+# то есть даг не собирается вовсе, причём на обоих контурах.
+#
+# Путь собираем из __name__, а не пишем строкой: имя модуля у DAG-файла Airflow
+# придумывает сам (unusual_prefix_<hash>_ctl_tfs) и кладёт модуль в sys.modules, поэтому
+# import_string находит функцию и в шедулере, и в воркере — оба сначала разбирают файл.
+# Тот же приём в check/test_kafka.py; прибитые пути на CI06932748 (xs_export, gp_exchange)
+# работают только на контуре и на стенде не резолвятся.
+_ON_DELIVERY_TFS = f"{__name__}._on_delivery_tfs"
 
 
 @task(map_index_template="{{ path[0] }}", outlets=[DatasetAlias(f"TFS/{profile}")],)
@@ -456,8 +469,8 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
         if not p.get('kafka_snd') or not p.get('topic_snd'):
             from airflow.exceptions import AirflowSkipException
             raise AirflowSkipException("kafka_snd/topic_snd not set, skipping receipt")
-        context['task'].kafka_config_id = p['kafka_snd']
-        context['task'].topic = p['topic_snd']
+        # kafka_config_id и topic подставляет рендер шаблонов (см. ниже): он идёт до
+        # pre_execute, так что здесь остаётся только проверка «параметры заданы».
 
         ti = context['task_instance']
         rq_uid = ti.xcom_pull(task_ids='tfs_wait', key='rq_uid') or ''
@@ -475,10 +488,14 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
 
     send_receipt = ProduceToTopicOperator(
         task_id='send_receipt',
-        kafka_config_id='',
-        topic='',
+        # Пустые строки здесь роняли РАЗБОР ФАЙЛА: конструктор оператора требует
+        # непустые topic и producer_function — одинаково в 1.12 (контур) и 1.15 (стенд).
+        # Оба поля шаблонные, поэтому значения приезжают параметрами запуска, а не
+        # присваиванием в pre_execute; не заданы — pre_execute уводит таск в скип.
+        kafka_config_id='{{ params.kafka_snd }}',
+        topic='{{ params.topic_snd }}',
         producer_function=_produce_receipt,
-        delivery_callback=_on_delivery_tfs,
+        delivery_callback=_ON_DELIVERY_TFS,
         pre_execute=_pre_receipt,
         trigger_rule='all_done',
     )

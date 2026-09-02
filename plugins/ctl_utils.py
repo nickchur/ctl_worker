@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-06-19 14:44 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-02 11:00 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -145,13 +145,22 @@ def log_retry_attempt(retry_state):
     )
 
 def pg_exe(sql='select 1', timeout=300):
-    """Выполняет SQL в Airflow DB (PostgreSQL) через create_session и возвращает список dict-строк."""
+    """Выполняет SQL в Airflow DB (PostgreSQL) через create_session и возвращает список dict-строк.
+
+    Для запросов без результата (UPDATE/DELETE без RETURNING) возвращает пустой список.
+    """
     ts_start = time.time()
     with create_session() as session:
         session.execute(text("SET LOCAL search_path = main"))
         if timeout:
             session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
         result = session.execute(text(sql))
+        # UPDATE/DELETE без RETURNING строк не отдают, и result.keys() на них бросает
+        # ResourceClosedError. Раньше через pg_exe ходили только SELECT-ы, поэтому
+        # незаметно; теперь функция годится и для правок — вернёт пустой список.
+        if not result.returns_rows:
+            logger.info(f"✅ {result.rowcount} rows affected in {time.time() - ts_start:.2f}s")
+            return []
         cols = [col for col in result.keys()]
         records = [dict(zip(cols, row)) for row in result.fetchall()]
     logger.info(f"✅ {len(records)} records loaded in {time.time() - ts_start:.2f}s")

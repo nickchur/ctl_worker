@@ -29,7 +29,7 @@
 | `gp_exchange/` | `gp_exchange/readme.md` | 2026-08-31 | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 | 2026-09-02 |
 | `plugins/` | `plugins/readme.md` | 2026-08-31 | `openspec/specs/plugins/spec.md` | 2026-08-31 | 2026-09-01 |
 | `tfs_kafka/` | `tfs_kafka/README.md` | 2026-08-28 | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 | 2026-08-28 |
-| `tools/` | `tools/readme.md` | 2026-08-31 | `openspec/specs/tools/spec.md` | 2026-08-31 | 2026-08-31 |
+| `tools/` | `tools/readme.md` | 2026-08-31 | `openspec/specs/tools/spec.md` | 2026-08-31 | 2026-09-02 |
 | `xs_export/` | `xs_export/readme.md` | 2026-08-31 | `openspec/specs/xs-export/spec.md` | 2026-08-31 | 2026-09-02 |
 
 *Собрано 2026-09-02 скриптом `sync_context.py`*

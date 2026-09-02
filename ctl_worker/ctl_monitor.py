@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-01 19:13 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-02 10:49 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -17,13 +17,15 @@
 from airflow import DAG
 from airflow.decorators import task, task_group
 from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.models import Param
 from airflow.sensors.base import PokeReturnValue # type: ignore
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
-from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
-from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_wait_until  # type: ignore
+from plugins.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
+from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until  # type: ignore
 
 import ast
+import re
 import sys
 from functools import partial
 from datetime import timedelta, datetime, timezone
@@ -74,6 +76,13 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
     },
     max_active_runs=1,
     is_paused_upon_creation=False,
+    params={
+        'zombie_dry_run': Param(
+            False, type='boolean', title='Санитар: только показать',
+            description='Не закрывать зависшие таски и загрузки, а только перечислить их '
+                        'в заметке. Полезно первым запуском на новом контуре.',
+        ),
+    },
     on_failure_callback=partial(on_callback, level='DAG'),
     on_success_callback=partial(on_callback, level='DAG'),
     # dagrun_timeout=timeout + str2timedelta(config.get('dagrun_timeout','minutes=10')),
@@ -365,5 +374,131 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 logger.error(f"ctl_action failed for lid={lid} action={action}: {e}")
 
     
+    @task(pool='ctl_pool')
+    def ctl_zombie(**context):
+        """🧟 Закрывает таски, зависшие в RUNNING с мёртвым heartbeat.
+
+        Зачем. Умерший воркер оставляет таск в состоянии RUNNING. Планировщик объявляет
+        его зомби и шлёт колбэк «пометить упавшим», но колбэк исполняется в контексте
+        файла дага — а даг к тому времени мог исчезнуть (воркфлоу выпал из ctl_workflows,
+        и фабрика его больше не строит). Тогда состояние не меняется никогда: те же таски
+        объявляются зомби каждые десять секунд годами. На alpha так накопилось 33 штуки,
+        самым старым — с апреля; они держали слоты ctl_pool, а каждое объявление дёргало
+        наш on_failure_callback (за пять минут — под тысячу вызовов и 33 МБ лога).
+
+        Что делает: помечает такие таски упавшими, закрывает осиротевшие раны и, если за
+        раном стоит загрузка CTL (`sensor__<lid>_…`), переводит её в ABORTED — иначе CTL
+        считает её активной, а идти ей уже некуда.
+
+        Порог берётся из конфига (`zombie_after`, по умолчанию 6 часов) и обязан быть
+        БОЛЬШЕ exe_timeout: длинный run_exe не бьётся чаще, чем работает, и попасть под
+        нож не должен. Параметр формы `zombie_dry_run` показывает список, ничего не трогая.
+        """
+        dry = bool(context['params'].get('zombie_dry_run'))
+        after = str2timedelta(get_config().get('zombie_after', 'hours=6'))
+        secs = int(after.total_seconds())
+
+        # Критерий один на выборку и на правку: таск в RUNNING, а его job либо не
+        # зарегистрирован, либо не бился дольше порога. Живой таск со свежим heartbeat
+        # сюда не попадает ни при каких условиях — это главное свойство запроса.
+        where = (
+            "ti.state = 'running' AND ("
+            "  ti.job_id IS NULL"
+            "  OR j.id IS NULL"
+            "  OR j.state <> 'running'"
+            f"  OR j.latest_heartbeat < now() - interval '{secs} seconds')"
+        )
+
+        stuck = pg_exe(
+            "SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.start_date,"
+            "       j.state AS job_state, j.latest_heartbeat"
+            "  FROM task_instance ti"
+            "  LEFT JOIN job j ON j.id = ti.job_id"
+            f" WHERE {where}"
+            " ORDER BY ti.start_date LIMIT 500"
+        )
+
+        note = {
+            f"{r['dag_id']}.{r['task_id']}": {
+                'run_id': r['run_id'],
+                'start': str(r['start_date'])[:19],
+                'heartbeat': str(r['latest_heartbeat'])[:19] if r['latest_heartbeat'] else 'нет job',
+            }
+            for r in stuck
+        }
+
+        # Раны, у которых не осталось ни одной живой задачи и которые старше порога.
+        # Считаются ОТДЕЛЬНО от тасков: ран остаётся висеть и после того, как его таски
+        # уже добиты — хоть нами, хоть штатным зомби-килом, — а планировщик разбирает
+        # такой ран на каждом круге. На alpha так висят раны с апреля.
+        orphan_where = (
+            "dr.state = 'running'"
+            f"   AND dr.start_date < now() - interval '{secs} seconds'"
+            "   AND NOT EXISTS (SELECT 1 FROM task_instance ti"
+            "                    WHERE ti.dag_id = dr.dag_id AND ti.run_id = dr.run_id"
+            "                      AND ti.state IN ('running','queued','scheduled','up_for_retry','deferred'))"
+        )
+
+        if dry:
+            # Загрузки CTL: id лежит в имени рана, который создаёт сенсор —
+            # sensor__<lid>_<попытка>_<дата>.
+            seen = sorted({int(m.group(1)) for r in stuck
+                           if (m := re.match(r'sensor__(\d+)_', str(r['run_id'])))})
+            orphans = pg_exe(f"SELECT dr.dag_id, dr.run_id FROM dag_run dr WHERE {orphan_where} LIMIT 500")
+            add_note({'🧟 Санитар (только показать)': note or 'зависших тасков нет',
+                      'осиротевшие раны': [f"{r['dag_id']} / {r['run_id']}" for r in orphans],
+                      'загрузки': seen},
+                     context, level='Task,DAG')
+            return {'stuck': len(stuck), 'runs': len(orphans), 'loadings': seen, 'dry_run': True}
+
+        # RETURNING, а не «обновили и надеемся»: в отчёт и в закрытие загрузок идёт то,
+        # что база действительно поменяла, а не то, что показала выборка секунду назад.
+        failed = []
+        if stuck:
+            failed = pg_exe(
+                "UPDATE task_instance ti SET state = 'failed', end_date = now()"
+                "  FROM job j WHERE j.id = ti.job_id AND " + where +
+                " RETURNING ti.dag_id, ti.task_id, ti.run_id"
+            )
+            # Таски без job вообще (ti.job_id пуст) отдельным запросом: JOIN их не поймает.
+            failed += pg_exe(
+                "UPDATE task_instance SET state = 'failed', end_date = now()"
+                " WHERE state = 'running' AND job_id IS NULL"
+                " RETURNING dag_id, task_id, run_id"
+            )
+
+        runs = pg_exe(
+            f"UPDATE dag_run dr SET state = 'failed', end_date = now() WHERE {orphan_where}"
+            " RETURNING dr.dag_id, dr.run_id"
+        )
+
+        lids = sorted({int(m.group(1)) for r in failed
+                       if (m := re.match(r'sensor__(\d+)_', str(r['run_id'])))})
+
+        closed, skipped = [], []
+        for lid in lids:
+            try:
+                ld = ctl_api(f"/v4/api/loading/{lid}")
+                if (ld or {}).get('alive') != 'ACTIVE':
+                    skipped.append(lid)
+                    continue
+                ctl_set_status(lid, 'ERROR', f'Zombie: таск не бился дольше {after}, закрыт санитаром')
+                ctl_set_completed(lid, completed=False)
+                closed.append(lid)
+            except Exception as e:                       # одна загрузка не должна ронять уборку
+                logger.error(f"ctl_zombie: не закрыл загрузку {lid}: {e}")
+
+        if not (failed or runs):
+            add_note('🧟 Зависших тасков и осиротевших ранов нет', context, level='Task')
+            return {'stuck': 0, 'runs': 0}
+
+        add_note({'🧟 Закрыто зависших тасков': len(failed), 'таски': note,
+                  'закрыто ранов': len(runs), 'загрузки ABORTED': closed,
+                  'уже закрыты': skipped},
+                 context, level='Task,DAG')
+        return {'stuck': len(failed), 'runs': len(runs), 'closed': closed, 'skipped': skipped}
+
+
     ctl_action(res = ctl_monitor())
+    ctl_zombie()
 

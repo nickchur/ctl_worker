@@ -1001,17 +1001,27 @@ def tools_test_dags():
             built = {dag_id: dag.fileloc for dag_id, dag in bag.dags.items()}
             with create_session() as session:
                 stored = {r[0] for r in session.query(SerializedDagModel.dag_id).all()}
-            missing = sorted(set(built) - stored)
-            gap_ids = missing[:note_rows]
-            per_file: dict[str, int] = {}
-            for dag_id in missing:
-                per_file[built[dag_id]] = per_file.get(built[dag_id], 0) + 1
-            built_per_file: dict[str, int] = {}
-            for fileloc in built.values():
-                built_per_file[fileloc] = built_per_file.get(fileloc, 0) + 1
-            gap_rows = sorted(
-                ({"file": f, "built": built_per_file[f], "missing": n} for f, n in per_file.items()),
-                key=lambda r: -r["missing"])
+            missing = set(built) - stored
+            gap_ids = sorted(missing)[:note_rows]
+
+            # Порядок важнее списка. DagBag складывает DAG'и в порядке построения, в том
+            # же порядке их пишет save_dag_to_db. Если пропавшие занимают ХВОСТ файла,
+            # значит запись оборвалась на полпути (файл бросили по тайм-ауту, транзакцию
+            # не докоммитили), а не отдельные DAG'и чем-то плохи.
+            per_file: dict[str, list[str]] = {}
+            for dag_id, fileloc in built.items():
+                per_file.setdefault(fileloc, []).append(dag_id)
+            gap_rows = []
+            for fileloc, dag_ids in per_file.items():
+                gone = [i for i, d in enumerate(dag_ids) if d in missing]
+                if not gone:
+                    continue
+                tail = gone[0] + len(gone) == len(dag_ids) and gone[-1] == len(dag_ids) - 1
+                gap_rows.append({"file": fileloc, "built": len(dag_ids), "missing": len(gone),
+                                 "positions": f"{gone[0] + 1}-{gone[-1] + 1} из {len(dag_ids)}",
+                                 "tail": tail,
+                                 "ids": sorted(dag_ids[i] for i in gone)[:200]})
+            gap_rows.sort(key=lambda r: -r["missing"])
         except Exception as e:                       # сверка не должна ронять таск
             logger.warning("Сверка с serialized_dag не вышла: %s: %s", type(e).__name__, e)
 
@@ -1041,10 +1051,17 @@ def tools_test_dags():
         gap_block = ""
         if gap_rows:
             gap_block = ("\n\n**Нет в serialized_dag:**\n\n"
-                         "| Файл | Построено | Не записано |\n|---|---:|---:|\n"
-                         + "\n".join(f"| `{_short(r['file'], 70)}` | {r['built']} | {r['missing']} |"
-                                     for r in gap_rows[:note_rows])
+                         "| Файл | Построено | Не записано | Позиции | Хвост |\n"
+                         "|---|---:|---:|---|---|\n"
+                         + "\n".join(
+                             f"| `{_short(r['file'], 50)}` | {r['built']} | {r['missing']} "
+                             f"| {r['positions']} | {'да' if r['tail'] else 'нет'} |"
+                             for r in gap_rows[:note_rows])
                          + "\n\nНапример: " + ", ".join(f"`{d}`" for d in gap_ids))
+            if any(r["tail"] for r in gap_rows):
+                gap_block += ("\n\nПропавшие занимают хвост файла — запись оборвалась на "
+                              "полпути. Смотреть в сторону `dag_file_processor_timeout` и "
+                              "времени разбора файла, а не отдельных DAG'ов.")
 
         add_xcom("parse_time", {"stats": {"files": len(rows), "mean": round(mean, 2),
                                           "sigma": round(sigma, 2),

@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-02 10:49 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-02 11:40 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -427,24 +427,38 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             for r in stuck
         }
 
-        # Раны, у которых не осталось ни одной живой задачи и которые старше порога.
-        # Считаются ОТДЕЛЬНО от тасков: ран остаётся висеть и после того, как его таски
-        # уже добиты — хоть нами, хоть штатным зомби-килом, — а планировщик разбирает
-        # такой ран на каждом круге. На alpha так висят раны с апреля.
+        # Раны, которые планировщик разбирает вхолостую на каждом круге. Считаются
+        # ОТДЕЛЬНО от тасков: ран висит и после того, как его таски добиты — хоть нами,
+        # хоть штатным зомби-килом. Два случая, оба старше порога:
+        #
+        #   1. RUNNING, в котором не осталось ни одной живой задачи — двигаться ему некуда;
+        #   2. RUNNING или QUEUED у дага, которого нет в serialized_dag: воркфлоу выпал
+        #      из ctl_workflows, фабрика его больше не строит, и планировщик на каждом
+        #      круге пишет «DAG ... not found in serialized_dag». На alpha один такой
+        #      призрак давал 60 строк ошибок в секунду.
+        #
+        # Порог обязателен и во втором случае: даг пропадает из сериализации и на время
+        # сбоя разбора, но шесть часов такого сбоя — это уже не мигание, а авария.
         orphan_where = (
-            "dr.state = 'running'"
-            f"   AND dr.start_date < now() - interval '{secs} seconds'"
-            "   AND NOT EXISTS (SELECT 1 FROM task_instance ti"
-            "                    WHERE ti.dag_id = dr.dag_id AND ti.run_id = dr.run_id"
-            "                      AND ti.state IN ('running','queued','scheduled','up_for_retry','deferred'))"
+            "coalesce(dr.start_date, dr.queued_at, dr.execution_date)"
+            f"       < now() - interval '{secs} seconds'"
+            "   AND ("
+            "        (dr.state = 'running'"
+            "         AND NOT EXISTS (SELECT 1 FROM task_instance ti"
+            "                          WHERE ti.dag_id = dr.dag_id AND ti.run_id = dr.run_id"
+            "                            AND ti.state IN ('running','queued','scheduled','up_for_retry','deferred')))"
+            "     OR (dr.state IN ('running','queued')"
+            "         AND NOT EXISTS (SELECT 1 FROM serialized_dag sd WHERE sd.dag_id = dr.dag_id))"
+            "       )"
         )
 
         if dry:
             # Загрузки CTL: id лежит в имени рана, который создаёт сенсор —
-            # sensor__<lid>_<попытка>_<дата>.
-            seen = sorted({int(m.group(1)) for r in stuck
-                           if (m := re.match(r'sensor__(\d+)_', str(r['run_id'])))})
+            # sensor__<lid>_<попытка>_<дата>. Отбор тот же, что в боевой ветке ниже,
+            # иначе «покажи» и «сделай» показывали бы разное.
             orphans = pg_exe(f"SELECT dr.dag_id, dr.run_id FROM dag_run dr WHERE {orphan_where} LIMIT 500")
+            seen = sorted({int(m.group(1)) for r in stuck + orphans
+                           if (m := re.match(r'sensor__(\d+)_', str(r['run_id'])))})
             add_note({'🧟 Санитар (только показать)': note or 'зависших тасков нет',
                       'осиротевшие раны': [f"{r['dag_id']} / {r['run_id']}" for r in orphans],
                       'загрузки': seen},
@@ -472,7 +486,9 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             " RETURNING dr.dag_id, dr.run_id"
         )
 
-        lids = sorted({int(m.group(1)) for r in failed
+        # Загрузки берутся и с тасков, и с ранов: у рана-призрака живых тасков нет
+        # вовсе, а загрузка за ним всё равно числится активной.
+        lids = sorted({int(m.group(1)) for r in failed + runs
                        if (m := re.match(r'sensor__(\d+)_', str(r['run_id'])))})
 
         closed, skipped = [], []

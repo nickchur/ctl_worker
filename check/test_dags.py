@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-08-07 13:50 MSK · v2.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-02 20:40 MSK · v2.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -17,7 +17,7 @@
 | **`compare.find_changed`** | Находит DAG'и, у которых `dag_hash` разошёлся с последней сохранённой версией, то есть изменившиеся с прошлого прогона. Ничего не скачивает: хэш виден в имени объекта |
 | **`compare.snapshot_dags`** | Пишет новые версии в S3 и возвращает пары «прошлая версия → новая» для `expand`; статистика — в XCom `snapshot_stats` |
 | **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
-| **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** |
+| **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** Он же сверяет построенное с `serialized_dag` и показывает DAG'и, которые разобрались, но в таблицу не доехали: такой DAG виден в UI, но `trigger_dag` по нему падает с `DagNotFound` |
 | **`summary`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга |
 
 **Исключения:** DAG'и с id по префиксам из `SKIP_DAG_PREFIXES` (сейчас `deadlocker_*`)
@@ -987,6 +987,63 @@ def tools_test_dags():
         # бросит на полпути, и DAG'и из него исчезнут из serialized_dag
         near_timeout = [r for r in rows if r["sec"] > timeout / 2]
 
+        # Сверка «построено против сериализовано». Разбор может отчитаться о N DAG'ах,
+        # а в serialized_dag доехать меньше: файл бросили на полпути, транзакцию
+        # откатили, строку вычистил deactivate_stale_dags. Снаружи это невидимо —
+        # # DAGs в статистике планировщика считает построенные, а не записанные.
+        # Такой DAG остаётся в таблице dag (виден в UI), но trigger_dag по нему падает
+        # с DagNotFound: он берёт DAG именно из serialized_dag.
+        gap_rows, gap_ids, gap_state, gap_no_row, gap_fresh = [], [], [], [], "—"
+        try:
+            from sqlalchemy import func  # noqa: PLC0415
+
+            from airflow.models.serialized_dag import SerializedDagModel  # noqa: PLC0415
+            from airflow.utils.session import create_session  # noqa: PLC0415
+
+            built = {dag_id: dag.fileloc for dag_id, dag in bag.dags.items()}
+            with create_session() as session:
+                stored = {r[0] for r in session.query(SerializedDagModel.dag_id).all()}
+            missing = set(built) - stored
+            gap_ids = sorted(missing)[:note_rows]
+
+            # Порядок важнее списка. DagBag складывает DAG'и в порядке построения, в том
+            # же порядке их пишет save_dag_to_db. Если пропавшие занимают ХВОСТ файла,
+            # значит запись оборвалась на полпути (файл бросили по тайм-ауту, транзакцию
+            # не докоммитили), а не отдельные DAG'и чем-то плохи.
+            per_file: dict[str, list[str]] = {}
+            for dag_id, fileloc in built.items():
+                per_file.setdefault(fileloc, []).append(dag_id)
+            gap_rows = []
+            for fileloc, dag_ids in per_file.items():
+                gone = [i for i, d in enumerate(dag_ids) if d in missing]
+                if not gone:
+                    continue
+                tail = gone[0] + len(gone) == len(dag_ids) and gone[-1] == len(dag_ids) - 1
+                gap_rows.append({"file": fileloc, "built": len(dag_ids), "missing": len(gone),
+                                 "positions": f"{gone[0] + 1}-{gone[-1] + 1} из {len(dag_ids)}",
+                                 "tail": tail,
+                                 "ids": sorted(dag_ids[i] for i in gone)[:200]})
+            gap_rows.sort(key=lambda r: -r["missing"])
+
+            # Состояние пропавших в таблице dag. Разбор их построил, значит строки dag у
+            # них обновились вместе со всеми: свежий last_parsed_time = писатель их
+            # пропустил, отставший = строку убрал deactivate_stale_dags как устаревшую
+            # (dag_processing/manager.py), а inactive — что этот уже сработал.
+            from airflow.models import DagModel  # noqa: PLC0415
+
+            with create_session() as session:
+                probe = session.query(
+                    DagModel.dag_id, DagModel.is_active, DagModel.last_parsed_time,
+                ).filter(DagModel.dag_id.in_(gap_ids)).all()
+                fresh = session.query(func.max(DagModel.last_parsed_time)).filter(
+                    DagModel.fileloc == gap_rows[0]["file"]).scalar() if gap_rows else None
+            gap_state = [{"dag_id": r.dag_id, "active": r.is_active,
+                          "parsed": str(r.last_parsed_time)[:19]} for r in probe]
+            gap_no_row = sorted(set(gap_ids) - {r.dag_id for r in probe})
+            gap_fresh = str(fresh)[:19]
+        except Exception as e:                       # сверка не должна ронять таск
+            logger.warning("Сверка с serialized_dag не вышла: %s: %s", type(e).__name__, e)
+
         shown = outliers or rows[:note_rows]  # dagbag_stats уже отсортирован по убыванию
         table = "| Файл | Сек | DAG'ов | Тасков |\n|---|---:|---:|---:|\n" + "\n".join(
             f"| `{_short(r['file'], 70)}` | {r['sec']:.2f} | {r['dags']} | {r['tasks']} |"
@@ -1006,18 +1063,49 @@ def tools_test_dags():
         if near_timeout:
             head += (f". ⚠️ {len(near_timeout)} файлов уже за половиной "
                      f"dag_file_processor_timeout ({timeout}с)")
+        if gap_rows:
+            head += (f". ❗ {sum(r['missing'] for r in gap_rows)} DAG'ов построились, "
+                     f"но их нет в serialized_dag — запустить их нельзя")
+
+        gap_block = ""
+        if gap_rows:
+            gap_block = ("\n\n**Нет в serialized_dag:**\n\n"
+                         "| Файл | Построено | Не записано | Позиции | Хвост |\n"
+                         "|---|---:|---:|---|---|\n"
+                         + "\n".join(
+                             f"| `{_short(r['file'], 50)}` | {r['built']} | {r['missing']} "
+                             f"| {r['positions']} | {'да' if r['tail'] else 'нет'} |"
+                             for r in gap_rows[:note_rows])
+                         + "\n\nНапример: " + ", ".join(f"`{d}`" for d in gap_ids))
+            if any(r["tail"] for r in gap_rows):
+                gap_block += ("\n\nПропавшие занимают хвост файла — запись оборвалась на "
+                              "полпути. Смотреть в сторону `dag_file_processor_timeout` и "
+                              "времени разбора файла, а не отдельных DAG'ов.")
+            if gap_state or gap_no_row:
+                gap_block += (f"\n\n**Они же в таблице `dag`** (файл разобран {gap_fresh}):\n\n"
+                              "| DAG | is_active | last_parsed_time |\n|---|---|---|\n"
+                              + "\n".join(f"| `{s['dag_id']}` | {s['active']} | {s['parsed']} |"
+                                          for s in gap_state))
+                if gap_no_row:
+                    gap_block += ("\n\nБез строки в `dag` вовсе: "
+                                  + ", ".join(f"`{d}`" for d in gap_no_row))
 
         add_xcom("parse_time", {"stats": {"files": len(rows), "mean": round(mean, 2),
                                           "sigma": round(sigma, 2),
                                           "threshold": round(threshold, 2)},
-                                "outliers": outliers}, context)
-        add_note(f"{head}\n\n{stats_block}\n\n{table}", context, level="task",
+                                "outliers": outliers,
+                                "serialized_gap": {"files": gap_rows,
+                                                   "examples": gap_ids,
+                                                   "dag_rows": gap_state,
+                                                   "no_dag_row": gap_no_row}}, context)
+        add_note(f"{head}\n\n{stats_block}\n\n{table}{gap_block}", context, level="task",
                  title=f"🕐 {elapsed:.1f} sec parse_time: {len(rows)} файлов")
         logger.info("🕐 разобрано %d файлов за %.1fс, среднее %.2fс, σ %.2fс, порог %.2fс, "
                     "выбросов %d", len(rows), elapsed, mean, sigma, threshold, len(outliers))
         return {"files": len(rows), "outliers": len(outliers), "mean": round(mean, 2),
                 "sigma": round(sigma, 2), "threshold": round(threshold, 2),
-                "near_timeout": len(near_timeout)}
+                "near_timeout": len(near_timeout),
+                "serialized_gap": sum(r["missing"] for r in gap_rows)}
 
     # --- Summary ---
     @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)

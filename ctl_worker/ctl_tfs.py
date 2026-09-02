@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-09-02 08:30 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-02 13:45 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -44,7 +44,7 @@ from airflow.models import Param
 from airflow.decorators import task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 # from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor 
-from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.exceptions import AirflowException, AirflowFailException, AirflowSkipException
 from airflow.sensors.base import PokeReturnValue
 from airflow.datasets import DatasetAlias, Dataset
 
@@ -59,6 +59,7 @@ from plugins.ctl_utils import get_config   # type: ignore
 
 import xml.etree.ElementTree as ET
 import pendulum
+from botocore.exceptions import ClientError
 from fnmatch import fnmatch
 from datetime import timedelta, datetime, timezone
 from logging import getLogger
@@ -269,6 +270,25 @@ def tfs_copy(path: str, **context):
     return msg
 
 
+def _s3_error_text(exc: Exception, tfs_prm: dict) -> str:
+    """Человеческая причина недоступности источника вместо трейса botocore.
+
+    В заметку и в письмо уходит одна строка: какой бакет, через какой коннект и что
+    именно ответил шлюз. Разбор кода — как в plugins/s3_utils.py.
+    """
+    conn_id, bucket = tfs_prm.get('conn_id'), tfs_prm.get('bucket')
+    if isinstance(exc, ClientError):
+        err = exc.response.get('Error', {})
+        code = err.get('Code', '?')
+        if code in ('NoSuchBucket', '404', 'NoSuchKey'):
+            return f"бакет {bucket} не заведён на коннекте {conn_id} ({code})"
+        if code in ('AccessDenied', 'InvalidAccessKeyId', 'SignatureDoesNotMatch', '403'):
+            return f"нет доступа к {bucket} через коннект {conn_id} ({code})"
+        return f"{bucket} через {conn_id} — {code}: {err.get('Message', '')}".strip()
+    # DNS, таймаут, обрыв соединения: класса ошибки достаточно, трейс остаётся в логе
+    return f"{bucket} через {conn_id} — {type(exc).__name__}: {exc}"
+
+
 # Основная логика DAG
 with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'TFS', 'tfs_sensor'],
@@ -330,17 +350,29 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
         add_note(tfs, context, level='DAG,Task', title='TFS')
         ti.xcom_push(key='tfs', value=tfs)
         
+        # Ошибки копим, а не бросаем на первом же источнике: сломанный tfs_kap не
+        # должен закрывать глаза на живой tfs_uvb
+        errors = {}
+        
         for path, tfs_prm,  in tfs.items():
 
             tfs_prm = { **tfs_prm, **s3_path_parse(path)}
             
-            objects = s3_keys(path)
+            try:
+                objects = s3_keys(path)
+            except Exception as e:
+                reason = _s3_error_text(e, tfs_prm)
+                logger.error(f"❌ {tfs_prm['tfs_id']}: {reason}", exc_info=True)
+                errors[tfs_prm['tfs_id']] = reason
+                continue
             
             if objects:
                 ti.xcom_push(key='tfs_src', value=tfs_prm)
                 # Сортируем: самые свежие файлы будут Последними в списке
                 objects = dict(sorted(objects.items(), key=lambda item: item[1]))
                 add_note(objects, context, level='DAG,Task', title=f'Files ({len(objects)}) ')
+                if errors:
+                    add_note(errors, context, level='DAG,Task', title='TFS: источники недоступны')
                 
                 # Забираем имена ключей для XCom
                 ret_keys = {
@@ -351,10 +383,21 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
                 
                 return PokeReturnValue(is_done=True, xcom_value=ret_keys)
         
+        # Файлов нет. Если какие-то источники не опросились — это не «пока пусто», а
+        # поломка: сообщаем причиной, а не трейсом. AirflowException, а не
+        # AirflowFailException: под soft_fail=True второе даёт skip вместо падения
+        # (airflow/sensors/base.py: except (...AirflowFailException) → AirflowSkipException)
+        if errors:
+            add_note(errors, context, level='DAG,Task', title='TFS: источники недоступны')
+            raise AirflowException(
+                "❌ Источники TFS недоступны: "
+                + "; ".join(f"{tfs_id} — {reason}" for tfs_id, reason in errors.items())
+            )
+        
         if manual:
             msg = f">❌ No files found in TFS"
             add_note(msg, context, level='DAG,Task')
-            raise AirflowFailException(msg)
+            raise AirflowException(msg)
         else:
             return False
     

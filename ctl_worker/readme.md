@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-02 22:35 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-03 09:55 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -67,6 +67,9 @@ ctl_worker/
 1. `run_prm` — Инициализация: создание загрузки в CTL, извлечение параметров из триггера.
 2. `run_tfs` *(опционально)* — Загрузка CSV-файлов из S3 в Greenplum (если `wf_tfs_in`).
 3. `run_exe` — Выполнение SQL-процедуры `pr_swf_start_ctl()` в Greenplum, сбор метрик.
+   Контракт вызова (входной JSON, подстановки `$lid$`/`$try$`, коды `res`) и сами
+   скрипты GP — в [`GP/readme.md`](../GP/readme.md). Функция неидемпотентна,
+   поэтому у таска `retries=0`, а повторы делает CTL через `TIME-WAIT`.
 4. `run_out` *(опционально)* — Экспорт результата в TFS (если `wf_tfs_out`).
 5. `run_end` — Публикация Dataset'ов, обновление статуса в CTL, retry при необходимости.
 
@@ -180,6 +183,11 @@ XCom из `ctl_monitor`: `{lid: {wid, wfn, sts, act, sch, ...}}` — перед�
 - Профиль и иерархия: `profile`, `root_category`, `root_entity`, `ue_category`.
 - Подключения: `ctl`, `gp`, `pg`, `s3` (основной), `files` (edpetl-files), `tfs` (источники файлов).
 - Таймауты: `task_timeout`, `exe_timeout`, `sla_time`, `gp_timeout`.
+  `exe_timeout` — это `statement_timeout` сессии Greenplum, и он держится **на пять
+  минут ниже серверного лимита**: сервер обрывает долгий запрос вместе с соединением,
+  и логи с ошибкой записаться не успевают. Свой таймаут срабатывает раньше, ошибка
+  попадает в лог и в письмо. Поднимать его выше серверного нельзя — см.
+  [`GP/readme.md`](../GP/readme.md).
 - Пулы и лимиты: `ctl_pool_slots`, `ctl_limit`, `ctl_days`.
 - PIN-защита: сохранение требует совпадения `AIRFLOW__CTL_PIN` из `/vault/secrets/application`.
 

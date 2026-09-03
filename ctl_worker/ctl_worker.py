@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-03 10:20 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-03 15:10 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -51,7 +51,7 @@ from plugins.utils import add_note, env_stand, on_callback, str2timedelta, updat
 from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
 from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
-                              ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed)
+                              ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed, ctl_loading_snapshot)
 
 from logging import  getLogger
 logger = getLogger('airflow.task')
@@ -368,15 +368,17 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
 
     ctl_set_status(lid, status, result)
 
+    # Ответ финализирующего вызова забираем, а не выбрасываем: в нём CTL отдаёт загрузку
+    # уже с итоговым статусом, и это избавляет run_end от лишнего GET ради снимка.
     if action == 'retry':
         retry.setdefault('try', 1)
         now = pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
         new_time = eval_delta(now, retry.get('delay'))
         for _ in range(1, retry.get('try')):
             new_time = eval_delta(new_time, retry.get('add'))
-        ctl_set_status(lid, 'TIME-WAIT', dict(time=new_time, retry=retry))
+        ld_end = ctl_set_status(lid, 'TIME-WAIT', dict(time=new_time, retry=retry))
     else:
-        ctl_set_completed(lid, action)
+        ld_end = ctl_set_completed(lid, action)
 
     data = {
         'wf': wf['name'],
@@ -387,7 +389,7 @@ def _finalize_status(lid, wid, result, wf, wf_prm, context):
     }
     add_note({**data, 'action': action, 'obj': lid}, context, level='task,DAG', title='Log')
 
-    return status, action, res_msg, res_icon
+    return status, action, res_msg, res_icon, ld_end
 
 
 def build_worker_dag(w):
@@ -886,7 +888,24 @@ def build_worker_dag(w):
             msg = _emit_datasets(lid, eids, result, context)
             ti.xcom_push(key='eids_result', value=json.dumps(msg, default=str))
 
-            status, action, res_msg, res_icon = _finalize_status(lid, int(wf['id']), result, wf, wf_prm, context)
+            # Номер попытки берём ДО финализации: внутри неё retry.setdefault('try', 1)
+            # меняет тот же словарь, что лежит в wf_prm['wfp_retry'] — он пришёл по ссылке,
+            # и после вызова первая попытка выглядела бы как первая повторная.
+            attempt = int((wf_prm.get('wfp_retry') or {}).get('try', 0) or 0)
+
+            status, action, res_msg, res_icon, ld_end = _finalize_status(
+                lid, int(wf['id']), result, wf, wf_prm, context)
+
+            # Итог попытки — отдельным снимком, до веток raise ниже: пропуск на повторе и
+            # падение на ошибке иначе не оставили бы в S3 ничего, а разбирать инцидент
+            # интереснее всего как раз по ним. Ошибка сохранения исход не меняет: загрузка
+            # уже финализирована в CTL, и красный таск после этого противоречил бы статусу.
+            try:
+                ctl_loading_snapshot(lid, wf['name'], f"ctl_done/{lid}_{attempt}", ld=ld_end)
+            except Exception as e:
+                msg = f"⚠️ Снимок итога не сохранён: {type(e).__name__}: {e}"
+                logger.warning(msg, exc_info=True)
+                add_note(msg, context, level='task')
 
             title = f"{status_icons[status]}{status} {action.upper()}\n\n"
             note = f"{res_icon} {result.get('msg') or res_msg.upper()}\n\n"

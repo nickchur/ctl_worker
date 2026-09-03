@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-01 19:13 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-03 15:10 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -152,6 +152,26 @@ def raise_status(status, payload):
         raise AirflowFailException(payload)
 
 
+def ctl_loading_snapshot(lid, wf_name, key, ld=None):
+    """Кладёт снимок загрузки в S3 под ключ `key` и возвращает нормализованный объект.
+
+    `ld` — то, что уже вернул CTL (например, ответ финализирующего PUT). Не похоже на
+    загрузку — перечитываем полную через GET: форма ответа на PUT со стороны CTL не
+    гарантирована, а снимок обязан быть настоящим объектом, иначе разбирать по нему
+    нечего.
+
+    Раскладка ключей живёт здесь одним местом:
+      * `ctl_working/{lid}` — состояние на вход в шаг (пишет ctl_chk_status);
+      * `ctl_done/{lid}_{try}` — итог попытки после финализации (пишет run_end);
+      * `ctl_loadings/{profile}/{id}` — снимки из списка сенсора (ctl_loading_load).
+    """
+    if not isinstance(ld, dict) or 'id' not in ld:
+        ld = ctl_api(f"/v4/api/loading/{int(lid)}")
+    ld = ctl_loading_norm(wf_name, ld)
+    ctl_obj_save(key, ld, var=False)
+    return ld
+
+
 def ctl_chk_status(lid, wf_name, alive=None, status=None, step=None, log_empty=None, save=True):
     """Проверяет, что загрузка lid находится в ожидаемых alive/status/step/log_empty.
 
@@ -168,9 +188,10 @@ def ctl_chk_status(lid, wf_name, alive=None, status=None, step=None, log_empty=N
     if isinstance(status, str): status = [status]
     if isinstance(step, str): step = [step]
     
-    ld = ctl_api(f"/v4/api/loading/{lid}")
-    ld = ctl_loading_norm(wf_name, ld)
-    if save: ctl_obj_save(f"ctl_working/{lid}", ld, var=False)
+    if save:
+        ld = ctl_loading_snapshot(lid, wf_name, f"ctl_working/{lid}")
+    else:
+        ld = ctl_loading_norm(wf_name, ctl_api(f"/v4/api/loading/{lid}"))
     ld_sts = ctl_get_status(ld)
     msg = ''
     ld_alive = ld_sts['alive']

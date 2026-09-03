@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-08-25 17:59 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-03 13:20 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -7,11 +7,23 @@
 которому она принадлежит — по pid из `application_name` (`app-dataplatform-etl-worker_<pid>`)
 и колонке `task_instance.pid`.
 
+Владелец бывает трёх сортов, и это разные диагнозы:
+
+| `owner_alive` | Что это | Что делать |
+|---|---|---|
+| `true` | таск идёт и бьётся (хартбит `job` свежее `zombie_after_sec`) | ничего: транзакция закроется вместе с таском. Висит сутками — вопрос к владельцам дага |
+| `false` | таск числится в работе, но хартбит протух, либо уже завершился | сессия брошена: процесса нет, соединение осталось |
+| `null` | владельца не опознали (чужой pid, не разобрался `application_name`) | то же, но без имени |
+
+Убиваем только тех, у кого `owner_alive` не `true`: прекратить сессию живого таска значит
+уронить чужую работу — он получит обрыв соединения с метабазой и умрёт зомби.
+
 | Параметр | Описание |
 |---|---|
 | `idle_tx_sec` | Порог для `idle in transaction`, сек *(default: `300`)* |
 | `long_query_sec` | Порог для активного запроса, сек *(default: `300`)* |
 | `lock_wait_sec` | Порог ожидания блокировки, сек *(default: `60`)* |
+| `zombie_after_sec` | Хартбит старше — владелец не жив, сек *(default: `300`, как у зомби-детектора Airflow)* |
 | `alert` | Краснеть при находках *(default: `True`)* |
 | `save_s3` | Писать снимки в S3 *(default: `True`)* |
 | `keep_days` | Сколько дней держим снимки, старше — удаляем *(default: `30`)* |
@@ -63,6 +75,10 @@ DEFAULTS = {
     "idle_tx_sec": 300,
     "long_query_sec": 300,
     "lock_wait_sec": 60,
+    # Столько же ждёт зомби-детектор Airflow (scheduler_zombie_task_threshold): если
+    # владелец не бьётся дольше, шедулер уже считает его мёртвым — и мы не должны
+    # расходиться с ним в вердикте.
+    "zombie_after_sec": 300,
     "alert": True,
     "save_s3": True,
     "keep_days": 30,
@@ -100,13 +116,23 @@ SELECT a.pid,
  ORDER BY a.xact_start
 """
 
-# Таски, которые сейчас идут: по ним опознаётся владелец сессии. pid — это pid процесса
-# задачи на поде, он же уезжает в application_name соединения (db_utils.failover_connect).
-SQL_RUNNING = r"""
-SELECT dag_id, task_id, run_id, map_index, hostname, pid,
-       round(extract(epoch FROM now() - start_date)) AS age
-  FROM main.task_instance
- WHERE state = 'running' AND pid IS NOT NULL
+# Владельцы сессий: pid — это pid процесса задачи на поде, он же уезжает в
+# application_name соединения (db_utils.failover_connect).
+#
+# Берём не только running: сессия переживает свою задачу — процесс умер, а соединение
+# осталось, — и такую находку нужно уметь отличать от долгой, но живой задачи. Отсюда же
+# join к main.job: state='running' в task_instance ставится один раз и живёт до конца,
+# а бьётся LocalTaskJob, и только его latest_heartbeat говорит, жив ли владелец сейчас.
+# Окно в шесть часов — чтобы не читать всю таблицу ради недавних покойников.
+SQL_OWNERS = r"""
+SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.state,
+       round(extract(epoch FROM now() - ti.start_date))       AS age,
+       j.state                                                AS job_state,
+       round(extract(epoch FROM now() - j.latest_heartbeat))  AS hb_age
+  FROM main.task_instance ti
+  LEFT JOIN main.job j ON j.id = ti.job_id
+ WHERE ti.pid IS NOT NULL
+   AND (ti.state = 'running' OR ti.end_date > now() - interval '6 hours')
 """
 
 
@@ -114,6 +140,41 @@ def _age(row: dict, key: str) -> int:
     """Возраст в секундах: NULL (транзакции/запроса нет) считаем нулём."""
     value = row.get(key)
     return int(value) if value is not None else 0
+
+
+def _human_age(seconds: int) -> str:
+    """Возраст словами: 86678 → «24ч 04м». Секунды остаются в данных, это для глаз."""
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return f"{seconds}с"
+    if seconds < 3600:
+        return f"{seconds // 60}м {seconds % 60:02d}с"
+    return f"{seconds // 3600}ч {seconds % 3600 // 60:02d}м"
+
+
+def _owner(ti: dict, zombie_after_sec: int) -> dict:
+    """Владелец сессии и вердикт «жив ли он».
+
+    Живой — тот, чья задача выполняется и чей LocalTaskJob бьётся не реже, чем ждёт
+    зомби-детектор Airflow. Задача, которая формально `running`, но перестала биться,
+    живой не считается: её сессия — то же брошенное соединение, только с записью в базе.
+    """
+    hb_age = ti.get('hb_age')
+    alive = ti.get('state') == 'running' and hb_age is not None and int(hb_age) <= zombie_after_sec
+    return {
+        'ti': f"{ti['dag_id']}.{ti['task_id']} [{ti['run_id']}]",
+        'state': ti.get('state'),
+        'age': _age(ti, 'age'),
+        'hb_age': int(hb_age) if hb_age is not None else None,
+        'alive': alive,
+    }
+
+
+def _owner_line(owner: dict) -> str:
+    """Владелец одной строкой для лога и заметки."""
+    hb = f"хартбит {_human_age(owner['hb_age'])} назад" if owner['hb_age'] is not None else 'хартбита нет'
+    verdict = 'жив' if owner['alive'] else 'НЕ жив'
+    return f"{owner['ti']} — {owner['state']} {_human_age(owner['age'])}, {hb}, {verdict}"
 
 
 def _app_pid(application_name: str):
@@ -202,6 +263,8 @@ def _fetch(sql: str) -> list:
                                 description='Порог для активного запроса, сек'),
         'lock_wait_sec': Param(_cfg['lock_wait_sec'], type='integer', minimum=5,
                                description='Порог ожидания блокировки, сек'),
+        'zombie_after_sec': Param(_cfg['zombie_after_sec'], type='integer', minimum=30,
+                                  description='Хартбит старше этого — владелец не жив, сек'),
         'alert': Param(_cfg['alert'], type='boolean',
                        description='Краснеть при находках'),
         'save_s3': Param(_cfg['save_s3'], type='boolean',
@@ -230,10 +293,11 @@ def tools_pg_activity():
             add_note(f"💾 настройки сохранены в `{CFG_VAR}`: {saved}", level='task', context=context)
 
         rows = _fetch(SQL_ACTIVITY)
-        running = _fetch(SQL_RUNNING)
+        owners_rows = _fetch(SQL_OWNERS)
         by_pid = {}
-        for ti in running:
-            by_pid.setdefault(ti['pid'], []).append(ti)
+        for ti in owners_rows:
+            by_pid.setdefault(ti['pid'], []).append(_owner(ti, p['zombie_after_sec']))
+        running = [ti for ti in owners_rows if ti.get('state') == 'running']
 
         # Кто кого блокирует: строим по blocking_pids, чтобы в отчёте виновник стоял рядом
         # с пострадавшим, а не искался глазами по списку. Порог тот же, что и у самого
@@ -258,26 +322,39 @@ def tools_pg_activity():
             if not kinds:
                 continue
 
+            # Кандидатов может быть несколько: pid уникален внутри пода, не по кластеру
             owners = by_pid.get(_app_pid(r.get('application_name')), [])
+            # None — владельца не опознали вовсе, и это не то же самое, что «мёртв»:
+            # в первом случае сессия ничья (или pid не разобрался), во втором за ней
+            # стоит конкретная задача, которая уже не бьётся.
+            owner_alive = any(o['alive'] for o in owners) if owners else None
+
             findings.append({
                 **{k: (str(v) if isinstance(v, datetime) else v) for k, v in r.items()},
                 # Возрасты приходят Decimal'ами: в JSON снимка они превратились бы
                 # в строки, а в отчёте — в '32' вместо 32
                 **{k: _age(r, k) for k in ('backend_age', 'tx_age', 'query_age', 'state_age')},
                 'kinds': kinds,
-                # Кандидатов может быть несколько: pid уникален внутри пода, не по кластеру
-                'owners': [f"{o['dag_id']}.{o['task_id']} [{o['run_id']}]" for o in owners],
+                'owners': [_owner_line(o) for o in owners],
+                'owner_alive': owner_alive,
             })
 
         counts = {kind: sum(kind in f['kinds'] for f in findings)
                   for kind in ('idle_tx', 'long_query', 'blocked', 'blocker')}
+        # Находки без живого владельца — те, ради которых вообще стоит что-то делать:
+        # у живой задачи транзакция закроется сама, у брошенной сессии — никогда.
+        counts['orphan'] = sum(f['owner_alive'] is not True for f in findings)
         logger.info("🔎 сессий всего: %d, тасков в работе: %d, находок: %d %s",
                     len(rows), len(running), len(findings), counts)
         for f in findings:
             logger.warning(
-                "⚠️ pid=%s %s state=%s tx=%ss query=%ss state=%ss app=%s addr=%s owners=%s\n    %s",
-                f['pid'], ','.join(f['kinds']), f['state'], f['tx_age'], f['query_age'],
-                f['state_age'], f['application_name'], f['client_addr'], f['owners'] or '—',
+                "⚠️ pid=%s %s state=%s tx=%s query=%s state=%s владелец=%s app=%s addr=%s\n"
+                "    %s\n    %s",
+                f['pid'], ','.join(f['kinds']), f['state'], _human_age(f['tx_age']),
+                _human_age(f['query_age']), _human_age(f['state_age']),
+                {True: 'жив', False: 'НЕ жив', None: 'не опознан'}[f['owner_alive']],
+                f['application_name'], f['client_addr'],
+                '; '.join(f['owners']) or 'владельца не нашли',
                 f['query'],
             )
 
@@ -323,11 +400,25 @@ def tools_pg_activity():
         # Себя не трогаем ни при каких настройках: таск, который убьёт собственную сессию,
         # упадёт на записи своего же статуса.
         me = context['dag'].dag_id
-        victims = [f for f in snapshot['findings']
-                   if ('idle_tx' in f['kinds'] or 'long_query' in f['kinds'])
-                   and not any(o.startswith(f"{me}.") for o in f['owners'])]
+        candidates = [f for f in snapshot['findings']
+                      if ('idle_tx' in f['kinds'] or 'long_query' in f['kinds'])
+                      and not any(o.startswith(f"{me}.") for o in f['owners'])]
+
+        # Живого владельца не трогаем никогда — ни по возрасту транзакции, ни по флагу.
+        # Прекратить его сессию значит уронить чужую работающую задачу: она получит обрыв
+        # соединения с метабазой, провалит хартбит и умрёт зомби. Суточная транзакция
+        # живой задачи остаётся находкой (её видно в отчёте), но не кандидатом — это
+        # вопрос к владельцам дага, а не к сторожу.
+        alive = [f for f in candidates if f.get('owner_alive') is True]
+        for f in alive:
+            logger.info("🙈 pid=%s пропущен: владелец жив — %s", f['pid'], '; '.join(f['owners']))
+
+        victims = [f for f in candidates if f.get('owner_alive') is not True]
         if not victims:
-            raise AirflowSkipException("подходящих кандидатов нет")
+            msg = "подходящих кандидатов нет"
+            if alive:
+                msg += f" (пропущено с живым владельцем: {len(alive)})"
+            raise AirflowSkipException(msg)
 
         killed = []
         for f in victims:
@@ -335,7 +426,9 @@ def tools_pg_activity():
             # поэтому терминируем. Активный запрос сначала пробуем отменить: таск получит
             # ошибку запроса, а не обрыв соединения.
             fn = 'pg_cancel_backend' if 'long_query' in f['kinds'] else 'pg_terminate_backend'
-            line = f"{fn}({f['pid']}) — {','.join(f['kinds'])}, {f['owners'] or '—'}"
+            owner = '; '.join(f['owners']) or 'владельца не нашли'
+            line = (f"{fn}({f['pid']}) — {','.join(f['kinds'])}, "
+                    f"транзакция {_human_age(f['tx_age'])}, {owner}")
             if p['dry_run']:
                 logger.info("🧪 dry-run: %s", line)
                 killed.append(f"[dry-run] {line}")
@@ -411,8 +504,10 @@ def tools_pg_activity():
         # Заметка режется до 1000 символов, поэтому в неё идут счётчики и три самые
         # старые находки; полный список — в логе таска collect.
         top = sorted(snapshot['findings'], key=lambda f: -(f['tx_age'] or 0))[:3]
+        verdict = {True: 'владелец жив', False: 'владелец НЕ жив', None: 'владельца не нашли'}
         lines = [
-            f"pid={f['pid']} {','.join(f['kinds'])} tx={f['tx_age']}с "
+            f"pid={f['pid']} {','.join(f['kinds'])} tx={_human_age(f['tx_age'])} "
+            f"· {verdict[f.get('owner_alive')]} · "
             f"{f['owners'][0] if f['owners'] else f['application_name']}"
             for f in top
         ]

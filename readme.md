@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-08-31 23:20 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-03 08:35 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -50,7 +50,14 @@ plugins/             # Переиспользуемые модули (импор
 ├── ctl_utils.py     # 🔧 API-обёртки, SQL, S3, конфигурация (get_config), логирование
 ├── s3_utils.py      # ☁️ Расширенные S3-утилиты: TTL, копирование, ZIP-распаковка
 └── utils.py         # 🛠️ Общие хелперы Airflow: пулы, заметки, колбэки, timedelta
+
+GP/                  # 🐘 Снимок DDL Greenplum: то, что тракт CTL вызывает и куда пишет
+├── srv_wf/          # Точка входа pr_swf_start_ctl, логирование pr_log_ctl, движок, отчёты
+└── srv_dq/          # ККД: Z-тест (pr_ztest_set / pr_ztest_all_diff) и его конфигурация
 ```
+
+`GP/` — копия из `HR_Data` для чтения, а не источник истины; контракт вызова, коды
+результата и карта объектов описаны в [`GP/readme.md`](GP/readme.md).
 
 ---
 

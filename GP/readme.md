@@ -1,5 +1,5 @@
 # GP — скрипты Greenplum, которые трогает ctl_worker
-*2026-09-03 08:30 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-03 09:05 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимок DDL тех объектов Greenplum, вокруг которых крутится тракт CTL. Скопировано из
 `HR_Data` (ветка `E360-6192`, ревизия `068018c`) 2026-09-03, чтобы не ходить туда за
@@ -105,6 +105,7 @@ XCom, заметку и в CTL.
 | `tb_log_ctl` | все ответы CTL API, которые прошли через `pr_log_ctl`: `ts, id, obj, url, msg (json)` |
 | `tb_log_ctl_all` | то же без фильтрации (вставка закомментирована, таблица осталась) |
 | `tb_swf_ctl_log` | действия движка по загрузке: `id, ts, parent, wf_action, wf_message (json)` — пишет `pr_swf_log_action` |
+| `tb_swf_mail_log` | тот же формат, но для отчётов: блоки HTML под общим `parent = mail_id` |
 | `vw_log_ctl` | плоский разбор `tb_log_ctl` |
 | `vw_log_ctl_loading` | по одной строке на загрузку: `alive, auto, start_dttm, end_dttm, profile, wf_id` |
 | `vw_log_ctl_wf` | то же в разрезе воркфлоу |
@@ -115,6 +116,10 @@ XCom, заметку и в CTL.
 
 Начинать разбор инцидента удобно с `vw_log_ctl_loading` по `lid` из имени рана
 (`sensor__<lid>_<попытка>_<дата>`), дальше — `vw_swf_ctl_log` по тому же `lid`.
+
+Слот лога выбирает второй аргумент `pr_swf_log_action`: `tb_swf_<swf>_log`. У тракта
+CTL это `ctl`, у отчётов — `mail`; в базе есть и другие слоты (`chk`, `dia`, `pxf`,
+цифровые `0`…`9`), они к ctl_worker отношения не имеют.
 
 ## Движок, в который упирается `exe`
 
@@ -127,18 +132,56 @@ XCom, заметку и в CTL.
 | `pr_log_start`, `pr_log_error` | открыть запись лога и записать ошибку — их зовёт каждая функция загрузки |
 | `tb_swf` | расписание: `wf_exec, wf_interval, wf_relations, wf_waits, wf_expire, wf_last, wf_reselt` |
 
-## Отчёты и почта
+## Отчёты: HTML собирается в Greenplum, письмо отправляет CTL
 
-| Функция | Что шлёт |
+`pr_mail_ctl_*` — не рассыльщики. Это обычные воркфлоу CTL (отсюда даги
+`CTL.pc1080.mail_ctl_report` и родня), которые считают отчёт **по логам самого CTL**
+и возвращают готовый HTML. Дальше он едет по тракту как обычный результат загрузки, а
+письмо по адресам `statusNotifications` шлёт уже CTL.
+
+Цепочка целиком:
+
+1. **Сборка блоков.** Функция гоняет `pr_tbl2html(sql, subj, over, style)` по каждому
+   разделу отчёта и складывает результат в лог:
+   `pr_swf_log_action(<название раздела>, 'mail', {len, html}, mail_id)`.
+   Второй аргумент выбирает таблицу-слот: `tb_swf_<swf>_log`, то есть здесь —
+   `tb_swf_mail_log`, а у самой загрузки (`swf = 'ctl'`) — `tb_swf_ctl_log`.
+2. **Сборка письма.** `pr_send_mail(mail_id)` находит пачку по `parent = mail_id`,
+   склеивает блоки в массив, помечает её действием `send` и **возвращает JSON**
+   `{res, id, ts, report, html}`. Никакой отправки: имя историческое.
+3. **Ответ воркфлоу.** Функция отчёта возвращает этот JSON текстом.
+   `pr_swf_start_ctl` видит валидный JSON, забирает из него `res` и `html`, ставит
+   `tag = 'html'` и кладёт `html` в свой ответ (строки 194-212).
+4. **Передача в CTL.** `ctl_worker` в `_emit_datasets` (`ctl_worker.py:239`) зовёт
+   `ctl_send_html(result['html'], lid, eid)`: тот режет HTML на куски по `max_html`
+   символов, не разрывая `<tr>`, и постит их в CTL как statval `stat_id = 12`
+   на сущность загрузки. Слишком длинные блоки (> `max_html` × 10) пропускаются.
+5. **Письмо.** Его формирует и отправляет CTL по своим `statusNotifications`.
+
+**Аргумент `reports text[]`** — фильтр разделов: пусто или `{All}` означает «все»,
+иначе собираются только перечисленные. Названия разделов — это те же строки, что уходят
+в `wf_action` лога, по ним же потом искать в `tb_swf_mail_log`.
+
+| Функция | Разделы |
 |---|---|
-| `pr_mail_ctl_report(reports[])` | сводка по загрузкам CTL |
-| `pr_mail_ctl_status(reports[])` | статусы и ККД |
-| `pr_mail_ctl_work_load_report(reports[])` | нагрузка: длительности, перекос, рост таблиц |
-| `pr_check_ctl(obj, sch, prm)` → `pr_check_etl` | проверка свежести и полноты загрузки |
-| `pr_send_mail`, `pr_tbl2html` | транспорт и вёрстка таблицы в HTML |
+| `pr_mail_ctl_report` | `CTL Today`, `CTL Today Errors`, `CTL Today No data`, `CTL Today Long`, `CTL Today Done`, `CTL Today Ok`, `CTL Today Fcts`, `CTL Old and Working`, `CTL SDPUE Errors`, `CTL Not scheduled`, `GP Working`, `Lock` |
+| `pr_mail_ctl_status` | `CTL Today`, `CTL All Active`, `CTL All WF`, `CTL All Today`, `CTL Not scheduled`, `Ztest Errors` |
+| `pr_mail_ctl_work_load_report` | `HR_Data Lake Speed / Skew / Ratio / Uncompress`, `CTL Yesterday Summary`, `CTL and GP Yesterday Errors`, `CTL Yesterday Work Load / SDPUE / Errors / Long`, `Yesterday Errors`, `CTL Not scheduled` |
 
-Эти воркфлоу запускаются как обычные загрузки CTL, то есть через тот же
-`pr_swf_start_ctl`, — отсюда даги вида `CTL.pc1080.mail_ctl_report`.
+Данные берутся из `vw_log_ctl_loading`, `vw_log_ctl_wf`, `vw_swf_ctl_log`, `tb_log_ctl`,
+`vw_ztest`, а отчёт о нагрузке добавляет `tb_log_skew`, `vw_growth_stats` и
+`vw_log_workflow_err`.
+
+Отдельно стоит `pr_check_ctl(obj, sch, prm)` → `pr_check_etl` — проверка свежести и
+полноты загрузки; её зовёт `pr_mail_ctl_report` и можно звать руками.
+
+## Мелочь, без которой не читается
+
+`try_cast2int`, `try_cast2json` — «мягкое» приведение типов: возвращают NULL вместо
+исключения. На них держится разбор ответа воркфлоу в `pr_swf_start_ctl` (JSON это или
+текст) и поиск отчёта по id в `pr_send_mail`. `pr_log_start` / `pr_log_end` /
+`pr_log_error` — открыть, закрыть и уронить запись лога; их зовёт каждая функция
+загрузки и каждый отчёт.
 
 ## Чего здесь нет
 

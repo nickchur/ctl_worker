@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-02 20:10 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-03 10:20 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -11,6 +11,10 @@
 | `run_exe` | Выполнение SQL-процедуры в Greenplum |
 | `run_out` | (опц.) Экспорт данных, генерация Dataset-событий |
 | `run_end` | Публикация метрик, финализация загрузки |
+
+🧪 Тестовый режим (`test_mode` в `ctl_config`, только контуры DEV и IFT): вместо процедуры
+воркфлоу выполняется ожидание, а код результата берётся из профиля — `ok`, `ok-no` или
+`ok-no-error`. Параметр воркфлоу из CTL режим не включает.
 """
 # Airflow 2.10.1
 
@@ -43,7 +47,7 @@ from operator import and_, or_
 from pprint import PrettyPrinter
 
 
-from plugins.utils import add_note, on_callback, str2timedelta, update_dag_pause, safe_eval, readable  # type: ignore
+from plugins.utils import add_note, env_stand, on_callback, str2timedelta, update_dag_pause, safe_eval, readable  # type: ignore
 from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
 from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
@@ -73,6 +77,66 @@ archive = get_config().get('archive_category', 'p1080.ARCHIVE')
 # wfs_dict = ctl_obj_load('ctl_workflows')
 # ent_dict = ctl_obj_load('ctl_entities')
 enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
+
+# 🌍 Тестовый режим: выражение воркфлоу подменяется ожиданием, код результата — своим.
+# Список контуров — константа в коде, а не ключ конфигурации: контур это единственный
+# признак, которым нельзя управлять ни из ctl_config, ни из параметров воркфлоу в CTL.
+# Пустое и незнакомое имя приравниваем к бою — переменная выставлена на всех контурах.
+TEST_STANDS = ('DEV', 'IFT')
+STAND = env_stand()
+
+# Коды исхода и веса по контракту pr_swf_start_ctl (GP/readme.md): 1 — успех, 0 — нет
+# данных, отрицательные — ошибка, причём -7 уводит в циклический повтор и TIME-WAIT.
+# Успех тяжелее прочих: иначе на стенде до конца не доходит ничего.
+TEST_PROFILES = {
+    'ok':           ([1],                 [1]),
+    'ok-no':        ([1, 0],              [3, 1]),
+    'ok-no-error':  ([1, 0, -1, -2, -7],  [3, 1, 1, 1, 1]),
+}
+# Прежнее истинное значение ключа означало ровно random.randint(0,2) — успех и «нет
+# данных», ошибка недостижима. Это профиль ok-no, только под старым именем.
+TEST_LEGACY = ('true', '1', 'yes', 'event', 'dataset', 'trigger')
+TEST_OFF = ('', 'off', 'false', 'none', '0')
+
+
+def test_profile(context=None):
+    """Профиль тестового режима: имя из `TEST_PROFILES` или None, если режима нет.
+
+    Источник один — `ctl_config`; параметр воркфлоу из CTL режим не включает. Контур не
+    из `TEST_STANDS` гасит режим, и это не должно быть молчаливым: иначе «почему на бою
+    ничего не подделывается» станет загадкой на полдня, а фиктивный успех на бою —
+    незамеченным.
+    """
+    mode = str(get_config().get('test_mode', 'off')).strip().lower()
+    if mode in TEST_OFF:
+        return None
+
+    if mode in TEST_LEGACY:
+        logger.warning(f"test_mode = {mode}: устаревшее значение, читаем как ok-no. "
+                       f"Новые значения: {', '.join(TEST_PROFILES)}")
+        mode = 'ok-no'
+
+    if mode not in TEST_PROFILES:
+        msg = f"⚠️ test_mode = {mode}: неизвестный профиль, тестовый режим выключен"
+        logger.warning(msg)
+        if context: add_note(msg, context, level='task')
+        return None
+
+    if STAND not in TEST_STANDS:
+        msg = (f"⚠️ Тестовый режим ({mode}) игнорируется: контур {STAND or 'не задан'}, "
+               f"режим разрешён на {'/'.join(TEST_STANDS)}. Загрузка выполняется по-настоящему")
+        logger.warning(msg)
+        if context: add_note(msg, context, level='task')
+        return None
+
+    return mode
+
+
+def test_res(mode):
+    """Код результата по профилю — вместо настоящего ответа Greenplum."""
+    codes, weights = TEST_PROFILES[mode]
+    return random.choices(codes, weights=weights)[0]
+
 
 def statval(data, log=False, logs=None):
     if log:
@@ -733,15 +797,15 @@ def build_worker_dag(w):
             raise_status(st, ld_sts)
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
 
-            # TEST !!!
-            test_mode = wf_prm.get('wf_test_mode', get_config().get('test_mode', False))
-            # test_mode = test_mode if isinstance(test_mode, (list, tuple)) else [test_mode, ]
-            test_mode = False if str(test_mode).lower() in ['false', 'none', '', '0'] else test_mode
+            # 🧪 Тестовый режим: только из ctl_config и только на разрешённых контурах
+            test_mode = test_profile(context)
 
-            # TEST !!!
             if test_mode:
-                rand = int((random.random() ** 3) * 45*60)
-                exe = f"'Ok Test work',pg_sleep({rand})" # TEST !!!
+                # Вместо процедуры воркфлоу — ожидание случайной длины. Куб смещает выборку
+                # к коротким прогонам: длинные нужны редко, а слот пула держат по-настоящему.
+                sleep_to = str2timedelta(get_config().get('test_sleep', 'minutes=45'))
+                rand = int((random.random() ** 3) * sleep_to.total_seconds())
+                exe = f"'Ok Test work',pg_sleep({rand})"
 
 
             retry = wf_prm.get('wfp_retry', {})
@@ -783,10 +847,11 @@ def build_worker_dag(w):
             # res['ts'] = pendulum.duration(seconds= int(time.time() - ts)).in_words()
             res['ts'] = str(timedelta(seconds=int(time.time() - ts)))
 
-            # TEST !!!
+            # 🧪 Код исхода по профилю. Пишем и сам профиль: без этого тестовая -7 в логах
+            # и письмах неотличима от настоящей ошибки Greenplum.
             if test_mode:
-                # rand = 'random.randint(0, 2)' # TEST !!!
-                res['res'] = random.randint(0, 2) # TEST !!!
+                res['res'] = test_res(test_mode)
+                res['test'] = test_mode
 
             ti.xcom_push(key='result', value=res)
             add_note(res, context, level='task,DAG', title='Result')

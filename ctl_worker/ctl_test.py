@@ -1,8 +1,20 @@
-"""### 🧪 DAG: Тестирование CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""### 🧪 DAG: Симулятор нагрузки CTL
+*2026-09-03 10:20 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Симулирует запуск workflow'ов в тестовом режиме (`test_mode=True`) без влияния на продакшн.
-Случайно выбирает workflow'ы и запускает их с уникальным `run_id`. Активен только при `get_config()['test_mode'] = True`.
+Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
+Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
+
+| `simulator` | Что делает |
+|---|---|
+| `off` (умолчание) | ничего, таск уходит в пропуск |
+| `event` | POST значений событий в CTL API — **только DEV** |
+| `dataset` | публикует Dataset-сигналы в Airflow |
+| `trigger` | случайно запускает даги воркфлоу через `trigger_dag` |
+
+⚠️ Запуск дага воркфлоу — это **настоящая загрузка в CTL**: `run_prm` создаёт её через
+`POST /v4/api/wf/{wid}/loading`. Поэтому симулятор существует только на DEV, IFT и PSI, а
+на боевом и неизвестном контуре не регистрируется вовсе. Притворяться выполнение будет
+только там, где разрешён `test_mode` (см. `ctl_worker.py`) — это отдельный ключ.
 """
 
 from airflow import DAG, Dataset
@@ -12,7 +24,7 @@ from airflow.decorators import task
 
 from airflow.exceptions import AirflowFailException, AirflowSkipException, AirflowRescheduleException
 # from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
-from plugins.utils import add_note, on_callback, get_current_load, str2timedelta  # type: ignore
+from plugins.utils import add_note, env_stand, on_callback, get_current_load, str2timedelta  # type: ignore
 from plugins.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
 from plugins.ctl_core import chk_any_conn  # type: ignore
 
@@ -31,136 +43,159 @@ MAX_XCOM = 500
 # в S3. Раньше ctl_enames грузились здесь же, хотя нужны единственному месту — set_events
 profile =  get_config()['profile']
 
+# 🌍 Контуры. Списки — константы в коде, а не ключи конфигурации: контур это единственный
+# признак, которым нельзя управлять ни из ctl_config, ни из параметров воркфлоу в CTL.
+# Пустое и незнакомое имя приравниваем к бою: переменная выставлена на всех контурах,
+# включая стенд, поэтому «не знаю, где я» — повод не генерировать ничего.
+SIM_STANDS = ('DEV', 'IFT', 'PSI')   # где симулятор вообще существует
+EVENT_STANDS = ('DEV',)              # где ему позволено писать события в CTL
+STAND = env_stand()
+OFF = ('', 'off', 'false', 'none', '0')
 
-with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
-    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
-    schedule_interval=str2timedelta(get_config().get('simulator_interval','minutes=5')),
-    default_args={ 
-    'owner': 'EDP.ETL',
-        'depends_on_past': False,
-        'email': ['p1080@sber.ru'],
-        'email_on_failure': False,
-        'email_on_retry': False,
-        'retries': 2,
-        'retry_delay': timedelta(minutes=1),
-        "on_failure_callback": on_callback,
-        "on_success_callback": None,
-        "priority_weight": 999,
-        'pool': 'ctl_pool',
-    },
-    catchup=False,
-    tags=['CTL', profile, 'CTL_agent', 'tools'],
-    max_active_runs=1,
-    # dagrun_timeout=str2timedelta(config.get('dagrun_timeout','minutes=10')),
-    is_paused_upon_creation=False,
-    on_failure_callback=on_callback,
-    # on_success_callback=on_callback,
-    doc_md=__doc__,
-) as dag:
+
+# Симулятор существует не везде: даг воркфлоу, запущенный отсюда, создаёт настоящую
+# загрузку в CTL (run_prm зовёт POST /v4/api/wf/{wid}/loading). На боевом и неизвестном
+# контуре его не должно быть вовсе — включать нечего, как у пишущих дагов tools/.
+if STAND not in SIM_STANDS:
+    logger.warning(f"DAG CTL.{profile}.test_simulator не регистрируется: "
+                   f"контур {STAND or 'не задан'}, симулятор разрешён на {'/'.join(SIM_STANDS)}")
+else:
+    with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
+        start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        schedule_interval=str2timedelta(get_config().get('simulator_interval','minutes=5')),
+        default_args={ 
+        'owner': 'EDP.ETL',
+            'depends_on_past': False,
+            'email': ['p1080@sber.ru'],
+            'email_on_failure': False,
+            'email_on_retry': False,
+            'retries': 2,
+            'retry_delay': timedelta(minutes=1),
+            "on_failure_callback": on_callback,
+            "on_success_callback": None,
+            "priority_weight": 999,
+            'pool': 'ctl_pool',
+        },
+        catchup=False,
+        tags=['CTL', profile, 'CTL_agent', 'tools'],
+        max_active_runs=1,
+        # dagrun_timeout=str2timedelta(config.get('dagrun_timeout','minutes=10')),
+        is_paused_upon_creation=False,
+        on_failure_callback=on_callback,
+        # on_success_callback=on_callback,
+        doc_md=__doc__,
+    ) as dag:
     
-    @task(pool='ctl_pool')
-    def test_events(**context): 
+        @task(pool='ctl_pool')
+        def test_events(**context): 
         
-        chk_any_conn('ctl')
+            chk_any_conn('ctl')
         
-        # TEST !!!
-        test_mode = get_config().get('test_mode', False)
-        test_mode = False if str(test_mode).lower() in ['false', 'none', '', '0'] else test_mode
-            
-        if not test_mode:
-            msg = "🔥 Test mode is off"
-            add_note(msg, context, level='Task,DAG')
-            raise AirflowSkipException(msg)
+            mode = str(get_config().get('simulator', 'off')).strip().lower()
 
+            if mode in OFF:
+                msg = "🔥 Симулятор выключен: simulator = off"
+                add_note(msg, context, level='Task,DAG')
+                raise AirflowSkipException(msg)
+
+            # Событийный режим пишет statval'ы в CTL, в том числе по сущностям чужих профилей —
+            # это дёргает зависимости соседних команд, поэтому только DEV. Проверка здесь, а не
+            # при разборе файла: режим задаётся конфигурацией и меняется без выкладки.
+            if mode == 'event' and STAND not in EVENT_STANDS:
+                msg = (f"🔥 Событийная симуляция доступна только на {'/'.join(EVENT_STANDS)}, "
+                       f"контур {STAND or 'не задан'}")
+                add_note(msg, context, level='Task,DAG')
+                raise AirflowSkipException(msg)
+
+
+            cl = get_current_load('gp_pool')
+            cnt = cl['pool_slots'] - cl['scheduled']
+
+            if cnt <= 1:
+                msg = "🔥 Sysytem is overloaded"
+                add_note(msg, context, level='Task,DAG')
+                raise AirflowSkipException(msg)
         
-        cl = get_current_load('gp_pool')
-        cnt = cl['pool_slots'] - cl['scheduled']
+            ret = []
+            if mode == 'event':
+            
+                all_events = str(get_config().get('all_events', False) ).lower() in  ['true', '1', 'yes']
+            
+                events = [k for k in ctl_obj_load('ctl_events').keys() if all_events or k.split('/')[0]!=profile]
+                add_note(f"⏳ Testing {len(events)} events. simulator: {mode}", context, level='Task,DAG')
+            
+                for k in range(random.randint(1, cnt)):
+                    evn = random.choice(events)
+                    prf, eid, sid = evn.split('/')
+                    try:
+                        ctl_api(f'/v4/api/entity/{eid}/stat/{sid}/profile/{prf}/statval', 'POST', json=["1"])
+                    except Exception as e:
+                        continue
+                    ret.append(evn)
+                
+            elif mode == 'dataset':
+                events = list(ctl_obj_load('ctl_events').keys())
+                add_note(f"⏳ Testing {len(events)} events", context, level='Task,DAG')
+            
+                for k in range(random.randint(1, cnt)):
+                    evn = random.choice(events)
+                    ret.append(evn)
+                
+            else: # trigger_dag
+                wfs = list(ctl_obj_load('ctl_workflows').values())
+                add_note(f"⏳ Testing {len(wfs)} DAGs", context, level='Task,DAG')
+            
+                for k in range(random.randint(1, cnt)):
+                    wf = random.choice(wfs)
+                    if wf['profile'] != profile: continue
+                    if wf['scheduled'] and wf['singleLoading']: continue 
+                    # if wf['category'] == "p1080.ARCHIVE": continue
+                    if wf['category'] == get_config().get('archive_category'): continue
 
-        if cnt <= 1:
-            msg = "🔥 Sysytem is overloaded"
-            add_note(msg, context, level='Task,DAG')
-            raise AirflowSkipException(msg)
-        
-        ret = []
-        if test_mode == 'event':
-            
-            all_events = str(get_config().get('all_events', False) ).lower() in  ['true', '1', 'yes']
-            
-            events = [k for k in ctl_obj_load('ctl_events').keys() if all_events or k.split('/')[0]!=profile]
-            add_note(f"⏳ Testing {len(events)} events. test_mode: {test_mode}", context, level='Task,DAG')
-            
-            for k in range(random.randint(1, cnt)):
-                evn = random.choice(events)
-                prf, eid, sid = evn.split('/')
-                try:
-                    ctl_api(f'/v4/api/entity/{eid}/stat/{sid}/profile/{prf}/statval', 'POST', json=["1"])
-                except Exception as e:
-                    continue
-                ret.append(evn)
+                    wf_name = wf['name']
+                    ret.append(wf_name)
                 
-        elif test_mode == 'dataset':
-            events = list(ctl_obj_load('ctl_events').keys())
-            add_note(f"⏳ Testing {len(events)} events", context, level='Task,DAG')
-            
-            for k in range(random.randint(1, cnt)):
-                evn = random.choice(events)
-                ret.append(evn)
+                    af_sdt = pendulum.instance(context['task_instance'].start_date).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
+                    extra={ "af_sdt": af_sdt, }        
                 
-        else: # trigger_dag
-            wfs = list(ctl_obj_load('ctl_workflows').values())
-            add_note(f"⏳ Testing {len(wfs)} DAGs", context, level='Task,DAG')
-            
-            for k in range(random.randint(1, cnt)):
-                wf = random.choice(wfs)
-                if wf['profile'] != profile: continue
-                if wf['scheduled'] and wf['singleLoading']: continue 
-                # if wf['category'] == "p1080.ARCHIVE": continue
-                if wf['category'] == get_config().get('archive_category'): continue
+                    run_id=f'test__{af_sdt}'
+                    run_id = run_id.replace(' ','_')
+                    logger.info(f"🔍 Triggering {wf_name} with run_id={run_id}")
+                
+                    try:
+                        trigger_dag(
+                            dag_id=f'CTL.{wf_name}',
+                            run_id=run_id,
+                            conf=extra,
+                        )
+                    except Exception as e:
+                        logger.error(f"🔥 Error triggering {wf_name}: {e}")
 
-                wf_name = wf['name']
-                ret.append(wf_name)
-                
-                af_sdt = pendulum.instance(context['task_instance'].start_date).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
-                extra={ "af_sdt": af_sdt, }        
-                
-                run_id=f'test__{af_sdt}'
-                run_id = run_id.replace(' ','_')
-                logger.info(f"🔍 Triggering {wf_name} with run_id={run_id}")
-                
-                try:
-                    trigger_dag(
-                        dag_id=f'CTL.{wf_name}',
-                        run_id=run_id,
-                        conf=extra,
-                    )
-                except Exception as e:
-                    logger.error(f"🔥 Error triggering {wf_name}: {e}")
-
-            add_note(ret, title=f"🔍 New events {len(ret)} created", context=context, level='Task,DAG')
+                add_note(ret, title=f"🔍 New events {len(ret)} created", context=context, level='Task,DAG')
                
-        add_note(ret, context, level='Task,DAG', title=f'Test_mode {test_mode}: {len(ret)}')      
+            add_note(ret, context, level='Task,DAG', title=f'Simulator {mode}: {len(ret)}')      
         
-        return ret if test_mode == 'dataset' else []
+            return ret if mode == 'dataset' else []
     
     
-    @task(pool='pg_pool', outlets=[DatasetAlias(f"CTL/events")],
-        max_active_tis_per_dag=15, 
-        map_index_template="{{ event }}"
-    )
-    def set_events(event, **context):
+        @task(pool='pg_pool', outlets=[DatasetAlias(f"CTL/events")],
+            max_active_tis_per_dag=15, 
+            map_index_template="{{ event }}"
+        )
+        def set_events(event, **context):
 
-        enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
+            enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 
-        prf, eid, sid = event.split('/')
-        ds = Dataset(f'CTL/{prf}/{eid}/{enames[int(eid)]}')
-        extra = { f"0/{event}": pendulum.now().format('YYYY-MM-DD HH:mm:ss') }
-        add_note(event, context, level='Task', title=event)
-        context['outlet_events'][f"CTL/events"].add(ds,extra=extra) 
+            prf, eid, sid = event.split('/')
+            ds = Dataset(f'CTL/{prf}/{eid}/{enames[int(eid)]}')
+            extra = { f"0/{event}": pendulum.now().format('YYYY-MM-DD HH:mm:ss') }
+            add_note(event, context, level='Task', title=event)
+            context['outlet_events'][f"CTL/events"].add(ds,extra=extra) 
     
-        return event[1]
+            return event[1]
     
     
-    events = test_events()
-    # chk_conn() >> 
-    events >> set_events.expand(event = events)
+        events = test_events()
+        # chk_conn() >> 
+        events >> set_events.expand(event = events)
 

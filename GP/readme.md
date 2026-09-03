@@ -1,5 +1,5 @@
 # GP — скрипты Greenplum, которые трогает ctl_worker
-*2026-09-03 09:55 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-03 10:20 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимок DDL тех объектов Greenplum, вокруг которых крутится тракт CTL. Скопировано из
 `HR_Data` (ветка `E360-6192`, ревизия `068018c`) 2026-09-03, чтобы не ходить туда за
@@ -113,6 +113,7 @@ XCom, заметку и в CTL.
 | `vw_swf_ctl_log` | читаемый вид `tb_swf_ctl_log` |
 | `vw_log_workflow_err` | ошибки воркфлоу |
 | `tb_log_skew`, `vw_growth_stats` | перекос по сегментам и рост таблиц — их читает отчёт о нагрузке |
+| `vw_resgroup_config`, `vw_resgroup_status` | ресурсные группы: лимиты и текущая загрузка — тем же управляет GPCC |
 
 Начинать разбор инцидента удобно с `vw_log_ctl_loading` по `lid` из имени рана
 (`sensor__<lid>_<попытка>_<дата>`), дальше — `vw_swf_ctl_log` по тому же `lid`.
@@ -262,6 +263,71 @@ msg = coalesce(m_jsn->>'msg', m_jsn::text, translate(wf_ret, '"', ''''));
 Отсюда правило: `wf_timeout` (и `exe_timeout`) поднимать можно только вместе с
 серверным лимитом и всегда держать его на пять минут ниже. Задрать наш таймаут выше
 серверного — значит вернуться к молчаливым обрывам.
+
+### Кто ещё может убить запрос: GPCC
+
+Сервером управляет **Greenplum Command Center**, и лимит, ниже которого мы держимся, —
+не только `statement_timeout` в конфиге базы. GPCC умеет три вещи, которые касаются
+наших загрузок:
+
+| Механизм GPCC | Что делает |
+|---|---|
+| Ресурсные группы | сколько одновременных запросов, доля CPU и памяти. Видно из базы: `vw_resgroup_config` (лимиты) и `vw_resgroup_status` (что происходит сейчас) |
+| Assignment rules | подменяют ресурсную группу до старта запроса — по пользователю, базе, `application_name` |
+| Workload rules | следят за уже идущим запросом и по условию действуют: **отменить**, **перевести в другую группу** (GP 6.8+) или **просто записать в лог** |
+
+Условия правил: время выполнения, время CPU, перекос CPU, стоимость плана (ORCA и
+Postgres), дисковый ввод-вывод, размер spill-файлов, число слайсов. Есть страховка
+`wlm_short_query_threshold` — правила не трогают запросы короче заданного числа секунд,
+и `wlm_query_cooldown_time` — пауза между повторами действия (по умолчанию не меньше
+15 секунд, попыток две).
+
+**Для нас важно, каким способом правило убивает запрос:**
+
+- `pg_cancel_backend()` — отмена. Прилетает как `query_canceled`, тот самый SQLSTATE,
+  который ловит `pr_swf_start_ctl`: логи пишутся, `res = -2`, письмо уходит. Внешне
+  неотличимо от нашего `statement_timeout`.
+- `pg_terminate_backend()` — обрыв сессии. Обработчик PL/pgSQL не выполняется вовсе,
+  соединение рвётся, в логах тракта пусто. Именно ради этого случая наш таймаут и
+  держится ниже: успеть отмениться самим, пока не пришли снаружи.
+
+Правилами с `pg_terminate_backend` обычно гасят простаивающие сессии, а не работающие
+запросы, но проверять это стоит на своём контуре: набор правил живёт в GPCC, а не в базе.
+
+### Как узнать, что загрузку убил GPCC
+
+Метрики GPCC лежат в схеме `gpmetrics` той же базы. Зацепка у нас уже есть:
+`pr_swf_start_ctl` первым делом ставит `application_name = 'ctl.<имя воркфлоу>'`
+(строка 102), и оно попадает в историю запросов.
+
+```sql
+-- чем закончился запрос загрузки: done / abort / error
+select tsubmit, tstart, tfinish, status, application_name, substring(query, 1, 120)
+  from gpmetrics.gpcc_queries_history
+ where application_name = 'ctl.pc1080.ctl_test'
+   and tstart >= now() - interval '2 days'
+ order by tstart desc;
+
+-- сработало ли по нему правило GPCC (по ключу tmid, ssid, ccnt)
+select h.tsubmit, h.status, l.rule_id, l.rule_serial_number, l.action_status
+  from gpmetrics.gpcc_queries_history h
+  join gpmetrics.gpcc_wlm_log_history l
+    on (l.tmid, l.ssid, l.ccnt) = (h.tmid, h.ssid, h.ccnt)
+ where h.application_name like 'ctl.%'
+   and h.tstart >= now() - interval '2 days';
+```
+
+Сами правила — в `gpmetrics.gpcc_wlm_rule` (условия и действие), алерты — в
+`gpcc_alert_history`. История правил ведётся только для workload rules: срабатывания
+assignment-правил не пишутся.
+
+Практический разбор «загрузка умерла, а в `tb_swf_ctl_log` пусто» выглядит так:
+`gpcc_queries_history` по `application_name` — есть ли запрос и с каким `status`;
+если `abort` — смотреть `gpcc_wlm_log_history`, не правило ли это; если запроса нет
+вовсе — искать раньше, на стороне подключения.
+
+*Названия таблиц и колонок — по документации GPCC 7.x; на нашем контуре версия может
+отличаться, поэтому первый запрос стоит начинать с `\d gpmetrics.gpcc_queries_history`.*
 
 ## Мелочь, без которой не читается
 

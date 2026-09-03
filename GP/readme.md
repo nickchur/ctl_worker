@@ -1,5 +1,5 @@
 # GP — скрипты Greenplum, которые трогает ctl_worker
-*2026-09-03 09:05 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-03 09:25 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимок DDL тех объектов Greenplum, вокруг которых крутится тракт CTL. Скопировано из
 `HR_Data` (ветка `E360-6192`, ревизия `068018c`) 2026-09-03, чтобы не ходить туда за
@@ -174,6 +174,49 @@ CTL это `ctl`, у отчётов — `mail`; в базе есть и друг
 
 Отдельно стоит `pr_check_ctl(obj, sch, prm)` → `pr_check_etl` — проверка свежести и
 полноты загрузки; её зовёт `pr_mail_ctl_report` и можно звать руками.
+
+### HTML умеют не только отчёты
+
+Тот же приём — вернуть `html` в JSON — используют проверки. Пример из жизни:
+`pr_check_bd4ds(obj)` считает бизнес-дату по группе объектов, собирает таблицу через
+`pr_tbl2html('tmp_vw', 'CHECK_<sch>_<obj>', 'order by res, bdate', style)` и возвращает
+`{res, msg, last, value, stat, html}`. Дальше всё как у отчётов — `pr_swf_start_ctl`,
+`ctl_send_html`, письмо от CTL.
+
+Вся родня, собирающая HTML (все — обычные воркфлоу CTL со своим дагом):
+
+| Функция | Разделы |
+|---|---|
+| `pr_mail_ztest_report` | `Ztest Summary`, `Actual_date repeat`, `Row_count repeat`, `Ztest Details` |
+| `pr_mail_sdpue_report` | `SDPUE Last`, `SDPUE logged Last`, `SDPUE Errors`, `SDPUE logged Errors` |
+| `pr_mail_informatica_report` | `Informatica Last`, `Informatica Log` |
+| `pr_check_bd4ds` | одна таблица на группу, конфигурация — в `tb_bd4ds`, лог — в `tb_swf_chk_log` (слот `chk`) |
+
+Вёрстка: `pr_tbl2html` — таблица из запроса; `pr_tbl2html_style` — то же с раскраской
+по значению; `pr_tbl2html_loop` — сравнение двух наборов строк.
+
+### Как это выглядит в письме
+
+Письмо целиком собирает CTL: шапка («Поток (100975) "pc1080.check_bd4ds_2" загрузка
+178989996 изменила статус на "SUCCESS"», времена начала и окончания) — его, а тело —
+наш HTML, доехавший через statval 12.
+
+```
+[ 0 669
+No new
+Grp m-2 Min Bisiness date 2026-06-30 >= 2026-06-30
+CHECK_bd4ds_m-2
+res    sch   tbl                          bd_exp                  bdate
+true   vda   vw_stg_erkc_performance      max(report_dt)::date    2026-06-30
+]
+```
+
+Числа `0 669` в начале — не часть отчёта: это заголовок куска из `ctl_send_html`
+(`f"{n:3}{length:6} {msg}"`, `ctl_core.py`), то есть номер фрагмента и его длина.
+CTL отдаёт statval как есть, поэтому служебный префикс виден в письме. Если отчёт
+пришёл разрезанным на несколько блоков — это те же номера по порядку; если раздел
+не пришёл вовсе, первым делом смотреть, не превысил ли он `max_html` × 10, после
+которого `ctl_send_html` кусок молча пропускает.
 
 ## Мелочь, без которой не читается
 

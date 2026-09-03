@@ -8,6 +8,7 @@
 
 Проверяет:
   * у каждого каталога-проекта есть readme и спецификация;
+  * снимок чужого кода (GP/) не разошёлся ни с записанной ревизией, ни с источником;
   * документ не отстал от кода больше, чем на STALE_DAYS дней;
   * строка версии на месте (дата · версия · автор во второй строке);
   * ссылки на файлы внутри документов не битые;
@@ -18,6 +19,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -39,6 +41,12 @@ PROJECTS = {
     'gp_exchange': 'gp-exchange',
 }
 
+# Каталог-справочник: свой readme, но спецификации нет и не должно быть. Код там чужой
+# (живёт в другом репозитории и в базе), чинить его правкой в ctl нельзя, а требования к
+# нашей стороне контракта записаны в спеке потребителя — ctl-worker. Прочерк в колонке
+# спеки у такого каталога стоит по праву, а не по недосмотру.
+REFERENCES = {'GP'}
+
 # Сколько дней документ может отставать от кода, прежде чем это стоит показать.
 # Меньше суток — обычный рабочий разрыв: правку кода и правку документа редко
 # коммитят одной секундой.
@@ -51,8 +59,8 @@ LINK_RE = re.compile(r'\[[^\]]*\]\(([^)#:]+?\.(?:md|py|sql|sh))\)')
 GENERATED = {'CONTEXT.md'}
 
 
-def git(*args: str) -> str:
-    return subprocess.run(['git', '-C', str(REPO), *args],
+def git(*args: str, cwd: Path = REPO) -> str:
+    return subprocess.run(['git', '-C', str(cwd), *args],
                           capture_output=True, text=True).stdout.strip()
 
 
@@ -137,6 +145,94 @@ def check_projects() -> list[str]:
                 problems.append(
                     f"{doc.relative_to(REPO)}: отстаёт от кода на {gap:.0f} дн. "
                     f"(код {code_ts:%Y-%m-%d}, документ {doc_ts:%Y-%m-%d})")
+
+    # Справочникам спека не положена, но readme обязателен: без него каталог с чужим
+    # кодом превращается в свалку файлов без объяснения, зачем они здесь.
+    for folder_name in sorted(REFERENCES):
+        folder = REPO / folder_name
+        if not folder.is_dir():
+            problems.append(f"каталога {folder_name}/ нет, а в карте артефактов он есть")
+        elif readme_of(folder) is None:
+            problems.append(f"{folder_name}/: нет readme")
+    return problems
+
+
+def gp_paths(meta: dict) -> list[tuple[Path, str]]:
+    """Пары «файл снимка → путь в репозитории-источнике».
+
+    Отображение детерминированное: GP/<схема>/<вид>/<файл> ↔
+    <source_root>/<полное имя схемы>/<вид>/<файл>.
+    """
+    pairs = []
+    root = REPO / 'GP'
+    for f in sorted(root.rglob('*.sql')):
+        rel = f.relative_to(root)
+        schema, *rest = rel.parts
+        full = meta['schemas'].get(schema)
+        if full is None:
+            continue
+        pairs.append((f, f"{meta['source_root']}/{full}/{'/'.join(rest)}"))
+    return pairs
+
+
+def check_gp_snapshot() -> list[str]:
+    """Снимок чужого кода в GP/ — не протух ли.
+
+    Даты коммитов здесь ничего не значат: снимок не меняется потому, что его никто не
+    трогает, а не потому, что он верен. Поэтому два разных вопроса:
+
+      1. Наша копия совпадает с ревизией, которую мы записали? Разошлась — значит файлы
+         правили руками, а такая правка никуда не уедет: источник не здесь.
+      2. Источник ушёл вперёд по этим же файлам? Ушёл — снимок пора обновить.
+
+    Нет чекаута источника — сверка не проводилась, и это говорится вслух: «не проверено»
+    не должно выглядеть как «проверено и хорошо».
+    """
+    src = REPO / 'GP' / 'source.json'
+    if not src.exists():
+        return ["GP/: нет source.json — неизвестно, откуда и на какой ревизии снят снимок"]
+
+    try:
+        meta = json.loads(src.read_text(encoding='utf-8'))
+        rev, checkout = meta['rev'], Path(meta['checkout']).expanduser()
+    except (ValueError, KeyError) as e:
+        return [f"GP/source.json: не читается ({e})"]
+
+    if not (checkout / '.git').exists():
+        return [f"GP/: чекаута {meta['checkout']} нет — снимок не сверялся с источником"]
+
+    if subprocess.run(['git', '-C', str(checkout), 'cat-file', '-e', f'{rev}^{{commit}}'],
+                      capture_output=True).returncode:
+        return [f"GP/: ревизии {rev[:7]} нет в {meta['checkout']} — сверить снимок не с чем"]
+
+    def at(ref: str, path: str) -> bytes | None:
+        out = subprocess.run(['git', '-C', str(checkout), 'show', f'{ref}:{path}'],
+                             capture_output=True)
+        return None if out.returncode else out.stdout
+
+    problems, pairs = [], gp_paths(meta)
+    for f, path in pairs:
+        name = f.relative_to(REPO / 'GP')
+        recorded, here = at(rev, path), f.read_bytes()
+        if recorded is None:
+            problems.append(f"GP/{name}: в {rev[:7]} такого файла нет")
+        elif recorded != here:
+            # Разошлось по двум разным причинам, и лечатся они по-разному: либо копию
+            # правили здесь (правка никуда не уедет, источник не тут), либо файл взят
+            # новее записанной ревизии — тогда врёт source.json, а не снимок.
+            if at('HEAD', path) == here:
+                problems.append(f"GP/{name}: соответствует текущему HR_Data, но не "
+                                f"записанной ревизии {rev[:7]} — врёт GP/source.json")
+            else:
+                problems.append(f"GP/{name}: отличается от {rev[:7]} — снимок правили "
+                                "здесь, а править надо в источнике")
+
+    ahead = git('log', '--oneline', f'{rev}..HEAD', '--', *[p for _, p in pairs],
+                cwd=checkout)
+    if ahead:
+        n = len(ahead.splitlines())
+        problems.append(f"GP/: источник ушёл вперёд на {n} коммит(ов) по этим объектам — "
+                        "снимок устарел, обновить: .claude/scripts/sync_context.py --gp")
     return problems
 
 
@@ -191,6 +287,7 @@ def check_specs() -> list[str]:
 def main() -> int:
     blocks = [
         ('каталоги, readme и спецификации', check_projects()),
+        ('снимок GP', check_gp_snapshot()),
         ('метки версий', check_version_lines()),
         ('ссылки', check_links()),
         ('спецификации', check_specs()),

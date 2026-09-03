@@ -10,10 +10,15 @@
   2. Пересобирает CONTEXT.md — карту артефактов со свежестью каждого документа.
   3. Зовёт check_context.py и печатает его вывод.
 
+С флагом --gp вдобавок обновляет снимок чужого кода в GP/ из чекаута HR_Data и
+переписывает GP/source.json. Отдельным флагом, а не всегда: снимок трогают по решению
+человека, а хук ходит на каждый checkout.
+
 Ничего не ломает при ошибке: хук не должен мешать работе с git.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -25,7 +30,46 @@ HOME_CLAUDE = Path.home() / '.claude'
 MARKER = '.from-repo'          # чем помечены копии, которые ставит этот скрипт
 
 sys.path.insert(0, str(REPO / '.claude' / 'scripts'))
-from check_context import PROJECTS, git, last_commit, readme_of  # noqa: E402
+from check_context import (  # noqa: E402
+    PROJECTS, REFERENCES, git, gp_paths, last_commit, readme_of)
+
+
+def sync_gp() -> list[str]:
+    """Обновляет снимок GP/ из чекаута HR_Data и переписывает GP/source.json.
+
+    Берётся не рабочее дерево, а `HEAD`: записанная ревизия должна соответствовать
+    содержимому снимка, иначе сверка в check_context.py потеряет смысл. Набор файлов
+    не расширяется — переносится ровно то, что в GP/ уже лежит: список объектов
+    курируется руками, скрипт только не даёт ему протухнуть.
+    """
+    src = REPO / 'GP' / 'source.json'
+    meta = json.loads(src.read_text(encoding='utf-8'))
+    checkout = Path(meta['checkout']).expanduser()
+    if not (checkout / '.git').exists():
+        return [f"чекаута {meta['checkout']} нет — обновлять снимок не из чего"]
+
+    head = git('rev-parse', 'HEAD', cwd=checkout)
+    branch = git('rev-parse', '--abbrev-ref', 'HEAD', cwd=checkout)
+    if not head:
+        return [f"{meta['checkout']}: не читается HEAD"]
+
+    log, changed = [], 0
+    for f, path in gp_paths(meta):
+        out = subprocess.run(['git', '-C', str(checkout), 'show', f'{head}:{path}'],
+                             capture_output=True)
+        if out.returncode:
+            log.append(f"нет в источнике: {path}")
+            continue
+        if out.stdout != f.read_bytes():
+            f.write_bytes(out.stdout)
+            changed += 1
+            log.append(f"обновлён {f.relative_to(REPO)}")
+
+    meta.update(rev=head, branch=branch,
+                copied=datetime.now(timezone.utc).strftime('%Y-%m-%d'))
+    src.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    log.append(f"снимок GP: обновлено файлов {changed}, ревизия {head[:7]} ({branch})")
+    return log
 
 
 def sync_tree(kind: str) -> tuple[int, int]:
@@ -84,6 +128,25 @@ def freshness_table() -> str:
             f"{'`openspec/specs/' + capability + '/spec.md`' if spec.exists() else '—'} | {age(spec)} | "
             f"{code_ts:%Y-%m-%d}" + " |" if code_ts else "— |")
 
+    # Справочники: спеки нет и не будет, поэтому вместо неё — откуда снят снимок.
+    # Дата в колонке «Код» здесь про наш коммит, а годность снимка меряет не она, а
+    # сверка с источником в check_context.py.
+    for folder_name in sorted(REFERENCES):
+        folder = REPO / folder_name
+        readme = readme_of(folder)
+        src = folder / 'source.json'
+        origin = '—'
+        if src.exists():
+            meta = json.loads(src.read_text(encoding='utf-8'))
+            origin = f"снимок `{meta['repo']}` @ `{meta['rev'][:7]}`"
+        code_ts = last_commit(folder_name)
+        rows.append(
+            f"| `{folder_name}/` | "
+            f"{'`' + str(readme.relative_to(REPO)) + '`' if readme else '—'} | "
+            f"{last_commit(str(readme.relative_to(REPO))):%Y-%m-%d} | "
+            f"{origin} | {meta['copied'] if src.exists() else '—'} | "
+            f"{code_ts:%Y-%m-%d} |")
+
     head = (
         "| Каталог | Как устроено | Обновлён | Что обязано работать | Обновлена | Код |\n"
         "|---|---|---|---|---|---|\n"
@@ -115,6 +178,13 @@ def write_context_md() -> None:
 каталога. ⚠️ означает отставание больше трёх дней: повод посмотреть, не разошлись
 ли они по существу.
 
+Последняя строка — каталог-справочник: чужой код, скопированный сюда для чтения.
+Спеки у него нет и не будет (чинить его правкой в `ctl` нельзя, требования к нашей
+стороне контракта записаны в спеке потребителя), а вместо неё — ревизия источника.
+Даты коммитов про его годность ничего не говорят: снимок не меняется потому, что его
+никто не трогает. Годность меряет сверка с источником в `check_context.py`, обновляет
+`sync_context.py --gp`.
+
 {freshness_table()}`sync_context.py`*
 """
     path = REPO / 'CONTEXT.md'
@@ -129,6 +199,10 @@ def write_context_md() -> None:
 
 def main() -> int:
     quiet = '--quiet' in sys.argv
+
+    if '--gp' in sys.argv:
+        for line in sync_gp():
+            print(f"→ {line}")
 
     c_cmd, r_cmd = sync_tree('commands')
     c_skill, r_skill = sync_tree('skills')

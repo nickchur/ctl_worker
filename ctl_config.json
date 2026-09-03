@@ -66,5 +66,7 @@
       "type": "tfs-in"
     }
   },
-  "test_mode": "event"
+  "simulator": "event",
+  "test_mode": "ok-no-error",
+  "test_sleep": "minutes=2"
 }

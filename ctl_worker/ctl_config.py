@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-08-21 13:40 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-03 10:20 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -11,6 +11,7 @@
 | `ctl_conn_id` / `ctl_url` / `ctl_timeout` | CTL API |
 | `ctl_pool_slots` / `ctl_limit` / `ctl_days` | Лимиты CTL |
 | `tz` / `expire` | Часовой пояс и таймаут ожидания |
+| `simulator` / `test_mode` / `test_sleep` | Отладочные режимы: генератор нагрузки и фиктивное выполнение. Действуют не на всех контурах — см. `ctl_test.py` и `ctl_worker.py` |
 | `CTL_PIN` | PIN подтверждения (скрыто) |
 """
 
@@ -37,6 +38,17 @@ def get_scrt(s: str) -> str:
 
 
 conf = Variable.get('ctl_config', default_var={}, deserialize_json=True)
+
+
+def enum_default(value, allowed, fallback='off'):
+    """Значение по умолчанию для списка в форме.
+
+    В Variable может лежать что угодно — устаревшее значение или опечатка, — а `Param` с
+    `enum` роняет запуск, если значение вне списка. Непонятное гасим в `fallback`: тракт
+    от этого не меняется (его читают ctl_test.py и ctl_worker.py), а форма открывается.
+    """
+    v = str(value or '').strip().lower()
+    return v if v in allowed else fallback
 
 conns = {
     'ctl': {
@@ -86,7 +98,13 @@ conns = {
     },
 }
 
-config = { 
+# Режимы отладочных ключей. Контуры, на которых они вообще действуют, задаются в коде
+# потребителей (ctl_test.py, ctl_worker.py) и отсюда не управляются — это и есть смысл
+# гейта: контур не должен переопределяться настройкой.
+SIMULATOR_MODES = ['off', 'event', 'dataset', 'trigger']
+TEST_MODES = ['off', 'ok', 'ok-no', 'ok-no-error']
+
+config = {
     'profile': 'HR_Data',
     'root_entity': '941010000',
     'root_category': 'p1080',
@@ -99,6 +117,9 @@ config = {
     'ctl_limit': 1000,  #сколько записей запросить из CTL
     'ctl_days': 5, #сколько дней назад запросить из CTL
     # 'ctl_task_timeout': 'hours=+5',
+    'simulator': 'off',        # генератор нагрузки, ctl_test.py: off/event/dataset/trigger
+    'test_mode': 'off',        # фиктивное выполнение, ctl_worker.py: off/ok/ok-no/ok-no-error
+    'test_sleep': 'minutes=45',# верхняя граница ожидания вместо процедуры воркфлоу
     'tz': 'Europe/Moscow',
     'conns': conns,
     **conf,
@@ -125,6 +146,15 @@ with DAG(f'CTL.{config["profile"]}.config',
     dagrun_timeout=str2timedelta(config.get('dagrun_timeout','minutes=10')),
     params={
         **config,
+        # Списком, а не руками: значения разбираются кодом, опечатка молча выключает режим.
+        # В сам config кладутся простые строки — он же уходит в Variable, а Param не
+        # сериализуется.
+        'simulator': Param(enum_default(config.get('simulator'), SIMULATOR_MODES), type='string',
+                           enum=SIMULATOR_MODES,
+                           title='Симулятор нагрузки (event — только DEV)'),
+        'test_mode': Param(enum_default(config.get('test_mode'), TEST_MODES), type='string',
+                           enum=TEST_MODES,
+                           title='Фиктивное выполнение (только DEV и IFT)'),
         "CTL_PIN": '',
     },
     doc_md=__doc__,

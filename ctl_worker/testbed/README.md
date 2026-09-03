@@ -1,6 +1,6 @@
 # 🎭 Эмулятор CTL API для тестового стенда
 
-*2026-09-01 19:13 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-03 10:20 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `ctl_worker/` — единственный каталог репозитория, который до сих пор проверялся только
 выкладкой на alpha: все его даги ходят в CTL API, а он живёт на контуре и закрыт Kerberos.
@@ -43,11 +43,18 @@
 
 Значит сценарии ошибок задаются параметром `wf_exe` у воркфлоу, а не правкой кода.
 
-⚠️ Но только при **выключенном** `test_mode`. Со включённым `run_exe` подменяет `exe`
-на `'Ok Test work', pg_sleep(N)`, где N случайное — **до 45 минут**, — и вдобавок
-перебивает `res` случайным числом 0…2 (`ctl_worker.py:786`). Для проверки живости тракта
-это удобно, для сценариев — нет: ставьте `"test_mode": false` в `ctl_config`, тогда
-выполняется ровно то, что в `wf_exe`.
+Со включённым `test_mode` до `wf_exe` дело не доходит: `run_exe` подменяет `exe` на
+ожидание (верхняя граница — `test_sleep`, на стенде ставим `minutes=2`) и подставляет код
+результата по профилю. Профиль `ok-no-error` даёт и успех, и «нет данных», и ошибки,
+включая `-7` с уходом в TIME-WAIT, — то есть весь разбор кодов гоняется без правки
+параметров воркфлоу. Нужен конкретный сценарий (например, деление на ноль в GP) — ставьте
+`"test_mode": "off"` и задавайте `wf_exe`.
+
+⚠️ Тестовый режим работает только на контурах DEV и IFT, симулятор — на DEV, IFT и PSI, а
+событийный режим симулятора — только на DEV. Контур берётся из `ENV_STAND`; на стенде она
+выставлена в `DEV` (`/opt/aftest/airflow.env`), так что оба режима доступны. Снимите
+переменную — и стенд начнёт вести себя как бой: симулятора не будет вовсе, а тестовый
+режим станет игнорироваться с заметкой.
 
 ## Разворачивание
 
@@ -76,7 +83,7 @@ curl -s http://127.0.0.1:9080/v5/api/info
 | Подключение `ctl` | в payload `HTTP_CONNECTIONS`: `{"schema": "http", "host": "127.0.0.1", "port": 9080}` |
 | Подключения `gp` / `ppl` | `alpha-adb_dev_comm-read` / `-write` → postgres `gp_test` |
 | Подключение `pg` | `airflowdb` → метабаза |
-| Variable `ctl_config` | копия `ctl_config.json` с этими conn_id, `test_mode: "event"` и бакетами `edpetl-ctl` / `edpetl-files` |
+| Variable `ctl_config` | копия `ctl_config.json` с этими conn_id, `simulator: "event"`, `test_mode: "ok-no-error"` и бакетами `edpetl-ctl` / `edpetl-files` |
 | Пулы | `ctl_pool`, `gp_pool` — без них таски висят в очереди |
 | Бакеты MinIO | `edpetl-ctl`, `edpetl-files` |
 

@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-08-27 12:00 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-03 10:20 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -20,6 +20,7 @@
 | `get_conns_by_type()` / `get_conn()` | Получение соединений по типу |
 | `query_to_dict()` | SQL → список словарей (Greenplum) |
 | `update_dag_pause()` | Программная пауза/возобновление DAG'а |
+| `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
 """
 
 from airflow.models import DagModel, TaskInstance, Pool
@@ -32,6 +33,7 @@ from datetime import timedelta, datetime, timezone
 from itertools import islice
 import json
 import hashlib
+import os
 
 from logging import getLogger, Handler
 logger = getLogger("airflow.task")
@@ -62,6 +64,17 @@ class LogCapture(Handler):
 
 
 # === Утилиты ===
+def env_stand() -> str:
+    """Контур, на котором мы работаем: `DEV`, `IFT`, `PSI`, `PROM` или пустая строка.
+
+    Сначала `ENV_STAND` — её читают платформенные операторы и `tools/`, — при отсутствии
+    `ENVIRONMENT`: там, где выставлена только она (`check/`), поведение не должно
+    отличаться. Обе не выставлены — контур неизвестен, и вызывающий обязан считать это
+    самым строгим случаем, а не стендом: переменная есть на всех контурах, включая
+    тестовый (`/opt/aftest/airflow.env`).
+    """
+    return (os.getenv('ENV_STAND') or os.getenv('ENVIRONMENT') or '').strip().upper()
+
 def sign(x):
     return (x > 0) - (x < 0)
 

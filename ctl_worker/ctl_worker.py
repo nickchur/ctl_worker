@@ -119,14 +119,14 @@ def test_profile(context=None):
     if mode not in TEST_PROFILES:
         msg = f"⚠️ test_mode = {mode}: неизвестный профиль, тестовый режим выключен"
         logger.warning(msg)
-        add_note(msg, context, level='task')
+        if context: add_note(msg, context, level='task')
         return None
 
     if STAND not in TEST_STANDS:
         msg = (f"⚠️ Тестовый режим ({mode}) игнорируется: контур {STAND or 'не задан'}, "
                f"режим разрешён на {'/'.join(TEST_STANDS)}. Загрузка выполняется по-настоящему")
         logger.warning(msg)
-        add_note(msg, context, level='task')
+        if context: add_note(msg, context, level='task')
         return None
 
     return mode

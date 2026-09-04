@@ -337,7 +337,7 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
         raise
 
 
-def gp_loading_result(lid: int, hours: int = 48, timeout: int = 30) -> dict | None:
+def gp_loading_result(lid: int, timeout: int = 30) -> dict | None:
     """Ответ Greenplum по загрузке из журнала движка — или None, если его там нет.
 
     Нужна там, где ответ `pr_swf_start_ctl` потерян: соединение оборвалось, процесс убили.
@@ -352,12 +352,14 @@ def gp_loading_result(lid: int, hours: int = 48, timeout: int = 30) -> dict | No
     начиналась» отсюда неотличимы. Вопрос, на который здесь есть ответ, ровно один —
     «выполнилась ли она».
 
-    **Окно обязательно.** `vw_swf_ctl_log` join'ит журнал сам с собой, а `loading_id` в нём
-    считается из json, так что индексом фильтр не закрыть — без окна обе стороны join'а
-    читаются целиком за всю историю. Условие по времени планировщик проталкивает внутрь
-    вьюхи (проверено `EXPLAIN`: `ts > now() - interval` уезжает в оба скана), и на
-    колоночной таблице отсев идёт по одной колонке, не разбирая json. Сутки по умолчанию
-    берутся с запасом: загрузка не живёт дольше `wf_timeout`, а это часы.
+Запрос идёт по всей истории журнала, и окна по времени здесь намеренно нет.
+    `vw_swf_ctl_log` join'ит журнал сам с собой, а `loading_id` в нём считается из json —
+    индексом такой фильтр не закрыть, и напрашивается ограничение по `ts`. Но на боевом
+    кластере (200 узлов) запрос по этим объёмам укладывается в секунды, а окно вводило бы
+    четвёртый исход — «ответ есть, но старше окна», который пришлось бы трактовать как
+    отказ. Платить лишним исходом за оптимизацию, которой кластер не требует, незачем.
+    Вернуть окно будет чем: условие по `ts` планировщик проталкивает внутрь вьюхи в оба
+    скана (проверено `EXPLAIN`).
 
     Ретрай укорочен намеренно. `gp_exe` рассчитан на саму работу и ждёт между попытками до
     30 секунд; здесь это справка, которую спрашивают, **держа слот `gp_pool`**, — а слотов
@@ -369,13 +371,11 @@ def gp_loading_result(lid: int, hours: int = 48, timeout: int = 30) -> dict | No
           from vw_swf_ctl_log
          where loading_id = %s
            and end_id is not null
-           and beg_ts > now() - make_interval(hours => %s)
-           and end_ts > now() - make_interval(hours => %s)
          order by beg_ts desc
          limit 1
     """
     ask = gp_exe.retry_with(stop=stop_after_attempt(2), wait=wait_fixed(2))
-    res = ask(sql=sql, val=(int(lid), int(hours), int(hours)), timeout=timeout)
+    res = ask(sql=sql, val=(int(lid),), timeout=timeout)
     if res and isinstance(res, str):
         res = json.loads(res)
     return res or None

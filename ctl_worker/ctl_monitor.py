@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-02 11:40 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 13:00 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -17,7 +17,8 @@
 from airflow import DAG
 from airflow.decorators import task, task_group
 from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.models import Param
+from airflow.models import DagModel, Param
+from airflow.utils.session import create_session
 from airflow.sensors.base import PokeReturnValue # type: ignore
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
@@ -117,6 +118,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         # wfs = ctl_obj_load('ctl_workflows')
         
         sla_notes = {}
+        # Загрузки, которым некуда ехать: даг на паузе. Сенсор их пропускает с заметкой
+        # (ctl_sensor.pause_reason), но по одной строке в его логе не видно, что загрузка
+        # ждёт четвёртый час. Собираем здесь и показываем возрастом, рядом с SLA.
+        paused_wait = {}
         res = {}
         actions = {}
         stats = {}
@@ -287,6 +292,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     # 'msg': f'{msg}',
                 }
                 
+                # Возраст берём тот же, что и у SLA: время с последней смены статуса
+                # загрузки. «Ждёт снятия паузы 4 часа» — это про загрузку, а не про ран.
+                if running or sts in ('RUNNING', 'TIME-WAIT', 'EVENT-WAIT'):
+                    paused_wait[lid] = (f'CTL.{wfn}', wfn, r['time'])
+
                 if action in ['Skipped', 'New']:
                     continue
                 elif action in ['notFound', 'SLA']:
@@ -306,6 +316,20 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         
         if sla_notes:
             add_note(sla_notes, context, level='Task', title='SLA')
+
+        # Один запрос на все увиденные даги: без него пришлось бы ходить в метабазу
+        # на каждую загрузку, а их до ctl_limit за круг.
+        if paused_wait:
+            with create_session() as session:
+                paused = {r[0] for r in session.query(DagModel.dag_id).filter(
+                    DagModel.dag_id.in_(sorted({d for d, _, _ in paused_wait.values()})),
+                    DagModel.is_paused.is_(True),
+                ).all()}
+            waiting = {lid: f"⏸️ {wfn} {age}"
+                       for lid, (dag_id, wfn, age) in paused_wait.items() if dag_id in paused}
+            if waiting:
+                logger.warning("⏸️ ждут снятия паузы: %d загрузок", len(waiting))
+                add_note(waiting, context, level='Task,DAG', title='⏸️ Ждут снятия паузы')
 
         chk_any_conn('ctl', **context)
         

@@ -1,5 +1,5 @@
 """### 📡 DAG: Сенсор CTL
-*2026-09-02 20:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 13:00 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
 
@@ -16,7 +16,7 @@ from airflow.decorators import task, task_group
 from airflow.api.common.trigger_dag import trigger_dag           
 from airflow.exceptions import DagRunAlreadyExists, DagNotFound
 from airflow.exceptions import AirflowSkipException, AirflowFailException
-from airflow.models import DagModel
+from airflow.models import DagModel, Log
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.utils.session import create_session
 
@@ -68,6 +68,42 @@ def dag_gone_reason(dag_id: str, wf: dict | None) -> str:
     except Exception as e:                       # диагност не должен ронять таск
         bits.append(f'метабазу опросить не вышло: {type(e).__name__}: {e}')
     return '; '.join(bits)
+
+# Имя события для журнала метабазы: по нему отчёт check/log_events считает, сколько раз
+# сенсор упёрся в паузу. Своё, не айрфлоуское: их имена — константы планировщика.
+PAUSED_EVENT = 'ctl dag paused'
+
+
+def pause_reason(dag_id: str):
+    """Кто и когда поставил паузу дагу — или None, если даг не на паузе.
+
+    Пауза бывает трёх происхождений, и лечатся они по-разному:
+      * поставил человек — в журнале метабазы есть `paused` (веб) или `cli_dag_pause`
+        (командная строка) с именем; тогда это осознанное решение, и снимать её за
+        человека нельзя;
+      * поставил наш код (`set_pause` по ключу `is_paused`) — записи нет, паузa массовая;
+      * пауза с создания: фабрика создаёт даг запаузенным, если воркфлоу не на расписании
+        в CTL (`is_paused_upon_creation = not w['scheduled']`), потому что такому дагу
+        `get_schedule` строит СОБСТВЕННОЕ расписание Airflow. Снять её значит заодно
+        включить это расписание — не то, о чём просил CTL.
+
+    Поэтому сенсор паузу не снимает: он называет причину и пропускает загрузку.
+    """
+    with create_session() as session:
+        dm = session.query(DagModel.is_paused).filter(DagModel.dag_id == dag_id).first()
+        if not dm or not dm.is_paused:
+            return None
+
+        row = session.query(Log.event, Log.owner, Log.dttm).filter(
+            Log.dag_id == dag_id,
+            Log.event.in_(('paused', 'unpaused', 'cli_dag_pause', 'cli_dag_unpause')),
+        ).order_by(Log.dttm.desc()).first()
+
+    if row and row.event in ('paused', 'cli_dag_pause'):
+        return f"паузу поставил {row.owner or 'неизвестно кто'} {str(row.dttm)[:19]}"
+    return ('пауза с создания: воркфлоу не на расписании в CTL, '
+            'даг ведёт расписание Airflow — снимать её за человека нельзя')
+
 
 wfs_dict = ctl_obj_load('ctl_workflows')
 
@@ -343,6 +379,20 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         if not wf:
             msg = (f"⏭️ Загрузка {lid} ({wf_name}): {dag_gone_reason(f'CTL.{wf_name}', None)}")
             add_note(msg, context, level='Task,DAG', title='⏭️ НЕТ ДАГА')
+            raise AirflowSkipException(msg)
+
+        # Запаузенный даг запускать бессмысленно: trigger_dag паузу не смотрит и создаёт
+        # ран сразу в очереди, а планировщик запаузенный даг не разбирает — ран висит
+        # вечно, а загрузка в CTL молча ждёт. Пропускаем, называя причину; загрузку не
+        # трогаем: снимут паузу — поедет сама, как и в случае пропавшего дага.
+        if (reason := pause_reason(f'CTL.{wf_name}')):
+            msg = f"⏸️ Загрузка {lid} ({wf_name}): даг на паузе, {reason}"
+            add_note(msg, context, level='Task,DAG', title='⏸️ ДАГ НА ПАУЗЕ')
+            # Запись в журнал метабазы — чтобы такие пропуски считались числом
+            # (check/log_events.py), а не оставались строкой в логе сенсора.
+            with create_session() as session:
+                session.add(Log(event=PAUSED_EVENT, dag_id=f'CTL.{wf_name}',
+                                owner='ctl_sensor', extra=msg))
             raise AirflowSkipException(msg)
         
         af_sdt = pendulum.instance(ti.start_date).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')

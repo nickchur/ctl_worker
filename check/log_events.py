@@ -183,6 +183,17 @@ SELECT event, count(*) AS cnt,
  ORDER BY cnt DESC
 """
 
+# Слово INTERVAL здесь не для красоты, и убирать его нельзя. Замер на PostgreSQL 16
+# для timestamptz-значения 2026-09-04 12:20:30+00:
+#
+#   AT TIME ZONE INTERVAL '+03:00'  → 15:20:30   верно
+#   AT TIME ZONE '+03:00'           → 09:20:30   на шесть часов мимо
+#   AT TIME ZONE 'Europe/Moscow'    → 15:20:30   верно, но тянет базу правил
+#
+# Текстовая форма разбирается как POSIX-спецификация зоны, где знак смещения
+# инвертирован, — «упрощение» до неё сдвигает время молча, цифры остаются
+# правдоподобными. Имя зоны считает верно, но ради константы UTC+3 базу правил
+# тянуть незачем: тот же довод, что у константы MSK выше.
 SQL_BY_TASK = """
 SELECT coalesce(dag_id, '—') AS dag_id, coalesce(task_id, '—') AS task_id,
        count(*) AS cnt, count(DISTINCT event) AS kinds,
@@ -196,6 +207,10 @@ SELECT coalesce(dag_id, '—') AS dag_id, coalesce(task_id, '—') AS task_id,
  LIMIT :top
 """
 
+# Сутки режутся по московскому календарю, и это смена смысла: раньше границу дня
+# задавал TimeZone соединения — на боевом контуре московский, на стенде UTC, то есть
+# один и тот же отчёт резал сутки по-разному. Теперь одинаково везде, но при сравнении
+# со старыми сводками строки за 21:00–23:59 UTC переезжают на следующий день.
 SQL_BY_DAY = """
 SELECT date_trunc('day', dttm AT TIME ZONE INTERVAL '+03:00')::date AS day,
        count(*) AS cnt,
@@ -452,8 +467,7 @@ def tools_log_events():
 
         add_note({f"⚠️ {head}": lines + ours}, context=context, level='task,dag', title='📊 log_events ')
 
-        # Порог — по задачам, а не по событиям: о зависшей задаче планировщик пишет на
-        # каждом круге, и порог по событиям меряет частоту его опроса, а не контур.
+        # Порог — по задачам, а не по событиям (почему — в docstring модуля).
         if limit and tasks > limit:
             raise AirflowFailException(f"⚠️ {head} — задач больше порога {limit}\n"
                                        + "\n".join(lines))

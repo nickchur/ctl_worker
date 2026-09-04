@@ -26,7 +26,7 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
 from airflow.utils.session import create_session
 from hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed, retry_if_exception_type
 from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError
 
 import json
@@ -335,6 +335,73 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
     except Exception as e:
         logger.error(f"💥 Непредвиденная ошибка в gp_exe: {str(e)}")
         raise
+
+
+def gp_backend_busy(pid: int, timeout: int = 15) -> bool:
+    """Занят ли backend Greenplum с этим pid запуском загрузки.
+
+    Нужна, чтобы отличить «работа ещё идёт» от «работы не было». По журналу это не
+    различить: пока транзакция не закоммичена, её записи не видны другим сессиям. А
+    различать обязательно — обрыв клиента запрос в Greenplum **не останавливает**
+    (проверено на боевом кластере), поэтому после падения воркера ETL продолжает работать
+    и закоммитится сам.
+
+    Смотрим `pg_stat_activity` на мастере: pid оттуда же, откуда его берёт `gp_exe`
+    (`pg_backend_pid()`). Отдельно сверяем текст запроса — pid переиспользуются, и без
+    этого чужая сессия сошла бы за нашу.
+    """
+    sql = """
+        select count(*)
+          from pg_stat_activity
+         where pid = %s
+           and query ilike '%%pr_swf_start_ctl%%'
+    """
+    ask = gp_exe.retry_with(stop=stop_after_attempt(2), wait=wait_fixed(2))
+    return bool(ask(sql=sql, val=(int(pid),), timeout=timeout))
+
+
+def gp_loading_result(lid: int, timeout: int = 30) -> dict | None:
+    """Ответ Greenplum по загрузке из журнала движка — или None, если его там нет.
+
+    Нужна там, где ответ `pr_swf_start_ctl` потерян: соединение оборвалось, процесс убили.
+    Спрашивать журнал имеет смысл потому, что функция в Greenplum атомарна — коммита внутри
+    функции там нет, вся работа идёт одной транзакцией, — а свой ответ она кладёт в журнал
+    **той же транзакцией** (`pr_swf_log_action('end'|'cancel'|'error', ...)`). Поэтому
+    состояний ровно два: запись есть — работа выполнена и закоммичена, записи нет — всё
+    откачено и не произошло ничего. Промежуточного не бывает.
+
+    Отсюда же следует, чего эта справка НЕ умеет: пока транзакция не закоммичена, её
+    записи не видны другим сессиям, так что «загрузка идёт прямо сейчас» и «загрузка не
+    начиналась» отсюда неотличимы. Вопрос, на который здесь есть ответ, ровно один —
+    «выполнилась ли она».
+
+Запрос идёт по всей истории журнала, и окна по времени здесь намеренно нет.
+    `vw_swf_ctl_log` join'ит журнал сам с собой, а `loading_id` в нём считается из json —
+    индексом такой фильтр не закрыть, и напрашивается ограничение по `ts`. Но на боевом
+    кластере (200 узлов) запрос по этим объёмам укладывается в секунды, а окно вводило бы
+    четвёртый исход — «ответ есть, но старше окна», который пришлось бы трактовать как
+    отказ. Платить лишним исходом за оптимизацию, которой кластер не требует, незачем.
+    Вернуть окно будет чем: условие по `ts` планировщик проталкивает внутрь вьюхи в оба
+    скана (проверено `EXPLAIN`).
+
+    Ретрай укорочен намеренно. `gp_exe` рассчитан на саму работу и ждёт между попытками до
+    30 секунд; здесь это справка, которую спрашивают, **держа слот `gp_pool`**, — а слотов
+    в нём меньше, чем разрешено запросов в Greenplum. Три минуты в дефицитном канале ради
+    справки дороже, чем не получить её вовсе.
+    """
+    sql = """
+        select end_msg
+          from vw_swf_ctl_log
+         where loading_id = %s
+           and end_id is not null
+         order by beg_ts desc
+         limit 1
+    """
+    ask = gp_exe.retry_with(stop=stop_after_attempt(2), wait=wait_fixed(2))
+    res = ask(sql=sql, val=(int(lid),), timeout=timeout)
+    if res and isinstance(res, str):
+        res = json.loads(res)
+    return res or None
 
 
 @retry(

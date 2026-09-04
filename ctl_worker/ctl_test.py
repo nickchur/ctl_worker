@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-09-04 12:04 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 12:15 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -22,7 +22,8 @@ from airflow.datasets import DatasetAlias
 from airflow.api.common.trigger_dag import trigger_dag           
 from airflow.decorators import task
 
-from airflow.exceptions import AirflowFailException, AirflowSkipException, AirflowRescheduleException
+from airflow.exceptions import (AirflowFailException, AirflowSkipException,
+                                AirflowRescheduleException, DagRunAlreadyExists)
 # from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from plugins.utils import add_note, env_stand, on_callback, get_current_load, str2timedelta  # type: ignore
 from plugins.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
@@ -232,7 +233,7 @@ else:
                     raise AirflowSkipException(
                         f"🔥 Запускать нечего: из {len(by_dag_id)} кандидатов ни один даг не поедет")
 
-                failed = []
+                failed, exists = [], []
                 # Выбор без повторов внутри одной попытки: run_id собирается из
                 # start_date таска и в её пределах одинаков, поэтому повторный выбор того
                 # же дага упирался бы в DagRunAlreadyExists. Пока кандидатов были сотни,
@@ -256,6 +257,14 @@ else:
                             run_id=run_id,
                             conf=extra,
                         )
+                    except DagRunAlreadyExists:
+                        # Ран уже есть — значит загрузка поедет, и воркфлоу остаётся среди
+                        # запущенных: отказа не было. Но по нашему построению этого не
+                        # должно случаться (run_id уникален по start_date таска,
+                        # одноимённые воркфлоу схлопнуты), поэтому и не молчим: строка в
+                        # заметке отличает «успех в маске отказа» от настоящей странности.
+                        logger.warning(f"♻️ {wf_name}: ран {run_id} уже создан")
+                        exists.append(wf_name)
                     except Exception as e:
                         # В заметку, а не только в лог: иначе «запустил 3 из 5» видно, а
                         # почему двух не хватает — только чтением логов таска.
@@ -264,8 +273,16 @@ else:
                         ret.remove(wf_name)
 
                 add_note(ret, title=f"🔍 New events {len(ret)} created", context=context, level='Task,DAG')
+                # Списком markdown, а не питоновским списком: заметка рендерится как
+                # markdown, где одиночный перенос строкой не считается, а pformat даёт
+                # скобки и переносы посреди сообщений об ошибках.
                 if failed:
-                    add_note(failed, title=f"🔥 Не запустились: {len(failed)}",
+                    add_note('\n'.join(f'- {x}' for x in failed),
+                             title=f"🔥 Не запустились: {len(failed)}",
+                             context=context, level='Task,DAG')
+                if exists:
+                    add_note('\n'.join(f'- {x}' for x in exists),
+                             title=f"♻️ Ран уже был: {len(exists)}",
                              context=context, level='Task,DAG')
                
             add_note(ret, context, level='Task,DAG', title=f'Simulator {mode}: {len(ret)}')      

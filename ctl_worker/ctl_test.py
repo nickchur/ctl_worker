@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-09-04 11:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 12:04 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -192,9 +192,13 @@ else:
                 # каждый прогон. deleted и архив исключаем по тем же правилам, что и
                 # фабрика: не строит она их — значит и запускать нечего.
                 archive_cat = get_config().get('archive_category', 'p1080.ARCHIVE')
-                wfs = [w for w in ctl_obj_load('ctl_workflows').values()
-                       if w.get('name') and w.get('profile') == profile
-                       and not w.get('deleted', False)
+                # Отбор в два шага, чтобы потом было что показать оператору: сначала наш
+                # профиль, потом годность. Чужие профили в счёт не идут — их «отсеяно»
+                # ничего не объясняет.
+                mine = [w for w in ctl_obj_load('ctl_workflows').values()
+                        if w.get('name') and w.get('profile') == profile]
+                wfs = [w for w in mine
+                       if not w.get('deleted', False)
                        and not (w.get('scheduled', False) and w.get('singleLoading', True))
                        and w.get('category') != archive_cat]
 
@@ -209,19 +213,26 @@ else:
                 by_dag_id = {f"CTL.{w['name']}": w for w in wfs}
                 runnable = runnable_dags(list(by_dag_id))
                 ready = [by_dag_id[d] for d in sorted(runnable)]
-                skipped = len(by_dag_id) - len(ready)
+
+                # Два счётчика, а не один: воркфлоу отсеиваются на двух разных этапах, и
+                # «отсеяно 676» без разделения читается как «676 дагов на паузе». Свойства
+                # воркфлоу (deleted, архив, своё расписание) — это «нам такое не нужно»;
+                # метабаза — «нужно, но не поедет». Ответы на «почему запусков мало» разные.
+                by_props = len(mine) - len(wfs)
+                by_meta = len(by_dag_id) - len(ready)
 
                 msg = f"⏳ Кандидатов к запуску: {len(ready)}"
-                if skipped:
-                    # Без этого числа «симулятор ничего не запустил» неотличимо от
-                    # «симулятор сломался»: запаузенных дагов у воркфлоу большинство.
-                    msg += f", отсеяно {skipped} (на паузе, неактивны или не сериализованы)"
+                if by_meta:
+                    msg += f" · не поедут {by_meta} (на паузе, неактивны или не сериализованы)"
+                if by_props:
+                    msg += f" · не подошли по свойствам {by_props}"
                 add_note(msg, context, level='Task,DAG')
 
                 if not ready:
                     raise AirflowSkipException(
                         f"🔥 Запускать нечего: из {len(by_dag_id)} кандидатов ни один даг не поедет")
 
+                failed = []
                 # Выбор без повторов внутри одной попытки: run_id собирается из
                 # start_date таска и в её пределах одинаков, поэтому повторный выбор того
                 # же дага упирался бы в DagRunAlreadyExists. Пока кандидатов были сотни,
@@ -246,9 +257,16 @@ else:
                             conf=extra,
                         )
                     except Exception as e:
+                        # В заметку, а не только в лог: иначе «запустил 3 из 5» видно, а
+                        # почему двух не хватает — только чтением логов таска.
                         logger.error(f"🔥 Error triggering {wf_name}: {e}")
+                        failed.append(f"{wf_name}: {type(e).__name__}: {e}")
+                        ret.remove(wf_name)
 
                 add_note(ret, title=f"🔍 New events {len(ret)} created", context=context, level='Task,DAG')
+                if failed:
+                    add_note(failed, title=f"🔥 Не запустились: {len(failed)}",
+                             context=context, level='Task,DAG')
                
             add_note(ret, context, level='Task,DAG', title=f'Simulator {mode}: {len(ret)}')      
         

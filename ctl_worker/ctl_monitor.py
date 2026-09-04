@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-02 11:40 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 14:08 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -17,7 +17,8 @@
 from airflow import DAG
 from airflow.decorators import task, task_group
 from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.models import Param
+from airflow.models import DagModel, Param
+from airflow.utils.session import create_session
 from airflow.sensors.base import PokeReturnValue # type: ignore
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
@@ -117,6 +118,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         # wfs = ctl_obj_load('ctl_workflows')
         
         sla_notes = {}
+        # Загрузки, которым некуда ехать: даг на паузе. Сенсор их пропускает с заметкой
+        # (ctl_sensor.pause_reason), но по одной строке в его логе не видно, что загрузка
+        # ждёт четвёртый час. Собираем здесь и показываем возрастом, рядом с SLA.
+        paused_wait = {}
         res = {}
         actions = {}
         stats = {}
@@ -287,6 +292,28 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     # 'msg': f'{msg}',
                 }
                 
+                # Кого считаем ждущим паузы: только тех, кому есть куда ехать прямо
+                # сейчас. Таких два рода, и одного признака мало:
+                #
+                #   * посчитанное действие — New (запустит сенсор), reRunned и reStarted
+                #     (перезапустит монитор);
+                #   * RUNNING с пустым логом — CTL считает загрузку идущей, а воркер её
+                #     даже не начинал. Это и есть типичный ждун паузы: сенсор пропустил
+                #     запуск, лог писать некому. По действию его не поймать — монитор
+                #     помечает такие Skipped и оставляет сенсору.
+                #
+                # Всё остальное паузы не ждёт: выполняющаяся загрузка (лог RUN),
+                # доигрывающая (Completed, Aborted), спящая по таймеру (TIME-WAIT до
+                # срока). Попади они в список — заметка кричала бы на нормальную работу,
+                # и дежурный перестал бы её читать.
+                #
+                # Возраст берём тот же, что и у SLA: время с последней смены статуса
+                # загрузки. «Ждёт снятия паузы 4 часа» — это про загрузку, а не про ран.
+                if action in ('New', 'reRunned', 'reStarted') or (sts == 'RUNNING' and not log):
+                    # Четвёртым — сам интервал: показывать надо старейших, а по строке
+                    # возраста («2 d 03:14» против «12:40») их не отсортировать.
+                    paused_wait[lid] = (f'CTL.{wfn}', wfn, r['time'], t)
+
                 if action in ['Skipped', 'New']:
                     continue
                 elif action in ['notFound', 'SLA']:
@@ -306,6 +333,33 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         
         if sla_notes:
             add_note(sla_notes, context, level='Task', title='SLA')
+
+        # Один запрос на все увиденные даги: без него пришлось бы ходить в метабазу
+        # на каждую загрузку, а их до ctl_limit за круг.
+        if paused_wait:
+            with create_session() as session:
+                # is_active обязателен: у выпавшего из ctl_workflows воркфлоу строка в dag
+                # остаётся, и без фильтра его загрузка попала бы в «ждут снятия паузы»
+                # вместо диагностики пропавшего дага — а ждать ей нечего.
+                paused = {r[0] for r in session.query(DagModel.dag_id).filter(
+                    DagModel.dag_id.in_(sorted({v[0] for v in paused_wait.values()})),
+                    DagModel.is_paused.is_(True),
+                    DagModel.is_active.is_(True),
+                ).all()}
+            waiting = {lid: (f"⏸️ {wfn} {age}", t)
+                       for lid, (dag_id, wfn, age, t) in paused_wait.items() if dag_id in paused}
+            if waiting:
+                logger.warning("⏸️ ждут снятия паузы: %d загрузок: %s", len(waiting),
+                               {lid: v[0] for lid, v in waiting.items()})
+                # В заметку — счёт и десяток старейших. Целиком список туда не влезет:
+                # заметка обрезается по MAX_NOTE_LEN, и длинный список вытеснил бы Action
+                # и Status, записанные в тот же тик. Полный — в логе таска.
+                top = {lid: v[0] for lid, v in
+                       sorted(waiting.items(), key=lambda kv: kv[1][1], reverse=True)[:10]}
+                if len(waiting) > len(top):
+                    top['…'] = f"и ещё {len(waiting) - len(top)}; полный список в логе таска"
+                add_note(top, context, level='Task,DAG',
+                         title=f'⏸️ Ждут снятия паузы: {len(waiting)}')
 
         chk_any_conn('ctl', **context)
         
@@ -386,9 +440,16 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         самым старым — с апреля; они держали слоты ctl_pool, а каждое объявление дёргало
         наш on_failure_callback (за пять минут — под тысячу вызовов и 33 МБ лога).
 
-        Что делает: помечает такие таски упавшими, закрывает осиротевшие раны и, если за
-        раном стоит загрузка CTL (`sensor__<lid>_…`), переводит её в ABORTED — иначе CTL
-        считает её активной, а идти ей уже некуда.
+        Что делает: помечает такие таски упавшими и закрывает осиротевшие раны. С
+        загрузкой CTL за раном (`sensor__<lid>_…`) поступает по-разному, и это главное
+        различие:
+
+        * ехать некуда (нет живых задач, даг выпал из сериализации) — загрузка
+          переводится в ABORTED: CTL иначе считает её активной, а идти ей действительно
+          некуда;
+        * ждёт снятия паузы — загрузка НЕ трогается. Снимут паузу — сенсор запустит её
+          заново; закрыть её значило бы потерять загрузку из-за плановых работ. Тот же
+          принцип, что у сенсора при `DagNotFound`: «вернётся даг — поедет и она».
 
         Порог берётся из конфига (`zombie_after`, по умолчанию 6 часов) и обязан быть
         БОЛЬШЕ exe_timeout: длинный run_exe не бьётся чаще, чем работает, и попасть под
@@ -397,6 +458,20 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         dry = bool(context['params'].get('zombie_dry_run'))
         after = str2timedelta(get_config().get('zombie_after', 'hours=6'))
         secs = int(after.total_seconds())
+
+        # Порог — единственное, что отделяет уборку от бойни: при нуле под нож идёт всё,
+        # что не успело добежать. Пять минут — не «разумное значение», а граница
+        # абсурда; настоящий порог обязан быть больше exe_timeout.
+        if secs < 300:
+            raise AirflowFailException(
+                f"🔥 zombie_after = {after} — меньше пяти минут; санитар с таким порогом "
+                "закрывает живые раны. Поправьте ctl_config.")
+
+        # Сколько ранов закрываем за один заход. Без потолка первый боевой прогон по
+        # накопленному бэклогу закрыл бы всё разом и утащил бы за собой поштучный обход
+        # CTL — под statement_timeout это отказ посреди работы. Бэклог доедается за
+        # несколько кругов, а «покажи» и «сделай» считают одинаково.
+        LIMIT = 500
 
         # Критерий один на выборку и на правку: таск в RUNNING, а его job либо не
         # зарегистрирован, либо не бился дольше порога. Живой таск со свежим heartbeat
@@ -429,7 +504,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
 
         # Раны, которые планировщик разбирает вхолостую на каждом круге. Считаются
         # ОТДЕЛЬНО от тасков: ран висит и после того, как его таски добиты — хоть нами,
-        # хоть штатным зомби-килом. Два случая, оба старше порога:
+        # хоть штатным зомби-килом. Три случая, все старше порога, но исходы у них
+        # РАЗНЫЕ, поэтому и запроса два.
+        #
+        # «Ехать некуда» — ран закрывается, загрузка за ним переводится в ABORTED:
         #
         #   1. RUNNING, в котором не осталось ни одной живой задачи — двигаться ему некуда;
         #   2. RUNNING или QUEUED у дага, которого нет в serialized_dag: воркфлоу выпал
@@ -437,33 +515,86 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         #      круге пишет «DAG ... not found in serialized_dag». На alpha один такой
         #      призрак давал 60 строк ошибок в секунду.
         #
-        # Порог обязателен и во втором случае: даг пропадает из сериализации и на время
-        # сбоя разбора, но шесть часов такого сбоя — это уже не мигание, а авария.
-        orphan_where = (
-            "coalesce(dr.start_date, dr.queued_at, dr.execution_date)"
-            f"       < now() - interval '{secs} seconds'"
+        # «Поедет, но позже» — ран закрывается, ЗАГРУЗКА НЕ ТРОГАЕТСЯ:
+        #
+        #   3. QUEUED у запаузенного дага: trigger_dag состояние паузы не смотрит и
+        #      создаёт ран сразу в очереди, а планировщик запаузенный даг не разбирает.
+        #      Такой ран не поедет, пока паузу не снимут, — и копится в очереди.
+        #
+        # Разница принципиальная. Пауза — это плановые работы, а не смерть: снимут её —
+        # сенсор запустит загрузку заново (он и делает это, пока у неё пустой status_log).
+        # Закрывать загрузку из-за ночного окна работ значило бы терять её на ровном
+        # месте. Ран же закрыть надо: он всё равно не поедет — сенсор создаст новый.
+        #
+        # Порядок запросов важен: случай 2 забирает раны дагов, пропавших из сериализации,
+        # включая запаузенные, — после него они уже 'failed' и во второй запрос не попадут.
+        #
+        # Живые состояния перечислены явно, и up_for_reschedule среди них обязателен:
+        # сенсоры в режиме reschedule (tfs_wait ждёт файл до суток) между опросами живут
+        # именно в нём. Без него санитар убивал бы их на шестом часе ожидания — включая
+        # собственный ран монитора.
+        LIVE_TASK = "('running','queued','scheduled','up_for_retry','deferred'," \
+                    "'up_for_reschedule','restarting')"
+        AGE = ("coalesce(dr.start_date, dr.queued_at, dr.execution_date)"
+               f" < now() - interval '{secs} seconds'")
+
+        dead_where = (
+            f"dr.state IN ('running','queued') AND {AGE}"
             "   AND ("
             "        (dr.state = 'running'"
             "         AND NOT EXISTS (SELECT 1 FROM task_instance ti"
             "                          WHERE ti.dag_id = dr.dag_id AND ti.run_id = dr.run_id"
-            "                            AND ti.state IN ('running','queued','scheduled','up_for_retry','deferred')))"
-            "     OR (dr.state IN ('running','queued')"
-            "         AND NOT EXISTS (SELECT 1 FROM serialized_dag sd WHERE sd.dag_id = dr.dag_id))"
+            f"                            AND ti.state IN {LIVE_TASK}))"
+            "     OR NOT EXISTS (SELECT 1 FROM serialized_dag sd WHERE sd.dag_id = dr.dag_id)"
             "       )"
         )
+        paused_where = (
+            f"dr.state = 'queued' AND {AGE}"
+            "   AND EXISTS (SELECT 1 FROM dag d WHERE d.dag_id = dr.dag_id AND d.is_paused)"
+        )
+
+        def orphan_sql(action, where):
+            """Отбор ранов: один и тот же для «покажи» и «сделай» — порядок и потолок.
+
+            Потолок вешается на подзапрос с id, а не на сам UPDATE: PostgreSQL не знает
+            LIMIT в UPDATE, а без него первый прогон по бэклогу закрывает всё разом.
+            """
+            return (
+                f"{action} WHERE dr.id IN ("
+                f"  SELECT dr.id FROM dag_run dr WHERE {where}"
+                "   ORDER BY coalesce(dr.start_date, dr.queued_at, dr.execution_date)"
+                f"  LIMIT {LIMIT})"
+            )
+
+        def lids_of(rows):
+            """Номера загрузок CTL из имён ранов, по возрастанию и без повторов.
+
+            Идентификатор лежит в имени рана, который создаёт сенсор:
+            `sensor__<lid>_<попытка>_<дата>`. Раны других происхождений (ручные,
+            расписания) имени не подходят и в ответ не попадают.
+            """
+            return sorted({int(m.group(1)) for r in rows
+                           if (m := re.match(r'sensor__(\d+)_', str(r['run_id'])))})
 
         if dry:
-            # Загрузки CTL: id лежит в имени рана, который создаёт сенсор —
-            # sensor__<lid>_<попытка>_<дата>. Отбор тот же, что в боевой ветке ниже,
-            # иначе «покажи» и «сделай» показывали бы разное.
-            orphans = pg_exe(f"SELECT dr.dag_id, dr.run_id FROM dag_run dr WHERE {orphan_where} LIMIT 500")
-            seen = sorted({int(m.group(1)) for r in stuck + orphans
-                           if (m := re.match(r'sensor__(\d+)_', str(r['run_id'])))})
+            # Отбор тот же, что в боевой ветке ниже, иначе «покажи» и «сделай» показывали
+            # бы разное. Полное число — отдельным счётом: потолок скрывает размер бэклога,
+            # а знать его нужно именно до первого боевого прогона.
+            cols = "SELECT dr.dag_id, dr.run_id FROM dag_run dr"
+            dead = pg_exe(orphan_sql(cols, dead_where))
+            paused = pg_exe(orphan_sql(cols, paused_where))
+            total = pg_exe(f"SELECT (SELECT count(*) FROM dag_run dr WHERE {dead_where}) AS dead,"
+                           f"       (SELECT count(*) FROM dag_run dr WHERE {paused_where}) AS paused")[0]
             add_note({'🧟 Санитар (только показать)': note or 'зависших тасков нет',
-                      'осиротевшие раны': [f"{r['dag_id']} / {r['run_id']}" for r in orphans],
-                      'загрузки': seen},
+                      f"осиротевшие раны (найдено {total['dead']}, потолок {LIMIT})":
+                          [f"{r['dag_id']} / {r['run_id']}" for r in dead] or 'нет',
+                      f"⏸️ раны на паузе (найдено {total['paused']}, потолок {LIMIT})":
+                          [f"{r['dag_id']} / {r['run_id']}" for r in paused] or 'нет',
+                      'загрузки под ABORTED': lids_of(stuck + dead),
+                      'загрузки, которые не трогаем (ждут снятия паузы)': lids_of(paused)},
                      context, level='Task,DAG')
-            return {'stuck': len(stuck), 'runs': len(orphans), 'loadings': seen, 'dry_run': True}
+            return {'stuck': len(stuck), 'runs': len(dead), 'paused': len(paused),
+                    'loadings': lids_of(stuck + dead), 'dry_run': True}
 
         # RETURNING, а не «обновили и надеемся»: в отчёт и в закрытие загрузок идёт то,
         # что база действительно поменяла, а не то, что показала выборка секунду назад.
@@ -475,44 +606,59 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 " RETURNING ti.dag_id, ti.task_id, ti.run_id"
             )
             # Таски без job вообще (ti.job_id пуст) отдельным запросом: JOIN их не поймает.
+            # Порог здесь тот же, что и везде: между «таск встал в running» и «job
+            # записался» есть окно, и попадать в него санитару незачем.
             failed += pg_exe(
                 "UPDATE task_instance SET state = 'failed', end_date = now()"
                 " WHERE state = 'running' AND job_id IS NULL"
+                f"   AND start_date < now() - interval '{secs} seconds'"
                 " RETURNING dag_id, task_id, run_id"
             )
 
-        runs = pg_exe(
-            f"UPDATE dag_run dr SET state = 'failed', end_date = now() WHERE {orphan_where}"
-            " RETURNING dr.dag_id, dr.run_id"
-        )
+        upd = "UPDATE dag_run dr SET state = 'failed', end_date = now()"
+        ret = " RETURNING dr.dag_id, dr.run_id"
+        # Порядок: сперва «ехать некуда» — иначе запаузенный ран пропавшего дага попал бы
+        # во второй запрос и загрузка осталась бы висеть активной.
+        runs = pg_exe(orphan_sql(upd, dead_where) + ret)
+        paused_runs = pg_exe(orphan_sql(upd, paused_where) + ret)
 
         # Загрузки берутся и с тасков, и с ранов: у рана-призрака живых тасков нет
-        # вовсе, а загрузка за ним всё равно числится активной.
-        lids = sorted({int(m.group(1)) for r in failed + runs
-                       if (m := re.match(r'sensor__(\d+)_', str(r['run_id'])))})
+        # вовсе, а загрузка за ним всё равно числится активной. Раны с паузы сюда НЕ
+        # входят — за ними стоят живые загрузки, которые поедут после снятия паузы.
+        reasons = {lid: f'Zombie: таск не бился дольше {after}, закрыт санитаром'
+                   for lid in lids_of(failed)}
+        for lid in lids_of(runs):
+            # Своя причина: у осиротевшего рана таск мог не запускаться вовсе, и «таск не
+            # бился» увело бы разбор по ложному следу.
+            reasons.setdefault(lid, f'Zombie: ран осиротел дольше {after} '
+                                    '(нет живых задач или даг выпал из сериализации), '
+                                    'закрыт санитаром')
 
         closed, skipped = [], []
-        for lid in lids:
+        for lid, reason in reasons.items():
             try:
                 ld = ctl_api(f"/v4/api/loading/{lid}")
                 if (ld or {}).get('alive') != 'ACTIVE':
                     skipped.append(lid)
                     continue
-                ctl_set_status(lid, 'ERROR', f'Zombie: таск не бился дольше {after}, закрыт санитаром')
+                ctl_set_status(lid, 'ERROR', reason)
                 ctl_set_completed(lid, completed=False)
                 closed.append(lid)
             except Exception as e:                       # одна загрузка не должна ронять уборку
                 logger.error(f"ctl_zombie: не закрыл загрузку {lid}: {e}")
 
-        if not (failed or runs):
+        if not (failed or runs or paused_runs):
             add_note('🧟 Зависших тасков и осиротевших ранов нет', context, level='Task')
-            return {'stuck': 0, 'runs': 0}
+            return {'stuck': 0, 'runs': 0, 'paused': 0}
 
         add_note({'🧟 Закрыто зависших тасков': len(failed), 'таски': note,
                   'закрыто ранов': len(runs), 'загрузки ABORTED': closed,
-                  'уже закрыты': skipped},
+                  'уже закрыты': skipped,
+                  '⏸️ закрыто ранов на паузе': len(paused_runs),
+                  'их загрузки не тронуты': lids_of(paused_runs)},
                  context, level='Task,DAG')
-        return {'stuck': len(failed), 'runs': len(runs), 'closed': closed, 'skipped': skipped}
+        return {'stuck': len(failed), 'runs': len(runs), 'paused': len(paused_runs),
+                'closed': closed, 'skipped': skipped}
 
 
     ctl_action(res = ctl_monitor())

@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-08-14 13:45 MSK · v2.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 15:30 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -399,6 +399,18 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         # без ретраев: тест снимает срез доступности здесь и сейчас, повтор только
         # растягивает прогон и маскирует моргнувшее соединение
         "retries": 0,
+        # 900: выше регрессионных прогонов того же пула (у них приоритета нет),
+        # ниже агента CTL (999/1000) — тот двигает боевые загрузки, и обгонять
+        # его диагностике незачем.
+        #
+        # absolute обязателен: правило по умолчанию (downstream) складывает вес
+        # вниз по цепочке, и первый таск получил бы 2700 вместо 900 — сравнение с
+        # соседями стало бы зависеть от длины цепочки, а не от намерения.
+        "priority_weight": 900,
+        "weight_rule": "absolute",
+        # У каждой проверки соединения свои таймауты в 15 секунд, так что три минуты
+        # ловят только зависание — сеть, которая не отвечает и не рвёт соединение.
+        "execution_timeout": timedelta(minutes=3),
         "on_failure_callback": on_callback,
     },
     # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
@@ -411,6 +423,9 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
+    # Потолок на прогон, а не только на таск: при max_active_runs=1 зависший
+    # прогон закрывает дорогу всем следующим.
+    dagrun_timeout=timedelta(minutes=30),
     on_failure_callback=on_callback,
 )
 def tools_test_connections():  # noqa: PLR0915

@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-02 11:40 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 12:10 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -436,9 +436,13 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         #      из ctl_workflows, фабрика его больше не строит, и планировщик на каждом
         #      круге пишет «DAG ... not found in serialized_dag». На alpha один такой
         #      призрак давал 60 строк ошибок в секунду.
+        #   3. QUEUED у запаузенного дага: trigger_dag состояние паузы не смотрит и
+        #      создаёт ран сразу в очереди, а планировщик запаузенный даг не разбирает.
+        #      Такой ран не поедет, пока паузу не снимут, — и копится в очереди.
         #
-        # Порог обязателен и во втором случае: даг пропадает из сериализации и на время
-        # сбоя разбора, но шесть часов такого сбоя — это уже не мигание, а авария.
+        # Порог обязателен во всех случаях: даг пропадает из сериализации и на время сбоя
+        # разбора, а паузу ставят на время работ. Шесть часов и того, и другого — это уже
+        # не мигание. Снимут паузу раньше порога — ран поедет сам, и санитар его не тронет.
         orphan_where = (
             "coalesce(dr.start_date, dr.queued_at, dr.execution_date)"
             f"       < now() - interval '{secs} seconds'"
@@ -449,6 +453,8 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             "                            AND ti.state IN ('running','queued','scheduled','up_for_retry','deferred')))"
             "     OR (dr.state IN ('running','queued')"
             "         AND NOT EXISTS (SELECT 1 FROM serialized_dag sd WHERE sd.dag_id = dr.dag_id))"
+            "     OR (dr.state = 'queued'"
+            "         AND EXISTS (SELECT 1 FROM dag d WHERE d.dag_id = dr.dag_id AND d.is_paused))"
             "       )"
         )
 

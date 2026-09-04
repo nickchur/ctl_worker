@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-03 15:10 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 14:30 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -77,6 +77,46 @@ archive = get_config().get('archive_category', 'p1080.ARCHIVE')
 # wfs_dict = ctl_obj_load('ctl_workflows')
 # ent_dict = ctl_obj_load('ctl_entities')
 enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
+
+# 🎛️ Режим оркестрации: кто владеет расписаниями и зависимостями (openspec/project.md).
+#   ctl   — CTL; фабрика дагу расписания не строит;
+#   mixed — как сложилось: нет расписания в CTL, значит расписание строит Airflow;
+#   af    — Airflow; расписание строится всегда.
+# Ключа нет — значит mixed: выкладка кода сама по себе поведения не меняет.
+ORCHESTRATOR_MODES = ('ctl', 'mixed', 'af')
+
+
+def _orchestrator() -> str:
+    value = str(get_config().get('orchestrator', 'mixed')).strip().lower()
+    if value not in ORCHESTRATOR_MODES:
+        logger.warning("orchestrator = %s: неизвестный режим, беру mixed. Известные: %s",
+                       value, ', '.join(ORCHESTRATOR_MODES))
+        return 'mixed'
+    return value
+
+
+ORCHESTRATOR = _orchestrator()
+
+
+def pause_new_dag(is_scheduled: bool) -> bool:
+    """Создавать ли даг запаузенным.
+
+    Раньше это было следствием поля `scheduled`, и в режиме `ctl` то же правило блокировало
+    ручной запуск из CTL: запуск паузу не проверяет, ран уходит в очередь и не едет.
+    Теперь настройка своя, а `auto` разворачивается по режиму:
+
+      * `ctl`   — не паузим: расписаний у дагов нет, пауза только мешает;
+      * `mixed` — паузим тех, у кого расписание строит Airflow (как было);
+      * `af`    — паузим всех: даг со своим расписанием не должен стартовать сам, пока его
+        не «взвели», иначе первая же выкладка даёт стампед из сотен дагов.
+    """
+    value = str(get_config().get('pause_new_dags', 'auto')).strip().lower()
+    if value in ('yes', 'true', '1'):
+        return True
+    if value in ('no', 'false', '0'):
+        return False
+    return {'ctl': False, 'mixed': not is_scheduled, 'af': True}[ORCHESTRATOR]
+
 
 # 🌍 Тестовый режим: выражение воркфлоу подменяется ожиданием, код результата — своим.
 # Список контуров — константа в коде, а не ключ конфигурации: контур это единственный
@@ -214,7 +254,10 @@ def get_schedule(w, enames):
 
     # 3. Определение тега (упрощенный маппинг)
     is_scheduled = w.get('scheduled', False)
-    prefix = 'CTL_' if is_scheduled else 'AF_'
+    # Кто строит расписание — решает режим, а не одно поле scheduled: в ctl не строим
+    # никому, в af строим всем, в mixed — тем, кого не ведёт CTL (как было).
+    owns_schedule = ORCHESTRATOR == 'af' or (ORCHESTRATOR == 'mixed' and not is_scheduled)
+    prefix = 'AF_' if owns_schedule else 'CTL_'
     
     if w.get('wf_event_sched'):   tag_type = 'event'
     elif w.get('wf_time_sched'):  tag_type = 'time'
@@ -223,8 +266,18 @@ def get_schedule(w, enames):
     
     tag = f"{prefix}{tag_type}"
     
-    # 4. Обработка логики расписания (только для не-scheduled или специфичных условий)
-    if not is_scheduled:
+    # 4. Обработка логики расписания — только там, где им владеет Airflow
+    if not owns_schedule and (tfs_path := wf_params.get('wf_tfs_in')):
+        # ТФС и Kafka — зона Airflow при ЛЮБОМ режиме: CTL про файлы не знает и знать не
+        # должен. Раньше датасет получали только воркфлоу, которых не ведёт CTL, — то есть
+        # у воркфлоу «на расписании в CTL и с источником ТФС» приход файла не поднимал
+        # ничего. Это расходилось с границей ответственности: режим делит расписания и
+        # зависимости, а не источники событий.
+        ds = Dataset(f"TFS/{profile}/{tfs_path.lstrip('/')}")
+        schedule = (schedule | ds) if schedule else ds
+        tag = 'AF_tfs-in'
+
+    if owns_schedule:
         # Вариант TFS
         if tfs_path := wf_params.get('wf_tfs_in'):
             ds = Dataset(f"TFS/{profile}/{tfs_path.lstrip('/')}")
@@ -450,7 +503,7 @@ def build_worker_dag(w):
         tags=tags,
         max_active_runs= 1 if w.get('singleLoading', True) else 10,
         # dagrun_timeout=dagrun_timeout,
-        is_paused_upon_creation= not w.get('scheduled', False),
+        is_paused_upon_creation=pause_new_dag(w.get('scheduled', False)),
     )
 
     ctl_url = f"{get_config()['conns']['ctl']['url']}/#/workflow-details/{w['id']}"
@@ -502,7 +555,8 @@ def build_worker_dag(w):
             **XCom Output:** `params` — полный набор параметров для следующих задач.
 
             **Особенности:**
-            - Поддерживает `scheduleAfterStart` — перевод в режим расписания.
+            - Поддерживает `scheduleAfterStart` — перевод в режим расписания
+              (в режиме `af` не передаётся: расписаниями владеет Airflow).
             - Автоматически удаляет расписание, если `!singleLoading`.
             """
             chk_any_conn('ctl')
@@ -528,9 +582,17 @@ def build_worker_dag(w):
                 
             if not params.get('start_wf'):
                 msg = '⚠️ Задание не запущено.'
-                if schedule_wf and not wf['scheduled']: 
-                    ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
-                    msg += ' ⏰ Задание поставлено на расписание.'
+                if schedule_wf and not wf['scheduled']:
+                    # Ставить расписание в CTL, когда расписаниями владеет Airflow, — это
+                    # своими руками сделать двойной запуск: тот же воркфлоу поедет и по
+                    # расписанию дага, и по загрузке из CTL. Снятие расписания при этом
+                    # разрешено: оно ведёт ровно в ту сторону, куда идёт режим.
+                    if ORCHESTRATOR == 'af':
+                        msg += (' ⏸️ Расписание в CTL не поставлено: в режиме af им владеет '
+                                'Airflow, и вторая постановка дала бы двойной запуск.')
+                    else:
+                        ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+                        msg += ' ⏰ Задание поставлено на расписание.'
                 elif not schedule_wf and wf['scheduled']: 
                     ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
                     msg += ' 💀 Задание снято с расписания.'
@@ -607,7 +669,10 @@ def build_worker_dag(w):
                 prm['wfp_run_type'] = run_type
                 # ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
 
-                new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={schedule_wf}", "post", json=prm)
+                # scheduleAfterStart вернул бы расписание в CTL после запуска — в режиме af
+                # это та же двойная оркестрация, только отложенная.
+                sched_after = schedule_wf and ORCHESTRATOR != 'af'
+                new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={sched_after}", "post", json=prm)
                 lid = int(new_lid['loadingId'])
                 ctl_set_status(lid, 'RUNNING', 'NEW-AF ' + context['dag_run'].run_id)
                 
@@ -981,6 +1046,18 @@ def _wf_check_shrink(eligible: list) -> None:
 
 _eligible = _wf_eligible(ctl_obj_load('ctl_workflows'))
 _wf_check_shrink(_eligible)
+
+# Режим af означает, что расписаниями владеет Airflow. Если при этом воркфлоу остались на
+# расписании и в CTL, их будут запускать обе системы. Разбор из-за этого не роняем: иначе
+# переключение режима становится опасным — предупреждаем и строим даги как обычно.
+if ORCHESTRATOR == 'af':
+    _still_in_ctl = [w['name'] for w in _eligible if w.get('scheduled')]
+    if _still_in_ctl:
+        logger.warning(
+            "orchestrator=af, но в CTL остались на расписании %d воркфлоу — их будут "
+            "запускать обе системы. Снимите расписание в CTL: %s%s",
+            len(_still_in_ctl), ', '.join(_still_in_ctl[:5]),
+            ' …' if len(_still_in_ctl) > 5 else '')
 
 for w in _eligible:
     try:

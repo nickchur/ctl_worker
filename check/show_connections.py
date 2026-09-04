@@ -1,5 +1,5 @@
 """### 🔌 DAG: Список Airflow Connections
-*2026-08-07 13:45 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 15:30 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список всех подключений из secret backend, сгруппированных по их типу.
 Используется для аудита доступных соединений и верификации конфигурации backend'а.
@@ -41,6 +41,17 @@ ensure_pool(TOOLS_POOL)
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 2,
+        # 900: выше регрессионных прогонов того же пула (у них приоритета нет),
+        # ниже агента CTL (999/1000) — тот двигает боевые загрузки, и обгонять
+        # его диагностике незачем.
+        #
+        # absolute обязателен: правило по умолчанию (downstream) складывает вес
+        # вниз по цепочке, и первый таск получил бы 2700 вместо 900 — сравнение с
+        # соседями стало бы зависеть от длины цепочки, а не от намерения.
+        'priority_weight': 900,
+        'weight_rule': 'absolute',
+        # Чтение секрет-бэкенда и запись переменной — секунды; потолок про зависание.
+        'execution_timeout': timedelta(minutes=5),
         'on_failure_callback': on_callback,
     },
     # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
@@ -53,6 +64,9 @@ ensure_pool(TOOLS_POOL)
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
+    # Потолок на прогон, а не только на таск: при max_active_runs=1 зависший
+    # прогон закрывает дорогу всем следующим.
+    dagrun_timeout=timedelta(minutes=30),
     on_failure_callback=on_callback,
 )
 def tools_show_connections():

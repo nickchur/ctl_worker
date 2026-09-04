@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-04 10:25 MSK · v2.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 15:30 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -423,6 +423,9 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
+    # Потолок на прогон, а не только на таск: при max_active_runs=1 зависший
+    # прогон закрывает дорогу всем следующим.
+    dagrun_timeout=timedelta(minutes=30),
     on_failure_callback=on_callback,
 )
 def tools_test_connections():  # noqa: PLR0915

@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-04 13:30 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 15:30 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -60,6 +60,8 @@ except ImportError:
 
 logger = logging.getLogger("airflow.task")
 
+# Москва живёт на постоянном UTC+3 с 2014 года, переходов нет — фиксированный сдвиг
+# честнее ZoneInfo: он не тянет базу правил ради константы.
 MSK = timezone(timedelta(hours=3))
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
@@ -91,6 +93,22 @@ PARAMS_VAR = 'tools_log_events_params'
 SAVED = saved_params(PARAMS_VAR)
 
 DEFAULT_SCHEDULE = '30 6 * * *'
+
+
+def names_drifted() -> str:
+    """Бесплатная половина сторожа: сверка с константой самого Airflow.
+
+    Одно из четырёх имён Airflow экспортирует константой — с ней и сверяемся на импорте.
+    Остальные три лежат в его коде литералами, их так не достать; для них есть дорогой
+    поиск похожих событий, но он платится только при нулевом счётчике (см. SQL_UNKNOWN).
+    """
+    try:
+        from airflow.jobs.scheduler_job_runner import TASK_STUCK_IN_QUEUED_RESCHEDULE_EVENT as ev
+    except Exception:
+        return "константа TASK_STUCK_IN_QUEUED_RESCHEDULE_EVENT в Airflow не найдена"
+    if ev not in INCIDENTS:
+        return f"Airflow пишет {ev!r}, а мы ищем {INCIDENTS[0]!r} — имена разъехались"
+    return ''
 
 
 def _param(key, default, **kwargs):
@@ -166,9 +184,12 @@ SELECT count(*) AS cnt
    AND event = :starts
 """
 
-# Сторож имён: события планировщика — константы Airflow, и при обновлении они могут
-# переехать. Тогда счётчик станет нулём, а отчёт напишет «чисто» — худший вид ошибки.
-# Ищем похожие по смыслу события, которых нет в наших списках.
+# Сторож имён, дорогая половина. События планировщика при обновлении Airflow могут
+# переехать: счётчик станет нулём, а отчёт напишет «чисто» — худший вид ошибки. Поиск
+# похожих по смыслу событий стоит дорого: ведущий `%` в ILIKE индексом по event
+# воспользоваться не даёт, и запрос перебирает все строки окна — 2,5 с за сутки и 16 с за
+# неделю на журнале в миллион строк. Поэтому он выполняется ТОЛЬКО когда сбоев не нашлось
+# вовсе: ровно в этом случае его ответ и нужен — тишина настоящая или имена разъехались.
 SQL_UNKNOWN = """
 SELECT event, count(*) AS cnt
   FROM main.log
@@ -274,11 +295,18 @@ def tools_log_events():
         ours_by_event = _fetch(SQL_BY_EVENT, {'cutoff': cutoff, 'events': ours})
         ours_by_task = _fetch(SQL_BY_TASK, {'cutoff': cutoff, 'events': ours, 'top': top})
 
-        # Сторож имён: если Airflow переименует событие, наш счётчик молча станет нулём.
-        unknown = _fetch(SQL_UNKNOWN, {'cutoff': cutoff, 'known': events + ours + [STARTS]})
-        for r in unknown:
-            logger.warning("⚠️ похожее событие вне наших списков: %s (%s) — "
-                           "проверьте имена в INCIDENTS", r['event'], r['cnt'])
+        # Сторож имён. Бесплатная половина — всегда; дорогая — только когда сбоев ноль:
+        # тогда и надо отличить настоящую тишину от разъехавшихся имён.
+        if (drift := names_drifted()):
+            logger.warning("⚠️ %s — проверьте INCIDENTS", drift)
+
+        total_incidents = sum(int(r['cnt']) for r in by_event)
+        unknown = []
+        if not total_incidents:
+            unknown = _fetch(SQL_UNKNOWN, {'cutoff': cutoff, 'known': events + ours + [STARTS]})
+            for r in unknown:
+                logger.warning("⚠️ похожее событие вне наших списков: %s (%s) — "
+                               "проверьте имена в INCIDENTS", r['event'], r['cnt'])
 
         total = sum(int(r['cnt']) for r in by_event)
         runs = int(starts[0]['cnt']) if starts else 0
@@ -303,6 +331,9 @@ def tools_log_events():
             'by_day': {str(r['day']): int(r['cnt']) for r in by_day},
             'ours_total': sum(int(r['cnt']) for r in ours_by_event),
             'ours_by_event': {r['event']: int(r['cnt']) for r in ours_by_event},
+            # task_id здесь нет намеренно: событие пишет сенсор, а dag_id в нём — это даг
+            # ВОРКФЛОУ, чью загрузку пропустили. Задача сенсора в группировке бесполезна,
+            # интересен воркфлоу.
             'ours_by_task': [
                 {'dag_id': r['dag_id'], 'cnt': int(r['cnt']), 'last_seen': str(r['last_seen'])[:19]}
                 for r in ours_by_task
@@ -350,7 +381,7 @@ def tools_log_events():
             # не здоровье, а простой, и заметка обязана их различать.
             msg = f"✅ чисто: {head}"
             add_note({msg: ours} if ours else msg,
-                     context=context, level='task,dag', title='📊 log_events')
+                     context=context, level='task,dag', title='📊 log_events ')
             return msg
 
         lines = [f"{k}: {v}" for k, v in snapshot['by_event'].items()]
@@ -358,10 +389,14 @@ def tools_log_events():
                   for r in snapshot['by_task']]
         by_day = snapshot['by_day']
         if by_day:
-            lines.append(f"по дням (за {snapshot['window_days']} д): "
+            # Сколько дней реально вернулось: журнал чистит db_cleanup по своему
+            # retention_days, и «за 30 д» с четырнадцатью датами читатель иначе примет
+            # за отсутствие сбоев, а не за отсутствие данных.
+            lines.append(f"по дням (за {snapshot['window_days']} д, дней с данными "
+                         f"{len(by_day)}): "
                          + ", ".join(f"{d[5:]}={n}" for d, n in by_day.items()))
 
-        add_note({f"⚠️ {head}": lines + ours}, context=context, level='task,dag', title='📊 log_events')
+        add_note({f"⚠️ {head}": lines + ours}, context=context, level='task,dag', title='📊 log_events ')
 
         if limit and total > limit:
             raise AirflowFailException(f"⚠️ {head} — больше порога {limit}\n" + "\n".join(lines))

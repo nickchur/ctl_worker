@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-04 10:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 13:30 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -14,6 +14,16 @@
 Все четыре — про доставку и жизнь процесса, а не про логику дага. В интерфейсе они видны
 по одной задаче за раз (вкладка Event Log), поэтому вопрос «это у нас или у всех» без
 такого отчёта не имеет ответа.
+
+Отдельной строкой считаются **наши собственные события** — их пишет код тракта:
+
+| Событие | Кто пишет | Что значит |
+|---|---|---|
+| `ctl dag paused` | `ctl_sensor` | загрузка пропущена: даг воркфлоу на паузе, запускать нечего |
+
+В число сбоев доставки они не входят и порога не трогают: запаузенный даг — не поломка
+инфраструктуры, а решение человека. Но и молчать о них нельзя: из-за паузы загрузка стоит,
+и «сколько раз за сутки» — это и есть ответ на «часто ли».
 
 **Знаменатель обязателен.** Десять сбоев на четыре тысячи запусков и десять на сорок —
 разные новости, поэтому рядом всегда стоит число запусков за то же окно (события
@@ -61,6 +71,14 @@ INCIDENTS = (
     'stuck in queued tries exceeded',
     'heartbeat timeout',
     'state mismatch',
+)
+
+# Наши собственные события — их пишет код тракта, а не планировщик. Считаются отдельно и
+# в число сбоев доставки НЕ входят: запаузенный даг это не поломка инфраструктуры, а
+# решение человека (или пауза с создания), и смешивать их в одном счётчике значит
+# получить бессмысленную сумму.
+OURS = (
+    'ctl dag paused',      # сенсор пропустил загрузку: даг воркфлоу на паузе
 )
 
 # Чем задача начинается: по этим записям считаем знаменатель. Событие пишется на каждый
@@ -214,6 +232,11 @@ def tools_log_events():
         by_day = _fetch(SQL_BY_DAY, {'days': days, 'events': events})
         starts = _fetch(SQL_STARTS, {'hours': hours, 'starts': STARTS})
 
+        # Те же запросы по нашим событиям: отдельный счётчик и отдельный список дагов.
+        ours = list(OURS)
+        ours_by_event = _fetch(SQL_BY_EVENT, {'hours': hours, 'events': ours})
+        ours_by_task = _fetch(SQL_BY_TASK, {'hours': hours, 'events': ours, 'top': top})
+
         total = sum(int(r['cnt']) for r in by_event)
         runs = int(starts[0]['cnt']) if starts else 0
         # Доля без знаменателя не считается: ноль запусков — это не «идеальное здоровье»,
@@ -233,6 +256,12 @@ def tools_log_events():
                 for r in by_task
             ],
             'by_day': {str(r['day']): int(r['cnt']) for r in by_day},
+            'ours_total': sum(int(r['cnt']) for r in ours_by_event),
+            'ours_by_event': {r['event']: int(r['cnt']) for r in ours_by_event},
+            'ours_by_task': [
+                {'dag_id': r['dag_id'], 'cnt': int(r['cnt']), 'last_seen': str(r['last_seen'])[:19]}
+                for r in ours_by_task
+            ],
         }
 
         logger.info("🔎 за %d ч: событий %d, запусков %d, доля %s%%",
@@ -242,6 +271,11 @@ def tools_log_events():
         for r in snapshot['by_task']:
             logger.warning("   %s.%s — %d (видов %d, последнее %s)",
                            r['dag_id'], r['task_id'], r['cnt'], r['kinds'], r['last_seen'])
+
+        if snapshot['ours_total']:
+            logger.warning("⏸️ наши события: %d %s", snapshot['ours_total'], snapshot['ours_by_event'])
+            for r in snapshot['ours_by_task']:
+                logger.warning("   %s — %d (последнее %s)", r['dag_id'], r['cnt'], r['last_seen'])
         return snapshot
 
     @task(task_id='report', trigger_rule=TriggerRule.NONE_FAILED)
@@ -257,11 +291,21 @@ def tools_log_events():
         head = (f"за {snapshot['window_hours']} ч: сбоев доставки {total}, "
                 f"запусков {runs}" + (f", доля {share}%" if share is not None else ""))
 
+        # Наши события идут отдельной строкой и порог не трогают: запаузенный даг это не
+        # поломка доставки, а решение человека. Но молчать о них нельзя — из-за паузы
+        # загрузка стоит, и «сколько раз за сутки» это и есть ответ на «часто ли».
+        ours = []
+        if snapshot['ours_total']:
+            ours = [f"⏸️ наши события: {snapshot['ours_total']}"]
+            ours += [f"   {r['dag_id']} — {r['cnt']} (последнее {r['last_seen']})"
+                     for r in snapshot['ours_by_task']]
+
         if not total:
             # Про запуски говорим и в этом случае: «ноль сбоев» при нуле запусков —
             # не здоровье, а простой, и заметка обязана их различать.
             msg = f"✅ чисто: {head}"
-            add_note(msg, context, level='task,dag', title='📊 log_events')
+            add_note({msg: ours} if ours else msg,
+                     context, level='task,dag', title='📊 log_events')
             return msg
 
         lines = [f"{k}: {v}" for k, v in snapshot['by_event'].items()]
@@ -271,7 +315,7 @@ def tools_log_events():
         if by_day:
             lines.append("по дням: " + ", ".join(f"{d[5:]}={n}" for d, n in by_day.items()))
 
-        add_note({f"⚠️ {head}": lines}, context, level='task,dag', title='📊 log_events')
+        add_note({f"⚠️ {head}": lines + ours}, context, level='task,dag', title='📊 log_events')
 
         if limit and total > limit:
             raise AirflowFailException(f"⚠️ {head} — больше порога {limit}\n" + "\n".join(lines))

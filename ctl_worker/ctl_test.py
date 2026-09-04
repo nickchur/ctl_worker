@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-09-03 10:20 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 11:10 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -28,6 +28,11 @@ from plugins.utils import add_note, env_stand, on_callback, get_current_load, st
 from plugins.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
 from plugins.ctl_core import chk_any_conn  # type: ignore
 
+# Отбор запускаемых дагов идёт по метабазе: пауза и сериализация живут там, а не в CTL
+from airflow.models import DagModel
+from airflow.models.serialized_dag import SerializedDagModel
+from airflow.utils.session import create_session
+
 import random
 import pendulum
 from datetime import timedelta, datetime, timezone
@@ -51,6 +56,39 @@ SIM_STANDS = ('DEV', 'IFT', 'PSI')   # где симулятор вообще с
 EVENT_STANDS = ('DEV',)              # где ему позволено писать события в CTL
 STAND = env_stand()
 OFF = ('', 'off', 'false', 'none', '0')
+
+
+def runnable_dags(dag_ids: list) -> set:
+    """Из списка дагов оставляет те, что действительно поедут.
+
+    `trigger_dag` состояние паузы не смотрит (`airflow/api/common/trigger_dag.py`): он
+    создаёт ран сразу в QUEUED, а планировщик запаузенный даг не разбирает. Такой ран
+    висит в очереди навсегда — место в списке занимает, для дага считается активным, и
+    очередь по нему перестаёт читаться.
+
+    Симулятор без этой проверки целится ровно в такие даги: фабрика создаёт даг
+    запаузенным, если воркфлоу не стоит на расписании (`ctl_worker.py`:
+    `is_paused_upon_creation = not w['scheduled']`), а из выборки ниже исключены как раз
+    воркфлоу «на расписании и с единственной загрузкой».
+
+    Сериализацию проверяем заодно: без неё `trigger_dag` бросает DagNotFound — этому мы
+    научены отдельно, в сенсоре.
+    """
+    if not dag_ids:
+        return set()
+
+    ids = sorted(set(dag_ids))
+    with create_session() as session:
+        alive = {r[0] for r in session.query(DagModel.dag_id).filter(
+            DagModel.dag_id.in_(ids),
+            DagModel.is_paused.is_(False),
+            DagModel.is_active.is_(True),
+        ).all()}
+        if not alive:
+            return set()
+        serialized = {r[0] for r in session.query(SerializedDagModel.dag_id).filter(
+            SerializedDagModel.dag_id.in_(sorted(alive))).all()}
+    return alive & serialized
 
 
 # Симулятор существует не везде: даг воркфлоу, запущенный отсюда, создаёт настоящую
@@ -142,16 +180,34 @@ else:
                     ret.append(evn)
                 
             else: # trigger_dag
-                wfs = list(ctl_obj_load('ctl_workflows').values())
-                add_note(f"⏳ Testing {len(wfs)} DAGs", context, level='Task,DAG')
-            
-                for k in range(random.randint(1, cnt)):
-                    wf = random.choice(wfs)
-                    if wf['profile'] != profile: continue
-                    if wf['scheduled'] and wf['singleLoading']: continue 
-                    # if wf['category'] == "p1080.ARCHIVE": continue
-                    if wf['category'] == get_config().get('archive_category'): continue
+                # Кандидаты отбираются заранее, а не по одному в цикле: запускать можно
+                # только те даги, что реально поедут, а это один запрос к метабазе на
+                # весь список вместо запроса на каждую попытку.
+                wfs = [w for w in ctl_obj_load('ctl_workflows').values()
+                       if w['profile'] == profile
+                       and not (w['scheduled'] and w['singleLoading'])
+                       and w['category'] != get_config().get('archive_category')]
 
+                runnable = runnable_dags([f"CTL.{w['name']}" for w in wfs])
+                ready = [w for w in wfs if f"CTL.{w['name']}" in runnable]
+                skipped = len(wfs) - len(ready)
+
+                msg = f"⏳ Testing {len(ready)} DAGs"
+                if skipped:
+                    # Без этого числа «симулятор ничего не запустил» неотличимо от
+                    # «симулятор сломался»: запаузенных дагов у воркфлоу большинство.
+                    msg += f", отсеяно {skipped} (на паузе, неактивны или не сериализованы)"
+                add_note(msg, context, level='Task,DAG')
+
+                if not ready:
+                    raise AirflowSkipException(
+                        f"🔥 Запускать нечего: из {len(wfs)} кандидатов ни один даг не поедет")
+
+                # Выбор без повторов: run_id внутри таска один (собирается из start_date),
+                # поэтому повторный выбор того же дага упирается в DagRunAlreadyExists и
+                # уходит в лог ошибкой. Пока кандидатов были сотни, это случалось редко;
+                # после отбора по запускаемости список короткий, и повтор стал бы нормой.
+                for wf in random.sample(ready, k=random.randint(1, min(cnt, len(ready)))):
                     wf_name = wf['name']
                     ret.append(wf_name)
                 

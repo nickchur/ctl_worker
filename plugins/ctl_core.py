@@ -127,6 +127,48 @@ def ctl_get_status(ld):
     }
 
 
+def ctl_exe_recover(lid, gp_pid=None, deadline=None, poll=30):
+    """🔎 Подбирает ответ по загрузке после обрыва: ждёт, если работа ещё идёт.
+
+    Зовётся на повторной попытке `run_exe`. Отвечает на вопрос «что стало с прошлой
+    попыткой» и возвращает пару ``('ok', ответ)`` либо ``('fail', сообщение)`` —
+    решение принимает таск через `raise_status`.
+
+    Различать приходится три исхода, а не два:
+
+    - **ответ в журнале есть** — работа выполнена и закоммичена, отдаём его;
+    - **ответа нет, но backend занят нашей процедурой** — обрыв клиента запрос в Greenplum
+      не останавливает, значит ETL продолжает работать. Ждём его: упасть здесь значило бы
+      отдать загрузку на повтор в CTL и получить второй ETL параллельно первому;
+    - **ответа нет и backend свободен** — транзакция откачена, работы не было.
+
+    Без `gp_pid` (его пушит `gp_exe` в XCom) второй исход неотличим от третьего, и тогда
+    неизвестность трактуется в пользу «работа могла быть выполнена»: падаем, а не
+    запускаем ETL заново.
+    """
+    from plugins.ctl_utils import gp_backend_busy, gp_loading_result  # noqa: PLC0415
+
+    waited = 0
+    while True:
+        done = gp_loading_result(lid)
+        if done:
+            return 'ok', done
+
+        pid = (gp_pid or {}).get('pid') if isinstance(gp_pid, dict) else gp_pid
+        if not pid:
+            return 'fail', (f"ответа по загрузке {lid} в журнале Greenplum нет, а pid прошлой "
+                            "попытки неизвестен — идёт ли работа, определить нечем")
+        if not gp_backend_busy(pid):
+            return 'fail', (f"ответа по загрузке {lid} в журнале Greenplum нет, backend {pid} "
+                            "свободен — транзакция откачена, работа не выполнялась")
+
+        if deadline and waited >= deadline:
+            return 'fail', (f"загрузка {lid} всё ещё выполняется в Greenplum (backend {pid}), "
+                            f"ждали {waited} с и не дождались")
+        time.sleep(poll)
+        waited += poll
+
+
 def raise_status(status, payload):
     """⤴️ Превращает статус решателя в исключение Airflow.
 

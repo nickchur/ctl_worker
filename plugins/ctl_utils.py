@@ -337,6 +337,29 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
         raise
 
 
+def gp_backend_busy(pid: int, timeout: int = 15) -> bool:
+    """Занят ли backend Greenplum с этим pid запуском загрузки.
+
+    Нужна, чтобы отличить «работа ещё идёт» от «работы не было». По журналу это не
+    различить: пока транзакция не закоммичена, её записи не видны другим сессиям. А
+    различать обязательно — обрыв клиента запрос в Greenplum **не останавливает**
+    (проверено на боевом кластере), поэтому после падения воркера ETL продолжает работать
+    и закоммитится сам.
+
+    Смотрим `pg_stat_activity` на мастере: pid оттуда же, откуда его берёт `gp_exe`
+    (`pg_backend_pid()`). Отдельно сверяем текст запроса — pid переиспользуются, и без
+    этого чужая сессия сошла бы за нашу.
+    """
+    sql = """
+        select count(*)
+          from pg_stat_activity
+         where pid = %s
+           and query ilike '%%pr_swf_start_ctl%%'
+    """
+    ask = gp_exe.retry_with(stop=stop_after_attempt(2), wait=wait_fixed(2))
+    return bool(ask(sql=sql, val=(int(pid),), timeout=timeout))
+
+
 def gp_loading_result(lid: int, timeout: int = 30) -> dict | None:
     """Ответ Greenplum по загрузке из журнала движка — или None, если его там нет.
 

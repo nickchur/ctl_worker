@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-03 10:20 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 14:30 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -11,6 +11,7 @@
 | `ctl_conn_id` / `ctl_url` / `ctl_timeout` | CTL API |
 | `ctl_pool_slots` / `ctl_limit` / `ctl_days` | Лимиты CTL |
 | `tz` / `expire` | Часовой пояс и таймаут ожидания |
+| `orchestrator` / `pause_new_dags` | Кто владеет расписаниями (`ctl`/`mixed`/`af`) и пауза при создании дага |
 | `simulator` / `test_mode` / `test_sleep` | Отладочные режимы: генератор нагрузки и фиктивное выполнение. Действуют не на всех контурах — см. `ctl_test.py` и `ctl_worker.py` |
 | `CTL_PIN` | PIN подтверждения (скрыто) |
 """
@@ -104,6 +105,13 @@ conns = {
 SIMULATOR_MODES = ['off', 'event', 'dataset', 'trigger']
 TEST_MODES = ['off', 'ok', 'ok-no', 'ok-no-error']
 
+# Кто владеет расписаниями и зависимостями (openspec/project.md, этапы переноса).
+# Отсутствие ключа = mixed: выкладка кода поведения не меняет.
+ORCHESTRATOR_MODES = ['ctl', 'mixed', 'af']
+# Пауза при создании дага: auto разворачивается по режиму (ctl — нет, mixed — тем, чьё
+# расписание строит Airflow, af — всем), yes/no перебивают режим.
+PAUSE_NEW_MODES = ['auto', 'yes', 'no']
+
 config = {
     'profile': 'HR_Data',
     'root_entity': '941010000',
@@ -117,6 +125,8 @@ config = {
     'ctl_limit': 1000,  #сколько записей запросить из CTL
     'ctl_days': 5, #сколько дней назад запросить из CTL
     # 'ctl_task_timeout': 'hours=+5',
+    'orchestrator': 'mixed',   # кто владеет расписаниями: ctl / mixed / af
+    'pause_new_dags': 'auto',  # создавать даг запаузенным: auto по режиму, либо yes/no
     'simulator': 'off',        # генератор нагрузки, ctl_test.py: off/event/dataset/trigger
     'test_mode': 'off',        # фиктивное выполнение, ctl_worker.py: off/ok/ok-no/ok-no-error
     'test_sleep': 'minutes=45',# верхняя граница ожидания вместо процедуры воркфлоу
@@ -149,6 +159,12 @@ with DAG(f'CTL.{config["profile"]}.config',
         # Списком, а не руками: значения разбираются кодом, опечатка молча выключает режим.
         # В сам config кладутся простые строки — он же уходит в Variable, а Param не
         # сериализуется.
+        'orchestrator': Param(enum_default(config.get('orchestrator'), ORCHESTRATOR_MODES, 'mixed'),
+                              type='string', enum=ORCHESTRATOR_MODES,
+                              title='Кто владеет расписаниями (переключение перестроит все даги)'),
+        'pause_new_dags': Param(enum_default(config.get('pause_new_dags'), PAUSE_NEW_MODES, 'auto'),
+                                type='string', enum=PAUSE_NEW_MODES,
+                                title='Новый даг создаётся запаузенным'),
         'simulator': Param(enum_default(config.get('simulator'), SIMULATOR_MODES), type='string',
                            enum=SIMULATOR_MODES,
                            title='Симулятор нагрузки (event — только DEV)'),

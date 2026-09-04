@@ -31,11 +31,11 @@
 
 | Параметр | Описание |
 |---|---|
-| 🕐 `hours` | Окно отчёта, часов *(default: `24`)* |
-| 📈 `days` | Глубина разбивки по дням *(default: `7`)* |
+| 🕐 `hours` | Окно отчёта, часов *(default: `24`, максимум `168` — см. замеры в коде)* |
+| 📈 `days` | Глубина разбивки по дням *(default: `7`, максимум `30`)* |
 | 🔝 `top` | Сколько строк «даг · задача» показать *(default: `10`)* |
 | 🚨 `alert_after` | Порог: событий больше — таск краснеет; `0` — только показывать *(default: `0`)* |
-| ⏰ `schedule` | Расписание: cron или пресет, пусто — только вручную *(default: `30 6 * * *`)* |
+| ⏰ `schedule` | Расписание (МСК): cron или пресет, пусто — только вручную *(default: `30 6 * * *`)* |
 | 💾 `save_params` | Сохранить параметры запуска как значения по умолчанию *(default: `False`)* |
 
 Отчёт только читает журнал: ничего не удаляет и не правит. Чистит `log` отдельный даг —
@@ -59,6 +59,8 @@ except ImportError:
         TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, valid_schedule)
 
 logger = logging.getLogger("airflow.task")
+
+MSK = timezone(timedelta(hours=3))
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
@@ -122,15 +124,16 @@ def _fetch(sql: str, args: dict) -> list:
         # Отчёт не должен висеть на метабазе: журнал большой, а индексы по dttm и event
         # есть, так что укладываться обязан с запасом.
         session.execute(text("SET LOCAL statement_timeout = '60s'"))
-        result = session.execute(text(sql), args)
-        cols = list(result.keys())
-        return [dict(zip(cols, row)) for row in result.fetchall()]
+        return [dict(row) for row in session.execute(text(sql), args).mappings().all()]
 
 
+# Границу окна считаем один раз в Python и передаём во все запросы: иначе у числителя и
+# знаменателя оказался бы свой now(), и доля «сбоев на запусков» считалась бы по разным
+# отрезкам. Заодно схема указана явно — как у соседей (pg_activity, db_cleanup).
 SQL_BY_EVENT = """
 SELECT event, count(*) AS cnt
-  FROM log
- WHERE dttm > now() - make_interval(hours => :hours)
+  FROM main.log
+ WHERE dttm > :cutoff
    AND event = ANY(:events)
  GROUP BY event
  ORDER BY cnt DESC
@@ -139,28 +142,41 @@ SELECT event, count(*) AS cnt
 SQL_BY_TASK = """
 SELECT coalesce(dag_id, '—') AS dag_id, coalesce(task_id, '—') AS task_id,
        count(*) AS cnt, count(DISTINCT event) AS kinds, max(dttm) AS last_seen
-  FROM log
- WHERE dttm > now() - make_interval(hours => :hours)
+  FROM main.log
+ WHERE dttm > :cutoff
    AND event = ANY(:events)
- GROUP BY 1, 2
+ GROUP BY dag_id, task_id
  ORDER BY cnt DESC
  LIMIT :top
 """
 
 SQL_BY_DAY = """
 SELECT date_trunc('day', dttm)::date AS day, count(*) AS cnt
-  FROM log
- WHERE dttm > now() - make_interval(days => :days)
+  FROM main.log
+ WHERE dttm > :cutoff
    AND event = ANY(:events)
- GROUP BY 1
- ORDER BY 1
+ GROUP BY day
+ ORDER BY day
 """
 
 SQL_STARTS = """
 SELECT count(*) AS cnt
-  FROM log
- WHERE dttm > now() - make_interval(hours => :hours)
+  FROM main.log
+ WHERE dttm > :cutoff
    AND event = :starts
+"""
+
+# Сторож имён: события планировщика — константы Airflow, и при обновлении они могут
+# переехать. Тогда счётчик станет нулём, а отчёт напишет «чисто» — худший вид ошибки.
+# Ищем похожие по смыслу события, которых нет в наших списках.
+SQL_UNKNOWN = """
+SELECT event, count(*) AS cnt
+  FROM main.log
+ WHERE dttm > :cutoff
+   AND (event ILIKE '%stuck%' OR event ILIKE '%heartbeat%'
+        OR event ILIKE '%mismatch%' OR event ILIKE '%zombie%')
+   AND NOT (event = ANY(:known))
+ GROUP BY event
 """
 
 
@@ -185,22 +201,33 @@ SELECT count(*) AS cnt
         'execution_timeout': timedelta(minutes=5),
         'on_failure_callback': on_callback,
     },
-    start_date=datetime(2026, 9, 4, tzinfo=timezone.utc),
+    # Часовой пояс DAG-а берётся из start_date.tzinfo, поэтому расписание московское —
+    # как у соседей по каталогу (show_connections, test_connections).
+    start_date=datetime(2026, 9, 4, tzinfo=MSK),
     schedule=_schedule(),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
     tags=['DataLab', 'tools', 'check'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
+    # Потолок на прогон, а не только на таск: при max_active_runs=1 зависший прогон
+    # закрывает дорогу всем следующим — так же, как у сторожа метабазы.
+    dagrun_timeout=timedelta(minutes=30),
     params={
-        'hours': _param('hours', 24, type='integer', minimum=1, maximum=720,
-                        description='Окно отчёта, часов'),
-        'days': _param('days', 7, type='integer', minimum=1, maximum=90,
+        # Потолки замерены, а не выбраны на глаз. Запросы по событиям сбоев дёшевы:
+        # значения редкие, планировщик берёт индекс по event — разбивка по дням за 90
+        # суток укладывается в 2 мс. Дорог знаменатель: `running` пишется на каждый
+        # запуск, и он идёт по индексу dttm — на журнале в миллион строк это 0,5 с за
+        # сутки, 9 с за неделю и 41 с за месяц. Поэтому окно ограничено неделей: дальше
+        # отчёт перестаёт быть оперативным, а цена растёт линейно с объёмом журнала.
+        'hours': _param('hours', 24, type='integer', minimum=1, maximum=168,
+                        description='Окно отчёта, часов (максимум неделя)'),
+        'days': _param('days', 7, type='integer', minimum=1, maximum=30,
                        description='Глубина разбивки по дням'),
         'top': _param('top', 10, type='integer', minimum=1, maximum=50,
                       description='Сколько строк «даг · задача» показать'),
         'alert_after': _param('alert_after', 0, type='integer', minimum=0,
-                              description='Событий больше — краснеть; 0 — только показывать'),
+                              description='Строго больше этого числа — краснеть; 0 — только показывать'),
         'schedule': _param('schedule', DEFAULT_SCHEDULE, type=['string', 'null'],
                            description='Расписание: cron или пресет, пусто — только вручную'),
         'save_params': Param(False, type='boolean',
@@ -210,14 +237,19 @@ SELECT count(*) AS cnt
 def tools_log_events():
 
     @task(task_id='params')
-    def save(**context) -> str:
+    def save_params(**context) -> str:
         """💾 Сохраняет параметры запуска как значения по умолчанию."""
-        from airflow.exceptions import AirflowSkipException
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
 
         status, msg = store_params(PARAMS_VAR, SAVED, context)
         if status == 'skip':
             raise AirflowSkipException(msg)
-        add_note(msg, context, level='task')
+        # Негодное расписание переменную не переписывает, и таск обязан упасть: битое
+        # значение уронило бы разбор файла и убрало из UI саму форму, через которую его
+        # можно починить (см. спеку check, сценарий «Негодное расписание в форме»).
+        if status == 'fail':
+            raise AirflowFailException(msg)
+        add_note(msg, context=context, level='task')
         return msg
 
     @task(task_id='collect', trigger_rule=TriggerRule.NONE_FAILED)
@@ -225,17 +257,28 @@ def tools_log_events():
         """🔎 Считает события за окно: всего, по дагам, по дням, и запуски для доли."""
         p = context['params']
         hours, days, top = int(p['hours']), int(p['days']), int(p['top'])
-        events = list(INCIDENTS)
+        events, ours = list(INCIDENTS), list(OURS)
 
-        by_event = _fetch(SQL_BY_EVENT, {'hours': hours, 'events': events})
-        by_task = _fetch(SQL_BY_TASK, {'hours': hours, 'events': events, 'top': top})
-        by_day = _fetch(SQL_BY_DAY, {'days': days, 'events': events})
-        starts = _fetch(SQL_STARTS, {'hours': hours, 'starts': STARTS})
+        # Один момент времени на все запросы: иначе числитель и знаменатель считались бы
+        # по разным отрезкам, а доля — это ключевая цифра отчёта.
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=hours)
+        cutoff_days = now - timedelta(days=days)
+
+        by_event = _fetch(SQL_BY_EVENT, {'cutoff': cutoff, 'events': events})
+        by_task = _fetch(SQL_BY_TASK, {'cutoff': cutoff, 'events': events, 'top': top})
+        by_day = _fetch(SQL_BY_DAY, {'cutoff': cutoff_days, 'events': events})
+        starts = _fetch(SQL_STARTS, {'cutoff': cutoff, 'starts': STARTS})
 
         # Те же запросы по нашим событиям: отдельный счётчик и отдельный список дагов.
-        ours = list(OURS)
-        ours_by_event = _fetch(SQL_BY_EVENT, {'hours': hours, 'events': ours})
-        ours_by_task = _fetch(SQL_BY_TASK, {'hours': hours, 'events': ours, 'top': top})
+        ours_by_event = _fetch(SQL_BY_EVENT, {'cutoff': cutoff, 'events': ours})
+        ours_by_task = _fetch(SQL_BY_TASK, {'cutoff': cutoff, 'events': ours, 'top': top})
+
+        # Сторож имён: если Airflow переименует событие, наш счётчик молча станет нулём.
+        unknown = _fetch(SQL_UNKNOWN, {'cutoff': cutoff, 'known': events + ours + [STARTS]})
+        for r in unknown:
+            logger.warning("⚠️ похожее событие вне наших списков: %s (%s) — "
+                           "проверьте имена в INCIDENTS", r['event'], r['cnt'])
 
         total = sum(int(r['cnt']) for r in by_event)
         runs = int(starts[0]['cnt']) if starts else 0
@@ -244,8 +287,10 @@ def tools_log_events():
         share = round(100.0 * total / runs, 2) if runs else None
 
         snapshot = {
-            'ts': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            'ts': now.strftime('%Y-%m-%d %H:%M:%S'),
             'window_hours': hours,
+            'window_days': days,
+            'unknown_events': {r['event']: int(r['cnt']) for r in unknown},
             'total': total,
             'runs': runs,
             'share_pct': share,
@@ -305,7 +350,7 @@ def tools_log_events():
             # не здоровье, а простой, и заметка обязана их различать.
             msg = f"✅ чисто: {head}"
             add_note({msg: ours} if ours else msg,
-                     context, level='task,dag', title='📊 log_events')
+                     context=context, level='task,dag', title='📊 log_events')
             return msg
 
         lines = [f"{k}: {v}" for k, v in snapshot['by_event'].items()]
@@ -313,16 +358,17 @@ def tools_log_events():
                   for r in snapshot['by_task']]
         by_day = snapshot['by_day']
         if by_day:
-            lines.append("по дням: " + ", ".join(f"{d[5:]}={n}" for d, n in by_day.items()))
+            lines.append(f"по дням (за {snapshot['window_days']} д): "
+                         + ", ".join(f"{d[5:]}={n}" for d, n in by_day.items()))
 
-        add_note({f"⚠️ {head}": lines + ours}, context, level='task,dag', title='📊 log_events')
+        add_note({f"⚠️ {head}": lines + ours}, context=context, level='task,dag', title='📊 log_events')
 
         if limit and total > limit:
             raise AirflowFailException(f"⚠️ {head} — больше порога {limit}\n" + "\n".join(lines))
         return head
 
     snapshot = collect()
-    save() >> snapshot >> report(snapshot)
+    save_params() >> snapshot >> report(snapshot)
 
 
 tools_log_events()

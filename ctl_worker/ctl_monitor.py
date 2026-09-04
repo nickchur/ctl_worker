@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-04 13:00 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 14:03 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -292,10 +292,27 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     # 'msg': f'{msg}',
                 }
                 
+                # Кого считаем ждущим паузы: только тех, кому есть куда ехать прямо
+                # сейчас. Таких два рода, и одного признака мало:
+                #
+                #   * посчитанное действие — New (запустит сенсор), reRunned и reStarted
+                #     (перезапустит монитор);
+                #   * RUNNING с пустым логом — CTL считает загрузку идущей, а воркер её
+                #     даже не начинал. Это и есть типичный ждун паузы: сенсор пропустил
+                #     запуск, лог писать некому. По действию его не поймать — монитор
+                #     помечает такие Skipped и оставляет сенсору.
+                #
+                # Всё остальное паузы не ждёт: выполняющаяся загрузка (лог RUN),
+                # доигрывающая (Completed, Aborted), спящая по таймеру (TIME-WAIT до
+                # срока). Попади они в список — заметка кричала бы на нормальную работу,
+                # и дежурный перестал бы её читать.
+                #
                 # Возраст берём тот же, что и у SLA: время с последней смены статуса
                 # загрузки. «Ждёт снятия паузы 4 часа» — это про загрузку, а не про ран.
-                if running or sts in ('RUNNING', 'TIME-WAIT', 'EVENT-WAIT'):
-                    paused_wait[lid] = (f'CTL.{wfn}', wfn, r['time'])
+                if action in ('New', 'reRunned', 'reStarted') or (sts == 'RUNNING' and not log):
+                    # Четвёртым — сам интервал: показывать надо старейших, а по строке
+                    # возраста («2 d 03:14» против «12:40») их не отсортировать.
+                    paused_wait[lid] = (f'CTL.{wfn}', wfn, r['time'], t)
 
                 if action in ['Skipped', 'New']:
                     continue
@@ -321,15 +338,28 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         # на каждую загрузку, а их до ctl_limit за круг.
         if paused_wait:
             with create_session() as session:
+                # is_active обязателен: у выпавшего из ctl_workflows воркфлоу строка в dag
+                # остаётся, и без фильтра его загрузка попала бы в «ждут снятия паузы»
+                # вместо диагностики пропавшего дага — а ждать ей нечего.
                 paused = {r[0] for r in session.query(DagModel.dag_id).filter(
-                    DagModel.dag_id.in_(sorted({d for d, _, _ in paused_wait.values()})),
+                    DagModel.dag_id.in_(sorted({v[0] for v in paused_wait.values()})),
                     DagModel.is_paused.is_(True),
+                    DagModel.is_active.is_(True),
                 ).all()}
-            waiting = {lid: f"⏸️ {wfn} {age}"
-                       for lid, (dag_id, wfn, age) in paused_wait.items() if dag_id in paused}
+            waiting = {lid: (f"⏸️ {wfn} {age}", t)
+                       for lid, (dag_id, wfn, age, t) in paused_wait.items() if dag_id in paused}
             if waiting:
-                logger.warning("⏸️ ждут снятия паузы: %d загрузок", len(waiting))
-                add_note(waiting, context, level='Task,DAG', title='⏸️ Ждут снятия паузы')
+                logger.warning("⏸️ ждут снятия паузы: %d загрузок: %s", len(waiting),
+                               {lid: v[0] for lid, v in waiting.items()})
+                # В заметку — счёт и десяток старейших. Целиком список туда не влезет:
+                # заметка обрезается по MAX_NOTE_LEN, и длинный список вытеснил бы Action
+                # и Status, записанные в тот же тик. Полный — в логе таска.
+                top = {lid: v[0] for lid, v in
+                       sorted(waiting.items(), key=lambda kv: kv[1][1], reverse=True)[:10]}
+                if len(waiting) > len(top):
+                    top['…'] = f"и ещё {len(waiting) - len(top)}; полный список в логе таска"
+                add_note(top, context, level='Task,DAG',
+                         title=f'⏸️ Ждут снятия паузы: {len(waiting)}')
 
         chk_any_conn('ctl', **context)
         

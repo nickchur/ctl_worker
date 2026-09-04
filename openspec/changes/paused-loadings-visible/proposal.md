@@ -42,5 +42,7 @@
 
 - Спецификация: `ctl-worker`
 - Код: `ctl_worker/ctl_sensor.py`, `ctl_worker/ctl_monitor.py`
-- Счёт этих пропусков числом добавляется в отчёт `check/log_events.py` отдельно: файл
-  ещё не в master (PR #34)
+- Документация: `ctl_worker/readme.md`
+- Событие `ctl dag paused` считает отчёт `check/log_events.py` (влит с PR #34) — оно
+  перечислено там как наше, а не как сбой Airflow
+- Порядок вливания: после PR #36, у них общие файлы (`ctl_monitor.py`, readme)

@@ -48,7 +48,8 @@ from pprint import PrettyPrinter
 
 
 from plugins.utils import add_note, env_stand, on_callback, str2timedelta, update_dag_pause, safe_eval, readable  # type: ignore
-from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
+from plugins.ctl_utils import (get_config, gp_exe, gp_loading_result, ctl_obj_load, ctl_api,  # type: ignore
+                               eval_delta, gp_upload_s3_csv)
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
 from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
                               ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed, ctl_loading_snapshot)
@@ -832,7 +833,10 @@ def build_worker_dag(w):
                 ctl_set_status(lid, 'RUNNING', f"RUN {retry}")
                 
 
-        @task(pool='gp_pool', sla=sla_time, retries=0) # execution_timeout=exe_task_to,)  retries=0: pr_swf_start_ctl неидемпотентна — ретрай = повторный ETL (повторы делает CTL через TIME-WAIT)
+        # retries=1 — не для повтора ETL, а чтобы подобрать потерянный ответ: pr_swf_start_ctl
+        # по-прежнему неидемпотентна, и повторная попытка её не зовёт (см. ниже). Повторами
+        # самой загрузки распоряжается CTL через TIME-WAIT.
+        @task(pool='gp_pool', sla=sla_time, retries=1) # execution_timeout=exe_task_to,)
         def run_exe(wf, **context):
             """### Выполнение бизнес-логики в Greenplum
 
@@ -859,6 +863,31 @@ def build_worker_dag(w):
             sdt = wf_prm.get('af_sdt', '')
             exe = wf_prm.get('wf_exe', wf_prm.get('wf_exec')) or f'pr_{wf_name}()'
             
+            # Повторная попытка ETL не запускает. Она отвечает на единственный вопрос: не
+            # выполнилась ли загрузка в прошлый раз до конца. Ответ достоверен потому, что
+            # функция в Greenplum атомарна (коммита внутри функции там нет) и свой ответ
+            # кладёт в журнал той же транзакцией: запись есть — работа закоммичена, записи
+            # нет — всё откачено. Чаще всего сюда попадают из-за обрыва в самом конце, когда
+            # Greenplum отправлял результат, а воркера уже убили по OOM или рестарту.
+            if ti.try_number > 1:
+                try:
+                    done = gp_loading_result(lid)
+                except Exception as e:
+                    # Неизвестность трактуем как «работа могла быть выполнена»: запустить
+                    # ETL заново здесь дороже, чем отдать загрузку на разбор в CTL.
+                    raise AirflowFailException(
+                        f"⚠️ Повтор {ti.try_number}: журнал Greenplum недоступен "
+                        f"({type(e).__name__}: {e}) — ETL заново не запускаем") from e
+                if not done:
+                    raise AirflowFailException(
+                        f"⚠️ Повтор {ti.try_number}: ответа по загрузке {lid} в журнале "
+                        "Greenplum нет — транзакция откачена, работа не выполнялась. "
+                        "Повтор загрузки остаётся за CTL")
+                done['ts'] = 'подобран из журнала GP'
+                ti.xcom_push(key='result', value=done)
+                add_note(done, context, level='task,DAG', title='Result (ответ подобран из журнала GP)')
+                return
+
             # Проверяем статус загрузки
             st, ld_sts = ctl_chk_status(lid, wf['name'], alive='ACTIVE', status='RUNNING', step='RUN')
             raise_status(st, ld_sts)
@@ -926,7 +955,10 @@ def build_worker_dag(w):
             # return eids
 
         if wf_tfs_out:
-            @task(pool='gp_pool', outlets=[ DatasetAlias(f"TFS/{profile}/{wf_tfs_out}") ],)
+            # Без пула намеренно: тело пустое, в Greenplum таск не ходит, а слотов в
+            # gp_pool меньше, чем разрешено запросов в самом Greenplum — они оставлены под
+            # короткие служебные запросы, и занимать их публикацией датасета незачем.
+            @task(outlets=[ DatasetAlias(f"TFS/{profile}/{wf_tfs_out}") ],)
             def run_out(wf, **context):
                 pass
 

@@ -337,6 +337,37 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
         raise
 
 
+def gp_loading_result(lid, timeout=60):
+    """Ответ Greenplum по загрузке из журнала движка — или None, если его там нет.
+
+    Нужна там, где ответ `pr_swf_start_ctl` потерян: соединение оборвалось, процесс убили.
+    Спрашивать журнал имеет смысл потому, что функция в Greenplum атомарна — коммита внутри
+    функции там нет, вся работа идёт одной транзакцией, — а свой ответ она кладёт в журнал
+    **той же транзакцией** (`pr_swf_log_action('end'|'cancel'|'error', ...)`). Поэтому
+    состояний ровно два: запись есть — работа выполнена и закоммичена, записи нет — всё
+    откачено и не произошло ничего. Промежуточного не бывает.
+
+    Отсюда же следует, чего эта справка НЕ умеет: пока транзакция не закоммичена, её
+    записи не видны другим сессиям, так что «загрузка идёт прямо сейчас» и «загрузка не
+    начиналась» отсюда неотличимы. Вопрос, на который здесь есть ответ, ровно один —
+    «выполнилась ли она».
+
+    Таймаут короткий: это справка, а не работа, и ждать её три часа незачем.
+    """
+    sql = """
+        select end_msg
+          from vw_swf_ctl_log
+         where loading_id = %s
+           and end_id is not null
+         order by beg_ts desc
+         limit 1
+    """
+    res = gp_exe(sql=sql, val=(int(lid),), timeout=timeout)
+    if res and isinstance(res, str):
+        res = json.loads(res)
+    return res or None
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=5, max=30),

@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-04 15:30 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 15:53 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -25,16 +25,24 @@
 инфраструктуры, а решение человека. Но и молчать о них нельзя: из-за паузы загрузка стоит,
 и «сколько раз за сутки» — это и есть ответ на «часто ли».
 
+**Событие и задача — разные вещи.** О зависшей задаче планировщик пишет не однажды, а на
+каждом круге проверки: одна мёртвая задача даёт тысячи записей. Поэтому рядом с числом
+событий всегда стоит число различных попыток — даг, задача, прогон, индекс отображения,
+номер попытки, — и доля с порогом считаются по ним. Само число событий никуда не девается:
+по его отношению к числу задач залипание как раз и видно.
+
 **Знаменатель обязателен.** Десять сбоев на четыре тысячи запусков и десять на сорок —
 разные новости, поэтому рядом всегда стоит число запусков за то же окно (события
-`running`) и доля.
+`running`) и доля. Совпадение единиц при этом неполное: часть сбоев относится к попыткам,
+которые так и не стартовали, а значит в знаменатель не попали. Доля — оценка порядка, а не
+строгая часть целого.
 
 | Параметр | Описание |
 |---|---|
 | 🕐 `hours` | Окно отчёта, часов *(default: `24`, максимум `168` — см. замеры в коде)* |
 | 📈 `days` | Глубина разбивки по дням *(default: `7`, максимум `30`)* |
 | 🔝 `top` | Сколько строк «даг · задача» показать *(default: `10`)* |
-| 🚨 `alert_after` | Порог: событий больше — таск краснеет; `0` — только показывать *(default: `0`)* |
+| 🚨 `alert_after` | Порог: **задач** больше — таск краснеет; `0` — только показывать *(default: `0`)* |
 | ⏰ `schedule` | Расписание (МСК): cron или пресет, пусто — только вручную *(default: `30 6 * * *`)* |
 | 💾 `save_params` | Сохранить параметры запуска как значения по умолчанию *(default: `False`)* |
 
@@ -86,7 +94,9 @@ OURS = (
 )
 
 # Чем задача начинается: по этим записям считаем знаменатель. Событие пишется на каждый
-# запуск таска, поэтому «сбоев на запусков» получается честной долей.
+# запуск попытки, то есть знаменатель считает то же, что и числитель после перехода на
+# задачи. Вложенность при этом неполная: попытка, застрявшая в очереди и не стартовавшая,
+# в числитель попадёт, а в знаменатель нет — поэтому доля читается как оценка порядка.
 STARTS = 'running'
 
 PARAMS_VAR = 'tools_log_events_params'
@@ -148,8 +158,24 @@ def _fetch(sql: str, args: dict) -> list:
 # Границу окна считаем один раз в Python и передаём во все запросы: иначе у числителя и
 # знаменателя оказался бы свой now(), и доля «сбоев на запусков» считалась бы по разным
 # отрезкам. Заодно схема указана явно — как у соседей (pg_activity, db_cleanup).
+# Задача считается по адресу попытки: даг, задача, прогон, индекс отображения, номер
+# попытки. `count(DISTINCT (...))` по кортежу — конструкция PostgreSQL (row value
+# expression), не общий SQL; на другой БД пришлось бы склеивать ключ строкой.
+#
+# Общий счётчик задач берётся отдельным запросом, а не суммой по видам событий: одна
+# попытка может дать и потерю хартбита, и расхождение состояния, и в сумме по видам она
+# посчиталась бы дважды.
+SQL_TOTALS = """
+SELECT count(*) AS cnt,
+       count(DISTINCT (dag_id, task_id, run_id, map_index, try_number)) AS tasks
+  FROM main.log
+ WHERE dttm > :cutoff
+   AND event = ANY(:events)
+"""
+
 SQL_BY_EVENT = """
-SELECT event, count(*) AS cnt
+SELECT event, count(*) AS cnt,
+       count(DISTINCT (dag_id, task_id, run_id, map_index, try_number)) AS tasks
   FROM main.log
  WHERE dttm > :cutoff
    AND event = ANY(:events)
@@ -159,7 +185,9 @@ SELECT event, count(*) AS cnt
 
 SQL_BY_TASK = """
 SELECT coalesce(dag_id, '—') AS dag_id, coalesce(task_id, '—') AS task_id,
-       count(*) AS cnt, count(DISTINCT event) AS kinds, max(dttm) AS last_seen
+       count(*) AS cnt, count(DISTINCT event) AS kinds,
+       count(DISTINCT (run_id, map_index, try_number)) AS tasks,
+       max(dttm AT TIME ZONE INTERVAL '+03:00') AS last_seen
   FROM main.log
  WHERE dttm > :cutoff
    AND event = ANY(:events)
@@ -169,7 +197,9 @@ SELECT coalesce(dag_id, '—') AS dag_id, coalesce(task_id, '—') AS task_id,
 """
 
 SQL_BY_DAY = """
-SELECT date_trunc('day', dttm)::date AS day, count(*) AS cnt
+SELECT date_trunc('day', dttm AT TIME ZONE INTERVAL '+03:00')::date AS day,
+       count(*) AS cnt,
+       count(DISTINCT (dag_id, task_id, run_id, map_index, try_number)) AS tasks
   FROM main.log
  WHERE dttm > :cutoff
    AND event = ANY(:events)
@@ -241,6 +271,11 @@ SELECT event, count(*) AS cnt
         # запуск, и он идёт по индексу dttm — на журнале в миллион строк это 0,5 с за
         # сутки, 9 с за неделю и 41 с за месяц. Поэтому окно ограничено неделей: дальше
         # отчёт перестаёт быть оперативным, а цена растёт линейно с объёмом журнала.
+        #
+        # `count(DISTINCT (...))` цену не изменил: он считается по той же редкой выборке
+        # по индексу event. Замер на журнале в 992 тысячи строк — итоги 3,8 мс, по видам
+        # 0,6 мс, по дагам 0,9 мс, по дням 0,7 мс; знаменатель, куда DISTINCT не
+        # добавляется, по-прежнему самый дорогой — 62 мс за сутки.
         'hours': _param('hours', 24, type='integer', minimum=1, maximum=168,
                         description='Окно отчёта, часов (максимум неделя)'),
         'days': _param('days', 7, type='integer', minimum=1, maximum=30,
@@ -248,7 +283,7 @@ SELECT event, count(*) AS cnt
         'top': _param('top', 10, type='integer', minimum=1, maximum=50,
                       description='Сколько строк «даг · задача» показать'),
         'alert_after': _param('alert_after', 0, type='integer', minimum=0,
-                              description='Строго больше этого числа — краснеть; 0 — только показывать'),
+                              description='Строго больше этого числа ЗАДАЧ — краснеть; 0 — только показывать'),
         'schedule': _param('schedule', DEFAULT_SCHEDULE, type=['string', 'null'],
                            description='Расписание: cron или пресет, пусто — только вручную'),
         'save_params': Param(False, type='boolean',
@@ -286,6 +321,7 @@ def tools_log_events():
         cutoff = now - timedelta(hours=hours)
         cutoff_days = now - timedelta(days=days)
 
+        totals = _fetch(SQL_TOTALS, {'cutoff': cutoff, 'events': events})
         by_event = _fetch(SQL_BY_EVENT, {'cutoff': cutoff, 'events': events})
         by_task = _fetch(SQL_BY_TASK, {'cutoff': cutoff, 'events': events, 'top': top})
         by_day = _fetch(SQL_BY_DAY, {'cutoff': cutoff_days, 'events': events})
@@ -300,35 +336,43 @@ def tools_log_events():
         if (drift := names_drifted()):
             logger.warning("⚠️ %s — проверьте INCIDENTS", drift)
 
-        total_incidents = sum(int(r['cnt']) for r in by_event)
+        total = int(totals[0]['cnt']) if totals else 0
+        tasks = int(totals[0]['tasks']) if totals else 0
         unknown = []
-        if not total_incidents:
+        if not total:
             unknown = _fetch(SQL_UNKNOWN, {'cutoff': cutoff, 'known': events + ours + [STARTS]})
             for r in unknown:
                 logger.warning("⚠️ похожее событие вне наших списков: %s (%s) — "
                                "проверьте имена в INCIDENTS", r['event'], r['cnt'])
 
-        total = sum(int(r['cnt']) for r in by_event)
         runs = int(starts[0]['cnt']) if starts else 0
         # Доля без знаменателя не считается: ноль запусков — это не «идеальное здоровье»,
-        # а «ничего не запускалось», и путать их нельзя.
-        share = round(100.0 * total / runs, 2) if runs else None
+        # а «ничего не запускалось», и путать их нельзя. Считается по задачам: доля по
+        # событиям мерила бы частоту опроса планировщика, а не здоровье контура.
+        share = round(100.0 * tasks / runs, 2) if runs else None
 
         snapshot = {
-            'ts': now.strftime('%Y-%m-%d %H:%M:%S'),
+            # Момент сбора — московский, как и last_seen из запросов: иначе рядом в одном
+            # снимке стоят два разных пояса и сравнить их глазами нельзя. Арифметика окна
+            # при этом остаётся в UTC — cutoff считается от `now`.
+            'ts': now.astimezone(MSK).strftime('%Y-%m-%d %H:%M:%S'),
             'window_hours': hours,
             'window_days': days,
             'unknown_events': {r['event']: int(r['cnt']) for r in unknown},
             'total': total,
+            'tasks': tasks,
             'runs': runs,
             'share_pct': share,
-            'by_event': {r['event']: int(r['cnt']) for r in by_event},
+            'by_event': {r['event']: {'cnt': int(r['cnt']), 'tasks': int(r['tasks'])}
+                         for r in by_event},
             'by_task': [
                 {'dag_id': r['dag_id'], 'task_id': r['task_id'], 'cnt': int(r['cnt']),
-                 'kinds': int(r['kinds']), 'last_seen': str(r['last_seen'])[:19]}
+                 'kinds': int(r['kinds']), 'tasks': int(r['tasks']),
+                 'last_seen': str(r['last_seen'])[:19]}
                 for r in by_task
             ],
-            'by_day': {str(r['day']): int(r['cnt']) for r in by_day},
+            'by_day': {str(r['day']): {'cnt': int(r['cnt']), 'tasks': int(r['tasks'])}
+                       for r in by_day},
             'ours_total': sum(int(r['cnt']) for r in ours_by_event),
             'ours_by_event': {r['event']: int(r['cnt']) for r in ours_by_event},
             # task_id здесь нет намеренно: событие пишет сенсор, а dag_id в нём — это даг
@@ -340,13 +384,14 @@ def tools_log_events():
             ],
         }
 
-        logger.info("🔎 за %d ч: событий %d, запусков %d, доля %s%%",
-                    hours, total, runs, share if share is not None else '—')
+        logger.info("🔎 за %d ч: событий %d, задач %d, запусков %d, доля %s%%",
+                    hours, total, tasks, runs, share if share is not None else '—')
         for r in by_event:
-            logger.warning("⚠️ %s: %s", r['event'], r['cnt'])
+            logger.warning("⚠️ %s: %s (задач %s)", r['event'], r['cnt'], r['tasks'])
         for r in snapshot['by_task']:
-            logger.warning("   %s.%s — %d (видов %d, последнее %s)",
-                           r['dag_id'], r['task_id'], r['cnt'], r['kinds'], r['last_seen'])
+            logger.warning("   %s.%s — %d (задач %d, видов %d, последнее %s)",
+                           r['dag_id'], r['task_id'], r['cnt'], r['tasks'], r['kinds'],
+                           r['last_seen'])
 
         if snapshot['ours_total']:
             logger.warning("⏸️ наши события: %d %s", snapshot['ours_total'], snapshot['ours_by_event'])
@@ -361,11 +406,17 @@ def tools_log_events():
 
         p = context['params']
         limit = int(p['alert_after'])
-        total, runs = snapshot['total'], snapshot['runs']
+        total, tasks, runs = snapshot['total'], snapshot['tasks'], snapshot['runs']
         share = snapshot['share_pct']
 
+        # Оба числа рядом и в этом порядке: событий много, задач мало, и разница между
+        # ними — сама по себе диагноз. Порог сравнивается с задачами (см. ниже).
+        # Форма «задач N» вместо «на N задачах» — чтобы не склонять числительное:
+        # «на 1 задачах» читается как опечатка, а согласовывать род и число ради одной
+        # строки сводки дороже, чем обойти согласование.
         head = (f"за {snapshot['window_hours']} ч: сбоев доставки {total}, "
-                f"запусков {runs}" + (f", доля {share}%" if share is not None else ""))
+                f"задач {tasks}, запусков {runs}"
+                + (f", доля {share}%" if share is not None else ""))
 
         # Наши события идут отдельной строкой и порог не трогают: запаузенный даг это не
         # поломка доставки, а решение человека. Но молчать о них нельзя — из-за паузы
@@ -384,22 +435,28 @@ def tools_log_events():
                      context=context, level='task,dag', title='📊 log_events ')
             return msg
 
-        lines = [f"{k}: {v}" for k, v in snapshot['by_event'].items()]
-        lines += [f"{r['dag_id']}.{r['task_id']} — {r['cnt']} (последнее {r['last_seen']})"
+        lines = [f"{k}: {v['cnt']} (задач {v['tasks']})"
+                 for k, v in snapshot['by_event'].items()]
+        lines += [f"{r['dag_id']}.{r['task_id']} — {r['cnt']} "
+                  f"(задач {r['tasks']}, последнее {r['last_seen']})"
                   for r in snapshot['by_task']]
         by_day = snapshot['by_day']
         if by_day:
             # Сколько дней реально вернулось: журнал чистит db_cleanup по своему
             # retention_days, и «за 30 д» с четырнадцатью датами читатель иначе примет
             # за отсутствие сбоев, а не за отсутствие данных.
-            lines.append(f"по дням (за {snapshot['window_days']} д, дней с данными "
-                         f"{len(by_day)}): "
-                         + ", ".join(f"{d[5:]}={n}" for d, n in by_day.items()))
+            lines.append(f"по дням (за {snapshot['window_days']} д, события·задачи, "
+                         f"дней с данными {len(by_day)}): "
+                         + ", ".join(f"{d[5:]}={v['cnt']}·{v['tasks']}"
+                                     for d, v in by_day.items()))
 
         add_note({f"⚠️ {head}": lines + ours}, context=context, level='task,dag', title='📊 log_events ')
 
-        if limit and total > limit:
-            raise AirflowFailException(f"⚠️ {head} — больше порога {limit}\n" + "\n".join(lines))
+        # Порог — по задачам, а не по событиям: о зависшей задаче планировщик пишет на
+        # каждом круге, и порог по событиям меряет частоту его опроса, а не контур.
+        if limit and tasks > limit:
+            raise AirflowFailException(f"⚠️ {head} — задач больше порога {limit}\n"
+                                       + "\n".join(lines))
         return head
 
     snapshot = collect()

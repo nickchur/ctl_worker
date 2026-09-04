@@ -122,7 +122,6 @@ def pause_reason(dag_id: str):
             'снимать за человека нельзя')
 
 
-
 def note_paused_event(dag_id: str, msg: str, every_min: int = 60):
     """Пишет в журнал метабазы событие о пропуске — но не чаще раза в час на даг.
 

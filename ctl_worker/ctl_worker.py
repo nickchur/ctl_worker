@@ -581,9 +581,17 @@ def build_worker_dag(w):
                 
             if not params.get('start_wf'):
                 msg = '⚠️ Задание не запущено.'
-                if schedule_wf and not wf['scheduled']: 
-                    ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
-                    msg += ' ⏰ Задание поставлено на расписание.'
+                if schedule_wf and not wf['scheduled']:
+                    # Ставить расписание в CTL, когда расписаниями владеет Airflow, — это
+                    # своими руками сделать двойной запуск: тот же воркфлоу поедет и по
+                    # расписанию дага, и по загрузке из CTL. Снятие расписания при этом
+                    # разрешено: оно ведёт ровно в ту сторону, куда идёт режим.
+                    if ORCHESTRATOR == 'af':
+                        msg += (' ⏸️ Расписание в CTL не поставлено: в режиме af им владеет '
+                                'Airflow, и вторая постановка дала бы двойной запуск.')
+                    else:
+                        ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
+                        msg += ' ⏰ Задание поставлено на расписание.'
                 elif not schedule_wf and wf['scheduled']: 
                     ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
                     msg += ' 💀 Задание снято с расписания.'
@@ -660,7 +668,10 @@ def build_worker_dag(w):
                 prm['wfp_run_type'] = run_type
                 # ctl_api(f'/v4/api/wf/{wid}/scheduled','delete')
 
-                new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={schedule_wf}", "post", json=prm)
+                # scheduleAfterStart вернул бы расписание в CTL после запуска — в режиме af
+                # это та же двойная оркестрация, только отложенная.
+                sched_after = schedule_wf and ORCHESTRATOR != 'af'
+                new_lid = ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={sched_after}", "post", json=prm)
                 lid = int(new_lid['loadingId'])
                 ctl_set_status(lid, 'RUNNING', 'NEW-AF ' + context['dag_run'].run_id)
                 

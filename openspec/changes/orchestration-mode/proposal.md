@@ -45,6 +45,10 @@
 ## Impact
 
 - Спецификация: `ctl-worker`
-- Код: `ctl_worker/ctl_worker.py` (фабрика), `ctl_worker/ctl_config.py` (форма)
-- Конфигурация: новые ключи `orchestrator` и `pause_new_dags`
+- Код: `ctl_worker/ctl_worker.py` (фабрика и галка расписания в `run_prm`),
+  `ctl_worker/ctl_config.py` (форма)
+- Конфигурация: новые ключи `orchestrator` и `pause_new_dags`; оба сохраняются формой
+  `ctl_config`, а она целиком защищена PIN — отдельной защиты ключам не требуется
+- Соседи, читающие `scheduled` (`ctl_loader`, `ctl_monitor`, `ctl_yml`): правок не требуют,
+  разбор каждого — в `design.md`, раздел «Взаимодействие с существующими модулями»
 - Миграция: переключение режима перестраивает расписания всех дагов профиля

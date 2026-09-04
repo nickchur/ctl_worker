@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-04 09:40 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-04 10:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -34,7 +34,7 @@
 **Таски:** `params` → `collect` → `report`.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 
 from airflow.decorators import dag, task
@@ -153,6 +153,18 @@ SELECT count(*) AS cnt
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 0,
+        # 900: выше регрессионных прогонов того же пула (у них приоритета нет),
+        # ниже агента CTL (999/1000) — тот двигает боевые загрузки, и обгонять
+        # его диагностике незачем.
+        #
+        # absolute обязателен: правило по умолчанию (downstream) складывает вес
+        # вниз по цепочке, и первый таск получил бы 2700 вместо 900 — сравнение с
+        # соседями стало бы зависеть от длины цепочки, а не от намерения.
+        'priority_weight': 900,
+        'weight_rule': 'absolute',
+        # Запросы идут по индексам dttm и event; пять минут — это про зависание,
+        # а не про медленный ответ.
+        'execution_timeout': timedelta(minutes=5),
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 9, 4, tzinfo=timezone.utc),

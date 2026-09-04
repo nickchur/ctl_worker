@@ -9,7 +9,7 @@
 | `off` (умолчание) | ничего, таск уходит в пропуск |
 | `event` | POST значений событий в CTL API — **только DEV** |
 | `dataset` | публикует Dataset-сигналы в Airflow |
-| `trigger` | случайно запускает даги воркфлоу через `trigger_dag` |
+| `trigger` | случайно запускает даги воркфлоу через `trigger_dag` — только те, что реально поедут: не на паузе, активные, сериализованные |
 
 ⚠️ Запуск дага воркфлоу — это **настоящая загрузка в CTL**: `run_prm` создаёт её через
 `POST /v4/api/wf/{wid}/loading`. Поэтому симулятор существует только на DEV, IFT и PSI, а
@@ -77,18 +77,19 @@ def runnable_dags(dag_ids: list) -> set:
     if not dag_ids:
         return set()
 
-    ids = sorted(set(dag_ids))
+    # Два запроса, оба пакетом на весь список, а не по одному на кандидата. sorted —
+    # ради детерминизма в логах: на план запроса порядок не влияет.
     with create_session() as session:
-        alive = {r[0] for r in session.query(DagModel.dag_id).filter(
-            DagModel.dag_id.in_(ids),
+        active = {r[0] for r in session.query(DagModel.dag_id).filter(
+            DagModel.dag_id.in_(sorted(set(dag_ids))),
             DagModel.is_paused.is_(False),
             DagModel.is_active.is_(True),
         ).all()}
-        if not alive:
+        if not active:
             return set()
-        serialized = {r[0] for r in session.query(SerializedDagModel.dag_id).filter(
-            SerializedDagModel.dag_id.in_(sorted(alive))).all()}
-    return alive & serialized
+        # Второй запрос уже сужен списком active, поэтому его результат и есть ответ.
+        return {r[0] for r in session.query(SerializedDagModel.dag_id).filter(
+            SerializedDagModel.dag_id.in_(sorted(active))).all()}
 
 
 # Симулятор существует не везде: даг воркфлоу, запущенный отсюда, создаёт настоящую
@@ -181,18 +182,36 @@ else:
                 
             else: # trigger_dag
                 # Кандидаты отбираются заранее, а не по одному в цикле: запускать можно
-                # только те даги, что реально поедут, а это один запрос к метабазе на
-                # весь список вместо запроса на каждую попытку.
+                # только те даги, что реально поедут, и это два запроса к метабазе на
+                # весь список сразу.
+                #
+                # Ключи читаем через .get с теми же умолчаниями, что у фабрики
+                # (ctl_worker.py): ctl_wf_norm их не гарантирует, они приходят как есть
+                # из ответа CTL. Раньше о битую запись спотыкался random.choice — редко;
+                # предварительный отбор проходит все записи, и одна такая роняла бы
+                # каждый прогон. deleted и архив исключаем по тем же правилам, что и
+                # фабрика: не строит она их — значит и запускать нечего.
+                archive_cat = get_config().get('archive_category', 'p1080.ARCHIVE')
                 wfs = [w for w in ctl_obj_load('ctl_workflows').values()
-                       if w['profile'] == profile
-                       and not (w['scheduled'] and w['singleLoading'])
-                       and w['category'] != get_config().get('archive_category')]
+                       if w.get('name') and w.get('profile') == profile
+                       and not w.get('deleted', False)
+                       and not (w.get('scheduled', False) and w.get('singleLoading', True))
+                       and w.get('category') != archive_cat]
 
-                runnable = runnable_dags([f"CTL.{w['name']}" for w in wfs])
-                ready = [w for w in wfs if f"CTL.{w['name']}" in runnable]
-                skipped = len(wfs) - len(ready)
+                if not wfs:
+                    raise AirflowSkipException(
+                        f"🔥 Запускать нечего: в ctl_workflows нет воркфлоу профиля {profile}, "
+                        "годных для симуляции")
 
-                msg = f"⏳ Testing {len(ready)} DAGs"
+                # Словарём, а не тремя f-строками подряд: заодно схлопываются одноимённые
+                # воркфлоу — иначе два элемента с одним dag_id дали бы DagRunAlreadyExists
+                # на втором триггере, ровно тот шум, от которого избавляемся.
+                by_dag_id = {f"CTL.{w['name']}": w for w in wfs}
+                runnable = runnable_dags(list(by_dag_id))
+                ready = [by_dag_id[d] for d in sorted(runnable)]
+                skipped = len(by_dag_id) - len(ready)
+
+                msg = f"⏳ Кандидатов к запуску: {len(ready)}"
                 if skipped:
                     # Без этого числа «симулятор ничего не запустил» неотличимо от
                     # «симулятор сломался»: запаузенных дагов у воркфлоу большинство.
@@ -201,12 +220,14 @@ else:
 
                 if not ready:
                     raise AirflowSkipException(
-                        f"🔥 Запускать нечего: из {len(wfs)} кандидатов ни один даг не поедет")
+                        f"🔥 Запускать нечего: из {len(by_dag_id)} кандидатов ни один даг не поедет")
 
-                # Выбор без повторов: run_id внутри таска один (собирается из start_date),
-                # поэтому повторный выбор того же дага упирается в DagRunAlreadyExists и
-                # уходит в лог ошибкой. Пока кандидатов были сотни, это случалось редко;
-                # после отбора по запускаемости список короткий, и повтор стал бы нормой.
+                # Выбор без повторов внутри одной попытки: run_id собирается из
+                # start_date таска и в её пределах одинаков, поэтому повторный выбор того
+                # же дага упирался бы в DagRunAlreadyExists. Пока кандидатов были сотни,
+                # это случалось редко; после отбора список короткий, и повтор стал бы
+                # нормой. На ретрае start_date другой, run_id тоже — там дубль возможен,
+                # и это осознанно: ретрай симулятора и должен создать новую нагрузку.
                 for wf in random.sample(ready, k=random.randint(1, min(cnt, len(ready)))):
                     wf_name = wf['name']
                     ret.append(wf_name)

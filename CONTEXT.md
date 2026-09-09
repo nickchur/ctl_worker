@@ -34,10 +34,10 @@
 | `ctl_worker/` | `ctl_worker/readme.md` | 2026-09-04 | `openspec/specs/ctl-worker/spec.md` | 2026-09-04 | 2026-09-04 |
 | `er_export/` | `er_export/README.md` | 2026-09-01 | `openspec/specs/er-export/spec.md` | 2026-09-01 | 2026-09-01 |
 | `gp_exchange/` | `gp_exchange/readme.md` | 2026-08-31 | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 | 2026-09-02 |
-| `plugins/` | `plugins/readme.md` | 2026-08-31 ⚠️ | `openspec/specs/plugins/spec.md` | 2026-09-03 | 2026-09-04 |
+| `plugins/` | `plugins/readme.md` | 2026-09-04 ⚠️ | `openspec/specs/plugins/spec.md` | 2026-09-03 ⚠️ | 2026-09-09 |
 | `tfs_kafka/` | `tfs_kafka/README.md` | 2026-08-28 | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 | 2026-08-28 |
 | `tools/` | `tools/readme.md` | 2026-08-31 | `openspec/specs/tools/spec.md` | 2026-08-31 | 2026-09-02 |
 | `xs_export/` | `xs_export/readme.md` | 2026-08-31 | `openspec/specs/xs-export/spec.md` | 2026-08-31 | 2026-09-02 |
 | `GP/` | `GP/readme.md` | 2026-09-03 | снимок `HR_Data` @ `068018c` | 2026-09-03 | 2026-09-03 |
 
-*Собрано 2026-09-04 скриптом `sync_context.py`*
+*Собрано 2026-09-09 скриптом `sync_context.py`*

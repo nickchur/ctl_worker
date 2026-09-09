@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-08-28 17:05 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-09 00:35 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -34,10 +34,18 @@ except ImportError:
 
 CH_ID = 'dlab-click'   # зеркало тракта в ClickHouse; пусто — выключено
 
-# 🌍 Контур. Платформа выставляет ENV_SPACE='alpha' в airflow_entrypoint.py:75, всё
-# остальное считаем sigma. ENV_STAND для этого не годится: DEV и PROM есть у обоих
-# контуров, и по нему альфу от сигмы не отличить.
-ENV_SPACE = 'alpha' if (os.getenv('ENV_SPACE') or '').strip().lower() == 'alpha' else 'sigma'
+# 🌍 Контур. Признак альфы — САМО НАЛИЧИЕ ENVIRONMENT, а не его значение: на альфе
+# платформа его задаёт (там ENVIRONMENT=DEV при пустом ENV_STAND), на сигме нет.
+#
+# Раньше здесь читался ENV_SPACE, и это перестало работать. Переменную читает не только
+# тракт: по ней же выбирает режим sber_hrp_py_libs_auth, и в режиме alpha она перестаёт
+# раскодировывать значения из vault — адрес брокера уезжает в подключение строкой base64.
+# Поэтому на альфа-стенде ENV_SPACE выставлен в 'sigma' намеренно, ради библиотеки, и
+# описанием контура он больше не является. Одна переменная на двух потребителей с
+# противоположными требованиями — читать её отсюда нельзя.
+#
+# ENV_STAND для этого тоже не годится: DEV и PROM есть у обоих контуров.
+ENV_SPACE = 'alpha' if (os.getenv('ENVIRONMENT') or '').strip() else 'sigma'
 
 # IN/OUT в conn_id и топиках — сторона ТФС: пишем мы в его вход, читаем из его выхода.
 KAFKA_SND_CONN  = 'tfs-kafka-in'
@@ -1646,7 +1654,8 @@ def get_config() -> dict:
         'TFS_STALE_MIN':    TFS_STALE_MIN,
         'MIRRORS':          mirrors(),   # включённые зеркала; S3 обязателен и в список не входит
         'DEF_ARGS':         DEF_ARGS,
-        'ENV_SPACE':        ENV_SPACE,
+        'ENV_SPACE':        ENV_SPACE,       # НАШ вывод о контуре, а не переменная окружения
+        'ENVIRONMENT':      (os.getenv('ENVIRONMENT') or '').strip(),   # по её наличию он и сделан
         'KAFKA_SND_CONN':   KAFKA_SND_CONN,
         'KAFKA_SND_TOPICS': KAFKA_SND_TOPICS,
         'DEFAULT_SND_TOPIC': DEFAULT_SND_TOPIC,

@@ -16,6 +16,11 @@ begin
     set search_path to s_grnplm_vd_hr_edp_srv_wf;
 
     drop table if exists tmp_html;
+
+    -- Закрывающая ') a' у каждого блока стиля стоит на отдельной строке, и это не
+    -- оформление: pr_mail_style(..., true) генерирует SQL с построчными комментариями
+    -- '-- ord:.. nn:.. lvl:..' и последняя строка фрагмента заканчивается таким
+    -- комментарием. Собери шаблон в одну строку - комментарий съест хвост запроса.
     sql = format($sql$
         with tbl as (
             select row_number() over(%2$s) rn, row_to_json(a.*) row from %1$s as a
@@ -23,7 +28,9 @@ begin
             select *, (
                 select string_agg(a.v, ' ') v from (
                     select concat(a.k, '="', string_agg(a.v, '; '), '"') v 
-                    from ( select null::text k, null::text v union %6$s ) a
+                    from ( 
+                        select null::text k, null::text v union %6$s 
+                    ) a
                     where a.k is not null and a.v is not null
                     group by a.k
                 ) a 
@@ -34,7 +41,9 @@ begin
                     select *, (
                         select string_agg(a.v, ' ') v from (
                             select concat(a.k, '="', string_agg(a.v, '; '), '"') v 
-                            from ( select null::text k, null::text v union %5$s ) a
+                            from ( 
+                                select null::text k, null::text v union %5$s 
+                            ) a
                             where a.k is not null and a.v is not null
                             group by a.k
                         ) a 
@@ -47,7 +56,9 @@ begin
         select concat('<table ', (
             select string_agg(a.v, ' ') v from (
                 select concat(a.k, '="', string_agg(a.v, '; '), '"') v 
-                from ( select null::text k, null::text v union %3$s ) a
+                from ( 
+                    select null::text k, null::text v union %3$s 
+                ) a
                 where a.k is not null and a.v is not null
                 group by a.k
             ) a 
@@ -58,7 +69,9 @@ begin
                 ('<thead id="thead"><tr id="tr">' || string_agg(concat('<th ', (
                     select string_agg(a.v, ' ') v from (
                         select concat(a.k, '="', string_agg(a.v, '; '), '"') v 
-                        from ( select null::text k, null::text v union %4$s ) a
+                        from ( 
+                            select null::text k, null::text v union %4$s 
+                        ) a
                         where a.k is not null and a.v is not null
                         group by a.k
                     ) a 

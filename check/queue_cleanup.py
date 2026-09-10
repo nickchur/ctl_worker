@@ -1,5 +1,5 @@
 """### 🧽 Чистка очереди celery от сообщений без задач
-*2026-09-10 17:17 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-10 17:25 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обходит очереди брокера, размечает каждое сообщение на живое и мусорное по метабазе и
 точечно удаляет мусор. Мусор — это сообщение, чья задача либо отсутствует в метабазе, либо
@@ -101,9 +101,11 @@ DATE_LEN = 10
 # Имя папки дампа. Отбор старого идёт строковым сравнением, поэтому объект, имя которого
 # на дату не похоже, под чистку попадать не должен — он «меньше» любой даты.
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}/")
-# Предел на чтение очереди: тела читаются в память целиком, иначе разметить их нечем.
+# Предел на чтение: тела читаются в память целиком, иначе разметить их нечем.
 # Гигабайтная очередь — уже не случай этого инструмента, и упасть на входе честнее, чем
-# по OOM в середине разбора. Проверяется по LLEN, до LRANGE, то есть даром.
+# по OOM в середине разбора. Проверяется по LLEN, до LRANGE, то есть даром, — и по
+# сумме тоже: в памяти лежат тела всех очередей сразу, поэтому пять очередей по сорок
+# тысяч ничем не лучше одной на двести.
 READ_LIMIT = 50_000
 
 # default_var={} обязателен: без него отсутствующая переменная роняет разбор файла и
@@ -214,11 +216,12 @@ def _read_queues(names: list) -> tuple:
                 # а содержимое и удаление идут по полному, которое собираем сами.
                 full = prefix + base
                 length = channel.client.llen(base)
-                if length > READ_LIMIT:
+                if length > READ_LIMIT or len(msgs) + length > READ_LIMIT:
                     raise RuntimeError(
-                        f"ключ {base!r}: {length} сообщений, предел чтения — {READ_LIMIT}. "
-                        f"Такую очередь этот инструмент в память не берёт: разбирать её нужно "
-                        f"иначе — пересборкой ключа, а не удалением по одному сообщению."
+                        f"ключ {base!r}: {length} сообщений, уже прочитано {len(msgs)}, "
+                        f"предел чтения — {READ_LIMIT}. Столько этот инструмент в память не "
+                        f"берёт: разбирать такую очередь нужно иначе — пересборкой ключа, а не "
+                        f"удалением по одному сообщению."
                     )
                 body = channel.client.lrange(full, 0, -1)
                 # Не «на всякий случай»: на контуре с префиксом это дало «в очереди 0»
@@ -423,7 +426,7 @@ def tools_queue_cleanup():
         return snapshot
 
     @task(task_id="purge", trigger_rule=TriggerRule.NONE_FAILED)
-    def purge(snapshot: dict, **context) -> dict:
+    def purge(snapshot: dict = None, **context) -> dict:
         """🧹 Удаляет размеченный мусор. По умолчанию выключено."""
         from airflow.exceptions import AirflowFailException, AirflowSkipException
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -432,6 +435,13 @@ def tools_queue_cleanup():
         p = context["params"]
         if not p["purge"]:
             raise AirflowSkipException("purge=False — очередь не трогаем")
+
+        # Разметки может не быть вовсе: NONE_FAILED считает пропуск успехом, и на пустой
+        # очереди (collect пропустился) сюда приходит пустой аргумент. Это не ошибка —
+        # удалять нечего, поэтому пропуск, а не падение. Упавший collect сюда не пускает
+        # само правило: у него состояние upstream_failed.
+        if not snapshot:
+            raise AirflowSkipException("разметки нет — collect пропустился, очередь была пуста")
 
         total, junk = snapshot["total"], snapshot["junk"]
         if not junk:

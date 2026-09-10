@@ -1,5 +1,5 @@
 """### 🧽 Чистка очереди celery от сообщений без задач
-*2026-09-10 09:40 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-10 17:17 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обходит очереди брокера, размечает каждое сообщение на живое и мусорное по метабазе и
 точечно удаляет мусор. Мусор — это сообщение, чья задача либо отсутствует в метабазе, либо
@@ -44,6 +44,7 @@ from datetime import datetime, timedelta, timezone
 import base64
 import json
 import logging
+import re
 
 from airflow.configuration import conf
 from airflow.decorators import dag, task
@@ -62,6 +63,10 @@ ensure_pool(TOOLS_POOL)
 
 # Бакет и коннект — те же, что у логов задач, но папка своя: дампы не должны попасть под
 # чистку логов (см. check/log_cleanup.py) и мешаться с ними в выдаче.
+# verify=False у S3Hook ниже — как во всех дагах этого репозитория: наш S3-шлюз ходит
+# по внутреннему сертификату, которого нет в бандле CA у образа. Правильное решение —
+# CA в подключении; пока его нет, оставляем как есть, но помним, что это не «на всякий
+# случай», а осознанный компромисс.
 AWS_CONN_ID = conf.get("logging", "REMOTE_LOG_CONN_ID")
 BUCKET_NAME = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].split("/")[0]
 PREFIX = "queue_cleanup/"
@@ -88,6 +93,18 @@ DEFAULTS = {
 # None, и его состав между версиями Airflow менялся. Здесь он решает, что удалять, —
 # такой список должен быть виден глазами, а не подразумеваться.
 TERMINAL_STATES = frozenset({"success", "failed", "skipped", "upstream_failed", "removed"})
+
+# Партия для IN по кортежам: планировщик разбирает список из тысяч элементов заметно дольше.
+STATE_BATCH = 500
+# Длина даты в имени папки дампа (`YYYY-MM-DD`) — по ней же отбираются старые дампы.
+DATE_LEN = 10
+# Имя папки дампа. Отбор старого идёт строковым сравнением, поэтому объект, имя которого
+# на дату не похоже, под чистку попадать не должен — он «меньше» любой даты.
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}/")
+# Предел на чтение очереди: тела читаются в память целиком, иначе разметить их нечем.
+# Гигабайтная очередь — уже не случай этого инструмента, и упасть на входе честнее, чем
+# по OOM в середине разбора. Проверяется по LLEN, до LRANGE, то есть даром.
+READ_LIMIT = 50_000
 
 # default_var={} обязателен: без него отсутствующая переменная роняет разбор файла и
 # вешает Broken DAG на весь даг, а не на один запуск.
@@ -170,8 +187,8 @@ def _states(keys: list) -> dict:
         return out
     sql = text(SQL_TARGETS).bindparams(bindparam("keys", expanding=True))
     with settings.engine.connect() as conn:
-        for i in range(0, len(keys), 500):
-            rows = conn.execute(sql, {"keys": keys[i:i + 500]})
+        for i in range(0, len(keys), STATE_BATCH):
+            rows = conn.execute(sql, {"keys": keys[i:i + STATE_BATCH]})
             for dag_id, task_id, run_id, map_index, state, eid in rows:
                 out[(dag_id, task_id, run_id, map_index)] = (state, eid)
     return out
@@ -197,6 +214,12 @@ def _read_queues(names: list) -> tuple:
                 # а содержимое и удаление идут по полному, которое собираем сами.
                 full = prefix + base
                 length = channel.client.llen(base)
+                if length > READ_LIMIT:
+                    raise RuntimeError(
+                        f"ключ {base!r}: {length} сообщений, предел чтения — {READ_LIMIT}. "
+                        f"Такую очередь этот инструмент в память не берёт: разбирать её нужно "
+                        f"иначе — пересборкой ключа, а не удалением по одному сообщению."
+                    )
                 body = channel.client.lrange(full, 0, -1)
                 # Не «на всякий случай»: на контуре с префиксом это дало «в очереди 0»
                 # при llen = 578 — удаление молча било бы мимо очереди. Стенд без
@@ -304,7 +327,10 @@ params = {
 )
 def tools_queue_cleanup():
 
-    @task(task_id="collect")
+    # Своя попытка сверх нуля в default_args: collect ничего не удаляет, а метабаза на
+    # дэве рвёт соединения сама по себе (падает праймери, реплика read-only). Прогон
+    # делает человек, и терять его из-за обрыва в середине опроса состояний обидно.
+    @task(task_id="collect", retries=1)
     def collect(**context) -> dict:
         """📸 Обход очередей, разметка по метабазе и дамп мусора в S3."""
         from airflow.exceptions import AirflowSkipException
@@ -414,13 +440,23 @@ def tools_queue_cleanup():
         # Пороги проверяем здесь, а не в collect: разметка должна отработать и показать
         # числа даже там, где удалять нельзя.
         share = junk / total if total else 0
+
+        def blocked(reason: str):
+            """Причина отказа — в XCom, до падения: иначе отчёт покажет «не удаляли».
+
+            Разница существенная: «не удаляли» — это выключенная галка, а здесь удаление
+            запрашивали и порог его не пустил. Возврат таска до отчёта не доходит.
+            """
+            context["ti"].xcom_push(key="blocked", value=reason)
+            return AirflowFailException(reason)
+
         if share < p["min_junk_share"]:
-            raise AirflowFailException(
+            raise blocked(
                 f"мусора {junk} из {total} — доля {share:.2f} ниже порога {p['min_junk_share']}. "
                 f"Картина не та, для которой инструмент сделан: разбираться нужно руками."
             )
         if junk > p["max_delete"]:
-            raise AirflowFailException(
+            raise blocked(
                 f"мусора {junk}, предел за один запуск — {p['max_delete']}. "
                 f"Либо поднять предел осознанно, либо сначала проверить разметку по дампу."
             )
@@ -457,30 +493,63 @@ def tools_queue_cleanup():
         return result
 
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
-    def report(snapshot: dict, purged: dict, **context) -> str:
-        """📊 Сводка: что было, что размечено, что удалено, где дамп."""
+    def report(snapshot: dict = None, purged: dict = None, **context) -> str:
+        """📊 Сводка: что было, что размечено, что удалено, где дамп.
+
+        Запускается при любом исходе (`ALL_DONE`), поэтому обоих словарей может не быть:
+        XCom упавшего или пропущенного таска не существует, и аргумент приезжает пустым.
+        Своё падение здесь хуже отсутствия сводки — дежурный получит два красных таска
+        вместо объяснения, что случилось с первым.
+        """
         p = context["params"]
         purged = purged or {}
+        if not snapshot:
+            done = context["dag_run"].get_task_instance("collect")
+            state = getattr(done, "state", None)
+            note = (
+                "очередь пуста — размечать было нечего"
+                if state == "skipped"
+                else f"collect не отработал (состояние: {state}) — размётки и дампа нет, сводки тоже"
+            )
+            add_note(note, context=context, level="DAG,Task", title="🧽 очередь celery")
+            return note
+
+        # Отказ порога отличается от выключенной галки: удаление запрашивали, и его не
+        # пустило. Причина приезжает из XCom, потому что возврат упавшего таска до сюда
+        # не доходит.
+        stop = context["ti"].xcom_pull(task_ids="purge", key="blocked")
+        if purged.get("removed") is not None:
+            deleted = purged["removed"]
+        elif stop:
+            deleted = "⛔️ порог не пустил"
+        else:
+            deleted = "☮️ не удаляли"
+
+        # Порядок строк — по убыванию важности: заметка обрезается по MAX_NOTE_LEN, и
+        # обрезаться должна разметка в хвосте, а не адрес дампа, по которому возвращают.
         lines = [
             "| Показатель | Значение |",
             "|---|---|",
-            f"| очереди | {', '.join(snapshot['queues'])} |",
-            f"| префикс ключей | `{snapshot['prefix'] or '—'}` |",
             f"| сообщений в очередях | {snapshot['total']} |",
             f"| живых | {snapshot['live']} |",
             f"| мусора | {snapshot['junk']} |",
-            f"| цель не прочиталась | {snapshot['unparsed']} |",
-            f"| расхождений с external_executor_id | {snapshot['eid_mismatch']} |",
-            f"| удалено | {purged.get('removed', '☮️ не удаляли')} |",
+            f"| удалено | {deleted} |",
             f"| осталось в очередях | {purged.get('left', '—')} |",
             f"| дамп | `s3://{BUCKET_NAME}/{snapshot['dump_key']}` |",
+            f"| очереди | {', '.join(snapshot['queues'])} |",
+            f"| префикс ключей | `{snapshot['prefix'] or '—'}` |",
+            f"| цель не прочиталась | {snapshot['unparsed']} |",
+            f"| расхождений с external_executor_id | {snapshot['eid_mismatch']} |",
         ]
+        if stop:
+            lines += ["", f"> ⛔️ {stop}"]
         if snapshot["reasons"]:
             lines += ["", "**Разметка:**"]
             lines += [f"- {k}: {v}" for k, v in sorted(snapshot["reasons"].items(), key=lambda x: -x[1])]
         if not p["purge"]:
             lines += ["", "> Подсчёт без удаления. Чтобы удалить — запуск с галкой `purge`."]
         summary = "\n".join(lines)
+        logger.info("📊 сводка:\n%s", summary)
         add_note(summary, context=context, level="DAG,Task", title="🧽 очередь celery")
         return summary
 
@@ -498,8 +567,13 @@ def tools_queue_cleanup():
         hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
         keys = hook.list_keys(bucket_name=BUCKET_NAME, prefix=PREFIX) or []
         # Дата лежит в имени папки, поэтому отбираем строковым сравнением, а не запросом
-        # метаданных на каждый объект.
-        old = [k for k in keys if k[len(PREFIX):len(PREFIX) + 10] < edge]
+        # метаданных на каждый объект: формат `YYYY-MM-DD` сравнивается как строка верно.
+        # Имя, на дату не похожее, пропускаем: чужой объект под нашим префиксом иначе
+        # сравнился бы «меньше края» и был бы удалён заодно.
+        old = [
+            k for k in keys
+            if DATE_DIR_RE.match(k[len(PREFIX):]) and k[len(PREFIX):len(PREFIX) + DATE_LEN] < edge
+        ]
         if old:
             hook.delete_objects(bucket=BUCKET_NAME, keys=old)
         msg = f"дампов: {len(keys)}, убрано старше {edge}: {len(old)}"

@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-02 20:40 MSK · v2.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-12 15:24 MSK · v2.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -14,8 +14,8 @@
 |---|---|
 | **`check_serialized.check_serialized_dag`** | Считает по `main.serialized_dag`, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка «на последнем парсинге» (`last_updated` попал в окно последнего разбора файла — `dag.last_parsed_time`). **Никогда не падает**: одного замера мало, чтобы отличить дрожание от деплоя. Возвращает список подозрительных DAG'ов, статистика — в XCom `serialized_stats` |
 | **`check_serialized.recheck_serialized_dag`** | Mapped-таск, по экземпляру на DAG из списка. Ждёт следующего парсинга (сдвига `dag.last_parsed_time`) и сравнивает сериализацию до и после, показывая расхождения по путям вида `.dag.params[0][1].schema.examples[0]` |
-| **`compare.find_changed`** | Находит DAG'и, у которых `dag_hash` разошёлся с последней сохранённой версией, то есть изменившиеся с прошлого прогона. Ничего не скачивает: хэш виден в имени объекта |
-| **`compare.snapshot_dags`** | Пишет новые версии в S3 и возвращает пары «прошлая версия → новая» для `expand`; статистика — в XCom `snapshot_stats` |
+| **`compare.find_changed`** | Находит DAG'и, у которых `dag_hash` разошёлся с последней сохранённой версией, то есть изменившиеся с прошлого прогона. Ничего не скачивает: хэш виден в имени объекта. Список — в XCom `changed_dags` и в заметку, возвращает только счётчики |
+| **`compare.snapshot_dags`** | Пишет новые версии в S3 — всех изменившихся, сколько бы их ни было — и возвращает для `expand` пары «прошлая версия → новая», не больше `COMPARE_LIMIT` (100), свежие первыми. Статистика — в XCom `snapshot_stats`, пары сверх лимита — в `not_compared` |
 | **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
 | **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** Он же сверяет построенное с `serialized_dag` и показывает DAG'и, которые разобрались, но в таблицу не доехали: такой DAG виден в UI, но `trigger_dag` по нему падает с `DagNotFound` |
 | **`summary`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга |
@@ -24,6 +24,11 @@
 не проверяются вовсе — ни в статистике сериализации, ни в версиях, ни в покрытии.
 Нагрузочный генератор переписывает свои DAG'и сам по себе, и в отчётах это шум.
 Исключение не касается `parse_time`: он меряет разбор **файлов**, а не DAG'и по id.
+
+**Массовое изменение.** После выкладки или обновления core меняется сериализация сотен
+DAG'ов разом. Версии записываются все, а сравниваются первые `COMPARE_LIMIT`: остальные
+идут в сводку числом и списком в XCom `not_compared`. У массового изменения расхождения
+почти у всех одни и те же, а сотни экземпляров сравнения на часы заняли бы пул.
 
 **Параметры:**
 
@@ -133,6 +138,15 @@ SKIP_SQL = " AND ".join(
 # таблицы с двумя ячейками и путём выходит под 270, а заметка режется по MAX_NOTE_LEN
 # (1000): три строки влезают даже в худшем случае. Остальное — в логе, там лимита нет
 NOTE_DIFFS = 3
+
+# Сколько пар «прошлая версия → новая» отдаём на сравнение за прогон. Потолок жёсткий:
+# XCom-бэкенд контура (core, hrp_adapter/limited_xcom_backend.py) не принимает список
+# длиннее 500 элементов, а expand раскрывается только по return_value — то есть по списку.
+# 12.09.2026 на альфе обновление core поменяло сериализацию 685 DAG'ов, find_changed
+# упал на return, snapshot_dags не запустился, и падение повторялось бы каждую ночь:
+# изменившиеся считаются от последней записанной версии. 100, а не 499: каждое сравнение —
+# отдельный экземпляр в пуле tools, а при массовом изменении расхождения одни и те же
+COMPARE_LIMIT = 100
 
 
 def _short(value, limit: int = 60) -> str:
@@ -273,6 +287,32 @@ def _snap_index(hook) -> tuple[dict, list[str]]:
             else:
                 cur["versions"] += 1
     return latest, all_keys
+
+
+def _current_dags(session) -> list[dict]:
+    """Метаданные serialized_dag без data: dag_id, dag_hash, last_updated; исключённые — мимо."""
+    from airflow.models.serialized_dag import SerializedDagModel
+
+    return [
+        {"dag_id": r[0], "dag_hash": r[1], "last_updated": r[2]}
+        for r in session.query(
+            SerializedDagModel.dag_id, SerializedDagModel.dag_hash,
+            SerializedDagModel.last_updated,
+        ).all()
+        if not _skip_dag(r[0])
+    ]
+
+
+def _changed_dags(current: list[dict], snaps: dict) -> list[dict]:
+    """Изменившиеся с последней записанной версии: dag_hash разошёлся с хэшем в имени копии.
+
+    Свежие первыми. DAG без копии сюда не попадает — сравнивать его не с чем.
+    """
+    return sorted(
+        (c for c in current
+         if c["dag_id"] in snaps and snaps[c["dag_id"]]["hash"] != c["dag_hash"]),
+        key=lambda c: c["last_updated"], reverse=True,
+    )
 
 
 def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], limit: int) -> list[str]:
@@ -615,7 +655,7 @@ def tools_test_dags():
                 "то есть изменившиеся с прошлого прогона. Сравнением занимается "
                 "`compare_changed` — после того, как snapshot_dags запишет новую версию"),
     )
-    def find_changed(**context) -> list[str]:
+    def find_changed(**context) -> dict:
         """Отбирает изменившиеся DAG'и, ничего не скачивая.
 
         «Изменился» определяется не окном по времени, а сравнением `dag_hash` с последней
@@ -626,10 +666,13 @@ def tools_test_dags():
 
         Хэш последней версии виден прямо в имени объекта, поэтому отбор стоит одного
         листинга бакета и одного запроса метаданных — без единого GET.
+
+        Возвращает счётчики, а не список: список через return упирается в лимит XCom
+        контура (см. COMPARE_LIMIT), и после обновления core таск падал бы каждую ночь.
+        snapshot_dags отбирает изменившиеся сам — по тем же хэшам, минутой позже.
         """
         import time
 
-        from airflow.models.serialized_dag import SerializedDagModel
         from airflow.utils.session import create_session
 
         try:
@@ -645,23 +688,12 @@ def tools_test_dags():
         # Тянем только метаданные: data по каждому DAG'у прочитает mapped-таск, и лишь
         # для тех, у кого hash разошёлся
         with create_session() as session:
-            current = [
-                {"dag_id": r[0], "dag_hash": r[1], "last_updated": r[2]}
-                for r in session.query(
-                    SerializedDagModel.dag_id, SerializedDagModel.dag_hash,
-                    SerializedDagModel.last_updated,
-                ).all()
-                if not _skip_dag(r[0])
-            ]
+            current = _current_dags(session)
 
         # Сравнивать не с чем, пока версии нет: такие DAG'и только считаем — на первом
         # прогоне это все, и построчно они бы залили и заметку, и XCom
         no_snapshot = [c["dag_id"] for c in current if c["dag_id"] not in snaps]
-        changed = sorted(
-            (c for c in current
-             if c["dag_id"] in snaps and snaps[c["dag_id"]]["hash"] != c["dag_hash"]),
-            key=lambda c: c["last_updated"], reverse=True,
-        )
+        changed = _changed_dags(current, snaps)
         elapsed = time.time() - ts
         logger.info("🔍 всего DAG'ов %d, с версиями %d, изменилось с прошлого прогона %d, "
                     "без версий %d", len(current), len(snaps), len(changed), len(no_snapshot))
@@ -678,27 +710,32 @@ def tools_test_dags():
         else:
             table = "С прошлого прогона ни один DAG не менялся"
 
-        dag_ids = [c["dag_id"] for c in changed]
-        add_xcom("changed_dags", dag_ids, context)
+        # add_xcom сам режет список до MAX_XCOM и кладёт строкой — лимит бэкенда ему не страшен
+        add_xcom("changed_dags", [c["dag_id"] for c in changed], context)
         add_note(table, context, level="task",
                  title=(f"🔍 {elapsed:.2f} sec find_changed: {len(changed)} из {len(current)}"
                         + (f", без версий {len(no_snapshot)}" if no_snapshot else "")))
-        add_xcom("find_stats", {"total": len(current), "changed": len(changed),
-                                "snapshots": len(snaps), "no_snapshot": len(no_snapshot)}, context)
-        return dag_ids
+        stats = {"total": len(current), "changed": len(changed),
+                 "snapshots": len(snaps), "no_snapshot": len(no_snapshot)}
+        add_xcom("find_stats", stats, context)
+        return stats
 
     @task(
         task_id="snapshot_dags",
         doc_md=("Складывает копии сериализаций в S3. `snapshot_limit=0` — все DAG'и, иначе "
                 "ротация: изменившиеся → без копии → с самой старой копией"),
     )
-    def snapshot_dags(changed: list, **context) -> list[dict]:
+    def snapshot_dags(**context) -> list[dict]:
         """Пишет новые версии и возвращает пары «прошлая версия → новая» для expand.
 
         Пары идут именно return-значением: expand умеет раскрываться только по
         `return_value` и на кастомном XCom-ключе падает ещё при разборе файла
         (`mappedoperator.py:132`, «cannot map over XCom with custom key»). Поэтому
         статистика для summary уезжает в ключ `snapshot_stats`, а не наоборот.
+
+        Изменившиеся отбираются здесь же, а не приезжают от find_changed: тот же листинг и
+        те же хэши, но без списка в XCom. Версии пишутся всем изменившимся, на сравнение
+        уходят первые COMPARE_LIMIT пар — свежие первыми, остальные в `not_compared`.
         """
         import gzip
         import json
@@ -719,8 +756,9 @@ def tools_test_dags():
         hook = _snap_hook()
         snaps, all_keys = _snap_index(hook)
         with create_session() as session:
-            all_dags = [r[0] for r in session.query(SerializedDagModel.dag_id).all()
-                        if not _skip_dag(r[0])]
+            current = _current_dags(session)
+        all_dags = [c["dag_id"] for c in current]
+        changed = [c["dag_id"] for c in _changed_dags(current, snaps)]
 
         snap_ages = {d: v["at"] for d, v in snaps.items()}
         targets = _snapshot_targets(all_dags, snap_ages, changed, limit)
@@ -769,6 +807,18 @@ def tools_test_dags():
                               "new_key": new_key, "new_version": version})
             logger.info("  %s: версия %05d (%s)", dag_id, version, readable_size(len(body)))
 
+        # Обход идёт в порядке ротации, а на сравнение нужны свежие изменения первыми.
+        # Пара без места в changed — DAG изменился уже после листинга: в хвост
+        rank = {d: i for i, d in enumerate(changed)}
+        pairs.sort(key=lambda p: rank.get(p["dag_id"], len(rank)))
+        pairs, not_compared = pairs[:COMPARE_LIMIT], [p["dag_id"] for p in pairs[COMPARE_LIMIT:]]
+        if not_compared:
+            logger.warning("📦 изменившихся с копией %d, на сравнение первые %d (COMPARE_LIMIT), "
+                           "без сравнения %d — версии записаны: %s",
+                           len(pairs) + len(not_compared), len(pairs), len(not_compared),
+                           ", ".join(not_compared[:20]))
+            add_xcom("not_compared", not_compared, context)
+
         # DAG'и, которых больше нет в serialized_dag: удалены совсем либо пропали временно
         deleted = sorted(set(snaps) - set(all_dags))
         deleted_keys = [k for k in all_keys
@@ -797,6 +847,7 @@ def tools_test_dags():
             f"| новых версий | {written} |",
             f"| из них первых | {first} |",
             f"| на сравнение | {len(pairs)} |",
+            *([f"| без сравнения (лимит {COMPARE_LIMIT}) | {len(not_compared)} |"] if not_compared else []),
             f"| без изменений | {unchanged} |",
             f"| объём выгрузки | {readable_size(total_bytes)} |",
             f"| покрытие | {covered} из {len(all_dags)} ({covered * 100 / total:.0f}%) |",
@@ -816,7 +867,8 @@ def tools_test_dags():
         add_xcom("snapshot_stats",
                  {"written": written, "first": first, "unchanged": unchanged,
                   "bytes": total_bytes, "covered": covered, "total": len(all_dags),
-                  "versions": versions, "pairs": len(pairs), "deleted": len(deleted),
+                  "versions": versions, "pairs": len(pairs), "not_compared": len(not_compared),
+                  "deleted": len(deleted),
                   "cleaned": bool(deleted and cleanup)}, context)
         return pairs
 
@@ -1213,6 +1265,12 @@ def tools_test_dags():
                              for r in compares))
         elif found and not cmp_silent:
             parts.append(f"С прошлого прогона не менялся ни один из {found.get('total')} DAG'ов")
+        if snapshot.get("not_compared"):
+            parts.append(f"⚠️ Без сравнения **{snapshot['not_compared']}** изменившихся DAG'ов: "
+                         f"за прогон сравнивается не больше {COMPARE_LIMIT}. Версии записаны, "
+                         f"список — XCom `not_compared` у `{COMPARE_GROUP}.snapshot_dags`. "
+                         f"Сотни изменений разом — обычно выкладка или обновление core, "
+                         f"а не дрожание.")
         if cmp_silent:
             parts.append(f"⚠️ **{cmp_silent}** сравнений не отчитались. Версии уже записаны, "
                          f"поэтому следующий прогон эти DAG'и не переоткроет — очистите "
@@ -1256,8 +1314,13 @@ def tools_test_dags():
     with TaskGroup(group_id=COMPARE_GROUP, tooltip="Версии в S3 и что изменилось") as tg_compare:
         # expand раскрывается только по return_value: на кастомном ключе Airflow
         # падает при разборе файла. Поэтому snapshot_dags возвращает пары,
-        # а статистику кладёт в XCom snapshot_stats
-        compare_changed.expand(target=snapshot_dags(find_changed()))
+        # а статистику кладёт в XCom snapshot_stats. find_changed связан с ним только
+        # порядком: он обязан прочитать бакет до того, как snapshot_dags запишет новые
+        # версии, иначе не увидит ни одного изменения. Данных между ними нет —
+        # список изменившихся через XCom упирался в лимит контура (см. COMPARE_LIMIT)
+        pairs = snapshot_dags()
+        find_changed() >> pairs
+        compare_changed.expand(target=pairs)
 
     # parse_time вне групп и ни от кого не зависит: он про разбор файлов, а не про
     # содержимое serialized_dag

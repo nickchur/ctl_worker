@@ -3,9 +3,9 @@
   "repo": "HR_Data",
   "checkout": "~/HR_Data",
   "source_root": "sql/create",
-  "branch": "E360-6192",
-  "rev": "068018c9cccee6f95fcf8790ef9d6cc1a8dec6d3",
-  "copied": "2026-09-03",
+  "branch": "E360-6367",
+  "rev": "279e52af02838eb47cc5020f3cb63c8bea895372",
+  "copied": "2026-09-10",
   "schemas": {
     "srv_wf": "s_grnplm_vd_hr_edp_srv_wf",
     "srv_dq": "s_grnplm_vd_hr_edp_srv_dq"

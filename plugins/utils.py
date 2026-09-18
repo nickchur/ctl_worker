@@ -544,7 +544,7 @@ def saved_params(var_name) -> dict:
         return {}
 
 
-def store_params(var_name, saved, context=None, flag='save_params'):
+def store_params(var_name, saved, context=None, flag='save_params', extra=None):
     """💾 Записывает параметры запуска в переменную как новые значения по умолчанию.
 
     Пара к saved_params(). Зовётся из отдельного таска в начале DAG-а — тогда в переменную
@@ -561,6 +561,10 @@ def store_params(var_name, saved, context=None, flag='save_params'):
         saved: Что лежало в переменной на парсинге — с ним сравниваем «было → стало».
         context: Контекст таска; по умолчанию берётся текущий.
         flag: Ключ-галочка «сохранить», в переменную не попадает.
+        extra: Служебные ключи, которых нет в форме (например версия набора параметров).
+            Дописываются в переменную, но в сравнение «было → стало» НЕ входят: иначе
+            первый же запуск у каждого тула показал бы ложное изменение и переписал свою
+            переменную. Без них форма затирала бы такие ключи при каждом сохранении.
 
     Returns:
         Кортеж ``(status, message)``: ``'ok'`` — записали, ``'skip'`` — галочка не стоит
@@ -586,7 +590,8 @@ def store_params(var_name, saved, context=None, flag='save_params'):
 
     # MSK круглый год UTC+3, отдельная зависимость ради этого не нужна
     ts = datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')
-    Variable.set(var_name, p, description=f"{ts} MSK · {context['dag_run'].run_id}", serialize_json=True)
+    Variable.set(var_name, {**p, **(extra or {})},
+                 description=f"{ts} MSK · {context['dag_run'].run_id}", serialize_json=True)
     logger.info(f"💾 {var_name}: {p}")
 
     lines = ['| Параметр | Было | Стало |', '|----------|------|-------|'] + [
